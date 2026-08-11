@@ -1,5 +1,8 @@
 
 ### Bug Fixes
+- Use GITHUB_TOKEN for homebrew formula publish
+
+### Bug Fixes
 - Suppress pre-existing and mid-sequence check false positives
 
 ### Features
