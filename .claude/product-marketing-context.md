@@ -42,7 +42,7 @@
 **Logo:** icon-only — a small speech-bubble/annotation mark, like a review comment pinned to a line of code. Leans into the name itself: a kibitzer heckles from the sidelines. Not yet designed — hand to `ui-logo-designer` when ready.
 
 ## Adoption Goals
-**Primary metric:** inferred, needs confirmation — proposing *integrations adopted* (agent runtimes + CI usage) over vanity metrics like stars, since the ambition is being the quality layer other tools wire into, not a standalone destination.
+**Primary metric:** GitHub stars / downloads (Homebrew installs, crates.io downloads once published).
 **Discovery path:** GitHub repo + Homebrew tap today; no other channel yet. Broadening beyond Claude Code will need a discovery path that isn't Claude-Code-specific (crates.io listing, a "works with any agent" positioning in the README).
 **Trust signals:** MIT license, small transparent codebase, explicit false-positive-handling docs, and — once broadened — evidence it works the same in CI as it does in an agent loop.
 **Adoption barrier:** currently narrow (Claude Code specifically); broadening to "general-purpose, AI-native, local-or-CI" removes that barrier but needs the README/positioning to catch up first.
@@ -59,5 +59,5 @@
 ## GitHub Presence
 **README purpose:** quick start (current README leads with install/usage for the CLI/hook/MCP surfaces)
 **Social proof:** none yet
-**Contribution posture:** inferred, needs confirmation — proposing "welcoming contributions," especially new checks and language coverage beyond Go, since the broadened ambition needs more check types than one person will write alone.
+**Contribution posture:** welcoming contributions, especially new checks and language coverage beyond Go, since the broadened ambition needs more check types than one person will write alone.
 **Topics/tags:** `claude-code`, `ai-agents`, `rust`, `cli`, `code-quality`, `ci`
