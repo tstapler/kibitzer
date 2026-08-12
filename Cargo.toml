@@ -6,7 +6,7 @@
 name = "kibitzer"
 version = "0.1.3"
 edition = "2024"
-description = "Diff-aware code/doc inspection hook for Claude Code"
+description = "Advisory, diff-aware code/doc quality checks for AI agents, CI, and local dev"
 repository = "https://github.com/tstapler/kibitzer"
 homepage = "https://github.com/tstapler/kibitzer"
 license = "MIT"
