@@ -7,6 +7,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Check, Severity};
 use crate::glob::matches_scope;
 
+/// Beyond this many lines, `describe()` truncates the command's raw output and points
+/// the agent at `command` to see the rest, instead of dumping everything inline —
+/// checks like whole-repo doc-structure reports can emit hundreds of lines, which
+/// buries the actionable part of the message and burns the agent's context on a single
+/// failed check.
+const MAX_SUMMARY_LINES: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     pub check_name: String,
@@ -14,21 +21,38 @@ pub struct CheckResult {
     pub passed: bool,
     pub output: String,
     pub message: Option<String>,
+    /// The shell command that produced `output`, substitutions already applied — shown
+    /// in the truncation note so the agent can re-run it directly to see everything.
+    pub command: String,
 }
 
 impl CheckResult {
-    /// Text to show the agent for a failed check: the config `message` explains *why*
-    /// the rule exists / is blocking, but only the command's own `output` says *where*
-    /// the violation is and what to change. Neither alone is enough to act on, so show
-    /// both whenever both are present, instead of the config message silently
-    /// swallowing the diagnostic (or vice versa).
+    /// Text to show the agent for a failed check: a top-level summary by default, with
+    /// an explicit path to the full detail on demand. The config `message` explains
+    /// *why* the rule exists / is blocking; the command's own `output` says *where* the
+    /// violation is. Neither alone is enough to act on, so show both whenever both are
+    /// present — but cap `output` at [`MAX_SUMMARY_LINES`] rather than concatenating an
+    /// unbounded wall of text, and tell the agent how to drill into the rest.
     pub fn describe(&self) -> String {
-        let output = self.output.trim();
-        match (&self.message, output.is_empty()) {
-            (Some(message), false) => format!("{message}\n{output}"),
+        let summary = self.summarize_output();
+        match (&self.message, summary.is_empty()) {
+            (Some(message), false) => format!("{message}\n{summary}"),
             (Some(message), true) => message.clone(),
-            (None, _) => output.to_string(),
+            (None, _) => summary,
         }
+    }
+
+    fn summarize_output(&self) -> String {
+        let lines: Vec<&str> = self.output.trim().lines().collect();
+        if lines.len() <= MAX_SUMMARY_LINES {
+            return lines.join("\n");
+        }
+        let shown = lines[..MAX_SUMMARY_LINES].join("\n");
+        let hidden = lines.len() - MAX_SUMMARY_LINES;
+        format!(
+            "{shown}\n… {hidden} more line(s) truncated — see everything: `{}`",
+            self.command
+        )
     }
 }
 
@@ -43,6 +67,7 @@ mod describe_tests {
             passed: false,
             output: output.to_string(),
             message: message.map(String::from),
+            command: "some-check-command".to_string(),
         }
     }
 
@@ -62,6 +87,27 @@ mod describe_tests {
     fn falls_back_to_output_when_no_message_configured() {
         let r = result(None, "file.md:12: bad anchor");
         assert_eq!(r.describe(), "file.md:12: bad anchor");
+    }
+
+    #[test]
+    fn truncates_long_output_and_points_to_full_command() {
+        let lines: Vec<String> = (1..=30).map(|n| format!("file.md:{n}: violation")).collect();
+        let r = result(None, &lines.join("\n"));
+        let described = r.describe();
+        let described_lines: Vec<&str> = described.lines().collect();
+        assert_eq!(described_lines.len(), MAX_SUMMARY_LINES + 1);
+        assert!(described_lines[..MAX_SUMMARY_LINES]
+            .iter()
+            .zip(&lines)
+            .all(|(a, b)| a == b));
+        assert!(described.contains("10 more line(s) truncated"));
+        assert!(described.contains("some-check-command"));
+    }
+
+    #[test]
+    fn short_output_is_not_truncated() {
+        let r = result(None, "one\ntwo\nthree");
+        assert_eq!(r.describe(), "one\ntwo\nthree");
     }
 }
 
@@ -116,6 +162,7 @@ pub fn run_check(
         passed,
         output: combined,
         message,
+        command: cmd_str,
     })
 }
 
