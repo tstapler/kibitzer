@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Check, Severity};
 use crate::glob::matches_scope;
 
+/// Beyond this many lines, `describe()` truncates the command's raw output and points
+/// the agent at `command` to see the rest, instead of dumping everything inline —
+/// checks like whole-repo doc-structure reports can emit hundreds of lines, which
+/// buries the actionable part of the message and burns the agent's context on a single
+/// failed check.
+const MAX_SUMMARY_LINES: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     pub check_name: String,
@@ -15,6 +22,102 @@ pub struct CheckResult {
     pub passed: bool,
     pub output: String,
     pub message: Option<String>,
+    /// The shell command that produced `output`, substitutions already applied — shown
+    /// in the truncation note so the agent can re-run it directly to see everything.
+    /// `serde(default)` so a `cache.json` written before this field existed deserializes
+    /// (with an empty command) instead of `Cache::load` silently discarding the whole
+    /// cache on the first run after upgrade.
+    #[serde(default)]
+    pub command: String,
+}
+
+impl CheckResult {
+    /// Text to show the agent for a failed check: a top-level summary by default, with
+    /// an explicit path to the full detail on demand. The config `message` explains
+    /// *why* the rule exists / is blocking; the command's own `output` says *where* the
+    /// violation is. Neither alone is enough to act on, so show both whenever both are
+    /// present — but cap `output` at [`MAX_SUMMARY_LINES`] rather than concatenating an
+    /// unbounded wall of text, and tell the agent how to drill into the rest.
+    pub fn describe(&self) -> String {
+        let summary = self.summarize_output();
+        match (&self.message, summary.is_empty()) {
+            (Some(message), false) => format!("{message}\n{summary}"),
+            (Some(message), true) => message.clone(),
+            (None, _) => summary,
+        }
+    }
+
+    fn summarize_output(&self) -> String {
+        let lines: Vec<&str> = self.output.trim().lines().collect();
+        if lines.len() <= MAX_SUMMARY_LINES {
+            return lines.join("\n");
+        }
+        let shown = lines[..MAX_SUMMARY_LINES].join("\n");
+        let hidden = lines.len() - MAX_SUMMARY_LINES;
+        format!(
+            "{shown}\n… {hidden} more line(s) truncated — see everything, run: {}",
+            self.command
+        )
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    fn result(message: Option<&str>, output: &str) -> CheckResult {
+        CheckResult {
+            check_name: "test-check".to_string(),
+            severity: Severity::Blocking,
+            passed: false,
+            output: output.to_string(),
+            message: message.map(String::from),
+            command: "some-check-command".to_string(),
+        }
+    }
+
+    #[test]
+    fn combines_message_and_output_when_both_present() {
+        let r = result(Some("why this is blocking"), "file.md:12: bad anchor");
+        assert_eq!(r.describe(), "why this is blocking\nfile.md:12: bad anchor");
+    }
+
+    #[test]
+    fn falls_back_to_message_when_output_is_empty() {
+        let r = result(Some("why this is blocking"), "");
+        assert_eq!(r.describe(), "why this is blocking");
+    }
+
+    #[test]
+    fn falls_back_to_output_when_no_message_configured() {
+        let r = result(None, "file.md:12: bad anchor");
+        assert_eq!(r.describe(), "file.md:12: bad anchor");
+    }
+
+    #[test]
+    fn truncates_long_output_and_points_to_full_command() {
+        let lines: Vec<String> = (1..=30)
+            .map(|n| format!("file.md:{n}: violation"))
+            .collect();
+        let r = result(None, &lines.join("\n"));
+        let described = r.describe();
+        let described_lines: Vec<&str> = described.lines().collect();
+        assert_eq!(described_lines.len(), MAX_SUMMARY_LINES + 1);
+        assert!(
+            described_lines[..MAX_SUMMARY_LINES]
+                .iter()
+                .zip(&lines)
+                .all(|(a, b)| a == b)
+        );
+        assert!(described.contains("10 more line(s) truncated"));
+        assert!(described.contains("some-check-command"));
+    }
+
+    #[test]
+    fn short_output_is_not_truncated() {
+        let r = result(None, "one\ntwo\nthree");
+        assert_eq!(r.describe(), "one\ntwo\nthree");
+    }
 }
 
 /// Run a single check against `file_path` (already confirmed in-scope by the caller).
@@ -71,6 +174,7 @@ pub fn run_check(
         passed,
         output: combined,
         message,
+        command: cmd_str,
     })
 }
 
