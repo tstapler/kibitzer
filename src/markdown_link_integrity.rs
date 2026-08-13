@@ -4,11 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use regex::Regex;
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Finding {
-    pub line: usize,
-    pub message: String,
-}
+use crate::checker::{Checker, Finding};
 
 /// Checks reference-style markdown links: `[label][ref-id]` uses with no matching
 /// `[ref-id]: target` definition, and definitions whose target is a dead heading anchor
@@ -20,6 +16,14 @@ pub fn check_file(path: &Path) -> Result<Vec<Finding>> {
     let src =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     check_source(path, &src)
+}
+
+pub struct MarkdownLinkIntegrityChecker;
+
+impl Checker for MarkdownLinkIntegrityChecker {
+    fn check_file(&self, path: &Path) -> Result<Vec<Finding>> {
+        check_file(path)
+    }
 }
 
 pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
