@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+    <!-- fix: same single-vertex-kink imbalance as concept-3-chevron.svg. Two-point S-bend at (181.8,273.9)/(330.2,238.1), reflected through center, restores exact 50/50. -->
+    <path d="M70,175 L175,70 L337,70 L442,175 L442,337 L330.2,238.1 L181.8,273.9 Z" fill="#e0a030"/>
+    <path d="M442,337 L337,442 L175,442 L70,337 L70,175 L181.8,273.9 L330.2,238.1 Z" fill="#c0392b"/>
+  </g>
+</svg>

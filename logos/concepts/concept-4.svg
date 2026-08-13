@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+    <!-- the reviewed work: a squared-off "[" scope bracket, spine + two arms,
+         all right angles, spanning 68.75% of the canvas height. this is the
+         diff hunk / file under review — deliberately plain, off-white, not
+         the thing carrying the brand accent. -->
+    <polygon fill="#d8dee9" points="138,80 338,80 338,144 202,144 202,368 338,368 338,432 138,432"/>
+    <!-- the kibitzer: a solid amber marker standing apart in the bracket's
+         open mouth, its apex pointed at the scoped line but never touching
+         the bracket, and its base sitting outside the arms' right edge —
+         commentary from beside the work, not inside it. the 48-unit gap
+         between the apex and the spine is the discovered element: read as
+         negative space it forms a thin vertical slot the full height of the
+         mouth, reading like an inserted caret standing in the gutter next to
+         the flagged line rather than on top of it. -->
+    <polygon fill="#e0a030" points="250,256 374,176 374,336"/>
+  </g>
+</svg>

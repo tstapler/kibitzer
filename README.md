@@ -1,3 +1,5 @@
+<img src="logos/export/logo-192.png" alt="kibitzer logo" width="96" align="right">
+
 # kibitzer
 
 Advisory, diff-aware code and doc checks built for how AI agents actually
@@ -28,6 +30,24 @@ kibitzer check primitive-obsession <file>   # run a single built-in check direct
 ```
 
 See `docs/checking-invocations.md` for how checks are wired up.
+
+### Diff-aware scoping
+
+When kibitzer knows which lines an edit touched (the `PostToolUse` hook,
+not batch mode), a check in `.claude/inspect.json` can opt into scoping its
+results to just those lines, two ways:
+
+- `{changed_lines}` in `command`: substituted with a comma-separated list
+  of 1-indexed, inclusive `start-end` ranges (e.g. `12-15,40-40`), for
+  linters that support scoping their own scan.
+- Automatic output filtering: if a check's command emits `{file}:{line}:
+  message`-style lines (most linters do), kibitzer filters them down to
+  the changed ranges and recomputes pass/fail from what survives — no
+  command changes needed.
+
+A failure kibitzer determines predates the current edit (present in
+`git show HEAD:<file>` too) is reported as advisory rather than blocking,
+even for a check configured as blocking.
 
 ## Development
 

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Logo Preview — Iterations (Round 3: refining the chevron)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 2rem;
+    transition: background-color 0.3s, color 0.3s;
+  }
+  body.light { background: #f5f5f5; color: #333; }
+  body.dark { background: #1a1a1a; color: #eee; }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+  }
+  h1 { font-size: 1.5rem; font-weight: 600; }
+  h2 { font-size: 1.1rem; font-weight: 600; margin: 2rem 0 1rem; }
+  .toggle {
+    padding: 0.5rem 1rem;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1.5rem;
+  }
+  .card {
+    border: 1px solid rgba(128, 128, 128, 0.3);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .card.recommended { border-color: #e0a030; border-width: 2px; }
+  .card-img {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    min-height: 240px;
+  }
+  body.light .card-img { background: #fff; }
+  body.dark .card-img { background: #2a2a2a; }
+  .card-img svg { max-width: 100%; max-height: 200px; width: 200px; height: 200px; }
+  .card-label {
+    padding: 0.75rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-top: 1px solid rgba(128, 128, 128, 0.3);
+  }
+  body.light .card-label { background: #fafafa; }
+  body.dark .card-label { background: #222; }
+  .card-desc {
+    padding: 0 1rem 0.75rem 1rem;
+    font-size: 0.8rem;
+    opacity: 0.75;
+  }
+  .favicon-strip {
+    display: flex;
+    gap: 1.5rem;
+    align-items: flex-end;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid rgba(128, 128, 128, 0.3);
+  }
+  body.light .favicon-strip { background: #fafafa; }
+  body.dark .favicon-strip { background: #222; }
+  .favicon-strip .fav { text-align: center; }
+  .favicon-strip .fav svg { display: block; margin: 0 auto 0.25rem; }
+  .favicon-strip .fav span { font-size: 0.65rem; opacity: 0.6; }
+  .notes {
+    margin-top: 2.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid rgba(128, 128, 128, 0.3);
+    font-size: 0.9rem;
+    line-height: 1.6;
+  }
+  .notes h2 { font-size: 1.1rem; margin-bottom: 0.5rem; margin-top: 0; }
+  .notes ul { margin: 0 0 1rem 1.25rem; }
+</style>
+</head>
+<body class="light">
+  <div class="header">
+    <h1>Logo Preview — Round 3 (refining the chevron)</h1>
+    <button class="toggle" onclick="document.body.classList.toggle('dark'); document.body.classList.toggle('light'); this.textContent = document.body.classList.contains('dark') ? '☀️ Light' : '🌙 Dark';">🌙 Dark</button>
+  </div>
+
+  <h2>Baseline vs. refined</h2>
+  <div class="grid">
+
+    <div class="card">
+      <div class="card-img">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+          <g id="icon">
+            <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+            <path d="M70,148 L148,70 L364,70 L442,148 L442,364 Z" fill="#e0a030"/>
+            <path d="M442,364 L364,442 L148,442 L70,364 L70,148 Z" fill="#c0392b"/>
+          </g>
+        </svg>
+      </div>
+      <div class="card-label">Baseline — Severity Mark</div>
+      <div class="card-desc">Straight diagonal split, no bend. Kept for reference.</div>
+      <div class="favicon-strip">
+        <div class="fav"><svg width="64" height="64" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 Z" fill="#c0392b"/></g></svg><span>64px</span></div>
+        <div class="fav"><svg width="32" height="32" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 Z" fill="#c0392b"/></g></svg><span>32px</span></div>
+        <div class="fav"><svg width="16" height="16" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 Z" fill="#c0392b"/></g></svg><span>16px</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-img">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+          <g id="icon">
+            <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+            <path d="M70,148 L148,70 L364,70 L442,148 L442,364 L334.9,248.6 L177.1,263.4 Z" fill="#e0a030"/>
+            <path d="M442,364 L364,442 L148,442 L70,364 L70,148 L177.1,263.4 L334.9,248.6 Z" fill="#c0392b"/>
+          </g>
+        </svg>
+      </div>
+      <div class="card-label">Discovered Chevron (Round 2 pick)</div>
+      <div class="card-desc">Where this round started from: symmetric two-point zigzag, offset 46, exact 50/50 split — but the bend carries no directional information (works equally well read either way).</div>
+      <div class="favicon-strip">
+        <div class="fav"><svg width="64" height="64" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L334.9,248.6 L177.1,263.4 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L177.1,263.4 L334.9,248.6 Z" fill="#c0392b"/></g></svg><span>64px</span></div>
+        <div class="fav"><svg width="32" height="32" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L334.9,248.6 L177.1,263.4 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L177.1,263.4 L334.9,248.6 Z" fill="#c0392b"/></g></svg><span>32px</span></div>
+        <div class="fav"><svg width="16" height="16" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L334.9,248.6 L177.1,263.4 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L177.1,263.4 L334.9,248.6 Z" fill="#c0392b"/></g></svg><span>16px</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-img">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+          <g id="icon">
+            <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+            <path d="M70,148 L148,70 L364,70 L442,148 L442,364 L344.9,231.3 L167.1,280.7 Z" fill="#e0a030"/>
+            <path d="M442,364 L364,442 L148,442 L70,364 L70,148 L167.1,280.7 L344.9,231.3 Z" fill="#c0392b"/>
+          </g>
+        </svg>
+      </div>
+      <div class="card-label">Bolder Kink (fallback)</div>
+      <div class="card-desc">Same symmetric bend, offset increased 46 → 66 for more visible presence at favicon size. Safe, legible, but still direction-agnostic — doesn't add the escalation cue.</div>
+      <div class="favicon-strip">
+        <div class="fav"><svg width="64" height="64" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L344.9,231.3 L167.1,280.7 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L167.1,280.7 L344.9,231.3 Z" fill="#c0392b"/></g></svg><span>64px</span></div>
+        <div class="fav"><svg width="32" height="32" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L344.9,231.3 L167.1,280.7 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L167.1,280.7 L344.9,231.3 Z" fill="#c0392b"/></g></svg><span>32px</span></div>
+        <div class="fav"><svg width="16" height="16" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L344.9,231.3 L167.1,280.7 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L167.1,280.7 L344.9,231.3 Z" fill="#c0392b"/></g></svg><span>16px</span></div>
+      </div>
+    </div>
+
+    <div class="card recommended">
+      <div class="card-img">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+          <g id="icon">
+            <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+            <path d="M70,148 L148,70 L364,70 L442,148 L442,364 L391.0,297.7 L199.3,250.8 Z" fill="#e0a030"/>
+            <path d="M442,364 L364,442 L148,442 L70,364 L70,148 L199.3,250.8 L391.0,297.7 Z" fill="#c0392b"/>
+          </g>
+        </svg>
+      </div>
+      <div class="card-label">Directional Taper (recommended)</div>
+      <div class="card-desc">Asymmetric kink: smaller move near the amber end, larger move near the red end — the bend itself now visually accelerates toward blocking, not just the color choice. Exact 50/50 area split holds despite the asymmetry.</div>
+      <div class="favicon-strip">
+        <div class="fav"><svg width="64" height="64" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L391.0,297.7 L199.3,250.8 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L199.3,250.8 L391.0,297.7 Z" fill="#c0392b"/></g></svg><span>64px</span></div>
+        <div class="fav"><svg width="32" height="32" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L391.0,297.7 L199.3,250.8 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L199.3,250.8 L391.0,297.7 Z" fill="#c0392b"/></g></svg><span>32px</span></div>
+        <div class="fav"><svg width="16" height="16" viewBox="0 0 512 512"><g id="icon"><rect x="0" y="0" width="512" height="512" fill="#0d0f12"/><path d="M70,148 L148,70 L364,70 L442,148 L442,364 L391.0,297.7 L199.3,250.8 Z" fill="#e0a030"/><path d="M442,364 L364,442 L148,442 L70,364 L70,148 L199.3,250.8 L391.0,297.7 Z" fill="#c0392b"/></g></svg><span>16px</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="notes">
+    <h2>What happened this round</h2>
+    <ul>
+      <li><strong>Explored 3 refinements</strong> of the Round 2 chevron, each targeting one of the critic's two sub-5 scores from last round (16px survival, and the bend carrying no directional meaning): a bolder offset, an asymmetric "directional taper," and a more compact/subtle kink.</li>
+      <li><strong>Dropped (killed): "Compact Kink."</strong> Pulling the kink points closer together and shrinking the offset to 28 units was meant to read as "subtle, discoverable on closer inspection" — but the deviation from a straight line at 16px works out to well under 1px. I didn't take that on faith: I rendered it with <code>rsvg-convert</code> at 16/24/32px and it's confirmed — the bend is invisible, it just looks like the plain baseline split. A detail that vanishes exactly at the size the icon is most often seen (favicon) isn't a discoverable detail, it's a bug. This is the first round where I raster-checked a claim rather than relying on analytical distance-from-edge math alone.</li>
+      <li><strong>Kept as fallback: "Bolder Kink."</strong> Same symmetric construction as Round 2, just a bigger offset (46→66 units) for more margin at small sizes. Raster-checked clean at 16px — no artifacts. It's a safe, modest improvement, but the bend still doesn't encode any direction; a viewer can't tell "advisory→blocking" from "blocking→advisory" by the geometry alone, only by which color is which.</li>
+      <li><strong>Recommended: "Directional Taper."</strong> This is the first version where the bend itself carries the escalation story: the kink near the amber end is smaller (offset 24), the kink near the red end is larger (offset 32) and packed into a shorter run of the seam — so the line visibly gains momentum as it approaches the blocking side. The critic flagged its tighter analytical edge-margin (51 vs. 97-146 units for the other candidates) as worth a raster spot-check before trusting it; I rendered it at 16/24/32/48px and it holds up — clean, legible bend, no notch or spike artifact at any size.</li>
+    </ul>
+    <h2>Open question for you</h2>
+    <p>Ship the Directional Taper, or prefer the safer Bolder Kink? And either way — another refinement pass, or is this the direction to move toward export?</p>
+  </div>
+</body>
+</html>

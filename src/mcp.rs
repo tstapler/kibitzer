@@ -4,7 +4,7 @@ use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,9 @@ impl KibitzerServer {
         }
     }
 
-    #[tool(description = "List the checks configured in the nearest .claude/inspect.json above the given path.")]
+    #[tool(
+        description = "List the checks configured in the nearest .claude/inspect.json above the given path."
+    )]
     async fn list_checks(&self, req: Parameters<ListChecksRequest>) -> String {
         let path = PathBuf::from(&req.0.path);
         match find_config(&path) {
@@ -53,14 +55,20 @@ impl KibitzerServer {
                     .iter()
                     .map(|c| format!("{} ({:?}, scope={:?})", c.name, c.severity, c.scope))
                     .collect();
-                format!("config root: {}\nchecks:\n{}", root.display(), names.join("\n"))
+                format!(
+                    "config root: {}\nchecks:\n{}",
+                    root.display(),
+                    names.join("\n")
+                )
             }
             Ok(None) => "no .claude/inspect.json found above this path".to_string(),
             Err(e) => format!("error reading config: {e}"),
         }
     }
 
-    #[tool(description = "Run all in-scope checks against a single file for the given trigger and report failures.")]
+    #[tool(
+        description = "Run all in-scope checks against a single file for the given trigger and report failures."
+    )]
     async fn run_checks(&self, req: Parameters<RunChecksRequest>) -> String {
         let file_path = PathBuf::from(&req.0.file_path);
         let config = match find_config(&file_path) {
@@ -69,7 +77,7 @@ impl KibitzerServer {
             Err(e) => return format!("error reading config: {e}"),
         };
         let (config, repo_root) = config;
-        match run_checks_for_trigger(&config.checks, &req.0.trigger, &repo_root, &file_path) {
+        match run_checks_for_trigger(&config.checks, &req.0.trigger, &repo_root, &file_path, None) {
             Ok(results) => {
                 let failures: Vec<String> = results
                     .iter()
@@ -110,7 +118,9 @@ impl ServerHandler for KibitzerServer {
 }
 
 pub async fn run_mcp_server() -> Result<()> {
-    let server = KibitzerServer::new().serve(rmcp::transport::stdio()).await?;
+    let server = KibitzerServer::new()
+        .serve(rmcp::transport::stdio())
+        .await?;
     server.waiting().await?;
     Ok(())
 }

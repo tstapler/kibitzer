@@ -39,7 +39,9 @@ pub fn matches_scope(rel_path: &str, scopes: &[String]) -> bool {
     if scopes.is_empty() {
         return true;
     }
-    scopes.iter().any(|pat| glob_to_regex(pat).is_match(rel_path))
+    scopes
+        .iter()
+        .any(|pat| glob_to_regex(pat).is_match(rel_path))
 }
 
 #[cfg(test)]
@@ -48,7 +50,10 @@ mod tests {
 
     #[test]
     fn matches_double_star_prefix() {
-        assert!(matches_scope("server/services/foo.go", &["**/*.go".to_string()]));
+        assert!(matches_scope(
+            "server/services/foo.go",
+            &["**/*.go".to_string()]
+        ));
         assert!(matches_scope("foo.go", &["**/*.go".to_string()]));
     }
 

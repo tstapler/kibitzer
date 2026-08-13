@@ -94,8 +94,7 @@ impl Cache {
         trigger: &str,
         results: Vec<CheckResult>,
     ) {
-        let (Some(file_stamp), Some(config_stamp)) = (stamp(file_path), stamp(config_path))
-        else {
+        let (Some(file_stamp), Some(config_stamp)) = (stamp(file_path), stamp(config_path)) else {
             return;
         };
         self.entries.insert(
@@ -150,5 +149,8 @@ pub fn default_cache_path() -> PathBuf {
         return PathBuf::from(dir).join("kibitzer").join("cache.json");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("kibitzer").join("cache.json")
+    PathBuf::from(home)
+        .join(".cache")
+        .join("kibitzer")
+        .join("cache.json")
 }

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <!-- fix: dropped the thin border+spike outline (24u border, 40u spike — below the 32u survival floor); the diagonal split reads fine on its own per the critic, so a full-bleed canvas now frames it instead -->
+    <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+    <path d="M70,148 L148,70 L364,70 L442,148 L442,364 Z" fill="#e0a030"/>
+    <path d="M442,364 L364,442 L148,442 L70,364 L70,148 Z" fill="#c0392b"/>
+  </g>
+</svg>

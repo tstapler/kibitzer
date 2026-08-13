@@ -3,8 +3,8 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use crate::check::{run_check, run_checks_for_trigger, walk_and_collect_files, CheckResult};
-use crate::config::{find_config, Check, Severity};
+use crate::check::{CheckResult, run_check, run_checks_for_trigger, walk_and_collect_files};
+use crate::config::{Check, Severity, find_config};
 
 fn report(file_display: &str, result: &CheckResult) {
     if result.passed {
@@ -32,7 +32,10 @@ fn report(file_display: &str, result: &CheckResult) {
 /// design-docs' ~22 markdown files).
 pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
     let Some((config, repo_root)) = find_config(&dir)? else {
-        eprintln!("[kibitzer] no .claude/inspect.json found above {}", dir.display());
+        eprintln!(
+            "[kibitzer] no .claude/inspect.json found above {}",
+            dir.display()
+        );
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -47,7 +50,7 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
         if !check.triggers.is_empty() && !check.triggers.iter().any(|t| t == trigger) {
             continue;
         }
-        let result = run_check(check, &repo_root, &repo_root)?;
+        let result = run_check(check, &repo_root, &repo_root, None)?;
         if !result.passed && result.severity == Severity::Blocking {
             any_blocking_failure = true;
         }
@@ -56,7 +59,7 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
 
     let files = walk_and_collect_files(&dir)?;
     for file in files {
-        for result in run_checks_for_trigger(&file_checks, trigger, &repo_root, &file)? {
+        for result in run_checks_for_trigger(&file_checks, trigger, &repo_root, &file, None)? {
             if !result.passed && result.severity == Severity::Blocking {
                 any_blocking_failure = true;
             }

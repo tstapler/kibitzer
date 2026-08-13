@@ -38,8 +38,8 @@ pub fn check_source(src: &str) -> Result<Vec<Finding>> {
 }
 
 pub fn check_file(path: &Path) -> Result<Vec<Finding>> {
-    let src = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     check_source(&src)
 }
 
@@ -69,7 +69,9 @@ fn check_parameter_list<'a>(list: Node<'a>, src: &'a [u8], findings: &mut Vec<Fi
 
     // Case (a): one declaration naming multiple identifiers of one primitive type.
     for param in &params {
-        if param.name_count >= 2 && let Some(ty) = param.primitive_type {
+        if param.name_count >= 2
+            && let Some(ty) = param.primitive_type
+        {
             findings.push(Finding {
                 line: param.node.start_position().row + 1,
                 message: format!(
@@ -145,16 +147,14 @@ mod tests {
 
     #[test]
     fn flags_consecutive_single_name_declarations() {
-        let findings =
-            check_source("package main\nfunc f(a string, b string) {}\n").unwrap();
+        let findings = check_source("package main\nfunc f(a string, b string) {}\n").unwrap();
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("2 consecutive parameters"));
     }
 
     #[test]
     fn flags_run_of_three() {
-        let findings =
-            check_source("package main\nfunc f(x int, y int, z int) {}\n").unwrap();
+        let findings = check_source("package main\nfunc f(x int, y int, z int) {}\n").unwrap();
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("3 consecutive parameters"));
     }
@@ -173,8 +173,7 @@ mod tests {
 
     #[test]
     fn ignores_non_primitive_types() {
-        let findings =
-            check_source("package main\nfunc f(a MyType, b MyType) {}\n").unwrap();
+        let findings = check_source("package main\nfunc f(a MyType, b MyType) {}\n").unwrap();
         assert!(findings.is_empty());
     }
 
@@ -184,8 +183,7 @@ mod tests {
         // declaration immediately after — together they'd also look like a run, but
         // case (a) already flagged the pair, so case (b) should not also fire since the
         // multi-name declaration itself isn't single-name and breaks the run.
-        let findings =
-            check_source("package main\nfunc f(a, b string, c string) {}\n").unwrap();
+        let findings = check_source("package main\nfunc f(a, b string, c string) {}\n").unwrap();
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("2 identifiers"));
     }
