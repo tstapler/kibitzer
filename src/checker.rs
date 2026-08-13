@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
+use crate::markdown_link_integrity::MarkdownLinkIntegrityChecker;
 use crate::primitive_obsession::PrimitiveObsessionChecker;
 
 /// A finding a [`Checker`] reports against a specific line of a file. Formatted by
@@ -61,7 +62,10 @@ pub trait Checker {
 /// All natively implemented checkers, keyed by [`Checker::name`]. Adding a new native
 /// check means adding its module and one entry here — no other file needs to change.
 pub fn registry() -> Vec<Box<dyn Checker>> {
-    vec![Box::new(PrimitiveObsessionChecker)]
+    vec![
+        Box::new(PrimitiveObsessionChecker),
+        Box::new(MarkdownLinkIntegrityChecker),
+    ]
 }
 
 pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
@@ -216,5 +220,11 @@ mod tests {
 
         assert_eq!(seen_a.get(), 1);
         assert_eq!(seen_b.get(), 1);
+    }
+
+    #[test]
+    fn registry_contains_markdown_link_integrity_by_name() {
+        let checker = lookup("markdown-link-integrity").expect("registered");
+        assert_eq!(checker.name(), "markdown-link-integrity");
     }
 }
