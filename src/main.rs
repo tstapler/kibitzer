@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod glob;
 mod hook;
+mod markdown_link_integrity;
 mod mcp;
 mod primitive_obsession;
 mod run;
@@ -52,6 +53,9 @@ enum CheckCommand {
     /// Flag Go parameters that pile up the same primitive type (see
     /// .claude/rules/primitive-obsession-checklist.md).
     PrimitiveObsession { file: PathBuf },
+    /// Flag broken markdown reference-style links: refs used but never defined, and
+    /// definitions pointing at a dead heading anchor or nonexistent file.
+    MarkdownLinkIntegrity { file: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -99,6 +103,17 @@ fn main() -> Result<ExitCode> {
         Command::Check { check } => match check {
             CheckCommand::PrimitiveObsession { file } => {
                 let findings = primitive_obsession::check_file(&file)?;
+                if findings.is_empty() {
+                    Ok(ExitCode::SUCCESS)
+                } else {
+                    for finding in &findings {
+                        println!("{}:{}: {}", file.display(), finding.line, finding.message);
+                    }
+                    Ok(ExitCode::from(1))
+                }
+            }
+            CheckCommand::MarkdownLinkIntegrity { file } => {
+                let findings = markdown_link_integrity::check_file(&file)?;
                 if findings.is_empty() {
                     Ok(ExitCode::SUCCESS)
                 } else {
