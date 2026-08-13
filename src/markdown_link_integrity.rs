@@ -27,22 +27,29 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
 
     let ref_use = Regex::new(r"\[([^\]]+)\]\[([^\]]*)\]").unwrap();
+    // Refs used by a non-image link — these are the only ones that can be reported
+    // "used but never defined" (mirrors the Python original's negative-lookbehind-for-`!`
+    // exclusion of image refs from that check).
     let mut used: HashMap<String, usize> = HashMap::new();
+    // Every ref used at all, image or not — a definition referenced only by `![alt][ref]`
+    // is still used, just not eligible for the undefined-ref check above.
+    let mut used_any: HashMap<String, usize> = HashMap::new();
     for caps in ref_use.captures_iter(&scan_body) {
         let whole = caps.get(0).unwrap();
         // Negative-lookbehind-for-`!` (image refs) by hand: the `regex` crate has no
         // look-around support.
-        if whole.start() > 0 && scan_body.as_bytes()[whole.start() - 1] == b'!' {
-            continue;
-        }
+        let is_image = whole.start() > 0 && scan_body.as_bytes()[whole.start() - 1] == b'!';
         let label = caps[1].trim();
         let ref_id = caps[2].trim();
         let id = if ref_id.is_empty() { label } else { ref_id };
         if id.starts_with('^') {
             continue; // footnote, not a reference link
         }
-        used.entry(id.to_string())
-            .or_insert_with(|| line_of(&scan_body, whole.start()));
+        let line = line_of(&scan_body, whole.start());
+        used_any.entry(id.to_string()).or_insert(line);
+        if !is_image {
+            used.entry(id.to_string()).or_insert(line);
+        }
     }
 
     let ref_def = Regex::new(r"(?m)^\[([^\]]+)\]:[ \t]*(\S+)").unwrap();
@@ -68,7 +75,8 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
         }
     }
 
-    let mut unused_def_ids: Vec<&String> = defs.keys().filter(|id| !used.contains_key(*id)).collect();
+    let mut unused_def_ids: Vec<&String> =
+        defs.keys().filter(|id| !used_any.contains_key(*id)).collect();
     unused_def_ids.sort();
     for ref_id in unused_def_ids {
         findings.push(Finding {
@@ -137,14 +145,25 @@ fn line_of(text: &str, byte_offset: usize) -> usize {
 /// offsets into the result still map to the same line numbers as the original body.
 fn strip_code(body: &str) -> String {
     let inline_code = Regex::new(r"`[^`\n]*`").unwrap();
-    let mut in_fence = false;
+    // The marker that opened the current fence (``` or ~~~) — a fence only closes on a
+    // matching marker, so e.g. a ```-fenced block demonstrating `~~~` syntax doesn't
+    // prematurely "close" and leak real code into reference-link scanning.
+    let mut fence_marker: Option<&'static str> = None;
     let mut out_lines: Vec<String> = Vec::new();
     for line in body.split('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        let opens_or_closes = match fence_marker {
+            Some(marker) => trimmed.starts_with(marker),
+            None => trimmed.starts_with("```") || trimmed.starts_with("~~~"),
+        };
+        if opens_or_closes {
+            fence_marker = match fence_marker {
+                Some(_) => None,
+                None if trimmed.starts_with("```") => Some("```"),
+                None => Some("~~~"),
+            };
             out_lines.push(String::new());
-        } else if in_fence {
+        } else if fence_marker.is_some() {
             out_lines.push(String::new());
         } else {
             out_lines.push(inline_code.replace_all(line, "").into_owned());
@@ -233,6 +252,44 @@ mod tests {
         let body = "```\n[thing][missing]\n```\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn mismatched_fence_marker_does_not_close_block() {
+        // A ```-fenced block that itself demonstrates `~~~` syntax must not be treated
+        // as closed by the `~~~` line — only a matching ``` closes it.
+        let body = "```\n~~~\n[thing][missing]\n```\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn image_ref_counts_as_used_for_unused_def_check() {
+        let body = "![alt][pic]\n\n[pic]: https://example.com/img.png\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn image_ref_still_excluded_from_undefined_check() {
+        let body = "![alt][missing-image]\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn repeated_undefined_usage_reported_once() {
+        let body = "[a][missing] and [b][missing] again.\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_definition_first_wins() {
+        let body = "See [x][ref].\n\n[ref]: first.md\n[ref]: second.md\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("first.md"));
     }
 
     #[test]
