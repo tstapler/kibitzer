@@ -21,6 +21,60 @@ struct HookInput {
 #[derive(Debug, Default, Deserialize)]
 struct ToolInput {
     file_path: Option<PathBuf>,
+    /// Present for the Edit tool.
+    new_string: Option<String>,
+    /// Present for the Write tool — a full-file rewrite, so it's treated as
+    /// unscoped (`changed_lines = None`) rather than diffed against anything.
+    content: Option<String>,
+    /// Present for the MultiEdit tool.
+    edits: Option<Vec<EditItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditItem {
+    new_string: String,
+}
+
+/// Derive 1-indexed, inclusive changed-line ranges in the *current* (post-edit)
+/// on-disk content of `file_path`, from the Edit/MultiEdit tool input that produced
+/// it. Returns `None` when there's nothing to scope to: a `Write` (whole-file
+/// rewrite), no edit info at all, or a `new_string` that can't be located in the
+/// current file content (e.g. a later edit already changed it again).
+fn compute_changed_lines(
+    tool_input: &ToolInput,
+    file_path: &PathBuf,
+) -> Option<Vec<(usize, usize)>> {
+    if tool_input.content.is_some() {
+        return None;
+    }
+
+    let new_strings: Vec<&str> = if let Some(edits) = &tool_input.edits {
+        edits.iter().map(|e| e.new_string.as_str()).collect()
+    } else if let Some(new_string) = &tool_input.new_string {
+        vec![new_string.as_str()]
+    } else {
+        return None;
+    };
+
+    let file_content = std::fs::read_to_string(file_path).ok()?;
+    let mut ranges = Vec::new();
+    for needle in new_strings {
+        if needle.is_empty() {
+            continue;
+        }
+        let Some(byte_offset) = file_content.find(needle) else {
+            continue;
+        };
+        let start_line = file_content[..byte_offset].matches('\n').count() + 1;
+        let end_line = start_line + needle.matches('\n').count();
+        ranges.push((start_line, end_line));
+    }
+
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
 }
 
 /// Implements the Claude Code `PostToolUse` hook contract: read the event off stdin,
@@ -33,11 +87,17 @@ pub fn run_hook() -> Result<ExitCode> {
         .context("reading hook input from stdin")?;
     let input: HookInput = serde_json::from_str(&raw).context("parsing hook input JSON")?;
 
-    let Some(file_path) = input.tool_input.file_path else {
+    let Some(file_path) = input.tool_input.file_path.clone() else {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let results = run_checks_smart(&input.cwd, &file_path, &input.hook_event_name)?;
+    let changed_lines = compute_changed_lines(&input.tool_input, &file_path);
+    let results = run_checks_smart(
+        &input.cwd,
+        &file_path,
+        &input.hook_event_name,
+        changed_lines.as_deref(),
+    )?;
     if results.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }

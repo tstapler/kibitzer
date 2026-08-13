@@ -18,6 +18,8 @@ enum Request {
         cwd: PathBuf,
         file_path: PathBuf,
         trigger: String,
+        #[serde(default)]
+        changed_lines: Option<Vec<(usize, usize)>>,
     },
     Ping,
     Shutdown,
@@ -103,7 +105,15 @@ fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path)
                 cwd,
                 file_path,
                 trigger,
-            }) => match handle_run_checks(&cwd, &file_path, &trigger, cache, cache_path) {
+                changed_lines,
+            }) => match handle_run_checks(
+                &cwd,
+                &file_path,
+                &trigger,
+                changed_lines.as_deref(),
+                cache,
+                cache_path,
+            ) {
                 Ok(results) => Response {
                     ok: true,
                     results: Some(results),
@@ -131,6 +141,7 @@ fn handle_run_checks(
     cwd: &Path,
     file_path: &Path,
     trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
     cache: &Arc<Mutex<Cache>>,
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
@@ -139,13 +150,22 @@ fn handle_run_checks(
     };
     let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
 
-    if let Ok(guard) = cache.lock()
+    // Cached entries aren't keyed by changed_lines — only bypass the cache lookup when a
+    // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
+    if changed_lines.is_none()
+        && let Ok(guard) = cache.lock()
         && let Some(cached) = guard.get(file_path, &config_path, trigger)
     {
         return Ok(cached);
     }
 
-    let mut results = run_checks_for_trigger(&config.checks, trigger, &repo_root, file_path)?;
+    let mut results = run_checks_for_trigger(
+        &config.checks,
+        trigger,
+        &repo_root,
+        file_path,
+        changed_lines,
+    )?;
 
     if let Ok(mut guard) = cache.lock() {
         guard.apply_grace(&mut results, file_path, trigger);
@@ -190,31 +210,40 @@ pub fn try_run_checks_via_daemon(
     cwd: &Path,
     file_path: &Path,
     trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<Vec<CheckResult>> {
     let response = request(&Request::RunChecks {
         cwd: cwd.to_path_buf(),
         file_path: file_path.to_path_buf(),
         trigger: trigger.to_string(),
+        changed_lines: changed_lines.map(|r| r.to_vec()),
     })?;
-    if response.ok {
-        response.results
-    } else {
-        None
-    }
+    if response.ok { response.results } else { None }
 }
 
 /// Run checks via the daemon if one is up, otherwise run them directly in-process
 /// (uncached). This is the entry point `hook`/`run` should use instead of calling
 /// `find_config` + `run_checks_for_trigger` themselves.
-pub fn run_checks_smart(cwd: &Path, file_path: &Path, trigger: &str) -> Result<Vec<CheckResult>> {
-    if let Some(results) = try_run_checks_via_daemon(cwd, file_path, trigger) {
+pub fn run_checks_smart(
+    cwd: &Path,
+    file_path: &Path,
+    trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Result<Vec<CheckResult>> {
+    if let Some(results) = try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines) {
         return Ok(results);
     }
     let Some((config, repo_root)) = find_config(cwd)? else {
         return Ok(Vec::new());
     };
     let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
-    let mut results = run_checks_for_trigger(&config.checks, trigger, &repo_root, file_path)?;
+    let mut results = run_checks_for_trigger(
+        &config.checks,
+        trigger,
+        &repo_root,
+        file_path,
+        changed_lines,
+    )?;
 
     let cache_path = default_cache_path();
     let mut cache = Cache::load(&cache_path);

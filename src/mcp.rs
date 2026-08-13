@@ -69,7 +69,7 @@ impl KibitzerServer {
             Err(e) => return format!("error reading config: {e}"),
         };
         let (config, repo_root) = config;
-        match run_checks_for_trigger(&config.checks, &req.0.trigger, &repo_root, &file_path) {
+        match run_checks_for_trigger(&config.checks, &req.0.trigger, &repo_root, &file_path, None) {
             Ok(results) => {
                 let failures: Vec<String> = results
                     .iter()
