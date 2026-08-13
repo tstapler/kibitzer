@@ -23,6 +23,10 @@ pub struct CheckResult {
     pub message: Option<String>,
     /// The shell command that produced `output`, substitutions already applied — shown
     /// in the truncation note so the agent can re-run it directly to see everything.
+    /// `serde(default)` so a `cache.json` written before this field existed deserializes
+    /// (with an empty command) instead of `Cache::load` silently discarding the whole
+    /// cache on the first run after upgrade.
+    #[serde(default)]
     pub command: String,
 }
 
@@ -50,7 +54,7 @@ impl CheckResult {
         let shown = lines[..MAX_SUMMARY_LINES].join("\n");
         let hidden = lines.len() - MAX_SUMMARY_LINES;
         format!(
-            "{shown}\n… {hidden} more line(s) truncated — see everything: `{}`",
+            "{shown}\n… {hidden} more line(s) truncated — see everything, run: {}",
             self.command
         )
     }
