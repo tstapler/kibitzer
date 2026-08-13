@@ -126,7 +126,7 @@ pub fn run_hook() -> Result<ExitCode> {
             eprintln!(
                 "[kibitzer] {} (blocking): {}",
                 result.check_name,
-                result.message.as_deref().unwrap_or(&result.output)
+                result.describe()
             );
         }
         return Ok(ExitCode::from(2));
@@ -134,13 +134,7 @@ pub fn run_hook() -> Result<ExitCode> {
 
     let context = failures
         .iter()
-        .map(|r| {
-            format!(
-                "{}: {}",
-                r.check_name,
-                r.message.as_deref().unwrap_or(&r.output)
-            )
-        })
+        .map(|r| format!("{}: {}", r.check_name, r.describe()))
         .collect::<Vec<_>>()
         .join("\n");
 
