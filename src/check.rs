@@ -16,6 +16,55 @@ pub struct CheckResult {
     pub message: Option<String>,
 }
 
+impl CheckResult {
+    /// Text to show the agent for a failed check: the config `message` explains *why*
+    /// the rule exists / is blocking, but only the command's own `output` says *where*
+    /// the violation is and what to change. Neither alone is enough to act on, so show
+    /// both whenever both are present, instead of the config message silently
+    /// swallowing the diagnostic (or vice versa).
+    pub fn describe(&self) -> String {
+        let output = self.output.trim();
+        match (&self.message, output.is_empty()) {
+            (Some(message), false) => format!("{message}\n{output}"),
+            (Some(message), true) => message.clone(),
+            (None, _) => output.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    fn result(message: Option<&str>, output: &str) -> CheckResult {
+        CheckResult {
+            check_name: "test-check".to_string(),
+            severity: Severity::Blocking,
+            passed: false,
+            output: output.to_string(),
+            message: message.map(String::from),
+        }
+    }
+
+    #[test]
+    fn combines_message_and_output_when_both_present() {
+        let r = result(Some("why this is blocking"), "file.md:12: bad anchor");
+        assert_eq!(r.describe(), "why this is blocking\nfile.md:12: bad anchor");
+    }
+
+    #[test]
+    fn falls_back_to_message_when_output_is_empty() {
+        let r = result(Some("why this is blocking"), "");
+        assert_eq!(r.describe(), "why this is blocking");
+    }
+
+    #[test]
+    fn falls_back_to_output_when_no_message_configured() {
+        let r = result(None, "file.md:12: bad anchor");
+        assert_eq!(r.describe(), "file.md:12: bad anchor");
+    }
+}
+
 /// Run a single check against `file_path` (already confirmed in-scope by the caller).
 /// `changed_lines`, when present, scopes the result to findings that fall within those
 /// 1-indexed inclusive line ranges — see [`scope_output_to_changed_lines`].
