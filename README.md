@@ -1,3 +1,5 @@
+<img src="logos/export/logo-192.png" alt="kibitzer logo" width="96" align="right">
+
 # kibitzer
 
 Advisory, diff-aware code and doc checks built for how AI agents actually

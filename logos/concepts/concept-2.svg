@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <!-- dominant tile: full-bleed angular badge, corners chamfered for asymmetry/motion -->
+    <polygon fill="#0d0f12" points="80,0 512,0 512,432 432,512 0,512 0,80" />
+    <!-- asymmetric chevron ribbon: top arm short/thin, bottom arm long/thick,
+         apex off the vertical centerline, so it reads as a specific mark
+         rather than a textbook symmetric ">" -->
+    <polygon fill="#d8dee9" points="96,64 432,232 96,448 96,368 300,264 96,128" />
+    <!-- the heckle: the notch between the two arms is not left as background -
+         it is filled amber, so the interjected remark is discovered fused
+         inside the chevron's own negative space, not bolted on beside it -->
+    <polygon fill="#e0a030" points="96,368 300,264 96,128" />
+  </g>
+</svg>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="icon">
+    <rect x="0" y="0" width="512" height="512" fill="#0d0f12"/>
+    <!-- fix: single-vertex kink (233,296) skewed the split to 58/42 amber-favoring (shoelace-verified). Replaced with two kink points reflected through the octagon's center (256,256) -- (177.1,263.4) and (334.9,248.6) -- so the added/removed area cancels exactly, restoring the original 50/50 split while keeping the discovered zigzag. -->
+    <path d="M70,148 L148,70 L364,70 L442,148 L442,364 L334.9,248.6 L177.1,263.4 Z" fill="#e0a030"/>
+    <path d="M442,364 L364,442 L148,442 L70,364 L70,148 L177.1,263.4 L334.9,248.6 Z" fill="#c0392b"/>
+  </g>
+</svg>
