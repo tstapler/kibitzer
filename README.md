@@ -45,9 +45,13 @@ results to just those lines, two ways:
   the changed ranges and recomputes pass/fail from what survives — no
   command changes needed.
 
-A failure kibitzer determines predates the current edit (present in
-`git show HEAD:<file>` too) is reported as advisory rather than blocking,
-even for a check configured as blocking.
+A failure kibitzer determines predates the current edit is reported as
+advisory rather than blocking, even for a check configured as blocking.
+For a per-file check (one with `{file}` in `command`), this means the same
+violation is also present in `git show HEAD:<file>`. For a whole-repo check
+(no `{file}` placeholder — it scans the whole tree), kibitzer snapshots the
+tree at HEAD (via `git archive`) and reruns the check against that snapshot
+to make the same determination.
 
 ## Development
 

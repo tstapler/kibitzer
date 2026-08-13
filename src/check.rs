@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -48,17 +49,20 @@ pub fn run_check(
     let mut severity = check.severity;
     let mut message = check.message.clone();
 
-    if !passed
-        && severity == Severity::Blocking
-        && check.command.contains("{file}")
-        && let Some(false) = check_against_git_head(check, repo_root, file_path, changed_lines)
-    {
-        severity = Severity::Advisory;
-        message = Some(format!(
-            "{} (downgraded: this violation predates your edits — already present in \
-             the git HEAD version of this file)",
-            message.unwrap_or_default()
-        ));
+    if !passed && severity == Severity::Blocking {
+        let baseline = if check.command.contains("{file}") {
+            check_against_git_head(check, repo_root, file_path, changed_lines)
+        } else {
+            check_against_git_head_repo(check, repo_root)
+        };
+        if let Some(false) = baseline {
+            severity = Severity::Advisory;
+            message = Some(format!(
+                "{} (downgraded: this violation predates your edits — already present \
+                 at the git HEAD commit)",
+                message.unwrap_or_default()
+            ));
+        }
     }
 
     Ok(CheckResult {
@@ -240,6 +244,70 @@ fn check_against_git_head(
         passed_raw
     };
     Some(passed)
+}
+
+/// Repo-wide counterpart to `check_against_git_head`: re-run `check` against a snapshot of
+/// the whole tree at HEAD (via `git archive`, not `git worktree` — see issue #2's plan for
+/// why: worktrees mutate repo-global `.git/worktrees/` state, which is unsafe to race under
+/// the daemon's one-thread-per-connection model and leaks metadata on a crash between `add`
+/// and `remove`). `git archive` is a pure read into a private scratch directory, so
+/// concurrent callers never interfere and cleanup is a plain `rm -rf`.
+///
+/// Returns `Some(true)` if the baseline passes (no violation at HEAD), `Some(false)` if the
+/// baseline also fails (pre-existing, not introduced by the current edit), or `None` if the
+/// baseline can't be determined (no HEAD, not a git repo, archive/tar failure, etc.).
+fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> {
+    let nonce = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let snapshot_dir = std::env::temp_dir().join(format!(
+        "kibitzer-head-snapshot-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&snapshot_dir).ok()?;
+
+    let archive = Command::new("git")
+        .args(["archive", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !archive.status.success() {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
+    }
+
+    let mut tar = match Command::new("tar")
+        .args(["-x", "-C"])
+        .arg(&snapshot_dir)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(tar) => tar,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return None;
+        }
+    };
+    let write_ok = tar
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&archive.stdout).is_ok())
+        .unwrap_or(false);
+    let wait_ok = tar.wait().map(|s| s.success()).unwrap_or(false);
+    if !write_ok || !wait_ok {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
+    }
+
+    let cmd_str = substitute_command(&check.command, &snapshot_dir, None);
+    let result = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .current_dir(&snapshot_dir)
+        .output();
+
+    let _ = std::fs::remove_dir_all(&snapshot_dir);
+
+    Some(result.ok()?.status.success())
 }
 
 struct DiffHunk {
@@ -615,6 +683,19 @@ mod git_head_integration_tests {
         }
     }
 
+    /// A whole-repo counterpart to `bad_marker_check`: no `{file}` in the command, so it
+    /// scans the whole tree it's run from rather than a single file.
+    fn repo_wide_bad_marker_check() -> Check {
+        Check {
+            name: "no-bad-marker-repo".to_string(),
+            command: "! grep -rn BAD .".to_string(),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("found BAD marker in repo".to_string()),
+        }
+    }
+
     #[test]
     fn baseline_passes_when_violation_is_genuinely_new() {
         let repo = TempRepo::new("genuinely-new");
@@ -683,6 +764,67 @@ mod git_head_integration_tests {
             Some(&[(2, 2)]),
         )
         .unwrap();
+        assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Advisory);
+        assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    #[test]
+    fn repo_wide_baseline_fails_when_violation_predates_the_edit() {
+        let repo = TempRepo::new("repo-wide-pre-existing");
+        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
+
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn repo_wide_baseline_passes_when_violation_is_genuinely_new() {
+        let repo = TempRepo::new("repo-wide-genuinely-new");
+        repo.write_and_commit("foo.txt", "line1\nline2\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
+
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn repo_wide_baseline_is_none_when_there_is_no_head_commit() {
+        let repo = TempRepo::new("repo-wide-no-head");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
+
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn repo_wide_baseline_concurrent_calls_do_not_interfere() {
+        let repo = TempRepo::new("repo-wide-concurrent");
+        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = repo.dir.clone();
+                std::thread::spawn(move || {
+                    check_against_git_head_repo(&repo_wide_bad_marker_check(), &dir)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), Some(false));
+        }
+    }
+
+    #[test]
+    fn run_check_downgrades_severity_for_repo_wide_check_when_violation_predates_edit() {
+        let repo = TempRepo::new("run-check-repo-wide-downgrade");
+        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
+
+        let result = run_check(&repo_wide_bad_marker_check(), &repo.dir, &repo.dir, None).unwrap();
         assert!(!result.passed);
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
