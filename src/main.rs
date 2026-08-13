@@ -103,9 +103,10 @@ fn main() -> Result<ExitCode> {
         },
         Command::Check { check } => {
             let (checker, file): (Box<dyn checker::Checker>, PathBuf) = match check {
-                CheckCommand::PrimitiveObsession { file } => {
-                    (Box::new(primitive_obsession::PrimitiveObsessionChecker), file)
-                }
+                CheckCommand::PrimitiveObsession { file } => (
+                    Box::new(primitive_obsession::PrimitiveObsessionChecker),
+                    file,
+                ),
                 CheckCommand::MarkdownLinkIntegrity { file } => (
                     Box::new(markdown_link_integrity::MarkdownLinkIntegrityChecker),
                     file,

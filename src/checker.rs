@@ -12,4 +12,3 @@ pub struct Finding {
 pub trait Checker {
     fn check_file(&self, path: &Path) -> Result<Vec<Finding>>;
 }
-

@@ -101,8 +101,10 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
         }
     }
 
-    let mut unused_def_ids: Vec<&String> =
-        defs.keys().filter(|id| !used_any.contains_key(*id)).collect();
+    let mut unused_def_ids: Vec<&String> = defs
+        .keys()
+        .filter(|id| !used_any.contains_key(*id))
+        .collect();
     unused_def_ids.sort();
     for ref_id in unused_def_ids {
         findings.push(Finding {
@@ -135,10 +137,17 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
             }
             continue;
         }
-        let target_path = path.parent().unwrap_or_else(|| Path::new(".")).join(file_part);
+        let target_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(file_part);
         let target_anchors = target_cache
             .entry(file_part.to_string())
-            .or_insert_with(|| std::fs::read_to_string(&target_path).ok().map(|s| anchors(&s)));
+            .or_insert_with(|| {
+                std::fs::read_to_string(&target_path)
+                    .ok()
+                    .map(|s| anchors(&s))
+            });
         match target_anchors {
             None => findings.push(Finding {
                 line: *line,
@@ -249,7 +258,11 @@ mod tests {
     fn flags_used_but_never_defined() {
         let findings = check_source(&path(), "See [thing][missing] for details.\n").unwrap();
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("[missing] used but never defined"));
+        assert!(
+            findings[0]
+                .message
+                .contains("[missing] used but never defined")
+        );
     }
 
     #[test]
@@ -342,10 +355,7 @@ mod tests {
 
     #[test]
     fn flags_missing_target_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-md-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("kibitzer-md-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let doc = dir.join("doc.md");
         let body = "See [x][ref].\n\n[ref]: nonexistent.md#anchor\n";
@@ -357,10 +367,8 @@ mod tests {
 
     #[test]
     fn flags_dead_cross_file_anchor() {
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-md-test-cross-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-md-test-cross-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let other = dir.join("other.md");
         fs::write(&other, "# Other Heading\n").unwrap();
@@ -374,10 +382,8 @@ mod tests {
 
     #[test]
     fn allows_live_cross_file_anchor() {
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-md-test-cross-ok-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-md-test-cross-ok-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let other = dir.join("other.md");
         fs::write(&other, "# Other Heading\n").unwrap();
@@ -393,7 +399,11 @@ mod tests {
         let body = "Nothing links here.\n\n[orphan]: https://example.com\n";
         let findings = check_source(&path(), body).unwrap();
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("[orphan] defined but never used"));
+        assert!(
+            findings[0]
+                .message
+                .contains("[orphan] defined but never used")
+        );
     }
 
     #[test]
