@@ -84,6 +84,15 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
                 config_path.display(),
                 check.name
             ),
+            (None, Some(checker_name)) if crate::checker::lookup(checker_name).is_none() => {
+                anyhow::bail!(
+                    "{}: check '{}' references unknown checker '{}' — run `kibitzer check list` \
+                     for available checkers",
+                    config_path.display(),
+                    check.name,
+                    checker_name
+                )
+            }
             _ => {}
         }
     }
@@ -165,5 +174,14 @@ mod tests {
     fn rejects_neither_command_nor_checker() {
         let err = parse(r#"{"checks": [{"name": "n", "severity": "advisory"}]}"#).unwrap_err();
         assert!(err.to_string().contains("exactly one is required"));
+    }
+
+    #[test]
+    fn rejects_unknown_checker_name() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "checker": "does-not-exist", "severity": "advisory"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown checker"));
     }
 }

@@ -68,9 +68,12 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
     registry().into_iter().find(|c| c.name() == name)
 }
 
-/// Parses each file at most once per [`Language`], regardless of how many checkers
-/// declare that language — checkers sharing a grammar share the parsed [`Tree`] instead
-/// of each re-parsing the same source.
+/// Parses at most once per [`Language`] over this cache instance's lifetime, regardless
+/// of how many checkers declare that language — checkers sharing a grammar share the
+/// parsed [`Tree`] instead of each re-parsing the same source. Callers must construct a
+/// fresh `GrammarCache` per file (as `run_checker_against_source` does): the cache key is
+/// `Language` alone, not `(Language, source)`, so reusing one instance across different
+/// files of the same language would return the wrong file's tree on a cache hit.
 #[derive(Default)]
 pub struct GrammarCache {
     trees: RefCell<HashMap<Language, Tree>>,

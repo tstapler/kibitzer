@@ -205,7 +205,39 @@ fn run_native_check(
         "kibitzer check native {checker_name} {}",
         file_path.display()
     );
-    let (mut combined, passed_raw) = run_checker_against_file(checker_name, file_path)?;
+
+    if let Some(checker) = crate::checker::lookup(checker_name) {
+        let globs: Vec<String> = checker.file_globs().iter().map(|g| g.to_string()).collect();
+        let rel_path = relativize(repo_root, file_path);
+        if !matches_scope(&rel_path, &globs) {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: true,
+                output: String::new(),
+                message: None,
+                command: cmd_str,
+            });
+        }
+    }
+
+    // Degrade to a failed CheckResult on error (e.g. an unreadable file) instead of
+    // propagating, matching the shell-out path above where a command's own failure is
+    // captured as `passed_raw = false` rather than aborting the whole batch — a single
+    // bad file shouldn't kill every other check/file in the run.
+    let (mut combined, passed_raw) = match run_checker_against_file(checker_name, file_path) {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: false,
+                output: format!("{err:#}"),
+                message: check.message.clone(),
+                command: cmd_str,
+            });
+        }
+    };
 
     let passed = if let Some(ranges) = changed_lines {
         let (scoped, scoped_passed) =
@@ -1088,5 +1120,59 @@ mod git_head_integration_tests {
         assert!(!result.passed);
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
+    }
+}
+
+#[cfg(test)]
+mod native_check_tests {
+    use super::*;
+    use crate::config::Severity;
+
+    fn primitive_obsession_check() -> Check {
+        Check {
+            name: "native".to_string(),
+            command: None,
+            checker: Some("primitive-obsession".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("primitive obsession".to_string()),
+        }
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-native-check-test-{}-{name}-{}",
+            std::process::id(),
+            TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_file_degrades_to_failed_result_instead_of_erroring() {
+        let dir = tmp_dir("missing-file");
+        let file = dir.join("does-not-exist.go");
+
+        let result = run_check(&primitive_obsession_check(), &dir, &file, None)
+            .expect("a missing file must not abort the whole check run");
+        assert!(!result.passed);
+        assert!(result.output.contains("does-not-exist.go"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_not_matching_checkers_globs_is_skipped_rather_than_misparsed() {
+        let dir = tmp_dir("wrong-glob");
+        let file = dir.join("notes.md");
+        std::fs::write(&file, "func f(a, b string) {}\n").unwrap();
+
+        let result = run_check(&primitive_obsession_check(), &dir, &file, None).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.output, "");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
