@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
+use crate::checker::{CheckContext, Checker, Finding, Language};
+
 /// Go's built-in primitive types worth flagging when two or more parameters share one.
 /// Deliberately wider than the old ast-grep rule (which only covered
 /// string/int/int32/int64/float32/float64/bool) — see
@@ -12,10 +14,35 @@ const PRIMITIVE_TYPES: &[&str] = &[
     "uint64", "float32", "float64", "bool", "byte", "rune",
 ];
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Finding {
-    pub line: usize,
-    pub message: String,
+/// Flags Go parameters that pile up the same primitive type (see
+/// .claude/rules/primitive-obsession-checklist.md).
+pub struct PrimitiveObsessionChecker;
+
+impl Checker for PrimitiveObsessionChecker {
+    fn name(&self) -> &str {
+        "primitive-obsession"
+    }
+
+    fn description(&self) -> &str {
+        "flags Go parameters that pile up the same primitive type"
+    }
+
+    fn language(&self) -> Option<Language> {
+        Some(Language::Go)
+    }
+
+    fn file_globs(&self) -> &[&str] {
+        &["**/*.go"]
+    }
+
+    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        let tree = ctx
+            .tree
+            .context("primitive-obsession checker requires a parsed tree")?;
+        let mut findings = Vec::new();
+        walk(tree.root_node(), ctx.source.as_bytes(), &mut findings);
+        Ok(findings)
+    }
 }
 
 /// Detects two shapes of same-typed-parameter piles in Go function signatures:
@@ -23,7 +50,11 @@ pub struct Finding {
 ///       type, e.g. `func f(a, b string)`
 ///   (b) a run of ≥2 consecutive single-name `parameter_declaration`s that share
 ///       one primitive type, e.g. `func f(a string, b string)`
-pub fn check_source(src: &str) -> Result<Vec<Finding>> {
+///
+/// Thin wrapper over [`PrimitiveObsessionChecker`] kept for the unit tests below, which
+/// predate the `Checker`/registry machinery and check a Go source string directly.
+#[cfg(test)]
+fn check_source(src: &str) -> Result<Vec<Finding>> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
@@ -31,16 +62,11 @@ pub fn check_source(src: &str) -> Result<Vec<Finding>> {
     let tree = parser
         .parse(src, None)
         .context("parsing Go source with tree-sitter")?;
-
-    let mut findings = Vec::new();
-    walk(tree.root_node(), src.as_bytes(), &mut findings);
-    Ok(findings)
-}
-
-pub fn check_file(path: &Path) -> Result<Vec<Finding>> {
-    let src =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    check_source(&src)
+    let ctx = CheckContext {
+        source: src,
+        tree: Some(&tree),
+    };
+    PrimitiveObsessionChecker.check(Path::new("<source>"), &ctx)
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {

@@ -1,5 +1,6 @@
 mod cache;
 mod check;
+mod checker;
 mod config;
 mod daemon;
 mod glob;
@@ -11,7 +12,7 @@ mod run;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -49,9 +50,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CheckCommand {
-    /// Flag Go parameters that pile up the same primitive type (see
-    /// .claude/rules/primitive-obsession-checklist.md).
-    PrimitiveObsession { file: PathBuf },
+    /// Run a natively implemented checker (see `checker::registry()`) against a file.
+    Native { name: String, file: PathBuf },
+    /// List natively implemented checkers available to reference from
+    /// `.claude/inspect.json`'s `checker` field.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -97,8 +100,36 @@ fn main() -> Result<ExitCode> {
             }
         },
         Command::Check { check } => match check {
-            CheckCommand::PrimitiveObsession { file } => {
-                let findings = primitive_obsession::check_file(&file)?;
+            CheckCommand::List => {
+                for checker in checker::registry() {
+                    let language = checker
+                        .language()
+                        .map(|l| format!("{l:?}"))
+                        .unwrap_or_else(|| "any".to_string());
+                    println!(
+                        "{}: {} (language: {language}, globs: {})",
+                        checker.name(),
+                        checker.description(),
+                        checker.file_globs().join(", ")
+                    );
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            CheckCommand::Native { name, file } => {
+                let checker = checker::lookup(&name)
+                    .with_context(|| format!("no checker named '{name}' registered"))?;
+                let source = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let cache = checker::GrammarCache::new();
+                let tree = match checker.language() {
+                    Some(language) => Some(cache.parse(language, &source)?),
+                    None => None,
+                };
+                let ctx = checker::CheckContext {
+                    source: &source,
+                    tree: tree.as_ref(),
+                };
+                let findings = checker.check(&file, &ctx)?;
                 if findings.is_empty() {
                     Ok(ExitCode::SUCCESS)
                 } else {
