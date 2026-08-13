@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{default_cache_path, Cache};
-use crate::check::{run_checks_for_trigger, CheckResult};
-use crate::config::{find_config, CONFIG_DIR, CONFIG_FILENAME};
+use crate::cache::{Cache, default_cache_path};
+use crate::check::{CheckResult, run_checks_for_trigger};
+use crate::config::{CONFIG_DIR, CONFIG_FILENAME, find_config};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
