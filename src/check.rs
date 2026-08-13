@@ -91,15 +91,19 @@ mod describe_tests {
 
     #[test]
     fn truncates_long_output_and_points_to_full_command() {
-        let lines: Vec<String> = (1..=30).map(|n| format!("file.md:{n}: violation")).collect();
+        let lines: Vec<String> = (1..=30)
+            .map(|n| format!("file.md:{n}: violation"))
+            .collect();
         let r = result(None, &lines.join("\n"));
         let described = r.describe();
         let described_lines: Vec<&str> = described.lines().collect();
         assert_eq!(described_lines.len(), MAX_SUMMARY_LINES + 1);
-        assert!(described_lines[..MAX_SUMMARY_LINES]
-            .iter()
-            .zip(&lines)
-            .all(|(a, b)| a == b));
+        assert!(
+            described_lines[..MAX_SUMMARY_LINES]
+                .iter()
+                .zip(&lines)
+                .all(|(a, b)| a == b)
+        );
         assert!(described.contains("10 more line(s) truncated"));
         assert!(described.contains("some-check-command"));
     }
