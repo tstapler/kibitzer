@@ -10,7 +10,7 @@ mod mcp;
 mod primitive_obsession;
 mod run;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -100,7 +100,6 @@ fn main() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
-<<<<<<< HEAD
         Command::Check { check } => match check {
             CheckCommand::List => {
                 for checker in checker::registry() {
@@ -142,32 +141,5 @@ fn main() -> Result<ExitCode> {
                 }
             }
         },
-=======
-        Command::Check { check } => {
-            let (checker, file): (Box<dyn checker::Checker>, PathBuf) = match check {
-                CheckCommand::PrimitiveObsession { file } => (
-                    Box::new(primitive_obsession::PrimitiveObsessionChecker),
-                    file,
-                ),
-                CheckCommand::MarkdownLinkIntegrity { file } => (
-                    Box::new(markdown_link_integrity::MarkdownLinkIntegrityChecker),
-                    file,
-                ),
-            };
-            run_checker(checker.as_ref(), &file)
-        }
-    }
-}
-
-fn run_checker(checker: &dyn checker::Checker, file: &Path) -> Result<ExitCode> {
-    let findings = checker.check_file(file)?;
-    if findings.is_empty() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        for finding in &findings {
-            println!("{}:{}: {}", file.display(), finding.line, finding.message);
-        }
-        Ok(ExitCode::from(1))
->>>>>>> origin/master
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::Regex;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
@@ -12,12 +12,7 @@ use crate::checker::{CheckContext, Checker, Finding, Language};
 /// `doc_report.py`'s `check_references` — deliberately scoped to link *integrity* only
 /// (a definition pointing nowhere is a factual error), not that script's advisory
 /// structure/readability checks.
-pub fn check_file(path: &Path) -> Result<Vec<Finding>> {
-    let src =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    check_source(path, &src)
-}
-
+///
 /// Flags broken markdown reference-style links: refs used but never defined, and
 /// definitions pointing at a dead heading anchor or nonexistent file.
 pub struct MarkdownLinkIntegrityChecker;
