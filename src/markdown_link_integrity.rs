@@ -52,6 +52,28 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
         }
     }
 
+    // A shortcut reference `[ref-id]` (label doubles as the id, no trailing `[...]`) is
+    // valid CommonMark but invisible to `ref_use` above. It only matters for the
+    // "defined but never used" check: the Python original never validates shortcut refs
+    // either, so `used` (the undefined-ref check) stays as-is to match it.
+    let shortcut_ref = Regex::new(r"\[([^\]\[]+)\]").unwrap();
+    for caps in shortcut_ref.captures_iter(&scan_body) {
+        let whole = caps.get(0).unwrap();
+        let is_image = whole.start() > 0 && scan_body.as_bytes()[whole.start() - 1] == b'!';
+        // A full reference `[text][ref]` or a definition `[ref]: target` both start with
+        // `[...]` followed by `[` or `:` — skip those, they're handled elsewhere.
+        let next_byte = scan_body.as_bytes().get(whole.end()).copied();
+        if is_image || matches!(next_byte, Some(b'[') | Some(b'(') | Some(b':')) {
+            continue;
+        }
+        let id = caps[1].trim();
+        if id.is_empty() || id.starts_with('^') {
+            continue;
+        }
+        let line = line_of(&scan_body, whole.start());
+        used_any.entry(id.to_string()).or_insert(line);
+    }
+
     let ref_def = Regex::new(r"(?m)^\[([^\]]+)\]:[ \t]*(\S+)").unwrap();
     let mut defs: HashMap<String, (String, usize)> = HashMap::new();
     for caps in ref_def.captures_iter(&scan_body) {
@@ -266,6 +288,13 @@ mod tests {
     #[test]
     fn image_ref_counts_as_used_for_unused_def_check() {
         let body = "![alt][pic]\n\n[pic]: https://example.com/img.png\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn shortcut_reference_counts_as_used_for_unused_def_check() {
+        let body = "See [my-ref] for details.\n\n[my-ref]: https://example.com\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
     }
