@@ -50,7 +50,7 @@ pub fn run_check(
     if !passed
         && severity == Severity::Blocking
         && check.command.contains("{file}")
-        && let Some(false) = check_against_git_head(check, repo_root, file_path)
+        && let Some(false) = check_against_git_head(check, repo_root, file_path, changed_lines)
     {
         severity = Severity::Advisory;
         message = Some(format!(
@@ -146,12 +146,24 @@ fn scope_output_to_changed_lines(
 }
 
 /// Re-run `check` against the file's `git show HEAD:<relpath>` content to determine
-/// whether a current failure predates this session's edits. Returns `Some(true)` if the
-/// baseline also fails (pre-existing violation, not introduced by the current edit),
-/// `Some(false)` if the baseline passes (the edit genuinely introduced this failure), or
-/// `None` if the baseline can't be determined (untracked file, no HEAD, not a git repo,
-/// etc.) — callers should treat `None` as "can't tell, don't suppress."
-fn check_against_git_head(check: &Check, repo_root: &Path, file_path: &Path) -> Option<bool> {
+/// whether a current failure predates this session's edits. `changed_lines`, when present,
+/// scopes the baseline's own pass/fail the same way the current-side result was scoped —
+/// otherwise an unrelated pre-existing violation elsewhere in the file would make the
+/// baseline "fail" as a whole and falsely downgrade a brand-new violation inside the
+/// edited range as "predates your edits" (see `run_check`'s scoped `passed`, which this
+/// must stay consistent with).
+///
+/// Returns `Some(true)` if the baseline passes (no violation in HEAD — the edit genuinely
+/// introduced this failure), `Some(false)` if the baseline also fails (pre-existing
+/// violation, not introduced by the current edit), or `None` if the baseline can't be
+/// determined (untracked file, no HEAD, not a git repo, etc.) — callers should treat
+/// `None` as "can't tell, don't suppress."
+fn check_against_git_head(
+    check: &Check,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
     let show = Command::new("git")
         .args(["show", &format!("HEAD:{rel_path}")])
@@ -185,7 +197,18 @@ fn check_against_git_head(check: &Check, repo_root: &Path, file_path: &Path) -> 
 
     let _ = std::fs::remove_file(&tmp_path);
 
-    result.ok().map(|out| out.status.success())
+    let output = result.ok()?;
+    let passed_raw = output.status.success();
+    let passed = if let Some(ranges) = changed_lines {
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        let (_, scoped_passed) =
+            scope_output_to_changed_lines(&combined, &tmp_path, ranges, passed_raw);
+        scoped_passed
+    } else {
+        passed_raw
+    };
+    Some(passed)
 }
 
 /// Run every check in `checks` that applies to `trigger` and whose scope matches

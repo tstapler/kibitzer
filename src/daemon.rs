@@ -169,8 +169,13 @@ fn handle_run_checks(
 
     if let Ok(mut guard) = cache.lock() {
         guard.apply_grace(&mut results, file_path, trigger);
-        guard.put(file_path, &config_path, trigger, results.clone());
-        let _ = guard.save(cache_path);
+        // A scoped result only reflects the diffed ranges, not the whole file — writing it
+        // to the cache would let a later unscoped (e.g. batch) request read back a partial
+        // result as if it were a full-file one.
+        if changed_lines.is_none() {
+            guard.put(file_path, &config_path, trigger, results.clone());
+            let _ = guard.save(cache_path);
+        }
     }
     Ok(results)
 }
@@ -248,8 +253,12 @@ pub fn run_checks_smart(
     let cache_path = default_cache_path();
     let mut cache = Cache::load(&cache_path);
     cache.apply_grace(&mut results, file_path, trigger);
-    cache.put(file_path, &config_path, trigger, results.clone());
-    let _ = cache.save(&cache_path);
+    // See handle_run_checks: don't let a diff-scoped partial result overwrite the
+    // full-file cache entry.
+    if changed_lines.is_none() {
+        cache.put(file_path, &config_path, trigger, results.clone());
+        let _ = cache.save(&cache_path);
+    }
 
     Ok(results)
 }

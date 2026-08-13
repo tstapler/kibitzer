@@ -17,6 +17,20 @@ pub enum Severity {
 pub struct Check {
     pub name: String,
     /// Shell command to run. `{file}` is substituted with the triggering file path.
+    ///
+    /// When kibitzer knows which lines an edit actually touched (the Claude Code hook,
+    /// not batch mode), a check can opt into diff-aware scoping two ways:
+    ///
+    /// - `{changed_lines}`: substituted with a comma-separated list of 1-indexed,
+    ///   inclusive `start-end` ranges (e.g. `12-15,40-40`), or empty if no ranges are
+    ///   known — pass this to a linter/tool that supports scoping its own scan to a
+    ///   line range.
+    /// - Automatic output filtering: if a check's command emits output lines in the
+    ///   `{file}:{line}: message` convention (most linters do), kibitzer filters those
+    ///   lines down to ones inside the changed ranges and recomputes pass/fail from
+    ///   what survives — no command changes needed. Output that doesn't follow this
+    ///   convention is left untouched (conservatively kept, so unrecognized output
+    ///   can't be silently swallowed).
     pub command: String,
     pub severity: Severity,
     /// Glob patterns (supporting `**`) a file path must match for this check to apply.
