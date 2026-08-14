@@ -11,6 +11,7 @@ mod hook;
 mod markdown_link_integrity;
 mod mcp;
 mod primitive_obsession;
+mod rules;
 mod run;
 
 use std::path::PathBuf;

@@ -30,6 +30,7 @@ kibitzer check native primitive-obsession <file>   # run a single built-in check
 kibitzer check native go-blank-imports <file>      # flag unjustified `import _ "pkg"`
 kibitzer check native go-ignored-error <file>      # flag `result, _ := f()` discards
 kibitzer check native go-error-context <file>      # flag bare error passthroughs (advisory)
+kibitzer check native syntax-rules <file>          # run the native syntactic rule catalog (see docs/syntax-rules.md)
 kibitzer check list                  # list all natively implemented checkers
 ```
 
