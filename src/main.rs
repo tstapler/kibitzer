@@ -10,10 +10,10 @@ mod mcp;
 mod primitive_obsession;
 mod run;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -51,12 +51,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CheckCommand {
-    /// Flag Go parameters that pile up the same primitive type (see
-    /// .claude/rules/primitive-obsession-checklist.md).
-    PrimitiveObsession { file: PathBuf },
-    /// Flag broken markdown reference-style links: refs used but never defined, and
-    /// definitions pointing at a dead heading anchor or nonexistent file.
-    MarkdownLinkIntegrity { file: PathBuf },
+    /// Run a natively implemented checker (see `checker::registry()`) against a file.
+    Native { name: String, file: PathBuf },
+    /// List natively implemented checkers available to reference from
+    /// `.claude/inspect.json`'s `checker` field.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -101,30 +100,46 @@ fn main() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Command::Check { check } => {
-            let (checker, file): (Box<dyn checker::Checker>, PathBuf) = match check {
-                CheckCommand::PrimitiveObsession { file } => (
-                    Box::new(primitive_obsession::PrimitiveObsessionChecker),
-                    file,
-                ),
-                CheckCommand::MarkdownLinkIntegrity { file } => (
-                    Box::new(markdown_link_integrity::MarkdownLinkIntegrityChecker),
-                    file,
-                ),
-            };
-            run_checker(checker.as_ref(), &file)
-        }
-    }
-}
-
-fn run_checker(checker: &dyn checker::Checker, file: &Path) -> Result<ExitCode> {
-    let findings = checker.check_file(file)?;
-    if findings.is_empty() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        for finding in &findings {
-            println!("{}:{}: {}", file.display(), finding.line, finding.message);
-        }
-        Ok(ExitCode::from(1))
+        Command::Check { check } => match check {
+            CheckCommand::List => {
+                for checker in checker::registry() {
+                    let language = checker
+                        .language()
+                        .map(|l| format!("{l:?}"))
+                        .unwrap_or_else(|| "any".to_string());
+                    println!(
+                        "{}: {} (language: {language}, globs: {})",
+                        checker.name(),
+                        checker.description(),
+                        checker.file_globs().join(", ")
+                    );
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            CheckCommand::Native { name, file } => {
+                let checker = checker::lookup(&name)
+                    .with_context(|| format!("no checker named '{name}' registered"))?;
+                let source = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let cache = checker::GrammarCache::new();
+                let tree = match checker.language() {
+                    Some(language) => Some(cache.parse(language, &source)?),
+                    None => None,
+                };
+                let ctx = checker::CheckContext {
+                    source: &source,
+                    tree: tree.as_ref(),
+                };
+                let findings = checker.check(&file, &ctx)?;
+                if findings.is_empty() {
+                    Ok(ExitCode::SUCCESS)
+                } else {
+                    for finding in &findings {
+                        println!("{}:{}: {}", file.display(), finding.line, finding.message);
+                    }
+                    Ok(ExitCode::from(1))
+                }
+            }
+        },
     }
 }

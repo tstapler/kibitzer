@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::Regex;
 
-use crate::checker::{Checker, Finding};
+use crate::checker::{CheckContext, Checker, Finding, Language};
 
 /// Checks reference-style markdown links: `[label][ref-id]` uses with no matching
 /// `[ref-id]: target` definition, and definitions whose target is a dead heading anchor
@@ -12,17 +12,31 @@ use crate::checker::{Checker, Finding};
 /// `doc_report.py`'s `check_references` — deliberately scoped to link *integrity* only
 /// (a definition pointing nowhere is a factual error), not that script's advisory
 /// structure/readability checks.
-pub fn check_file(path: &Path) -> Result<Vec<Finding>> {
-    let src =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    check_source(path, &src)
-}
-
+///
+/// Flags broken markdown reference-style links: refs used but never defined, and
+/// definitions pointing at a dead heading anchor or nonexistent file.
 pub struct MarkdownLinkIntegrityChecker;
 
 impl Checker for MarkdownLinkIntegrityChecker {
-    fn check_file(&self, path: &Path) -> Result<Vec<Finding>> {
-        check_file(path)
+    fn name(&self) -> &str {
+        "markdown-link-integrity"
+    }
+
+    fn description(&self) -> &str {
+        "flags broken markdown reference-style links and dead heading anchors"
+    }
+
+    fn language(&self) -> Option<Language> {
+        // Not tree-sitter-based — scans the raw markdown source directly.
+        None
+    }
+
+    fn file_globs(&self) -> &[&str] {
+        &["**/*.md"]
+    }
+
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        check_source(file, ctx.source)
     }
 }
 
