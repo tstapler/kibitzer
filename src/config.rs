@@ -31,7 +31,15 @@ pub struct Check {
     ///   what survives — no command changes needed. Output that doesn't follow this
     ///   convention is left untouched (conservatively kept, so unrecognized output
     ///   can't be silently swallowed).
-    pub command: String,
+    ///
+    /// Mutually exclusive with `checker` — exactly one of the two must be set.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Name of a natively implemented checker (looked up in `checker::registry()`) to
+    /// run in-process instead of shelling out via `command`. Mutually exclusive with
+    /// `command`.
+    #[serde(default)]
+    pub checker: Option<String>,
     pub severity: Severity,
     /// Glob patterns (supporting `**`) a file path must match for this check to apply.
     #[serde(default)]
@@ -44,10 +52,51 @@ pub struct Check {
     pub message: Option<String>,
 }
 
+impl Check {
+    /// Whether this check is scoped to a single triggering file, as opposed to
+    /// whole-repo (no `{file}` placeholder in `command`, or a native checker — which
+    /// always runs against one file at a time).
+    pub fn is_per_file(&self) -> bool {
+        match (&self.command, &self.checker) {
+            (Some(command), _) => command.contains("{file}"),
+            (None, Some(_)) => true,
+            (None, None) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub checks: Vec<Check>,
+}
+
+fn validate(config: &Config, config_path: &Path) -> Result<()> {
+    for check in &config.checks {
+        match (&check.command, &check.checker) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "{}: check '{}' sets both `command` and `checker` — these are mutually exclusive",
+                config_path.display(),
+                check.name
+            ),
+            (None, None) => anyhow::bail!(
+                "{}: check '{}' sets neither `command` nor `checker` — exactly one is required",
+                config_path.display(),
+                check.name
+            ),
+            (None, Some(checker_name)) if crate::checker::lookup(checker_name).is_none() => {
+                anyhow::bail!(
+                    "{}: check '{}' references unknown checker '{}' — run `kibitzer check list` \
+                     for available checkers",
+                    config_path.display(),
+                    check.name,
+                    checker_name
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Walk upward from `start` looking for `.claude/inspect.json`, returning the parsed
@@ -69,11 +118,70 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
                 .with_context(|| format!("reading {}", candidate.display()))?;
             let config: Config = serde_json::from_str(&raw)
                 .with_context(|| format!("parsing {}", candidate.display()))?;
+            validate(&config, &candidate)?;
             return Ok(Some((config, dir)));
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
             None => return Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<Config> {
+        let config: Config = serde_json::from_str(json)?;
+        validate(&config, Path::new(".claude/inspect.json"))?;
+        Ok(config)
+    }
+
+    #[test]
+    fn accepts_checker_without_command() {
+        let config = parse(
+            r#"{"checks": [{"name": "n", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.checks[0].checker.as_deref(),
+            Some("primitive-obsession")
+        );
+        assert!(config.checks[0].command.is_none());
+    }
+
+    #[test]
+    fn accepts_command_without_checker() {
+        let config = parse(
+            r#"{"checks": [{"name": "n", "command": "true {file}", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.checks[0].command.as_deref(), Some("true {file}"));
+        assert!(config.checks[0].checker.is_none());
+    }
+
+    #[test]
+    fn rejects_both_command_and_checker() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "command": "true", "checker": "x", "severity": "advisory"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn rejects_neither_command_nor_checker() {
+        let err = parse(r#"{"checks": [{"name": "n", "severity": "advisory"}]}"#).unwrap_err();
+        assert!(err.to_string().contains("exactly one is required"));
+    }
+
+    #[test]
+    fn rejects_unknown_checker_name() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "checker": "does-not-exist", "severity": "advisory"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown checker"));
     }
 }

@@ -39,10 +39,8 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let (repo_checks, file_checks): (Vec<Check>, Vec<Check>) = config
-        .checks
-        .into_iter()
-        .partition(|c| !c.command.contains("{file}"));
+    let (file_checks, repo_checks): (Vec<Check>, Vec<Check>) =
+        config.checks.into_iter().partition(Check::is_per_file);
 
     let mut any_blocking_failure = false;
 
@@ -71,5 +69,36 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{Check, Severity};
+
+    fn checker_check() -> Check {
+        Check {
+            name: "native".to_string(),
+            command: None,
+            checker: Some("primitive-obsession".to_string()),
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: None,
+        }
+    }
+
+    #[test]
+    fn native_checker_check_is_per_file() {
+        assert!(checker_check().is_per_file());
+    }
+
+    #[test]
+    fn native_checker_check_partitions_into_file_checks() {
+        let checks = vec![checker_check()];
+        let (file_checks, repo_checks): (Vec<Check>, Vec<Check>) =
+            checks.into_iter().partition(Check::is_per_file);
+        assert_eq!(file_checks.len(), 1);
+        assert!(repo_checks.is_empty());
     }
 }

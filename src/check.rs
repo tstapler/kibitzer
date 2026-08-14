@@ -1,9 +1,12 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::checker::{CheckContext, GrammarCache};
 use crate::config::{Check, Severity};
 use crate::glob::matches_scope;
 
@@ -128,7 +131,16 @@ pub fn run_check(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> anyhow::Result<CheckResult> {
-    let cmd_str = substitute_command(&check.command, file_path, changed_lines);
+    if let Some(checker_name) = &check.checker {
+        return run_native_check(check, checker_name, repo_root, file_path, changed_lines);
+    }
+
+    let command = check
+        .command
+        .as_deref()
+        .expect("config-load validation guarantees command is set when checker is not");
+
+    let cmd_str = substitute_command(command, file_path, changed_lines);
     let output = Command::new("sh")
         .arg("-c")
         .arg(&cmd_str)
@@ -151,17 +163,20 @@ pub fn run_check(
     let mut severity = check.severity;
     let mut message = check.message.clone();
 
-    if !passed
-        && severity == Severity::Blocking
-        && check.command.contains("{file}")
-        && let Some(false) = check_against_git_head(check, repo_root, file_path, changed_lines)
-    {
-        severity = Severity::Advisory;
-        message = Some(format!(
-            "{} (downgraded: this violation predates your edits — already present in \
-             the git HEAD version of this file)",
-            message.unwrap_or_default()
-        ));
+    if !passed && severity == Severity::Blocking {
+        let baseline = if command.contains("{file}") {
+            check_against_git_head(check, repo_root, file_path, changed_lines)
+        } else {
+            check_against_git_head_repo(check, repo_root)
+        };
+        if let Some(false) = baseline {
+            severity = Severity::Advisory;
+            message = Some(format!(
+                "{} (downgraded: this violation predates your edits — already present \
+                 at the git HEAD commit)",
+                message.unwrap_or_default()
+            ));
+        }
     }
 
     Ok(CheckResult {
@@ -172,6 +187,173 @@ pub fn run_check(
         message,
         command: cmd_str,
     })
+}
+
+/// In-process counterpart to the shell-out path above for `config::Check::checker`-based
+/// checks: runs the named native [`crate::checker::Checker`] against `file_path` instead
+/// of spawning a command, but otherwise applies the exact same diff-scoping and git-HEAD
+/// baseline-suppression logic so a check's behavior doesn't change based on whether it's
+/// implemented natively or as a shell-out.
+fn run_native_check(
+    check: &Check,
+    checker_name: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> anyhow::Result<CheckResult> {
+    let cmd_str = format!(
+        "kibitzer check native {checker_name} {}",
+        file_path.display()
+    );
+
+    if let Some(checker) = crate::checker::lookup(checker_name) {
+        let globs: Vec<String> = checker.file_globs().iter().map(|g| g.to_string()).collect();
+        let rel_path = relativize(repo_root, file_path);
+        if !matches_scope(&rel_path, &globs) {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: true,
+                output: String::new(),
+                message: None,
+                command: cmd_str,
+            });
+        }
+    }
+
+    // Degrade to a failed CheckResult on error (e.g. an unreadable file) instead of
+    // propagating, matching the shell-out path above where a command's own failure is
+    // captured as `passed_raw = false` rather than aborting the whole batch — a single
+    // bad file shouldn't kill every other check/file in the run.
+    let (mut combined, passed_raw) = match run_checker_against_file(checker_name, file_path) {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: false,
+                output: format!("{err:#}"),
+                message: check.message.clone(),
+                command: cmd_str,
+            });
+        }
+    };
+
+    let passed = if let Some(ranges) = changed_lines {
+        let (scoped, scoped_passed) =
+            scope_output_to_changed_lines(&combined, file_path, ranges, passed_raw);
+        combined = scoped;
+        scoped_passed
+    } else {
+        passed_raw
+    };
+
+    let mut severity = check.severity;
+    let mut message = check.message.clone();
+
+    if !passed && severity == Severity::Blocking {
+        let baseline =
+            check_native_against_git_head(checker_name, repo_root, file_path, changed_lines);
+        if let Some(false) = baseline {
+            severity = Severity::Advisory;
+            message = Some(format!(
+                "{} (downgraded: this violation predates your edits — already present \
+                 at the git HEAD commit)",
+                message.unwrap_or_default()
+            ));
+        }
+    }
+
+    Ok(CheckResult {
+        check_name: check.name.clone(),
+        severity,
+        passed,
+        output: combined,
+        message,
+        command: cmd_str,
+    })
+}
+
+/// Runs `checker_name` against `source` (as if it were the content of `file_path`),
+/// producing output in the same `{file}:{line}: {message}` convention a shell-out check's
+/// command output would follow, so downstream diff-scoping and baseline logic can treat
+/// native and shell-out checks identically.
+fn run_checker_against_source(
+    checker_name: &str,
+    file_path: &Path,
+    source: &str,
+) -> anyhow::Result<(String, bool)> {
+    let checker = crate::checker::lookup(checker_name)
+        .ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
+    let cache = GrammarCache::new();
+    let tree = match checker.language() {
+        Some(language) => Some(cache.parse(language, source)?),
+        None => None,
+    };
+    let ctx = CheckContext {
+        source,
+        tree: tree.as_ref(),
+    };
+    let findings = checker.check(file_path, &ctx)?;
+    let passed = findings.is_empty();
+    let combined = findings
+        .iter()
+        .map(|f| format!("{}:{}: {}", file_path.display(), f.line, f.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((combined, passed))
+}
+
+fn run_checker_against_file(
+    checker_name: &str,
+    file_path: &Path,
+) -> anyhow::Result<(String, bool)> {
+    let source = std::fs::read_to_string(file_path)
+        .with_context(|| format!("reading {}", file_path.display()))?;
+    run_checker_against_source(checker_name, file_path, &source)
+}
+
+/// Native-checker counterpart to [`check_against_git_head`]: same git-HEAD comparison, but
+/// runs the checker in-process against the HEAD content instead of shelling out to a
+/// substituted command.
+fn check_native_against_git_head(
+    checker_name: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Option<bool> {
+    let rel_path = relativize(repo_root, file_path);
+    let show = Command::new("git")
+        .args(["show", &format!("HEAD:{rel_path}")])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !show.status.success() {
+        return None;
+    }
+
+    let head_ranges = match changed_lines {
+        Some(ranges) => Some(map_ranges_to_head(repo_root, &rel_path, ranges)?),
+        None => None,
+    };
+    if let Some(ranges) = &head_ranges
+        && ranges.is_empty()
+    {
+        return Some(true);
+    }
+
+    let source = String::from_utf8(show.stdout).ok()?;
+    let (combined, passed_raw) =
+        run_checker_against_source(checker_name, file_path, &source).ok()?;
+
+    let passed = if let Some(ranges) = &head_ranges {
+        let (_, scoped_passed) =
+            scope_output_to_changed_lines(&combined, file_path, ranges, passed_raw);
+        scoped_passed
+    } else {
+        passed_raw
+    };
+    Some(passed)
 }
 
 /// Substitute `{file}` and, if present, `{changed_lines}` into `command`. `{changed_lines}`
@@ -323,7 +505,11 @@ fn check_against_git_head(
     tmp_path.set_file_name(tmp_name);
     std::fs::write(&tmp_path, &show.stdout).ok()?;
 
-    let cmd_str = substitute_command(&check.command, &tmp_path, head_ranges.as_deref());
+    let command = check
+        .command
+        .as_deref()
+        .expect("config-load validation guarantees command is set when checker is not");
+    let cmd_str = substitute_command(command, &tmp_path, head_ranges.as_deref());
     let result = Command::new("sh")
         .arg("-c")
         .arg(&cmd_str)
@@ -344,6 +530,74 @@ fn check_against_git_head(
         passed_raw
     };
     Some(passed)
+}
+
+/// Repo-wide counterpart to `check_against_git_head`: re-run `check` against a snapshot of
+/// the whole tree at HEAD (via `git archive`, not `git worktree` — see issue #2's plan for
+/// why: worktrees mutate repo-global `.git/worktrees/` state, which is unsafe to race under
+/// the daemon's one-thread-per-connection model and leaks metadata on a crash between `add`
+/// and `remove`). `git archive` is a pure read into a private scratch directory, so
+/// concurrent callers never interfere and cleanup is a plain `rm -rf`.
+///
+/// Returns `Some(true)` if the baseline passes (no violation at HEAD), `Some(false)` if the
+/// baseline also fails (pre-existing, not introduced by the current edit), or `None` if the
+/// baseline can't be determined (no HEAD, not a git repo, archive/tar failure, etc.).
+fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> {
+    let nonce = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let snapshot_dir = std::env::temp_dir().join(format!(
+        "kibitzer-head-snapshot-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&snapshot_dir).ok()?;
+
+    let archive = Command::new("git")
+        .args(["archive", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !archive.status.success() {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
+    }
+
+    let mut tar = match Command::new("tar")
+        .args(["-x", "-C"])
+        .arg(&snapshot_dir)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(tar) => tar,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return None;
+        }
+    };
+    let write_ok = tar
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&archive.stdout).is_ok())
+        .unwrap_or(false);
+    let wait_ok = tar.wait().map(|s| s.success()).unwrap_or(false);
+    if !write_ok || !wait_ok {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
+    }
+
+    let command = check
+        .command
+        .as_deref()
+        .expect("config-load validation guarantees command is set when checker is not");
+    let cmd_str = substitute_command(command, &snapshot_dir, None);
+    let result = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .current_dir(&snapshot_dir)
+        .output();
+
+    let _ = std::fs::remove_dir_all(&snapshot_dir);
+
+    Some(result.ok()?.status.success())
 }
 
 struct DiffHunk {
@@ -711,11 +965,26 @@ mod git_head_integration_tests {
     fn bad_marker_check() -> Check {
         Check {
             name: "no-bad-marker".to_string(),
-            command: "! grep -n BAD {file}".to_string(),
+            command: Some("! grep -n BAD {file}".to_string()),
+            checker: None,
             severity: Severity::Blocking,
             scope: vec![],
             triggers: vec![],
             message: Some("found BAD marker".to_string()),
+        }
+    }
+
+    /// A whole-repo counterpart to `bad_marker_check`: no `{file}` in the command, so it
+    /// scans the whole tree it's run from rather than a single file.
+    fn repo_wide_bad_marker_check() -> Check {
+        Check {
+            name: "no-bad-marker-repo".to_string(),
+            command: Some("! grep -rn BAD .".to_string()),
+            checker: None,
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("found BAD marker in repo".to_string()),
         }
     }
 
@@ -790,5 +1059,120 @@ mod git_head_integration_tests {
         assert!(!result.passed);
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    #[test]
+    fn repo_wide_baseline_fails_when_violation_predates_the_edit() {
+        let repo = TempRepo::new("repo-wide-pre-existing");
+        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
+
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn repo_wide_baseline_passes_when_violation_is_genuinely_new() {
+        let repo = TempRepo::new("repo-wide-genuinely-new");
+        repo.write_and_commit("foo.txt", "line1\nline2\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
+
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn repo_wide_baseline_is_none_when_there_is_no_head_commit() {
+        let repo = TempRepo::new("repo-wide-no-head");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
+
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn repo_wide_baseline_concurrent_calls_do_not_interfere() {
+        let repo = TempRepo::new("repo-wide-concurrent");
+        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = repo.dir.clone();
+                std::thread::spawn(move || {
+                    check_against_git_head_repo(&repo_wide_bad_marker_check(), &dir)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), Some(false));
+        }
+    }
+
+    #[test]
+    fn run_check_downgrades_severity_for_repo_wide_check_when_violation_predates_edit() {
+        let repo = TempRepo::new("run-check-repo-wide-downgrade");
+        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
+
+        let result = run_check(&repo_wide_bad_marker_check(), &repo.dir, &repo.dir, None).unwrap();
+        assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Advisory);
+        assert!(result.message.unwrap().contains("predates your edits"));
+    }
+}
+
+#[cfg(test)]
+mod native_check_tests {
+    use super::*;
+    use crate::config::Severity;
+
+    fn primitive_obsession_check() -> Check {
+        Check {
+            name: "native".to_string(),
+            command: None,
+            checker: Some("primitive-obsession".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("primitive obsession".to_string()),
+        }
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-native-check-test-{}-{name}-{}",
+            std::process::id(),
+            TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_file_degrades_to_failed_result_instead_of_erroring() {
+        let dir = tmp_dir("missing-file");
+        let file = dir.join("does-not-exist.go");
+
+        let result = run_check(&primitive_obsession_check(), &dir, &file, None)
+            .expect("a missing file must not abort the whole check run");
+        assert!(!result.passed);
+        assert!(result.output.contains("does-not-exist.go"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_not_matching_checkers_globs_is_skipped_rather_than_misparsed() {
+        let dir = tmp_dir("wrong-glob");
+        let file = dir.join("notes.md");
+        std::fs::write(&file, "func f(a, b string) {}\n").unwrap();
+
+        let result = run_check(&primitive_obsession_check(), &dir, &file, None).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.output, "");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
