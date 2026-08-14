@@ -1215,4 +1215,45 @@ mod native_check_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn blank_imports_check() -> Check {
+        Check {
+            name: "native".to_string(),
+            command: None,
+            checker: Some("go-blank-imports".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("blank import".to_string()),
+        }
+    }
+
+    // Proves criterion 6 concretely for a new native checker (not just
+    // primitive-obsession): two unjustified blank imports, one inside
+    // `changed_lines` and one outside it, and only the in-range one survives
+    // output-filtering and drives the pass/fail result.
+    #[test]
+    fn native_go_blank_imports_check_scopes_output_to_changed_lines() {
+        let dir = tmp_dir("blank-imports-scoping");
+        let file = dir.join("main.go");
+        std::fs::write(
+            &file,
+            "package main\n\nimport (\n\t_ \"unjustified/outside\"\n\t_ \"unjustified/inside\"\n)\n",
+        )
+        .unwrap();
+
+        // Line 4 (outside/pre-existing) is excluded; line 5 (inside) is the
+        // only changed line, matching this file's `{file}:{line}:` findings.
+        let result = run_check(&blank_imports_check(), &dir, &file, Some(&[(5, 5)])).unwrap();
+        assert!(!result.passed);
+        assert!(result.output.contains("unjustified/inside"));
+        assert!(!result.output.contains("unjustified/outside"));
+
+        // Scoping to a range with no findings at all reports a pass, proving the
+        // filtering — not just the checker itself — determines the outcome.
+        let clean = run_check(&blank_imports_check(), &dir, &file, Some(&[(1, 1)])).unwrap();
+        assert!(clean.passed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
