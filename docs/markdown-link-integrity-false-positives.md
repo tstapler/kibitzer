@@ -57,3 +57,23 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   the reference-style *use* as part of the same hunk that removes the old inline link.
   No cleaner (pure-deletion-only) example of this check firing has been found yet in
   the sessions audited so far — see `checking-invocations.md` for how to look for one.
+
+## Resolution: native `markdown-link-integrity` checker + grace period
+
+`markdown-link-integrity` is no longer a `markdownlint-cli2`/`doc_report.py`
+shell-command check — it's a native Rust `Checker` (`src/markdown_link_integrity.rs`),
+wired via `checker: "markdown-link-integrity"` in `.claude/inspect.json` (see
+`README.md`'s Usage section for the migration). The whole-file-vs-diff mismatch
+described above still exists in principle (the checker still reads the whole file),
+but the specific failure mode this doc logs — a valid multi-step edit getting blocked
+mid-sequence — is now handled generically by `Cache::apply_grace` (`src/cache.rs`),
+not by anything markdown-specific: the first time a given file+check fails under a
+live per-edit trigger, it's downgraded to Advisory with a "will block if still failing
+on the next edit" message, and only escalates to Blocking if the same file is still
+failing on a later touch. This was verified empirically with a live `kibitzer daemon`
+running: first touch → Advisory/exit 0, second still-failing touch → Blocking/exit 2.
+See the module doc comment on `MarkdownLinkIntegrityChecker` for the full policy,
+including the caveat that this escalation only survives across edits when a
+`kibitzer daemon` is running (the recommended setup) — without one, grace state isn't
+persisted for diff-scoped per-edit hook calls, so a still-failing violation stays
+Advisory instead of escalating.

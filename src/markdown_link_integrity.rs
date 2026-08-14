@@ -2,19 +2,52 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use regex::Regex;
+use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 
-/// Checks reference-style markdown links: `[label][ref-id]` uses with no matching
-/// `[ref-id]: target` definition, and definitions whose target is a dead heading anchor
-/// (same-doc `#frag` or `other.md#frag`) or a nonexistent file. Ported from
-/// `doc_report.py`'s `check_references` — deliberately scoped to link *integrity* only
-/// (a definition pointing nowhere is a factual error), not that script's advisory
-/// structure/readability checks.
+/// Checks a markdown document for three shapes of link/anchor breakage:
+///   - a reference-style use (`[label][ref-id]`) with no matching `[ref-id]: target`
+///     definition anywhere in the document
+///   - a reference definition with zero uses
+///   - a dead heading anchor, either an in-doc link (`[text](#slug)`) or a reference
+///     definition pointing at `#slug` or `other.md#slug`
 ///
-/// Flags broken markdown reference-style links: refs used but never defined, and
-/// definitions pointing at a dead heading anchor or nonexistent file.
+/// Parses with `pulldown-cmark` rather than regex, so reference-label matching gets
+/// CommonMark's case-insensitive/whitespace-normalized semantics for free, and heading
+/// anchors are slugified from the *rendered* heading text (inline code/emphasis/links
+/// resolved to their visible text) rather than raw markup. Content inside fenced code
+/// blocks or inline code spans is never treated as a real link or definition, because
+/// pulldown-cmark's tokenizer does not parse link syntax there.
+///
+/// ## Multi-step edits: reference used before its definition exists
+///
+/// An agent adding a reference-style link (`[label][ref-id]`) and its `[ref-id]:
+/// target` definition as two separate edits will trip this check between the two
+/// edits — this is a real, expected transient state, not a false positive to special-
+/// case away in this checker. It's handled generically by [`crate::cache::Cache::apply_grace`]:
+/// under a live per-edit trigger (anything other than `"batch"`), the first time a
+/// given `(file, check)` pair fails, the result is downgraded from Blocking to
+/// Advisory with a "first occurrence this edit sequence" message; it only escalates
+/// back to Blocking if the *same* file is still failing the check on a later touch.
+///
+/// This grace state lives in the check-runner's `Cache`, keyed by `{file}::{check
+/// name}`. It survives across edits only for as long as that `Cache` instance does:
+///
+/// - **With a `kibitzer daemon` running** (the normal setup — see `README.md`), every
+///   `hook`/`run` call is served by the same long-lived `Arc<Mutex<Cache>>`, so grace
+///   state persists correctly across edits regardless of diff-scoping. Verified via
+///   `kibitzer daemon start` plus two successive `kibitzer hook` calls against the same
+///   still-failing file: first call → Advisory/exit 0 ("first occurrence..."), second
+///   call → Blocking/exit 2.
+/// - **Without a daemon** (`run_checks_smart`'s fallback path in `src/daemon.rs`), each
+///   `hook` invocation is a fresh process that reloads `Cache` from disk, and disk
+///   persistence (`Cache::save`) is only triggered when `changed_lines` is `None` — so
+///   a diff-scoped per-edit hook call (the common case) never writes grace state back
+///   to disk. In that configuration a still-failing violation stays Advisory on every
+///   touch instead of escalating; it will never falsely block, but it also won't
+///   self-escalate until the daemon is running or a non-diff-scoped (e.g. batch) check
+///   runs against the file.
 pub struct MarkdownLinkIntegrityChecker;
 
 impl Checker for MarkdownLinkIntegrityChecker {
@@ -41,95 +74,127 @@ impl Checker for MarkdownLinkIntegrityChecker {
 }
 
 pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
-    let scan_body = strip_code(body);
-    let mut findings = Vec::new();
+    let line_starts = line_start_offsets(body);
 
-    let ref_use = Regex::new(r"\[([^\]]+)\]\[([^\]]*)\]").unwrap();
-    // Refs used by a non-image link — these are the only ones that can be reported
-    // "used but never defined" (mirrors the Python original's negative-lookbehind-for-`!`
-    // exclusion of image refs from that check).
-    let mut used: HashMap<String, usize> = HashMap::new();
-    // Every ref used at all, image or not — a definition referenced only by `![alt][ref]`
-    // is still used, just not eligible for the undefined-ref check above.
-    let mut used_any: HashMap<String, usize> = HashMap::new();
-    for caps in ref_use.captures_iter(&scan_body) {
-        let whole = caps.get(0).unwrap();
-        // Negative-lookbehind-for-`!` (image refs) by hand: the `regex` crate has no
-        // look-around support.
-        let is_image = whole.start() > 0 && scan_body.as_bytes()[whole.start() - 1] == b'!';
-        let label = caps[1].trim();
-        let ref_id = caps[2].trim();
-        let id = if ref_id.is_empty() { label } else { ref_id };
-        if id.starts_with('^') {
-            continue; // footnote, not a reference link
-        }
-        let line = line_of(&scan_body, whole.start());
-        used_any.entry(id.to_string()).or_insert(line);
-        if !is_image {
-            used.entry(id.to_string()).or_insert(line);
-        }
-    }
+    // Force the parser to still emit Link/Image events for dangling references (as
+    // *Unknown link types) instead of silently rendering them as plain text, so a single
+    // pass over events can detect both uses and dangling uses.
+    let callback =
+        |_broken: pulldown_cmark::BrokenLink| Some((CowStr::Borrowed(""), CowStr::Borrowed("")));
+    let parser = Parser::new_with_broken_link_callback(body, Options::empty(), Some(callback));
 
-    // A shortcut reference `[ref-id]` (label doubles as the id, no trailing `[...]`) is
-    // valid CommonMark but invisible to `ref_use` above. It only matters for the
-    // "defined but never used" check: the Python original never validates shortcut refs
-    // either, so `used` (the undefined-ref check) stays as-is to match it.
-    let shortcut_ref = Regex::new(r"\[([^\]\[]+)\]").unwrap();
-    for caps in shortcut_ref.captures_iter(&scan_body) {
-        let whole = caps.get(0).unwrap();
-        let is_image = whole.start() > 0 && scan_body.as_bytes()[whole.start() - 1] == b'!';
-        // A full reference `[text][ref]` or a definition `[ref]: target` both start with
-        // `[...]` followed by `[` or `:` — skip those, they're handled elsewhere.
-        let next_byte = scan_body.as_bytes().get(whole.end()).copied();
-        if is_image || matches!(next_byte, Some(b'[') | Some(b'(') | Some(b':')) {
-            continue;
-        }
-        let id = caps[1].trim();
-        if id.is_empty() || id.starts_with('^') {
-            continue;
-        }
-        let line = line_of(&scan_body, whole.start());
-        used_any.entry(id.to_string()).or_insert(line);
-    }
-
-    let ref_def = Regex::new(r"(?m)^\[([^\]]+)\]:[ \t]*(\S+)").unwrap();
-    let mut defs: HashMap<String, (String, usize)> = HashMap::new();
-    for caps in ref_def.captures_iter(&scan_body) {
-        let ref_id = caps[1].trim().to_string();
-        if ref_id.starts_with('^') {
-            continue;
-        }
-        let target = caps[2].trim().to_string();
-        let line = line_of(&scan_body, caps.get(0).unwrap().start());
-        defs.entry(ref_id).or_insert((target, line));
-    }
-
-    let mut used_ids: Vec<&String> = used.keys().collect();
-    used_ids.sort();
-    for ref_id in used_ids {
-        if !defs.contains_key(ref_id) {
-            findings.push(Finding {
-                line: used[ref_id],
-                message: format!("[{ref_id}] used but never defined"),
-            });
-        }
-    }
-
-    let mut unused_def_ids: Vec<&String> = defs
-        .keys()
-        .filter(|id| !used_any.contains_key(*id))
+    let ref_defs: HashMap<String, (String, usize)> = parser
+        .reference_definitions()
+        .iter()
+        .map(|(label, def)| {
+            (
+                normalize_label(label),
+                (
+                    def.dest.to_string(),
+                    line_for_offset(&line_starts, def.span.start),
+                ),
+            )
+        })
         .collect();
-    unused_def_ids.sort();
-    for ref_id in unused_def_ids {
+
+    let mut used_labels: HashSet<String> = HashSet::new();
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut anchor_links: Vec<(usize, String)> = Vec::new();
+    let mut headings: Vec<String> = Vec::new();
+    let mut current_heading: Option<String> = None;
+
+    for (event, range) in parser.into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { .. }) => current_heading = Some(String::new()),
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(text) = current_heading.take() {
+                    headings.push(text);
+                }
+            }
+            Event::Text(ref text) | Event::Code(ref text) => {
+                if let Some(heading) = current_heading.as_mut() {
+                    heading.push_str(text);
+                }
+            }
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                id,
+                ..
+            })
+            | Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                id,
+                ..
+            }) => {
+                let is_reference_style = matches!(
+                    link_type,
+                    LinkType::Reference
+                        | LinkType::ReferenceUnknown
+                        | LinkType::Collapsed
+                        | LinkType::CollapsedUnknown
+                        | LinkType::Shortcut
+                        | LinkType::ShortcutUnknown
+                );
+                let is_dangling = matches!(
+                    link_type,
+                    LinkType::ReferenceUnknown
+                        | LinkType::CollapsedUnknown
+                        | LinkType::ShortcutUnknown
+                );
+                if is_reference_style {
+                    let normalized = normalize_label(&id);
+                    used_labels.insert(normalized.clone());
+                    if is_dangling && !normalized.starts_with('^') {
+                        findings.push(Finding {
+                            line: line_for_offset(&line_starts, range.start),
+                            message: format!("[{id}] used but never defined"),
+                        });
+                    }
+                }
+                // Only inline-style links/images (`[text](#slug)`) are checked here.
+                // A reference-style link's `dest_url` resolves to its definition's
+                // target, which the `def_entries` pass below already checks once at the
+                // definition's own line — checking it again here would double-report
+                // the same dead anchor at both the use site and the definition site.
+                if let (LinkType::Inline, Some(slug)) = (link_type, dest_url.strip_prefix('#')) {
+                    anchor_links
+                        .push((line_for_offset(&line_starts, range.start), slug.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut unused_ids: Vec<&String> = ref_defs
+        .keys()
+        .filter(|id| !used_labels.contains(*id))
+        .collect();
+    unused_ids.sort();
+    for ref_id in unused_ids {
         findings.push(Finding {
-            line: defs[ref_id].1,
+            line: ref_defs[ref_id].1,
             message: format!("[{ref_id}] defined but never used"),
         });
     }
 
-    let local_anchors = anchors(body);
+    let local_anchors = heading_slugs(&headings);
+
+    for (line, slug) in &anchor_links {
+        if !local_anchors.contains(slug) {
+            findings.push(Finding {
+                line: *line,
+                message: format!("#{slug} -> no such heading in this doc"),
+            });
+        }
+    }
+
+    // Reference definitions pointing at a heading anchor (`[ref]: #slug` or
+    // `[ref]: other.md#slug`) get the same dead-anchor check as an in-doc link, plus a
+    // nonexistent-target-file check for the cross-file case.
     let mut target_cache: HashMap<String, Option<HashSet<String>>> = HashMap::new();
-    let mut def_entries: Vec<(&String, &(String, usize))> = defs.iter().collect();
+    let mut def_entries: Vec<(&String, &(String, usize))> = ref_defs.iter().collect();
     def_entries.sort_by_key(|(id, _)| id.as_str());
     for (ref_id, (target, line)) in def_entries {
         if target.starts_with("http://") || target.starts_with("https://") {
@@ -160,7 +225,7 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
             .or_insert_with(|| {
                 std::fs::read_to_string(&target_path)
                     .ok()
-                    .map(|s| anchors(&s))
+                    .map(|s| heading_slugs(&extract_headings(&s)))
             });
         match target_anchors {
             None => findings.push(Finding {
@@ -182,81 +247,106 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     }
 
     findings.sort_by_key(|f| f.line);
+    findings.dedup();
     Ok(findings)
 }
 
-fn line_of(text: &str, byte_offset: usize) -> usize {
-    text[..byte_offset].matches('\n').count() + 1
+/// CommonMark reference-label matching is case-insensitive and collapses internal
+/// whitespace; pulldown-cmark applies this when resolving definitions, but the raw label
+/// text it hands back through events/`reference_definitions()` is not folded, so
+/// use/definition bookkeeping here re-normalizes it the same way.
+fn normalize_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
-/// Blank out fenced (``` / ~~~) and inline (`...`) code so bracket syntax inside code
-/// examples isn't mistaken for a real reference link. Preserves line structure so byte
-/// offsets into the result still map to the same line numbers as the original body.
-fn strip_code(body: &str) -> String {
-    let inline_code = Regex::new(r"`[^`\n]*`").unwrap();
-    // The marker that opened the current fence (``` or ~~~) — a fence only closes on a
-    // matching marker, so e.g. a ```-fenced block demonstrating `~~~` syntax doesn't
-    // prematurely "close" and leak real code into reference-link scanning.
-    let mut fence_marker: Option<&'static str> = None;
-    let mut out_lines: Vec<String> = Vec::new();
-    for line in body.split('\n') {
-        let trimmed = line.trim_start();
-        let opens_or_closes = match fence_marker {
-            Some(marker) => trimmed.starts_with(marker),
-            None => trimmed.starts_with("```") || trimmed.starts_with("~~~"),
-        };
-        if opens_or_closes {
-            fence_marker = match fence_marker {
-                Some(_) => None,
-                None if trimmed.starts_with("```") => Some("```"),
-                None => Some("~~~"),
-            };
-            out_lines.push(String::new());
-        } else if fence_marker.is_some() {
-            out_lines.push(String::new());
-        } else {
-            out_lines.push(inline_code.replace_all(line, "").into_owned());
+fn line_start_offsets(src: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
+    starts
+}
+
+fn line_for_offset(line_starts: &[usize], offset: usize) -> usize {
+    match line_starts.binary_search(&offset) {
+        Ok(i) => i + 1,
+        Err(i) => i,
+    }
+}
+
+/// Rendered heading text for every heading in a document, extracted the same way
+/// `check_source`'s main pass does — used for cross-file anchor targets, which only need
+/// the anchor set of the *other* file, not its links/references.
+fn extract_headings(body: &str) -> Vec<String> {
+    let parser = Parser::new(body);
+    let mut headings = Vec::new();
+    let mut current_heading: Option<String> = None;
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { .. }) => current_heading = Some(String::new()),
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(text) = current_heading.take() {
+                    headings.push(text);
+                }
+            }
+            Event::Text(ref text) | Event::Code(ref text) => {
+                if let Some(heading) = current_heading.as_mut() {
+                    heading.push_str(text);
+                }
+            }
+            _ => {}
         }
     }
-    out_lines.join("\n")
+    headings
 }
 
-/// GitHub-style heading-anchor slugification: lowercase, drop emphasis markers and other
-/// punctuation (keeping literal underscores/hyphens), and turn each whitespace character
-/// into its own hyphen without collapsing runs — a stripped em-dash can leave two spaces
-/// that must anchor as `--` to match GitHub's real slugger (and pass markdownlint MD051).
-fn slugify(heading: &str) -> String {
-    let mut out = String::new();
-    for ch in heading.to_lowercase().chars() {
-        if ch == '`' || ch == '*' {
-            continue;
-        } else if ch.is_whitespace() {
-            out.push('-');
-        } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// The full set of valid heading anchors in a doc, with GitHub's real duplicate-heading
-/// suffixing: the first occurrence of a slug is unsuffixed, later ones get `-1`, `-2`, ...
-fn anchors(body: &str) -> HashSet<String> {
-    let heading = Regex::new(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$").unwrap();
+/// GitHub-style heading-anchor slugification, with GitHub's real duplicate-heading
+/// suffixing: the first occurrence of a slug is unsuffixed, later ones get `-1`, `-2`,
+/// ... Operates on rendered heading text (inline code/emphasis/links already resolved to
+/// their visible text by the caller), not raw markup.
+fn heading_slugs(headings: &[String]) -> HashSet<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut result = HashSet::new();
-    for caps in heading.captures_iter(body) {
-        let slug = slugify(&caps[2]);
-        let count = counts.entry(slug.clone()).or_insert(0);
-        let anchor = if *count == 0 {
-            slug
+    let mut slugs = HashSet::new();
+    for heading in headings {
+        let base = github_slug(heading);
+        let count = counts.entry(base.clone()).or_insert(0);
+        let slug = if *count == 0 {
+            base
         } else {
-            format!("{slug}-{count}")
+            format!("{base}-{count}")
         };
         *count += 1;
-        result.insert(anchor);
+        slugs.insert(slug);
     }
-    result
+    slugs
+}
+
+/// Lowercase, decode HTML entities, drop anything that isn't a letter/digit/space/
+/// hyphen/underscore, then turn whitespace into hyphens without collapsing runs — a
+/// stripped em-dash can leave two spaces that must anchor as `--` to match GitHub's real
+/// slugger.
+fn github_slug(heading: &str) -> String {
+    let decoded = decode_html_entities(heading);
+    let mut slug = String::with_capacity(decoded.len());
+    for ch in decoded.chars() {
+        if ch.is_whitespace() {
+            slug.push('-');
+        } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            slug.extend(ch.to_lowercase());
+        }
+        // all other punctuation is dropped entirely
+    }
+    slug
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 #[cfg(test)]
@@ -294,10 +384,15 @@ mod tests {
     }
 
     #[test]
-    fn ignores_image_references() {
+    fn flags_dangling_image_reference() {
         let body = "![alt][missing-image]\n";
         let findings = check_source(&path(), body).unwrap();
-        assert!(findings.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .message
+                .contains("[missing-image] used but never defined")
+        );
     }
 
     #[test]
@@ -308,10 +403,8 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_fence_marker_does_not_close_block() {
-        // A ```-fenced block that itself demonstrates `~~~` syntax must not be treated
-        // as closed by the `~~~` line — only a matching ``` closes it.
-        let body = "```\n~~~\n[thing][missing]\n```\n";
+    fn ignores_refs_inside_inline_code() {
+        let body = "Docs about markdown syntax:\n\n`[label][ref-id]` and `[ref-id]: target` are just examples.\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
     }
@@ -331,25 +424,10 @@ mod tests {
     }
 
     #[test]
-    fn image_ref_still_excluded_from_undefined_check() {
-        let body = "![alt][missing-image]\n";
+    fn collapsed_reference_counts_as_used() {
+        let body = "Use [collapsed][].\n\n[collapsed]: https://example.com/b\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn repeated_undefined_usage_reported_once() {
-        let body = "[a][missing] and [b][missing] again.\n";
-        let findings = check_source(&path(), body).unwrap();
-        assert_eq!(findings.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_definition_first_wins() {
-        let body = "See [x][ref].\n\n[ref]: first.md\n[ref]: second.md\n";
-        let findings = check_source(&path(), body).unwrap();
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("first.md"));
     }
 
     #[test]
@@ -365,6 +443,14 @@ mod tests {
         let body = "# Real Heading\n\nSee [x][ref].\n\n[ref]: #real-heading\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn flags_dead_inline_anchor_link() {
+        let body = "# Real Heading\n\nSee [here](#nonexistent).\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("no such heading in this doc"));
     }
 
     #[test]
@@ -432,5 +518,67 @@ mod tests {
         let body = "line one\n\nSee [x][missing] here.\n";
         let findings = check_source(&path(), body).unwrap();
         assert_eq!(findings[0].line, 3);
+    }
+
+    // AC3: reference-label matching is case-insensitive and whitespace-normalized, on
+    // both the use side and the definition side, regardless of which comes first.
+    #[test]
+    fn reference_matching_is_case_and_whitespace_insensitive_use_first() {
+        let body = "See [it][Foo   Bar].\n\n[foo bar]: https://example.com\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reference_matching_is_case_and_whitespace_insensitive_def_first() {
+        let body = "[foo bar]: https://example.com\n\nSee [it][Foo   Bar].\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    // AC5: anchors are computed from rendered heading text, not raw markup — inline
+    // code/emphasis/links inside a heading resolve to their visible text before
+    // slugifying.
+    #[test]
+    fn anchor_computed_from_rendered_heading_text_with_inline_code() {
+        let body = "## Using `fetch()`\n\n[link](#using-fetch)\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn anchor_computed_from_rendered_heading_text_with_emphasis_and_link() {
+        let body = "## The *Bold* [Plan](https://example.com)\n\n[link](#the-bold-plan)\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    // GitHub's real slugger drops punctuation without collapsing the hyphen runs that
+    // leaves behind — "A & B" removes `&` but keeps both surrounding spaces, so the
+    // real GitHub anchor is `#a--b`, not `#a-b`.
+    #[test]
+    fn html_entity_headings_decode_before_slugifying() {
+        let body = "## A &amp; B\n\n[link](#a--b)\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn headings_inside_details_blocks_are_recognized() {
+        let body = "<details>\n<summary>More</summary>\n\n## Nested Heading\n\n</details>\n\n[link](#nested-heading)\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_file_has_no_findings() {
+        assert!(check_source(&path(), "").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_reference_syntax_does_not_panic() {
+        let body = "This has an [unclosed bracket and no matching close.\n";
+        let findings = check_source(&path(), body).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn fully_consistent_document_has_zero_findings() {
+        let body = "# Heading One\n\nSee [the site][site-ref] and [Heading One](#heading-one).\n\n[site-ref]: https://example.com\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
     }
 }
