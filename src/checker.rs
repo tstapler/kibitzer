@@ -5,6 +5,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
+use crate::go_blank_imports::BlankImportsChecker;
+use crate::go_error_context::ErrorContextChecker;
+use crate::go_ignored_error::IgnoredErrorChecker;
 use crate::markdown_link_integrity::MarkdownLinkIntegrityChecker;
 use crate::primitive_obsession::PrimitiveObsessionChecker;
 
@@ -65,6 +68,9 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
     vec![
         Box::new(PrimitiveObsessionChecker),
         Box::new(MarkdownLinkIntegrityChecker),
+        Box::new(BlankImportsChecker),
+        Box::new(IgnoredErrorChecker),
+        Box::new(ErrorContextChecker),
     ]
 }
 

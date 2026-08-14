@@ -26,7 +26,11 @@ kibitzer run [dir] --trigger batch   # batch mode: check every file under dir
 kibitzer hook                        # Claude Code PostToolUse hook, reads event off stdin
 kibitzer mcp                         # serve as an MCP server over stdio
 kibitzer daemon start|stop|status    # background daemon that caches check results
-kibitzer check primitive-obsession <file>   # run a single built-in check directly
+kibitzer check native primitive-obsession <file>   # run a single built-in check directly
+kibitzer check native go-blank-imports <file>      # flag unjustified `import _ "pkg"`
+kibitzer check native go-ignored-error <file>      # flag `result, _ := f()` discards
+kibitzer check native go-error-context <file>      # flag bare error passthroughs (advisory)
+kibitzer check list                  # list all natively implemented checkers
 ```
 
 See `docs/checking-invocations.md` for how checks are wired up.
