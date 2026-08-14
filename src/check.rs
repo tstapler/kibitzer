@@ -369,11 +369,17 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = Command::new("git")
+    let archive = match Command::new("git")
         .args(["archive", "HEAD"])
         .current_dir(repo_root)
         .output()
-        .ok()?;
+    {
+        Ok(archive) => archive,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return None;
+        }
+    };
     if !archive.status.success() {
         let _ = std::fs::remove_dir_all(&snapshot_dir);
         return None;
@@ -920,6 +926,40 @@ mod git_head_integration_tests {
         for handle in handles {
             assert_eq!(handle.join().unwrap(), Some(false));
         }
+    }
+
+    #[test]
+    fn repo_wide_baseline_cleans_up_snapshot_dir_when_archive_fails_to_spawn() {
+        let pid = std::process::id();
+        let prefix = format!("kibitzer-head-snapshot-{pid}-");
+        let list_matching = || -> std::collections::HashSet<PathBuf> {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with(&prefix))
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+
+        let before = list_matching();
+        // A nonexistent repo_root makes `Command::current_dir` fail at the OS level before
+        // `git` even execs, exercising the same "archive command fails to spawn" path a
+        // missing `git` binary would hit.
+        let missing_repo_root = std::env::temp_dir().join(format!("kibitzer-does-not-exist-{pid}"));
+        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &missing_repo_root);
+        assert_eq!(result, None);
+
+        let after = list_matching();
+        assert!(
+            after.is_subset(&before),
+            "check_against_git_head_repo leaked a snapshot dir on spawn failure: {:?}",
+            after.difference(&before).collect::<Vec<_>>()
+        );
     }
 
     #[test]
