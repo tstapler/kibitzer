@@ -10,6 +10,7 @@ use crate::go_error_context::ErrorContextChecker;
 use crate::go_ignored_error::IgnoredErrorChecker;
 use crate::markdown_link_integrity::MarkdownLinkIntegrityChecker;
 use crate::primitive_obsession::PrimitiveObsessionChecker;
+use crate::rules::SyntaxRulesChecker;
 
 /// A finding a [`Checker`] reports against a specific line of a file. Formatted by
 /// callers as `{file}:{line}: {message}` — the convention `check.rs`'s diff-scoping
@@ -71,6 +72,7 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(BlankImportsChecker),
         Box::new(IgnoredErrorChecker),
         Box::new(ErrorContextChecker),
+        Box::new(SyntaxRulesChecker),
     ]
 }
 
