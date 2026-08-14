@@ -31,10 +31,65 @@ kibitzer check native go-blank-imports <file>      # flag unjustified `import _ 
 kibitzer check native go-ignored-error <file>      # flag `result, _ := f()` discards
 kibitzer check native go-error-context <file>      # flag bare error passthroughs (advisory)
 kibitzer check native syntax-rules <file>          # run the native syntactic rule catalog (see docs/syntax-rules.md)
+kibitzer check native markdown-link-integrity <file> # flag broken markdown reference links/anchors
 kibitzer check list                  # list all natively implemented checkers
 ```
 
 See `docs/checking-invocations.md` for how checks are wired up.
+
+### Migrating off `markdownlint-cli2` / `scripts/doc_report.py`
+
+If your `.claude/inspect.json` currently shells out to `markdownlint-cli2` and/or a
+project-local `scripts/doc_report.py` for reference-link/anchor checking (see
+`docs/markdown-link-integrity-false-positives.md` for the whole-file false-positive
+issues that setup has), replace those `command` entries with a single native
+`checker` entry — no npm install, no bespoke Python script:
+
+```jsonc
+// Before
+{
+  "checks": [
+    {
+      "name": "markdown-link-integrity",
+      "command": "markdownlint-cli2 {file}",
+      "severity": "blocking",
+      "scope": ["**/*.md"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "doc-structure-report",
+      "command": "python3 scripts/doc_report.py",
+      "severity": "blocking",
+      "scope": ["**/*.md"],
+      "triggers": ["PostToolUse", "batch"]
+    }
+  ]
+}
+```
+
+```jsonc
+// After
+{
+  "checks": [
+    {
+      "name": "markdown-link-integrity",
+      "checker": "markdown-link-integrity",
+      "severity": "blocking",
+      "scope": ["**/*.md"],
+      "triggers": ["PostToolUse", "batch"],
+      "message": "broken markdown link/anchor"
+    }
+  ]
+}
+```
+
+The native checker replaces both — it covers what `doc_report.py` checked (dangling
+reference-style uses, unused reference definitions) plus dead heading anchors, and it
+runs in-process rather than shelling out. You can drop `markdownlint-cli2` and
+`scripts/doc_report.py` entirely once this is wired up. Reference-use-before-definition
+across a multi-step edit is handled by a grace period, not by disabling the check —
+see the module doc comment on `MarkdownLinkIntegrityChecker` in
+`src/markdown_link_integrity.rs`.
 
 ### Diff-aware scoping
 
