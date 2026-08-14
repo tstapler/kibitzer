@@ -18,7 +18,7 @@ fn report(file_display: &str, result: &CheckResult) {
         },
         file_display,
         result.check_name,
-        result.message.as_deref().unwrap_or(&result.output)
+        result.describe()
     );
 }
 

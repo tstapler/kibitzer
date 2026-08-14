@@ -82,14 +82,7 @@ impl KibitzerServer {
                 let failures: Vec<String> = results
                     .iter()
                     .filter(|r| !r.passed)
-                    .map(|r| {
-                        format!(
-                            "[{:?}] {}: {}",
-                            r.severity,
-                            r.check_name,
-                            r.message.as_deref().unwrap_or(&r.output)
-                        )
-                    })
+                    .map(|r| format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe()))
                     .collect();
                 if failures.is_empty() {
                     "all checks passed".to_string()
