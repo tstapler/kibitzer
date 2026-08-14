@@ -85,6 +85,7 @@ mod tests {
             scope: vec![],
             triggers: vec![],
             message: None,
+            output_format: None,
         }
     }
 

@@ -58,6 +58,13 @@ violation is also present in `git show HEAD:<file>`. For a whole-repo check
 tree at HEAD (via `git archive`) and reruns the check against that snapshot
 to make the same determination.
 
+### Structured output formats
+
+A `command` check's `output_format` field tells kibitzer to parse its
+stdout as a known structured shape (currently SARIF) instead of relying
+solely on the exit code, so severity and finding counts survive into the
+reported output. See `docs/output-formats.md`.
+
 ## Development
 
 ```bash

@@ -7,7 +7,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, GrammarCache};
-use crate::config::{Check, Severity};
+use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 
 /// Beyond this many lines, `describe()` truncates the command's raw output and points
@@ -148,10 +148,29 @@ pub fn run_check(
         .output()?;
 
     let passed_raw = output.status.success();
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
 
-    let passed = if let Some(ranges) = changed_lines {
+    let (mut combined, is_sarif) = match check.output_format {
+        Some(OutputFormat::Sarif) => match render_sarif_output(&output.stdout) {
+            Some(rendered) => (rendered, true),
+            None => {
+                let mut fallback = String::from_utf8_lossy(&output.stdout).into_owned();
+                fallback.push_str(&String::from_utf8_lossy(&output.stderr));
+                (fallback, false)
+            }
+        },
+        None => {
+            let mut c = String::from_utf8_lossy(&output.stdout).into_owned();
+            c.push_str(&String::from_utf8_lossy(&output.stderr));
+            (c, false)
+        }
+    };
+
+    // SARIF output is already a structured summary, not `{file}:{line}: message` text —
+    // diff-aware scoping only understands the latter, so it's skipped here. Documented
+    // as a known limitation in docs/output-formats.md.
+    let passed = if is_sarif {
+        passed_raw
+    } else if let Some(ranges) = changed_lines {
         let (scoped, scoped_passed) =
             scope_output_to_changed_lines(&combined, file_path, ranges, passed_raw);
         combined = scoped;
@@ -379,6 +398,171 @@ fn substitute_command(
         cmd = cmd.replace("{changed_lines}", &ranges_str);
     }
     cmd
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifLog {
+    #[serde(default)]
+    runs: Vec<SarifRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifRun {
+    #[serde(default)]
+    results: Vec<SarifResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifResult {
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(rename = "ruleId", default)]
+    rule_id: Option<String>,
+    message: SarifMessage,
+    #[serde(default)]
+    locations: Vec<SarifLocation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifMessage {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifLocation {
+    #[serde(rename = "physicalLocation", default)]
+    physical_location: Option<SarifPhysicalLocation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifPhysicalLocation {
+    #[serde(rename = "artifactLocation", default)]
+    artifact_location: Option<SarifArtifactLocation>,
+    #[serde(default)]
+    region: Option<SarifRegion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifArtifactLocation {
+    #[serde(default)]
+    uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SarifRegion {
+    #[serde(rename = "startLine", default)]
+    start_line: Option<u64>,
+}
+
+/// Parse a linter's SARIF 2.1.0 log (`output_format: "sarif"`) into a plain-text summary:
+/// a leading count-by-level line (so "1 warning" and "50 errors" no longer read the same),
+/// followed by one `{uri}:{line}: [{level}] {message} ({ruleId})` line per result. Returns
+/// `None` on anything that doesn't parse as SARIF, so the caller can fall back to raw
+/// stdout+stderr instead of hiding a misconfigured `output_format` behind an empty result.
+fn render_sarif_output(stdout: &[u8]) -> Option<String> {
+    let log: SarifLog = serde_json::from_slice(stdout).ok()?;
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut lines = Vec::new();
+
+    for result in log.runs.iter().flat_map(|run| &run.results) {
+        let level = result
+            .level
+            .clone()
+            .unwrap_or_else(|| "warning".to_string());
+        *counts.entry(level.clone()).or_insert(0) += 1;
+
+        let physical = result
+            .locations
+            .first()
+            .and_then(|loc| loc.physical_location.as_ref());
+        let uri = physical
+            .and_then(|p| p.artifact_location.as_ref())
+            .and_then(|a| a.uri.as_deref());
+        let start_line = physical
+            .and_then(|p| p.region.as_ref())
+            .and_then(|r| r.start_line);
+
+        let location = match (uri, start_line) {
+            (Some(uri), Some(line)) => format!("{uri}:{line}: "),
+            (Some(uri), None) => format!("{uri}: "),
+            (None, _) => String::new(),
+        };
+        let rule = result
+            .rule_id
+            .as_deref()
+            .map(|id| format!(" ({id})"))
+            .unwrap_or_default();
+        lines.push(format!("{location}[{level}] {}{rule}", result.message.text));
+    }
+
+    let header = if counts.is_empty() {
+        "0 findings".to_string()
+    } else {
+        counts
+            .iter()
+            .map(|(level, n)| format!("{n} {level}(s)"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut rendered = vec![header];
+    rendered.extend(lines);
+    Some(rendered.join("\n"))
+}
+
+#[cfg(test)]
+mod sarif_tests {
+    use super::*;
+
+    fn sarif_log(results_json: &str) -> String {
+        format!(r#"{{"version": "2.1.0", "runs": [{{"results": [{results_json}]}}]}}"#)
+    }
+
+    #[test]
+    fn renders_counts_and_findings() {
+        let log = sarif_log(
+            r#"{"level": "error", "ruleId": "no-foo", "message": {"text": "found a foo"},
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/lib.rs"},
+                "region": {"startLine": 12}}}]}"#,
+        );
+        let rendered = render_sarif_output(log.as_bytes()).unwrap();
+        assert_eq!(
+            rendered,
+            "1 error(s)\nsrc/lib.rs:12: [error] found a foo (no-foo)"
+        );
+    }
+
+    #[test]
+    fn defaults_missing_level_to_warning() {
+        let log = sarif_log(r#"{"message": {"text": "no level given"}, "locations": []}"#);
+        let rendered = render_sarif_output(log.as_bytes()).unwrap();
+        assert_eq!(rendered, "1 warning(s)\n[warning] no level given");
+    }
+
+    #[test]
+    fn empty_results_render_as_zero_findings() {
+        let log = r#"{"version": "2.1.0", "runs": [{"results": []}]}"#;
+        let rendered = render_sarif_output(log.as_bytes()).unwrap();
+        assert_eq!(rendered, "0 findings");
+    }
+
+    #[test]
+    fn counts_multiple_levels_separately() {
+        let log = sarif_log(
+            r#"{"level": "error", "message": {"text": "e1"}, "locations": []},
+               {"level": "error", "message": {"text": "e2"}, "locations": []},
+               {"level": "note", "message": {"text": "n1"}, "locations": []}"#,
+        );
+        let rendered = render_sarif_output(log.as_bytes()).unwrap();
+        assert!(rendered.starts_with("2 error(s), 1 note(s)\n"));
+    }
+
+    #[test]
+    fn returns_none_for_invalid_json() {
+        assert!(render_sarif_output(b"not json").is_none());
+    }
 }
 
 /// Filter a check's `{file}:{line}: message`-style output down to lines whose line number
@@ -853,6 +1037,55 @@ mod diff_scoping_tests {
 }
 
 #[cfg(test)]
+mod sarif_run_check_tests {
+    use super::*;
+    use crate::config::OutputFormat;
+
+    fn sarif_check(sarif_json: &str) -> Check {
+        Check {
+            name: "sarif-linter".to_string(),
+            command: Some(format!("cat <<'EOF'\n{sarif_json}\nEOF")),
+            checker: None,
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("linter found issues".to_string()),
+            output_format: Some(OutputFormat::Sarif),
+        }
+    }
+
+    #[test]
+    fn renders_sarif_output_and_ignores_diff_scoping() {
+        let sarif_json = r#"{"version": "2.1.0", "runs": [{"results": [
+            {"level": "error", "ruleId": "no-foo", "message": {"text": "found a foo"},
+             "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/lib.rs"},
+             "region": {"startLine": 12}}}]}
+        ]}]}"#;
+        let result = run_check(
+            &sarif_check(sarif_json),
+            Path::new("."),
+            Path::new("src/lib.rs"),
+            Some(&[(1, 5)]),
+        )
+        .unwrap();
+        assert_eq!(
+            result.output,
+            "1 error(s)\nsrc/lib.rs:12: [error] found a foo (no-foo)"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_raw_output_when_stdout_is_not_sarif() {
+        let check = Check {
+            command: Some("echo 'not sarif at all'".to_string()),
+            ..sarif_check("{}")
+        };
+        let result = run_check(&check, Path::new("."), Path::new("src/lib.rs"), None).unwrap();
+        assert_eq!(result.output.trim(), "not sarif at all");
+    }
+}
+
+#[cfg(test)]
 mod head_mapping_tests {
     use super::*;
 
@@ -977,6 +1210,7 @@ mod git_head_integration_tests {
             scope: vec![],
             triggers: vec![],
             message: Some("found BAD marker".to_string()),
+            output_format: None,
         }
     }
 
@@ -991,6 +1225,7 @@ mod git_head_integration_tests {
             scope: vec![],
             triggers: vec![],
             message: Some("found BAD marker in repo".to_string()),
+            output_format: None,
         }
     }
 
@@ -1177,6 +1412,7 @@ mod native_check_tests {
             scope: vec![],
             triggers: vec![],
             message: Some("primitive obsession".to_string()),
+            output_format: None,
         }
     }
 
@@ -1225,6 +1461,7 @@ mod native_check_tests {
             scope: vec![],
             triggers: vec![],
             message: Some("blank import".to_string()),
+            output_format: None,
         }
     }
 

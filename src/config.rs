@@ -13,6 +13,16 @@ pub enum Severity {
     Advisory,
 }
 
+/// A structured output shape kibitzer knows how to parse from a `command` check's
+/// stdout, instead of only reading the process exit code. See `docs/output-formats.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    /// SARIF 2.1.0 (`https://sarifweb.azurewebsites.net/`) — the format most linters
+    /// with a `--format sarif`/`--output-format sarif` flag already emit.
+    Sarif,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Check {
     pub name: String,
@@ -50,6 +60,11 @@ pub struct Check {
     /// Message shown to the agent alongside command output when the check fails.
     #[serde(default)]
     pub message: Option<String>,
+    /// A structured shape kibitzer should parse from `command`'s stdout instead of
+    /// treating the check as pure exit-code pass/fail. Requires `command` — native
+    /// checkers already report structured findings. See `docs/output-formats.md`.
+    #[serde(default)]
+    pub output_format: Option<OutputFormat>,
 }
 
 impl Check {
@@ -94,6 +109,14 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
                 )
             }
             _ => {}
+        }
+        if check.output_format.is_some() && check.command.is_none() {
+            anyhow::bail!(
+                "{}: check '{}' sets `output_format` without `command` — structured output \
+                 parsing only applies to shell-command checks",
+                config_path.display(),
+                check.name
+            );
         }
     }
     Ok(())
@@ -183,5 +206,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown checker"));
+    }
+
+    #[test]
+    fn accepts_output_format_with_command() {
+        let config = parse(
+            r#"{"checks": [{"name": "n", "command": "lint --sarif {file}", "severity": "advisory", "output_format": "sarif"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.checks[0].output_format, Some(OutputFormat::Sarif));
+    }
+
+    #[test]
+    fn rejects_output_format_without_command() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "checker": "primitive-obsession", "severity": "advisory", "output_format": "sarif"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("output_format"));
     }
 }
