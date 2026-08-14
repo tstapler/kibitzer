@@ -66,11 +66,13 @@ fn has_wrapping_convention(node: Node, src: &[u8]) -> bool {
     {
         let mut cursor = args.walk();
         for arg in args.children(&mut cursor) {
-            if arg.kind() == "interpreted_string_literal"
-                && arg
-                    .utf8_text(src)
-                    .map(|s| s.contains("%w"))
-                    .unwrap_or(false)
+            if matches!(
+                arg.kind(),
+                "interpreted_string_literal" | "raw_string_literal"
+            ) && arg
+                .utf8_text(src)
+                .map(|s| s.contains("%w"))
+                .unwrap_or(false)
             {
                 return true;
             }
@@ -102,9 +104,19 @@ fn collect_bare_passthroughs(node: Node, src: &[u8], findings: &mut Vec<Finding>
 /// `errors.Is`/`errors.As` calls, extra statements, bare `return` with no
 /// expression) falls through untouched — see the module doc comment.
 fn is_bare_err_passthrough(if_stmt: Node, src: &[u8]) -> bool {
-    let Some(condition) = if_stmt.child_by_field_name("condition") else {
+    let Some(mut condition) = if_stmt.child_by_field_name("condition") else {
         return false;
     };
+    while condition.kind() == "parenthesized_expression" {
+        let mut cursor = condition.walk();
+        let Some(inner) = condition
+            .children(&mut cursor)
+            .find(|c| c.kind() != "(" && c.kind() != ")")
+        else {
+            return false;
+        };
+        condition = inner;
+    }
     if condition.kind() != "binary_expression" {
         return false;
     }
@@ -149,17 +161,14 @@ fn is_bare_err_passthrough(if_stmt: Node, src: &[u8]) -> bool {
     if only.kind() != "return_statement" {
         return false;
     }
-    let Some(expr_list) = only.child_by_field_name("child") else {
-        // return_statement's returned expressions aren't a named field in this
-        // grammar; fall back to scanning direct children for the expression_list.
-        let mut inner_cursor = only.walk();
-        let exprs: Vec<Node> = only
-            .children(&mut inner_cursor)
-            .filter(|n| n.kind() == "expression_list")
-            .collect();
-        return exprs.len() == 1 && single_identifier_matches(exprs[0], src, err_name);
-    };
-    single_identifier_matches(expr_list, src, err_name)
+    // return_statement's returned expressions aren't exposed as a named field in
+    // this grammar, so scan direct children for the expression_list instead.
+    let mut cursor = only.walk();
+    let exprs: Vec<Node> = only
+        .children(&mut cursor)
+        .filter(|n| n.kind() == "expression_list")
+        .collect();
+    exprs.len() == 1 && single_identifier_matches(exprs[0], src, err_name)
 }
 
 fn single_identifier_matches(expr_list: Node, src: &[u8], name: &str) -> bool {
@@ -258,5 +267,30 @@ mod tests {
     fn empty_file_produces_no_findings() {
         let findings = check_source("package main\n").unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detects_wrapping_convention_in_raw_string_literal() {
+        let src = "package main\nimport \"fmt\"\nfunc wrap(err error) error {\n\treturn fmt.Errorf(`wrap: %w`, err)\n}\nfunc g() error {\n\terr := doThing()\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n";
+        let findings = check_source(src).unwrap();
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn flags_parenthesized_condition() {
+        let src = format!(
+            "package main\nimport \"fmt\"\n{WRAPPING_CONVENTION}func g() error {{\n\terr := doThing()\n\tif (err != nil) {{\n\t\treturn err\n\t}}\n\treturn nil\n}}\n"
+        );
+        let findings = check_source(&src).unwrap();
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn flags_multi_value_bare_passthrough() {
+        let src = format!(
+            "package main\nimport \"fmt\"\n{WRAPPING_CONVENTION}func g() (int, error) {{\n\terr := doThing()\n\tif err != nil {{\n\t\treturn 0, err\n\t}}\n\treturn 0, nil\n}}\n"
+        );
+        let findings = check_source(&src).unwrap();
+        assert_eq!(findings.len(), 1);
     }
 }

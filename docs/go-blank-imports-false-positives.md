@@ -26,6 +26,15 @@ comment can't accidentally justify the next import down.
 - **Aliased non-blank imports** (`import f "fmt"`) and normal named imports are
   never flagged — only `name: (blank_identifier)` triggers the check.
 
+## Known limitation: unbounded recursion on pathological input
+
+`collect_comment_rows`/`collect_import_spec_rows`/`collect_blank_imports`
+recurse over the tree-sitter AST with no depth guard. A Go source file with
+extreme nesting depth can exhaust the stack and abort the `kibitzer` process
+rather than degrading to a failed check result. Pre-existing pattern shared
+with `src/primitive_obsession.rs`'s AST walk — no depth guard exists anywhere
+in the codebase yet.
+
 ## Log
 
 No confirmed false-positive firings logged yet. When one occurs, add an entry

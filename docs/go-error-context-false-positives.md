@@ -10,13 +10,17 @@ scratch.
 ## Mechanism (confirmed by reading the source)
 
 The check only fires in a file where `has_wrapping_convention` finds at least
-one `fmt.Errorf(...)` call containing `%w` in a string literal argument —
-without that signal, the file has no established wrapping convention to be
-inconsistent with, so the check stays silent everywhere in it. Within such a
-file, `collect_bare_passthroughs`/`is_bare_err_passthrough` matches only the
-exact shape `if <id> != nil { return <id> }`: a `binary_expression` condition
-comparing one identifier to `nil` with `!=`, whose consequence block's *only*
-statement is a `return_statement` returning that same identifier unchanged.
+one `fmt.Errorf(...)` call containing `%w` in an interpreted (`"..."`) or raw
+(`` `...` ``) string literal argument — without that signal, the file has no
+established wrapping convention to be inconsistent with, so the check stays
+silent everywhere in it. Within such a file, `collect_bare_passthroughs`/
+`is_bare_err_passthrough` matches the shape `if <id> != nil { return ...,
+<id> }` (parenthesized conditions are unwrapped first): a `binary_expression`
+condition comparing one identifier to `nil` with `!=`, whose consequence
+block's *only* statement is a `return_statement` whose returned expression
+list contains exactly one identifier, matching that same name — a plain
+single-value `return err` or a multi-value `return 0, err` both match, since
+only the identifiers in the list are considered.
 
 ## Documented scope gaps (deliberate, by design)
 
@@ -38,6 +42,16 @@ These are the four exclusions from criterion 4, each covered by a test in
   only statement is a `return_statement` with no returned identifier, which
   `single_identifier_matches` rejects (it requires exactly one identifier in
   the returned expression list).
+
+## Known limitation: unbounded recursion on pathological input
+
+`has_wrapping_convention` and `collect_bare_passthroughs` recurse over the
+tree-sitter AST with no depth guard. A Go source file with extreme nesting
+depth (thousands of nested blocks — implausible from a human but possible
+from generated code) can exhaust the stack and abort the `kibitzer` process
+rather than degrading to a failed check result. This is a pre-existing
+pattern shared with `src/primitive_obsession.rs`'s AST walk, not something
+new to this check; no depth guard exists anywhere in the codebase yet.
 
 ## Log
 

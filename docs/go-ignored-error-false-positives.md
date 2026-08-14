@@ -29,6 +29,14 @@ cannot confirm the discarded value is actually an `error`.
   never flagged, by design — the check only fires when the last slot is
   explicitly discarded.
 
+## Known limitation: unbounded recursion on pathological input
+
+The AST walk that finds `short_var_declaration` nodes recurses with no depth
+guard. A Go source file with extreme nesting depth can exhaust the stack and
+abort the `kibitzer` process rather than degrading to a failed check result.
+Pre-existing pattern shared with `src/primitive_obsession.rs`'s AST walk — no
+depth guard exists anywhere in the codebase yet.
+
 ## Log
 
 No confirmed false-positive firings logged yet. When one occurs — most likely
