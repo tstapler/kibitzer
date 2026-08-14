@@ -25,6 +25,7 @@ cargo install --path .
 kibitzer run [dir] --trigger batch   # batch mode: check every file under dir
 kibitzer hook                        # Claude Code PostToolUse hook, reads event off stdin
 kibitzer mcp                         # serve as an MCP server over stdio
+kibitzer lsp                         # serve as an LSP server over stdio (diagnostics)
 kibitzer daemon start|stop|status    # background daemon that caches check results
 kibitzer check native primitive-obsession <file>   # run a single built-in check directly
 kibitzer check native go-blank-imports <file>      # flag unjustified `import _ "pkg"`

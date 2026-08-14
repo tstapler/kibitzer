@@ -8,6 +8,7 @@ mod go_blank_imports;
 mod go_error_context;
 mod go_ignored_error;
 mod hook;
+mod lsp;
 mod markdown_link_integrity;
 mod mcp;
 mod primitive_obsession;
@@ -40,6 +41,8 @@ enum Command {
     Hook,
     /// Run kibitzer as an MCP server over stdio.
     Mcp,
+    /// Run kibitzer as an LSP server over stdio, publishing check results as diagnostics.
+    Lsp,
     /// Manage the background daemon that caches check results across invocations.
     Daemon {
         #[command(subcommand)]
@@ -80,6 +83,11 @@ fn main() -> Result<ExitCode> {
         Command::Mcp => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(mcp::run_mcp_server())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Lsp => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(lsp::run_lsp_server())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon { action } => match action {
