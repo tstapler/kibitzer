@@ -116,18 +116,23 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
                     heading.push_str(text);
                 }
             }
-            Event::Start(Tag::Link {
-                link_type,
-                dest_url,
-                id,
-                ..
-            })
-            | Event::Start(Tag::Image {
-                link_type,
-                dest_url,
-                id,
-                ..
-            }) => {
+            Event::Start(tag @ Tag::Link { .. }) | Event::Start(tag @ Tag::Image { .. }) => {
+                let is_image = matches!(tag, Tag::Image { .. });
+                let (link_type, dest_url, id) = match tag {
+                    Tag::Link {
+                        link_type,
+                        dest_url,
+                        id,
+                        ..
+                    }
+                    | Tag::Image {
+                        link_type,
+                        dest_url,
+                        id,
+                        ..
+                    } => (link_type, dest_url, id),
+                    _ => unreachable!(),
+                };
                 let is_reference_style = matches!(
                     link_type,
                     LinkType::Reference
@@ -146,7 +151,12 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
                 if is_reference_style {
                     let normalized = normalize_label(&id);
                     used_labels.insert(normalized.clone());
-                    if is_dangling && !normalized.starts_with('^') {
+                    // A dangling *image* reference (missing asset via `![alt][ref]`) is
+                    // a different, unrelated failure mode from a broken doc
+                    // cross-reference — matching the prior doc_report.py-based
+                    // checker, which never flagged these. It still counts as a "use"
+                    // above so a definition backing only an image isn't flagged unused.
+                    if is_dangling && !is_image && !normalized.starts_with('^') {
                         findings.push(Finding {
                             line: line_for_offset(&line_starts, range.start),
                             message: format!("[{id}] used but never defined"),
@@ -384,15 +394,10 @@ mod tests {
     }
 
     #[test]
-    fn flags_dangling_image_reference() {
+    fn ignores_image_references() {
         let body = "![alt][missing-image]\n";
         let findings = check_source(&path(), body).unwrap();
-        assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0]
-                .message
-                .contains("[missing-image] used but never defined")
-        );
+        assert!(findings.is_empty());
     }
 
     #[test]
