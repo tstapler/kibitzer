@@ -64,21 +64,40 @@ struct LangRuleConfig {
     file_globs: &'static [&'static str],
     /// Declaration-like node kinds checked for the three rules below.
     function_kinds: &'static [&'static str],
-    /// Node kinds that add one level of nesting depth. `if_statement` is always
-    /// implicitly included (handled specially to flatten `else if` chains) and should
-    /// not be repeated here.
+    /// The if-like node kind for this grammar — `"if_statement"` everywhere except
+    /// Kotlin's `"if_expression"`.
+    if_kind: &'static str,
+    /// Node kinds that add one level of nesting depth. `if_kind` is always implicitly
+    /// included (handled specially to flatten `else if` chains) and should not be
+    /// repeated here.
     nesting_kinds: &'static [&'static str],
-    /// Node kinds an `if_statement`'s `alternative` field may be wrapped in before the
-    /// chained `if_statement` itself — e.g. JS/TS's `else_clause`. Go has none.
+    /// Node kinds an if-node's `alternative` field may be wrapped in before the
+    /// chained if-node itself — e.g. JS/TS's `else_clause`. Go has none.
     else_wrapper_kinds: &'static [&'static str],
-    /// Node kinds that behave like `if_statement` itself (own `condition`/
-    /// `consequence`/`alternative` fields) when found as a chained `alternative` —
-    /// e.g. Python's `elif_clause`, which (unlike JS/TS) is a distinct node kind
-    /// rather than an `if_statement` wrapped in an `else_clause`. Empty everywhere
-    /// else, since Go/JS/TS chain via a literal `if_statement`.
+    /// Node kinds that behave like the if-node itself (own `condition`/`consequence`/
+    /// `alternative` fields, or the positional equivalent) when found as a chained
+    /// `alternative` — e.g. Python's `elif_clause`, which (unlike JS/TS) is a distinct
+    /// node kind rather than an if-node wrapped in an `else_clause`. Empty everywhere
+    /// else, since Go/JS/TS chain via a literal if-node and Kotlin's `if_expression`
+    /// chains via a nested `if_expression` directly (already covered by `if_kind`).
     chain_kinds: &'static [&'static str],
-    /// Counts the parameters in a `parameters`-field node for this language's grammar.
+    /// Counts the parameters in the node `params_finder` returns.
     param_counter: fn(Node) -> usize,
+    /// Locates a declaration's body node. Field-based (`child_by_field_name("body")`)
+    /// for every grammar so far except Kotlin, whose `function_declaration`/
+    /// `anonymous_function` expose no field names at all — only positional children.
+    body_finder: fn(Node) -> Option<Node>,
+    /// Locates a declaration's parameter-list node. Same field-vs-positional split as
+    /// `body_finder`.
+    params_finder: fn(Node) -> Option<Node>,
+}
+
+fn field_body(decl: Node) -> Option<Node> {
+    decl.child_by_field_name("body")
+}
+
+fn field_params(decl: Node) -> Option<Node> {
+    decl.child_by_field_name("parameters")
 }
 
 fn go_param_identifier_count(params: Node) -> usize {
@@ -124,12 +143,42 @@ fn py_param_count(params: Node) -> usize {
         .count()
 }
 
+/// Kotlin's `function_value_parameters` children are `parameter` nodes plus a sibling
+/// `parameter_modifiers` node (holding `vararg`/etc.) — the modifier node names no
+/// parameter itself and must be excluded from the count.
+fn kotlin_param_count(params: Node) -> usize {
+    let mut cursor = params.walk();
+    params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "parameter")
+        .count()
+}
+
+/// Kotlin's `function_declaration`/`anonymous_function` expose no field names at all
+/// (verified via an explicit `field_name_for_child` dump, not just `to_sexp()`, since
+/// the latter's omission of field names was initially ambiguous) — the body is instead
+/// the first positional `function_body` child.
+fn kotlin_body(decl: Node) -> Option<Node> {
+    let mut cursor = decl.walk();
+    decl.named_children(&mut cursor)
+        .find(|c| c.kind() == "function_body")
+}
+
+/// Same positional situation as `kotlin_body`: the parameter list is the first
+/// `function_value_parameters` child, found by kind rather than field name.
+fn kotlin_params(decl: Node) -> Option<Node> {
+    let mut cursor = decl.walk();
+    decl.named_children(&mut cursor)
+        .find(|c| c.kind() == "function_value_parameters")
+}
+
 fn lang_config(lang: Language) -> LangRuleConfig {
     match lang {
         Language::Go => LangRuleConfig {
             name: "syntax-rules",
             file_globs: &["**/*.go"],
             function_kinds: &["function_declaration", "method_declaration"],
+            if_kind: "if_statement",
             nesting_kinds: &[
                 "for_statement",
                 "expression_switch_statement",
@@ -140,6 +189,8 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             else_wrapper_kinds: &[],
             chain_kinds: &[],
             param_counter: go_param_identifier_count,
+            body_finder: field_body,
+            params_finder: field_params,
         },
         Language::TypeScript => LangRuleConfig {
             name: "syntax-rules-typescript",
@@ -151,6 +202,7 @@ fn lang_config(lang: Language) -> LangRuleConfig {
                 "method_definition",
                 "arrow_function",
             ],
+            if_kind: "if_statement",
             nesting_kinds: &[
                 "for_statement",
                 "for_in_statement",
@@ -163,6 +215,8 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             else_wrapper_kinds: &["else_clause"],
             chain_kinds: &[],
             param_counter: js_ts_param_count,
+            body_finder: field_body,
+            params_finder: field_params,
         },
         Language::Tsx => LangRuleConfig {
             name: "syntax-rules-tsx",
@@ -184,6 +238,7 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             // produces a plain `function_definition` too (verified via to_sexp — no
             // distinct "async" node kind wraps it).
             function_kinds: &["function_definition"],
+            if_kind: "if_statement",
             nesting_kinds: &["for_statement", "while_statement", "match_statement", "lambda"],
             else_wrapper_kinds: &[],
             // Python's `elif` is a distinct `elif_clause` node (not an `if_statement`
@@ -192,6 +247,62 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             // itself once recognized here.
             chain_kinds: &["elif_clause"],
             param_counter: py_param_count,
+            body_finder: field_body,
+            params_finder: field_params,
+        },
+        Language::Java => LangRuleConfig {
+            name: "syntax-rules-java",
+            file_globs: &["**/*.java"],
+            // Constructors (`constructor_declaration`) are deliberately excluded for
+            // now — unverified against the real grammar; can be added later without
+            // disturbing this entry.
+            function_kinds: &["method_declaration", "lambda_expression"],
+            if_kind: "if_statement",
+            nesting_kinds: &[
+                "for_statement",
+                "enhanced_for_statement",
+                "while_statement",
+                "do_statement",
+                "switch_expression",
+                "lambda_expression",
+            ],
+            else_wrapper_kinds: &[],
+            chain_kinds: &[],
+            param_counter: js_ts_param_count,
+            body_finder: field_body,
+            params_finder: field_params,
+        },
+        Language::Kotlin => LangRuleConfig {
+            name: "syntax-rules-kotlin",
+            file_globs: &["**/*.kt", "**/*.kts"],
+            // `function_declaration` covers both top-level functions and class methods
+            // (like Python's `function_definition`). `anonymous_function` is Kotlin's
+            // `fun(x: Int) { ... }` expression form — checked the same way TS/JS check
+            // `arrow_function`/`function_expression` (both a function-kind and a
+            // nesting-kind). Lambda literals (`{ x -> ... }`) are nesting-only, like
+            // Go's `func_literal` — their `lambda_parameters` node shape differs from
+            // `function_value_parameters` and isn't handled by `kotlin_params`.
+            function_kinds: &["function_declaration", "anonymous_function"],
+            // Kotlin's `if_expression` exposes only `condition` as a named field — the
+            // then-branch and else/elif continuation are positional named children.
+            // `walk_if_chain`'s field lookups fall back to positional order when the
+            // field lookup returns `None`, so no separate flag is needed here; the
+            // chained `elif` is itself a nested `if_expression` (covered by `if_kind`
+            // already, not a distinct wrapper kind).
+            if_kind: "if_expression",
+            nesting_kinds: &[
+                "for_statement",
+                "while_statement",
+                "do_while_statement",
+                "when_expression",
+                "lambda_literal",
+                "anonymous_function",
+            ],
+            else_wrapper_kinds: &[],
+            chain_kinds: &[],
+            param_counter: kotlin_param_count,
+            body_finder: kotlin_body,
+            params_finder: kotlin_params,
         },
     }
 }
@@ -247,7 +358,7 @@ fn walk_declarations(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<Findin
 fn check_declaration(decl: Node, cfg: &LangRuleConfig, findings: &mut Vec<Finding>) {
     let line = decl.start_position().row + 1;
 
-    if let Some(body) = decl.child_by_field_name("body") {
+    if let Some(body) = (cfg.body_finder)(decl) {
         let body_lines = body.end_position().row - body.start_position().row + 1;
         if body_lines > LONG_FUNCTION_LINES {
             findings.push(Finding {
@@ -269,7 +380,7 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, findings: &mut Vec<Findin
         }
     }
 
-    if let Some(params) = decl.child_by_field_name("parameters") {
+    if let Some(params) = (cfg.params_finder)(decl) {
         let count = (cfg.param_counter)(params);
         if count > LONG_PARAM_LIST_COUNT {
             findings.push(Finding {
@@ -286,14 +397,14 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, findings: &mut Vec<Findin
 /// descendants. Each nesting-construct body adds one — except a chained `else if`,
 /// which stays at the current depth rather than adding one (see `walk_if_chain`).
 fn max_nesting_depth(node: Node, current_depth: usize, cfg: &LangRuleConfig) -> usize {
-    if node.kind() == "if_statement" {
+    if node.kind() == cfg.if_kind {
         return walk_if_chain(node, current_depth, cfg);
     }
 
     let mut max_depth = current_depth;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        let child_depth = if child.kind() == "if_statement" || cfg.nesting_kinds.contains(&child.kind()) {
+        let child_depth = if child.kind() == cfg.if_kind || cfg.nesting_kinds.contains(&child.kind()) {
             current_depth + 1
         } else {
             current_depth
@@ -301,6 +412,23 @@ fn max_nesting_depth(node: Node, current_depth: usize, cfg: &LangRuleConfig) -> 
         max_depth = max_depth.max(max_nesting_depth(child, child_depth, cfg));
     }
     max_depth
+}
+
+/// Returns an if-node's then-branch and else/elif continuation. Prefers the
+/// `consequence`/`alternative` fields (every grammar handled so far except Kotlin);
+/// falls back to positional order — the first and second named children after
+/// `condition` — for Kotlin's `if_expression`, which names only `condition`.
+fn if_branches(if_node: Node<'_>) -> (Option<Node<'_>>, Option<Node<'_>>) {
+    if let Some(consequence) = if_node.child_by_field_name("consequence") {
+        return (Some(consequence), if_node.child_by_field_name("alternative"));
+    }
+
+    let condition_id = if_node.child_by_field_name("condition").map(|n| n.id());
+    let mut cursor = if_node.walk();
+    let mut rest = if_node
+        .named_children(&mut cursor)
+        .filter(|c| Some(c.id()) != condition_id);
+    (rest.next(), rest.next())
 }
 
 /// Walks a single `if_statement`, flattening any `else if` chain to the same depth
@@ -317,14 +445,15 @@ fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
     if let Some(condition) = if_node.child_by_field_name("condition") {
         max_depth = max_depth.max(max_nesting_depth(condition, depth, cfg));
     }
-    if let Some(consequence) = if_node.child_by_field_name("consequence") {
+    let (consequence, alternative) = if_branches(if_node);
+    if let Some(consequence) = consequence {
         max_depth = max_depth.max(max_nesting_depth(consequence, depth, cfg));
     }
 
-    if let Some(alt) = if_node.child_by_field_name("alternative") {
+    if let Some(alt) = alternative {
         let mut cur = alt;
         loop {
-            if cur.kind() == "if_statement" || cfg.chain_kinds.contains(&cur.kind()) {
+            if cur.kind() == cfg.if_kind || cfg.chain_kinds.contains(&cur.kind()) {
                 max_depth = max_depth.max(walk_if_chain(cur, depth, cfg));
                 break;
             } else if cfg.else_wrapper_kinds.contains(&cur.kind()) {
@@ -789,6 +918,8 @@ mod tests {
             Language::Tsx,
             Language::JavaScript,
             Language::Python,
+            Language::Java,
+            Language::Kotlin,
         ]
         .iter()
         .map(|&lang| lang_config(lang).name)
@@ -928,6 +1059,225 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    fn check_java_source(src: &str) -> Result<Vec<Finding>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .context("loading tree-sitter-java grammar")?;
+        let tree = parser
+            .parse(src, None)
+            .context("parsing Java source with tree-sitter")?;
+
+        let cfg = lang_config(Language::Java);
+        let mut findings = Vec::new();
+        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        Ok(findings)
+    }
+
+    #[test]
+    fn java_allows_short_method() {
+        let findings =
+            check_java_source("class C {\n    void f() {\n        g();\n    }\n}\n").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn java_flags_long_method() {
+        let mut src = String::from("class C {\n    void f() {\n");
+        for _ in 0..45 {
+            src.push_str("        g();\n");
+        }
+        src.push_str("    }\n}\n");
+        let findings = check_java_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    #[test]
+    fn java_flags_deep_nesting() {
+        let src = "class C {\n\
+             \tvoid f(int x) {\n\
+             \t\tif (x > 0) {\n\
+             \t\t\tfor (int i = 0; i < x; i++) {\n\
+             \t\t\t\twhile (i > 0) {\n\
+             \t\t\t\t\tif (i == 0) {\n\
+             \t\t\t\t\t\tg();\n\
+             \t\t\t\t\t}\n\
+             \t\t\t\t}\n\
+             \t\t\t}\n\
+             \t\t}\n\
+             \t}\n\
+             }\n";
+        let findings = check_java_source(src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn java_flat_else_if_chain_does_not_count_as_nesting() {
+        let src = "class C {\n\
+             \tvoid f(int x) {\n\
+             \t\tif (x == 0) {\n\
+             \t\t\tg();\n\
+             \t\t} else if (x == 1) {\n\
+             \t\t\tg();\n\
+             \t\t} else {\n\
+             \t\t\tg();\n\
+             \t\t}\n\
+             \t}\n\
+             }\n";
+        let findings = check_java_source(src).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn java_flags_long_parameter_list() {
+        let findings = check_java_source(
+            "class C {\n    void f(int a, int b, int c, int d, int e, int g) {}\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn java_allows_short_parameter_list() {
+        let findings =
+            check_java_source("class C {\n    void f(int a, int b) {}\n}\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    fn check_kotlin_source(src: &str) -> Result<Vec<Finding>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .context("loading tree-sitter-kotlin-ng grammar")?;
+        let tree = parser
+            .parse(src, None)
+            .context("parsing Kotlin source with tree-sitter")?;
+
+        let cfg = lang_config(Language::Kotlin);
+        let mut findings = Vec::new();
+        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        Ok(findings)
+    }
+
+    #[test]
+    fn kotlin_allows_short_function() {
+        let findings = check_kotlin_source("fun f() {\n    g()\n}\n").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn kotlin_flags_long_function() {
+        let mut src = String::from("fun f() {\n");
+        for _ in 0..45 {
+            src.push_str("    g()\n");
+        }
+        src.push_str("}\n");
+        let findings = check_kotlin_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_flags_deep_nesting() {
+        let src = "fun f(x: Int) {\n\
+             \tif (x > 0) {\n\
+             \t\tfor (i in 0..x) {\n\
+             \t\t\twhile (i > 0) {\n\
+             \t\t\t\tif (i == 0) {\n\
+             \t\t\t\t\tg()\n\
+             \t\t\t\t}\n\
+             \t\t\t}\n\
+             \t\t}\n\
+             \t}\n\
+             }\n";
+        let findings = check_kotlin_source(src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_flat_else_if_chain_does_not_count_as_nesting() {
+        // Exercises `if_branches`'s positional fallback: Kotlin's `if_expression` has
+        // no `consequence`/`alternative` fields, only `condition`.
+        let src = "fun f(x: Int) {\n\
+             \tif (x == 0) {\n\
+             \t\tg()\n\
+             \t} else if (x == 1) {\n\
+             \t\tg()\n\
+             \t} else {\n\
+             \t\tg()\n\
+             \t}\n\
+             }\n";
+        let findings = check_kotlin_source(src).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_flags_long_parameter_list() {
+        let findings = check_kotlin_source(
+            "fun f(a: Int, b: Int, c: Int, d: Int, e: Int, g: Int) {}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_allows_short_parameter_list() {
+        let findings = check_kotlin_source("fun f(a: Int, b: Int) {}\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_vararg_modifier_does_not_inflate_parameter_count() {
+        // `vararg` produces a sibling `parameter_modifiers` node, not one nested inside
+        // `parameter` — `kotlin_param_count` must filter to `kind() == "parameter"` only.
+        let findings =
+            check_kotlin_source("fun f(a: Int, vararg b: Int) {}\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
         );
     }
 }

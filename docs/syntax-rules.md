@@ -17,6 +17,8 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | TSX        | `syntax-rules-tsx`             | `**/*.tsx`                                |
 | JavaScript | `syntax-rules-javascript`      | `**/*.js`, `**/*.jsx`, `**/*.mjs`, `**/*.cjs` |
 | Python     | `syntax-rules-python`          | `**/*.py`                                 |
+| Java       | `syntax-rules-java`            | `**/*.java`                               |
+| Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
 
 The three rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
@@ -68,6 +70,33 @@ each grammar's real `to_sexp()` output:
   `dictionary_splat_pattern` for `**kwargs`) — each counts as one parameter,
   except the bare `positional_separator` (`/`) and `keyword_separator` (`*`)
   marker nodes, which name no parameter and are excluded from the count.
+- **Java**: function-like — `method_declaration`, `lambda_expression`
+  (`constructor_declaration` deliberately excluded — not yet verified against
+  the grammar). Nesting — `for_statement`, `enhanced_for_statement`,
+  `while_statement`, `do_statement`, `switch_expression`,
+  `lambda_expression`. `if_statement` has proper `condition`/`consequence`/
+  `alternative` fields (Go-like, no wrapper); `method_declaration` has proper
+  `parameters` (`formal_parameters`, containing `formal_parameter` nodes) and
+  `body` (`block`) fields.
+- **Kotlin** (`tree-sitter-kotlin-ng`): function-like —
+  `function_declaration` (unified across top-level functions and methods,
+  like Python) and `anonymous_function` (the `fun(x: Int) { ... }` expression
+  form). Neither exposes `body`/`parameters` as named fields — unlike every
+  other supported language, `function_value_parameters` and `function_body`
+  are purely positional children, found by node kind rather than
+  `child_by_field_name` (see `body_finder`/`params_finder` on
+  `LangRuleConfig`, and `kotlin_body`/`kotlin_params` in `src/rules.rs`).
+  Nesting — `for_statement`, `while_statement`, `do_while_statement`,
+  `when_expression`, `lambda_literal` (the `{ x -> ... }` literal form,
+  treated as nesting-only, not function-like — its parameter list uses a
+  different node kind than regular functions and is deliberately not
+  counted), `anonymous_function`. `if_expression` only exposes `condition` as
+  a named field; the then-branch and else/elif continuation are positional
+  named children, resolved via `if_branches`'s field-then-positional
+  fallback. `function_value_parameters` wraps `parameter` nodes; a `vararg`
+  modifier produces a **sibling** `parameter_modifiers` node rather than
+  nesting inside the `parameter`, so the counter filters to
+  `kind() == "parameter"` to avoid over-counting.
 
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.

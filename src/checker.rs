@@ -31,6 +31,8 @@ pub enum Language {
     Tsx,
     JavaScript,
     Python,
+    Java,
+    Kotlin,
 }
 
 impl Language {
@@ -41,6 +43,8 @@ impl Language {
             Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Language::Python => tree_sitter_python::LANGUAGE.into(),
+            Language::Java => tree_sitter_java::LANGUAGE.into(),
+            Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         }
     }
 }
@@ -85,6 +89,8 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(SyntaxRulesChecker::new(Language::Tsx)),
         Box::new(SyntaxRulesChecker::new(Language::JavaScript)),
         Box::new(SyntaxRulesChecker::new(Language::Python)),
+        Box::new(SyntaxRulesChecker::new(Language::Java)),
+        Box::new(SyntaxRulesChecker::new(Language::Kotlin)),
     ]
 }
 
