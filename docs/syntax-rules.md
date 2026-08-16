@@ -16,6 +16,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | TypeScript | `syntax-rules-typescript`      | `**/*.ts`                                 |
 | TSX        | `syntax-rules-tsx`             | `**/*.tsx`                                |
 | JavaScript | `syntax-rules-javascript`      | `**/*.js`, `**/*.jsx`, `**/*.mjs`, `**/*.cjs` |
+| Python     | `syntax-rules-python`          | `**/*.py`                                 |
 
 The three rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
@@ -52,6 +53,21 @@ each grammar's real `to_sexp()` output:
   wrapper (`identifier`, `assignment_pattern`, `rest_pattern`,
   `object_pattern`, `array_pattern`); each *named* child counts as one
   parameter (unnamed punctuation children like `,` are filtered out).
+- **Python**: function-like — `function_definition` (used for both top-level
+  functions and class methods; a `@decorator` wraps it in a
+  `decorated_definition` node, and `async def` produces a plain
+  `function_definition` with no wrapper — neither needs special-casing since
+  the walk recurses into every descendant regardless of kind). Nesting —
+  `for_statement`, `while_statement`, `match_statement`, `lambda`. Chained
+  `elif` is a distinct `elif_clause` node (not an `if_statement` wrapped in
+  an `else_clause` like JS/TS) but shares the same `condition`/
+  `consequence`/`alternative` fields, so it's recognized as a chain
+  continuation rather than added nesting. `parameters`' children are bare
+  pattern nodes (`identifier`, `default_parameter`, `typed_parameter`,
+  `typed_default_parameter`, `list_splat_pattern` for `*args`,
+  `dictionary_splat_pattern` for `**kwargs`) — each counts as one parameter,
+  except the bare `positional_separator` (`/`) and `keyword_separator` (`*`)
+  marker nodes, which name no parameter and are excluded from the count.
 
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.

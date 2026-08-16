@@ -71,6 +71,12 @@ struct LangRuleConfig {
     /// Node kinds an `if_statement`'s `alternative` field may be wrapped in before the
     /// chained `if_statement` itself — e.g. JS/TS's `else_clause`. Go has none.
     else_wrapper_kinds: &'static [&'static str],
+    /// Node kinds that behave like `if_statement` itself (own `condition`/
+    /// `consequence`/`alternative` fields) when found as a chained `alternative` —
+    /// e.g. Python's `elif_clause`, which (unlike JS/TS) is a distinct node kind
+    /// rather than an `if_statement` wrapped in an `else_clause`. Empty everywhere
+    /// else, since Go/JS/TS chain via a literal `if_statement`.
+    chain_kinds: &'static [&'static str],
     /// Counts the parameters in a `parameters`-field node for this language's grammar.
     param_counter: fn(Node) -> usize,
 }
@@ -105,6 +111,19 @@ fn js_ts_param_count(params: Node) -> usize {
     params.named_children(&mut cursor).count()
 }
 
+/// Python's `parameters` children are one-parameter-per-named-child, like JS —
+/// `identifier`, `default_parameter`, `typed_parameter`, `typed_default_parameter`,
+/// `list_splat_pattern` (`*args`), `dictionary_splat_pattern` (`**kwargs`) — except it
+/// also includes bare `positional_separator` (`/`) and `keyword_separator` (`*`) marker
+/// nodes, which name no parameter and must be excluded from the count.
+fn py_param_count(params: Node) -> usize {
+    let mut cursor = params.walk();
+    params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() != "positional_separator" && c.kind() != "keyword_separator")
+        .count()
+}
+
 fn lang_config(lang: Language) -> LangRuleConfig {
     match lang {
         Language::Go => LangRuleConfig {
@@ -119,6 +138,7 @@ fn lang_config(lang: Language) -> LangRuleConfig {
                 "func_literal",
             ],
             else_wrapper_kinds: &[],
+            chain_kinds: &[],
             param_counter: go_param_identifier_count,
         },
         Language::TypeScript => LangRuleConfig {
@@ -141,6 +161,7 @@ fn lang_config(lang: Language) -> LangRuleConfig {
                 "function_expression",
             ],
             else_wrapper_kinds: &["else_clause"],
+            chain_kinds: &[],
             param_counter: js_ts_param_count,
         },
         Language::Tsx => LangRuleConfig {
@@ -152,6 +173,25 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             name: "syntax-rules-javascript",
             file_globs: &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
             ..lang_config(Language::TypeScript)
+        },
+        Language::Python => LangRuleConfig {
+            name: "syntax-rules-python",
+            file_globs: &["**/*.py"],
+            // Decorators wrap a `function_definition` in a `decorated_definition` node
+            // (with the function as its `definition` field) — no separate entry needed
+            // here since `walk_declarations` recurses into every child regardless of
+            // kind, so the wrapped `function_definition` is still found. `async def`
+            // produces a plain `function_definition` too (verified via to_sexp — no
+            // distinct "async" node kind wraps it).
+            function_kinds: &["function_definition"],
+            nesting_kinds: &["for_statement", "while_statement", "match_statement", "lambda"],
+            else_wrapper_kinds: &[],
+            // Python's `elif` is a distinct `elif_clause` node (not an `if_statement`
+            // wrapped in an `else_clause` like JS/TS) but carries the same
+            // condition/consequence/alternative fields, so it chains like `if_statement`
+            // itself once recognized here.
+            chain_kinds: &["elif_clause"],
+            param_counter: py_param_count,
         },
     }
 }
@@ -284,7 +324,7 @@ fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
     if let Some(alt) = if_node.child_by_field_name("alternative") {
         let mut cur = alt;
         loop {
-            if cur.kind() == "if_statement" {
+            if cur.kind() == "if_statement" || cfg.chain_kinds.contains(&cur.kind()) {
                 max_depth = max_depth.max(walk_if_chain(cur, depth, cfg));
                 break;
             } else if cfg.else_wrapper_kinds.contains(&cur.kind()) {
@@ -748,6 +788,7 @@ mod tests {
             Language::TypeScript,
             Language::Tsx,
             Language::JavaScript,
+            Language::Python,
         ]
         .iter()
         .map(|&lang| lang_config(lang).name)
@@ -756,5 +797,137 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(names.len(), sorted.len());
+    }
+
+    fn check_py_source(src: &str) -> Result<Vec<Finding>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .context("loading tree-sitter-python grammar")?;
+        let tree = parser
+            .parse(src, None)
+            .context("parsing Python source with tree-sitter")?;
+
+        let cfg = lang_config(Language::Python);
+        let mut findings = Vec::new();
+        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        Ok(findings)
+    }
+
+    #[test]
+    fn py_allows_short_function() {
+        let findings = check_py_source("def f():\n    print(\"ok\")\n").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn py_flags_long_function() {
+        let mut src = String::from("def f():\n");
+        for _ in 0..45 {
+            src.push_str("    print(\"line\")\n");
+        }
+        let findings = check_py_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    #[test]
+    fn py_flags_deep_nesting() {
+        let src = "def f(x):\n\
+             \tif x > 0:\n\
+             \t\tfor i in range(x):\n\
+             \t\t\twhile i > 0:\n\
+             \t\t\t\tif i == 0:\n\
+             \t\t\t\t\tprint(\"deep\")\n";
+        let findings = check_py_source(src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn py_flat_elif_chain_does_not_count_as_nesting() {
+        let src = "def f(x):\n\
+             \tif x == 0:\n\
+             \t\tprint(0)\n\
+             \telif x == 1:\n\
+             \t\tprint(1)\n\
+             \telif x == 2:\n\
+             \t\tprint(2)\n\
+             \telse:\n\
+             \t\tprint(3)\n";
+        let findings = check_py_source(src).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn py_allows_short_parameter_list() {
+        let findings = check_py_source("def f(a, b, c):\n    return a + b + c\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn py_flags_long_parameter_list() {
+        let findings =
+            check_py_source("def f(a, b, c, d, e, f, g):\n    return a\n").unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn py_positional_and_keyword_separators_do_not_count_as_parameters() {
+        // `/` and `*` are marker nodes, not parameters — five real parameters here,
+        // which must stay at the >5 threshold despite the two separators present.
+        let findings =
+            check_py_source("def f(a, b, /, c, *, d, e):\n    return a\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn py_decorated_and_async_functions_are_checked() {
+        let mut src = String::from("@decorator\nasync def f():\n");
+        for _ in 0..45 {
+            src.push_str("    print(\"line\")\n");
+        }
+        let findings = check_py_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    #[test]
+    fn py_checks_class_methods() {
+        let mut src = String::from("class C:\n    def m(self):\n");
+        for _ in 0..45 {
+            src.push_str("        print(\"line\")\n");
+        }
+        let findings = check_py_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
     }
 }
