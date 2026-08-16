@@ -176,7 +176,14 @@ Two more architecture checkers ship alongside `import-cycles`:
   `long-function` already uses (see `docs/syntax-rules.md`) — no separate
   config field yet.
 
-
+`kibitzer mcp` also exposes an `architecture_assessment` tool: given a repo
+path and an optional `scope` glob, it runs every configured
+`architecture_checker` check plus the native `syntax-rules*` complexity
+checkers across every in-scope file, and returns a combined findings report
+(one `[level] {file}:{line}: {message}` line per finding) with canned
+recommendations for `import-cycles`/`layering` findings appended under a
+`## Recommendations` heading. A `## Dependency graph` heading is reserved for
+a future Mermaid rendering and is currently a placeholder.
 
 ```bash
 cargo test --workspace
