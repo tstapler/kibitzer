@@ -115,10 +115,26 @@ impl Check {
     }
 }
 
+/// Project-wide settings consumed by `architecture_checker`s that need more than the
+/// import graph itself — currently just the declared layer order for `layering`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ArchitectureConfig {
+    /// Declared layers, highest-level first (e.g. `["handlers", "domain", "infra"]`).
+    /// A package/module belongs to the first layer whose name matches one of its path
+    /// segments exactly; packages matching no layer are ignored by `layering`. An import
+    /// edge from a package in an earlier layer to one in a later layer is expected
+    /// (higher layers depend on lower ones); an edge running the other way — a later
+    /// layer reaching back into an earlier one — is flagged.
+    #[serde(default)]
+    pub layers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub checks: Vec<Check>,
+    #[serde(default)]
+    pub architecture: ArchitectureConfig,
 }
 
 fn validate(config: &Config, config_path: &Path) -> Result<()> {

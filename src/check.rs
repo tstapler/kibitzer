@@ -799,6 +799,7 @@ pub fn run_architecture_check(
     check: &Check,
     repo_root: &Path,
     files: &[PathBuf],
+    arch_config: &crate::config::ArchitectureConfig,
 ) -> anyhow::Result<CheckResult> {
     let arch_name = check
         .architecture_checker
@@ -835,7 +836,7 @@ pub fn run_architecture_check(
         }
     };
 
-    let findings = checker.check(&graph);
+    let findings = checker.check(&graph, arch_config);
     let passed = findings.is_empty();
     let combined = findings
         .iter()
@@ -851,7 +852,7 @@ pub fn run_architecture_check(
     let mut message = check.message.clone();
 
     if !passed && severity == Severity::Blocking {
-        let baseline = check_native_against_git_head_repo(arch_name, repo_root);
+        let baseline = check_native_against_git_head_repo(arch_name, repo_root, arch_config);
         if let Some(false) = baseline {
             severity = Severity::Advisory;
             message = Some(format!(
@@ -875,7 +876,11 @@ pub fn run_architecture_check(
 /// Native-checker counterpart to [`check_against_git_head_repo`]: snapshots HEAD the same
 /// way, but builds the import graph and runs the architecture checker in-process against
 /// the snapshot instead of shelling out.
-fn check_native_against_git_head_repo(arch_name: &str, repo_root: &Path) -> Option<bool> {
+fn check_native_against_git_head_repo(
+    arch_name: &str,
+    repo_root: &Path,
+    arch_config: &crate::config::ArchitectureConfig,
+) -> Option<bool> {
     let checker = crate::architecture_checks::lookup(arch_name)?;
 
     let nonce = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -929,7 +934,7 @@ fn check_native_against_git_head_repo(arch_name: &str, repo_root: &Path) -> Opti
     let result = files.and_then(|files| {
         crate::import_graph::build(&snapshot_dir, &files)
             .ok()
-            .map(|graph| checker.check(&graph).is_empty())
+            .map(|graph| checker.check(&graph, arch_config).is_empty())
     });
 
     let _ = std::fs::remove_dir_all(&snapshot_dir);

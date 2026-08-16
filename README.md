@@ -149,6 +149,33 @@ import graph on every file edit. `kibitzer check list` doesn't cover these
 (that command lists per-file `Checker`s only); the registered architecture
 checkers are in `src/architecture_checks.rs::registry()`.
 
+Two more architecture checkers ship alongside `import-cycles`:
+
+- `layering` flags an import edge that runs from a later-declared layer back
+  into an earlier-declared one. Declare the layer order, highest-level
+  first, in a top-level `architecture` section of `.claude/inspect.json`:
+  ```jsonc
+  {
+    "architecture": {
+      "layers": ["handlers", "domain", "infra"]
+    },
+    "checks": [
+      { "name": "layering", "architecture_checker": "layering", "severity": "advisory" }
+    ]
+  }
+  ```
+  A package/module belongs to the first declared layer whose name exactly
+  matches one of its `/`-separated path segments; packages matching no
+  declared layer are ignored. With the layers above, `infra` is expected to
+  depend on `domain`/`handlers`, but an import from `infra` back into
+  `domain` is flagged. If `architecture.layers` is empty (the default),
+  `layering` finds nothing.
+- `coupling` flags a package/module whose fan-out (distinct packages it
+  imports) or fan-in (distinct packages that import it) exceeds a fixed
+  threshold of 10, mirroring the fixed-then-configurable threshold pattern
+  `long-function` already uses (see `docs/syntax-rules.md`) — no separate
+  config field yet.
+
 
 
 ```bash

@@ -42,6 +42,7 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
+    let arch_config = config.architecture.clone();
     let (file_checks, repo_checks): (Vec<Check>, Vec<Check>) =
         config.checks.into_iter().partition(Check::is_per_file);
 
@@ -54,7 +55,7 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
             continue;
         }
         let result = if check.architecture_checker.is_some() {
-            run_architecture_check(check, &repo_root, &files)?
+            run_architecture_check(check, &repo_root, &files, &arch_config)?
         } else {
             run_check(check, &repo_root, &repo_root, None)?
         };
