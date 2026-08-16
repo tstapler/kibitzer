@@ -121,7 +121,35 @@ stdout as a known structured shape (currently SARIF) instead of relying
 solely on the exit code, so severity and finding counts survive into the
 reported output. See `docs/output-formats.md`.
 
-## Development
+### Architecture checks
+
+An `architecture_checker` entry runs a native, whole-repo, cross-file check
+against an import graph built once per invocation (Go and TS/JS import
+extraction), instead of a `command` or a per-file `checker`:
+
+```jsonc
+{
+  "checks": [
+    {
+      "name": "import-cycles",
+      "architecture_checker": "import-cycles",
+      "severity": "advisory"
+    }
+  ]
+}
+```
+
+`architecture_checker` is mutually exclusive with `command`/`checker`.
+Because building the import graph means walking the whole repo,
+`architecture_checker` checks may only declare `triggers: ["batch"]` (or
+omit `triggers` — batch and the MCP tool's implicit invocation are the only
+callers) — `kibitzer` rejects config that lists `PostToolUse` or any other
+per-edit trigger for one of these checks, to avoid rescanning the whole
+import graph on every file edit. `kibitzer check list` doesn't cover these
+(that command lists per-file `Checker`s only); the registered architecture
+checkers are in `src/architecture_checks.rs::registry()`.
+
+
 
 ```bash
 cargo test --workspace

@@ -1,3 +1,4 @@
+mod architecture_checks;
 mod cache;
 mod check;
 mod checker;
@@ -8,6 +9,7 @@ mod go_blank_imports;
 mod go_error_context;
 mod go_ignored_error;
 mod hook;
+mod import_graph;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;

@@ -790,6 +790,153 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     Some(result.ok()?.status.success())
 }
 
+/// Runs a whole-repo, in-process [`crate::architecture_checks::ArchitectureChecker`]
+/// against the import graph built from `files` — the native counterpart to
+/// `run_check`'s shell-out path for `WholeRepoNative` checks. `files` is expected to
+/// already be walked/collected by the caller (batch mode builds it once and reuses it
+/// across every whole-repo check, native or not).
+pub fn run_architecture_check(
+    check: &Check,
+    repo_root: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<CheckResult> {
+    let arch_name = check
+        .architecture_checker
+        .as_deref()
+        .expect("config-load validation guarantees architecture_checker is set");
+
+    let cmd_str = format!("kibitzer check architecture {arch_name}");
+
+    let checker = match crate::architecture_checks::lookup(arch_name) {
+        Some(checker) => checker,
+        None => {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: false,
+                output: format!("no architecture checker named '{arch_name}' registered"),
+                message: check.message.clone(),
+                command: cmd_str,
+            });
+        }
+    };
+
+    let graph = match crate::import_graph::build(repo_root, files) {
+        Ok(graph) => graph,
+        Err(err) => {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: false,
+                output: format!("{err:#}"),
+                message: check.message.clone(),
+                command: cmd_str,
+            });
+        }
+    };
+
+    let findings = checker.check(&graph);
+    let passed = findings.is_empty();
+    let combined = findings
+        .iter()
+        .map(|f| match (&f.file, f.line) {
+            (Some(file), Some(line)) => format!("{}:{}: {}", file.display(), line, f.message),
+            (Some(file), None) => format!("{}: {}", file.display(), f.message),
+            (None, _) => f.message.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut severity = check.severity;
+    let mut message = check.message.clone();
+
+    if !passed && severity == Severity::Blocking {
+        let baseline = check_native_against_git_head_repo(arch_name, repo_root);
+        if let Some(false) = baseline {
+            severity = Severity::Advisory;
+            message = Some(format!(
+                "{} (downgraded: this violation predates your edits — already present \
+                 at the git HEAD commit)",
+                message.unwrap_or_default()
+            ));
+        }
+    }
+
+    Ok(CheckResult {
+        check_name: check.name.clone(),
+        severity,
+        passed,
+        output: combined,
+        message,
+        command: cmd_str,
+    })
+}
+
+/// Native-checker counterpart to [`check_against_git_head_repo`]: snapshots HEAD the same
+/// way, but builds the import graph and runs the architecture checker in-process against
+/// the snapshot instead of shelling out.
+fn check_native_against_git_head_repo(arch_name: &str, repo_root: &Path) -> Option<bool> {
+    let checker = crate::architecture_checks::lookup(arch_name)?;
+
+    let nonce = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let snapshot_dir = std::env::temp_dir().join(format!(
+        "kibitzer-arch-head-snapshot-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&snapshot_dir).ok()?;
+
+    let archive = match Command::new("git")
+        .args(["archive", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(archive) => archive,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return None;
+        }
+    };
+    if !archive.status.success() {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
+    }
+
+    let mut tar = match Command::new("tar")
+        .args(["-x", "-C"])
+        .arg(&snapshot_dir)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(tar) => tar,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return None;
+        }
+    };
+    let write_ok = tar
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&archive.stdout).is_ok())
+        .unwrap_or(false);
+    let wait_ok = tar.wait().map(|s| s.success()).unwrap_or(false);
+    if !write_ok || !wait_ok {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
+    }
+
+    let files = walk_and_collect_files(&snapshot_dir).ok();
+    let result = files.and_then(|files| {
+        crate::import_graph::build(&snapshot_dir, &files)
+            .ok()
+            .map(|graph| checker.check(&graph).is_empty())
+    });
+
+    let _ = std::fs::remove_dir_all(&snapshot_dir);
+
+    result
+}
+
 struct DiffHunk {
     old_start: usize,
     old_count: usize,
@@ -1046,6 +1193,7 @@ mod sarif_run_check_tests {
             name: "sarif-linter".to_string(),
             command: Some(format!("cat <<'EOF'\n{sarif_json}\nEOF")),
             checker: None,
+            architecture_checker: None,
             severity: Severity::Advisory,
             scope: vec![],
             triggers: vec![],
@@ -1206,6 +1354,7 @@ mod git_head_integration_tests {
             name: "no-bad-marker".to_string(),
             command: Some("! grep -n BAD {file}".to_string()),
             checker: None,
+            architecture_checker: None,
             severity: Severity::Blocking,
             scope: vec![],
             triggers: vec![],
@@ -1221,6 +1370,7 @@ mod git_head_integration_tests {
             name: "no-bad-marker-repo".to_string(),
             command: Some("! grep -rn BAD .".to_string()),
             checker: None,
+            architecture_checker: None,
             severity: Severity::Blocking,
             scope: vec![],
             triggers: vec![],
@@ -1408,6 +1558,7 @@ mod native_check_tests {
             name: "native".to_string(),
             command: None,
             checker: Some("primitive-obsession".to_string()),
+            architecture_checker: None,
             severity: Severity::Blocking,
             scope: vec![],
             triggers: vec![],
@@ -1457,6 +1608,7 @@ mod native_check_tests {
             name: "native".to_string(),
             command: None,
             checker: Some("go-blank-imports".to_string()),
+            architecture_checker: None,
             severity: Severity::Blocking,
             scope: vec![],
             triggers: vec![],

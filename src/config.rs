@@ -42,14 +42,22 @@ pub struct Check {
     ///   convention is left untouched (conservatively kept, so unrecognized output
     ///   can't be silently swallowed).
     ///
-    /// Mutually exclusive with `checker` — exactly one of the two must be set.
+    /// Mutually exclusive with `checker`/`architecture_checker` — exactly one of the
+    /// three must be set.
     #[serde(default)]
     pub command: Option<String>,
     /// Name of a natively implemented checker (looked up in `checker::registry()`) to
     /// run in-process instead of shelling out via `command`. Mutually exclusive with
-    /// `command`.
+    /// `command`/`architecture_checker`.
     #[serde(default)]
     pub checker: Option<String>,
+    /// Name of a natively implemented whole-repo architecture checker (looked up in
+    /// `architecture_checks::registry()`) that runs once per batch against the whole
+    /// repo's import graph, instead of once per triggering file. Mutually exclusive
+    /// with `command`/`checker`. `triggers` must be empty or `["batch"]` — rebuilding
+    /// the import graph on every `PostToolUse` edit is too expensive.
+    #[serde(default)]
+    pub architecture_checker: Option<String>,
     pub severity: Severity,
     /// Glob patterns (supporting `**`) a file path must match for this check to apply.
     #[serde(default)]
@@ -67,16 +75,43 @@ pub struct Check {
     pub output_format: Option<OutputFormat>,
 }
 
+/// How a [`Check`] is dispatched: once per triggering file, or once per whole-repo
+/// batch invocation; and via a shell `command` or an in-process native checker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    PerFileCommand,
+    WholeRepoCommand,
+    PerFileNative,
+    WholeRepoNative,
+}
+
 impl Check {
-    /// Whether this check is scoped to a single triggering file, as opposed to
-    /// whole-repo (no `{file}` placeholder in `command`, or a native checker — which
-    /// always runs against one file at a time).
-    pub fn is_per_file(&self) -> bool {
-        match (&self.command, &self.checker) {
-            (Some(command), _) => command.contains("{file}"),
-            (None, Some(_)) => true,
-            (None, None) => true,
+    /// Which of the four dispatch shapes this check is.
+    pub fn kind(&self) -> CheckKind {
+        if self.architecture_checker.is_some() {
+            return CheckKind::WholeRepoNative;
         }
+        match (&self.command, &self.checker) {
+            (Some(command), _) => {
+                if command.contains("{file}") {
+                    CheckKind::PerFileCommand
+                } else {
+                    CheckKind::WholeRepoCommand
+                }
+            }
+            (None, Some(_)) => CheckKind::PerFileNative,
+            (None, None) => CheckKind::PerFileNative,
+        }
+    }
+
+    /// Whether this check is scoped to a single triggering file, as opposed to
+    /// whole-repo (no `{file}` placeholder in `command`, a whole-repo `command`, or a
+    /// whole-repo `architecture_checker`).
+    pub fn is_per_file(&self) -> bool {
+        matches!(
+            self.kind(),
+            CheckKind::PerFileCommand | CheckKind::PerFileNative
+        )
     }
 }
 
@@ -88,27 +123,59 @@ pub struct Config {
 
 fn validate(config: &Config, config_path: &Path) -> Result<()> {
     for check in &config.checks {
-        match (&check.command, &check.checker) {
-            (Some(_), Some(_)) => anyhow::bail!(
-                "{}: check '{}' sets both `command` and `checker` — these are mutually exclusive",
+        let set_count = [
+            check.command.is_some(),
+            check.checker.is_some(),
+            check.architecture_checker.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        if set_count > 1 {
+            anyhow::bail!(
+                "{}: check '{}' sets more than one of `command`/`checker`/`architecture_checker` \
+                 — these are mutually exclusive",
                 config_path.display(),
                 check.name
-            ),
-            (None, None) => anyhow::bail!(
-                "{}: check '{}' sets neither `command` nor `checker` — exactly one is required",
+            );
+        }
+        if set_count == 0 {
+            anyhow::bail!(
+                "{}: check '{}' sets none of `command`/`checker`/`architecture_checker` — \
+                 exactly one is required",
                 config_path.display(),
                 check.name
-            ),
-            (None, Some(checker_name)) if crate::checker::lookup(checker_name).is_none() => {
+            );
+        }
+        if let Some(checker_name) = &check.checker
+            && crate::checker::lookup(checker_name).is_none()
+        {
+            anyhow::bail!(
+                "{}: check '{}' references unknown checker '{}' — run `kibitzer check list` \
+                 for available checkers",
+                config_path.display(),
+                check.name,
+                checker_name
+            );
+        }
+        if let Some(arch_name) = &check.architecture_checker {
+            if crate::architecture_checks::lookup(arch_name).is_none() {
                 anyhow::bail!(
-                    "{}: check '{}' references unknown checker '{}' — run `kibitzer check list` \
-                     for available checkers",
+                    "{}: check '{}' references unknown architecture checker '{}'",
                     config_path.display(),
                     check.name,
-                    checker_name
-                )
+                    arch_name
+                );
             }
-            _ => {}
+            if check.triggers.iter().any(|t| t != "batch") {
+                anyhow::bail!(
+                    "{}: check '{}' sets `architecture_checker` with a trigger other than \
+                     `batch` — whole-repo architecture checks may only run in batch mode, \
+                     never on a per-edit trigger like `PostToolUse`",
+                    config_path.display(),
+                    check.name
+                );
+            }
         }
         if check.output_format.is_some() && check.command.is_none() {
             anyhow::bail!(
@@ -224,5 +291,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("output_format"));
+    }
+
+    #[test]
+    fn accepts_architecture_checker_with_batch_trigger() {
+        let config = parse(
+            r#"{"checks": [{"name": "n", "architecture_checker": "import-cycles", "severity": "advisory", "triggers": ["batch"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.checks[0].architecture_checker.as_deref(),
+            Some("import-cycles")
+        );
+        assert_eq!(config.checks[0].kind(), CheckKind::WholeRepoNative);
+        assert!(!config.checks[0].is_per_file());
+    }
+
+    #[test]
+    fn accepts_architecture_checker_with_no_triggers() {
+        parse(
+            r#"{"checks": [{"name": "n", "architecture_checker": "import-cycles", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_architecture_checker_alongside_checker() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "checker": "primitive-obsession", "architecture_checker": "import-cycles", "severity": "advisory"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn rejects_unknown_architecture_checker_name() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "architecture_checker": "does-not-exist", "severity": "advisory"}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown architecture checker"));
+    }
+
+    #[test]
+    fn rejects_architecture_checker_on_non_batch_trigger() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "architecture_checker": "import-cycles", "severity": "advisory", "triggers": ["PostToolUse"]}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("batch"));
+    }
+
+    #[test]
+    fn whole_repo_command_check_is_not_per_file() {
+        let config = parse(
+            r#"{"checks": [{"name": "n", "command": "true", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.checks[0].kind(), CheckKind::WholeRepoCommand);
+        assert!(!config.checks[0].is_per_file());
     }
 }

@@ -3,7 +3,10 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use crate::check::{CheckResult, run_check, run_checks_for_trigger, walk_and_collect_files};
+use crate::check::{
+    CheckResult, run_architecture_check, run_check, run_checks_for_trigger,
+    walk_and_collect_files,
+};
 use crate::config::{Check, Severity, find_config};
 
 fn report(file_display: &str, result: &CheckResult) {
@@ -44,18 +47,23 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
 
     let mut any_blocking_failure = false;
 
+    let files = walk_and_collect_files(&dir)?;
+
     for check in &repo_checks {
         if !check.triggers.is_empty() && !check.triggers.iter().any(|t| t == trigger) {
             continue;
         }
-        let result = run_check(check, &repo_root, &repo_root, None)?;
+        let result = if check.architecture_checker.is_some() {
+            run_architecture_check(check, &repo_root, &files)?
+        } else {
+            run_check(check, &repo_root, &repo_root, None)?
+        };
         if !result.passed && result.severity == Severity::Blocking {
             any_blocking_failure = true;
         }
         report(&repo_root.display().to_string(), &result);
     }
 
-    let files = walk_and_collect_files(&dir)?;
     for file in files {
         for result in run_checks_for_trigger(&file_checks, trigger, &repo_root, &file, None)? {
             if !result.passed && result.severity == Severity::Blocking {
@@ -81,6 +89,7 @@ mod tests {
             name: "native".to_string(),
             command: None,
             checker: Some("primitive-obsession".to_string()),
+            architecture_checker: None,
             severity: Severity::Advisory,
             scope: vec![],
             triggers: vec![],
