@@ -47,9 +47,9 @@ struct ArchitectureAssessmentRequest {
     /// Defaults to the whole repo.
     #[serde(default)]
     scope: Option<String>,
-    /// Whether to append a Mermaid dependency-graph section. Currently a no-op — the
-    /// diagram renderer isn't implemented yet — accepted for forward compatibility so
-    /// callers don't need to change their request shape once it lands.
+    /// Whether to append a Mermaid dependency-graph section (`graph TD`, import-cycle
+    /// edges highlighted). Repos over 150 nodes fall back to a text note instead —
+    /// pass a narrower `scope` to render a subgraph.
     #[serde(default = "default_true")]
     include_diagram: bool,
 }
@@ -229,8 +229,6 @@ impl KibitzerServer {
             }
         }
 
-        let _ = req.0.include_diagram;
-
         let mut output = format!(
             "architecture assessment: {} finding(s) across {} file(s)\n",
             finding_count,
@@ -250,7 +248,25 @@ impl KibitzerServer {
                 output.push_str(&format!("- {rec}\n"));
             }
         }
-        output.push_str("\n## Dependency graph\n(diagram rendering not yet implemented)\n");
+        output.push_str("\n## Dependency graph\n");
+        if req.0.include_diagram {
+            match crate::import_graph::build(&repo_root, &files) {
+                Ok(graph) => {
+                    let diagram = crate::mermaid::render_dependency_graph(&graph);
+                    if diagram.starts_with("graph TD") {
+                        output.push_str("```mermaid\n");
+                        output.push_str(&diagram);
+                        output.push_str("\n```\n");
+                    } else {
+                        output.push_str(&diagram);
+                        output.push('\n');
+                    }
+                }
+                Err(e) => output.push_str(&format!("error building import graph: {e}\n")),
+            }
+        } else {
+            output.push_str("(omitted: include_diagram was false)\n");
+        }
         output
     }
 

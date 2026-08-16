@@ -182,8 +182,13 @@ path and an optional `scope` glob, it runs every configured
 checkers across every in-scope file, and returns a combined findings report
 (one `[level] {file}:{line}: {message}` line per finding) with canned
 recommendations for `import-cycles`/`layering` findings appended under a
-`## Recommendations` heading. A `## Dependency graph` heading is reserved for
-a future Mermaid rendering and is currently a placeholder.
+`## Recommendations` heading. When `include_diagram` is true (the default),
+a `## Dependency graph` heading follows with a Mermaid `graph TD` diagram of
+the import graph — nodes are packages/modules, edges are import
+relationships, and any node/edge that's part of an import cycle is
+highlighted in red. Repos with more than 150 nodes fall back to a text note
+instead of an unreadably large diagram; pass a narrower `scope` to render a
+subgraph.
 
 ```bash
 cargo test --workspace

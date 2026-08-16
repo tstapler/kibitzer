@@ -13,6 +13,7 @@ mod import_graph;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;
+mod mermaid;
 mod primitive_obsession;
 mod rules;
 mod run;

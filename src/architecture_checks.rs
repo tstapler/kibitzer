@@ -180,8 +180,10 @@ impl ArchitectureChecker for CouplingChecker {
 
 /// Tarjan's SCC algorithm, keeping only components with more than one node (or a
 /// single node with a self-edge) — those are the only SCCs that represent an actual
-/// import cycle rather than an isolated, acyclic package.
-fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
+/// import cycle rather than an isolated, acyclic package. Exposed (not just used
+/// internally by `ImportCycleChecker`) so `src/mermaid.rs` can highlight cycle edges
+/// in the rendered dependency diagram without re-deriving SCCs itself.
+pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     struct Tarjan<'a> {
         graph: &'a ImportGraph,
         index_counter: usize,
