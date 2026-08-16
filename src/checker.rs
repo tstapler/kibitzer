@@ -27,12 +27,18 @@ pub struct Finding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Go,
+    TypeScript,
+    Tsx,
+    JavaScript,
 }
 
 impl Language {
     fn ts_language(self) -> tree_sitter::Language {
         match self {
             Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         }
     }
 }
@@ -72,7 +78,10 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(BlankImportsChecker),
         Box::new(IgnoredErrorChecker),
         Box::new(ErrorContextChecker),
-        Box::new(SyntaxRulesChecker),
+        Box::new(SyntaxRulesChecker::new(Language::Go)),
+        Box::new(SyntaxRulesChecker::new(Language::TypeScript)),
+        Box::new(SyntaxRulesChecker::new(Language::Tsx)),
+        Box::new(SyntaxRulesChecker::new(Language::JavaScript)),
     ]
 }
 
