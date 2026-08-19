@@ -1,4 +1,5 @@
 mod architecture_checks;
+mod backtest;
 mod cache;
 mod check;
 mod checker;
@@ -67,6 +68,20 @@ enum CheckCommand {
     /// List natively implemented checkers available to reference from
     /// `.claude/inspect.json`'s `checker` field.
     List,
+    /// Backtests a checker (or "all") against file edits reconstructed from Claude
+    /// Code session transcripts, to validate it against real historical edits before
+    /// shipping it. See docs/backtesting.md.
+    Backtest {
+        /// Checker name from `checker::registry()`, or "all" to run every checker.
+        name: String,
+        /// Directory of `<session>/*.jsonl` transcripts (default: `~/.claude/projects`).
+        #[arg(long)]
+        transcripts_dir: Option<PathBuf>,
+        /// Only report findings introduced by the edit itself, dropping ones that
+        /// also fired against the pre-edit content.
+        #[arg(long)]
+        only_new: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -154,6 +169,50 @@ fn main() -> Result<ExitCode> {
                         println!("{}:{}: {}", file.display(), finding.line, finding.message);
                     }
                     Ok(ExitCode::from(1))
+                }
+            }
+            CheckCommand::Backtest {
+                name,
+                transcripts_dir,
+                only_new,
+            } => {
+                let dir = transcripts_dir
+                    .or_else(backtest::default_projects_dir)
+                    .context("no transcripts directory given and $HOME is unset")?;
+                let transcripts = backtest::discover_transcripts(&dir)
+                    .with_context(|| format!("discovering transcripts under {}", dir.display()))?;
+                let checker_names: Vec<String> = if name == "all" {
+                    Vec::new()
+                } else {
+                    vec![name]
+                };
+                let cache_path = backtest::default_cache_path();
+                let mut cache = backtest::BacktestCache::load(&cache_path);
+                let report =
+                    backtest::run_backtest(&transcripts, &checker_names, only_new, &mut cache)?;
+                cache.save(&cache_path)?;
+                println!(
+                    "[kibitzer] scanned {} transcript(s), checked {} snapshot(s), {} edit(s) unreconstructable",
+                    report.stats.transcripts_scanned,
+                    report.stats.snapshots_checked,
+                    report.stats.edits_unreconstructable
+                );
+                for finding in &report.findings {
+                    println!(
+                        "{}#{} {}:{}: [{}]{} {}",
+                        finding.transcript.display(),
+                        finding.seq,
+                        finding.file_path.display(),
+                        finding.line,
+                        finding.checker,
+                        if finding.pre_existing { " (pre-existing)" } else { "" },
+                        finding.message
+                    );
+                }
+                if report.findings.iter().any(|f| !f.pre_existing) {
+                    Ok(ExitCode::from(1))
+                } else {
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         },

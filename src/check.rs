@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::checker::{CheckContext, GrammarCache};
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 
@@ -302,18 +301,7 @@ fn run_checker_against_source(
     file_path: &Path,
     source: &str,
 ) -> anyhow::Result<(String, bool)> {
-    let checker = crate::checker::lookup(checker_name)
-        .ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
-    let cache = GrammarCache::new();
-    let tree = match checker.language() {
-        Some(language) => Some(cache.parse(language, source)?),
-        None => None,
-    };
-    let ctx = CheckContext {
-        source,
-        tree: tree.as_ref(),
-    };
-    let findings = checker.check(file_path, &ctx)?;
+    let findings = crate::checker::run_checker(checker_name, file_path, source)?;
     let passed = findings.is_empty();
     let combined = findings
         .iter()

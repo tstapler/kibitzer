@@ -100,6 +100,42 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
     registry().into_iter().find(|c| c.name() == name)
 }
 
+/// Parses `source` with `checker_name`'s declared grammar (if any) and runs it,
+/// returning raw [`Finding`]s. The shared entry point for anything that needs a
+/// checker's structured findings against arbitrary text — `check.rs`'s live
+/// dispatch (which then formats findings as `{file}:{line}: {message}` for its
+/// diff-scoping/baseline machinery) and `backtest.rs`'s reconstructed-history runs
+/// (which need the structured line/message, not that string form) both call this
+/// instead of duplicating the parse-then-check sequence.
+pub fn run_checker(checker_name: &str, file: &Path, source: &str) -> Result<Vec<Finding>> {
+    let checker =
+        lookup(checker_name).ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
+    let cache = GrammarCache::new();
+    run_checker_with_cache(checker.as_ref(), file, source, &cache)
+}
+
+/// Same as [`run_checker`], but parses through a [`GrammarCache`] the caller already
+/// owns instead of a fresh one-shot cache. Lets a caller running several checkers
+/// against the *same* `(file, source)` pair — as `backtest.rs` does, once per
+/// reconstructed snapshot — share one parse per language across all of them instead
+/// of each checker re-parsing it from scratch.
+pub fn run_checker_with_cache(
+    checker: &dyn Checker,
+    file: &Path,
+    source: &str,
+    cache: &GrammarCache,
+) -> Result<Vec<Finding>> {
+    let tree = match checker.language() {
+        Some(language) => Some(cache.parse(language, source)?),
+        None => None,
+    };
+    let ctx = CheckContext {
+        source,
+        tree: tree.as_ref(),
+    };
+    checker.check(file, &ctx)
+}
+
 /// Parses at most once per [`Language`] over this cache instance's lifetime, regardless
 /// of how many checkers declare that language — checkers sharing a grammar share the
 /// parsed [`Tree`] instead of each re-parsing the same source. Callers must construct a
