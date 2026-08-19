@@ -37,12 +37,14 @@ struct EditItem {
 
 /// Derive 1-indexed, inclusive changed-line ranges in the *current* (post-edit)
 /// on-disk content of `file_path`, from the Edit/MultiEdit tool input that produced
-/// it. Returns `None` when there's nothing to scope to: a `Write` (whole-file
-/// rewrite), no edit info at all, or a `new_string` that can't be located *uniquely*
-/// in the current file content (e.g. a later edit already changed it again, or the
-/// text also occurs elsewhere in the file — matching the wrong occurrence would
-/// produce a silently wrong range, so any ambiguity falls back to an unscoped,
-/// whole-file check rather than risk a false negative).
+/// it. Returns `None` when there's nothing to scope to at all: a `Write` (whole-file
+/// rewrite) or no edit info. When a `new_string` can't be located *uniquely* in the
+/// current file content — e.g. it's boilerplate that already occurs elsewhere, such
+/// as an identical setup block duplicated across several `t.Run` subtests — we can't
+/// tell which occurrence is the actual edit, so we scope to the union of *all*
+/// occurrences rather than falling back to an unscoped whole-file check: that keeps
+/// unrelated, pre-existing findings elsewhere in the file suppressed, at the cost of
+/// occasionally including a same-text occurrence that isn't the one that changed.
 fn compute_changed_lines(
     tool_input: &ToolInput,
     file_path: &PathBuf,
@@ -65,18 +67,11 @@ fn compute_changed_lines(
         if needle.is_empty() {
             continue;
         }
-        let mut matches = file_content.match_indices(needle);
-        let Some((byte_offset, _)) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
-            // Ambiguous — this text occurs more than once, so we can't tell which
-            // occurrence is the actual edit. Bail out entirely rather than guess.
-            return None;
+        for (byte_offset, _) in file_content.match_indices(needle) {
+            let start_line = file_content[..byte_offset].matches('\n').count() + 1;
+            let end_line = start_line + needle.matches('\n').count();
+            ranges.push((start_line, end_line));
         }
-        let start_line = file_content[..byte_offset].matches('\n').count() + 1;
-        let end_line = start_line + needle.matches('\n').count();
-        ranges.push((start_line, end_line));
     }
 
     if ranges.is_empty() {
@@ -174,7 +169,7 @@ mod compute_changed_lines_tests {
     }
 
     #[test]
-    fn bails_when_new_string_is_ambiguous() {
+    fn unions_all_occurrences_when_new_string_is_ambiguous() {
         let path = write_temp("ambiguous", "dup line\nother\ndup line\n");
         let tool_input = ToolInput {
             file_path: None,
@@ -184,7 +179,38 @@ mod compute_changed_lines_tests {
         };
         let ranges = compute_changed_lines(&tool_input, &path);
         std::fs::remove_file(&path).ok();
-        assert_eq!(ranges, None);
+        // Can't tell which occurrence is the real edit, so scope to both rather
+        // than bailing to an unscoped whole-file check.
+        assert_eq!(ranges, Some(vec![(1, 1), (3, 3)]));
+    }
+
+    #[test]
+    fn duplicated_subtest_boilerplate_scopes_to_all_copies_not_whole_file() {
+        // Mirrors the primitive-obsession false positive: identical setup lines
+        // duplicated into several t.Run subtests make new_string non-unique, but
+        // scoping to just those occurrences (rather than the whole file) should
+        // still exclude an unrelated, pre-existing flaggable signature elsewhere.
+        let content = "package main\n\
+func unrelated(a, b string) {}\n\
+func TestX(t *testing.T) {\n\
+\tt.Run(\"a\", func(t *testing.T) {\n\
+\t\tsvc := New(x)\n\
+\t})\n\
+\tt.Run(\"b\", func(t *testing.T) {\n\
+\t\tsvc := New(x)\n\
+\t})\n\
+}\n";
+        let path = write_temp("dup-boilerplate", content);
+        let tool_input = ToolInput {
+            file_path: None,
+            new_string: Some("\t\tsvc := New(x)".to_string()),
+            content: None,
+            edits: None,
+        };
+        let ranges = compute_changed_lines(&tool_input, &path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(ranges, vec![(5, 5), (8, 8)]);
+        assert!(!ranges.iter().any(|&(start, end)| (start..=end).contains(&2)));
     }
 
     #[test]

@@ -30,6 +30,28 @@ just one that introduces a new same-typed-parameter signature.
 
 ## Log
 
+### 2026-08-18 — stapler-squad-tests — ambiguous-substring fallback re-scanned whole file
+
+- **Repo**: `tstapler/stapler-squad` (session `stapler-squad-tests`), file
+  `server/services/session_service_test.go`.
+- **What changed**: an `Edit` moved an identical 3-line setup block
+  (`eventBus := events.NewEventBus(8)` / `svc := NewSessionService(storage, eventBus)`
+  / `t.Cleanup(func() { svc.Shutdown() })`) into a new `t.Run("onDetected", ...)`
+  subtest of a table that already duplicates this same boilerplate across several
+  other subtests.
+- **Why it's a false positive**: the checker isn't a bug here — the underlying
+  diff-scoping infra (`src/hook.rs::compute_changed_lines`, `src/check.rs`'s
+  `changed_lines`/git-HEAD-baseline machinery) *does* exist and normally prevents
+  the whole-file rescan described above. This case bypassed it: `compute_changed_lines`
+  located an `Edit`'s `new_string` by searching for it as a unique substring of the
+  current file, and previously bailed to `None` (unscoped, whole-file check) whenever
+  that text occurred more than once — which duplicated subtest boilerplate guarantees.
+- **Fix**: `compute_changed_lines` (`src/hook.rs`) now scopes to the union of *all*
+  occurrences of an ambiguous `new_string` instead of giving up and scanning the whole
+  file. Covered by `unions_all_occurrences_when_new_string_is_ambiguous` and
+  `duplicated_subtest_boilerplate_scopes_to_all_copies_not_whole_file` in
+  `src/hook.rs`'s test module.
+
 ### 2026-08-10 — stapler-squad — deletion-only edit flagged
 
 - **Repo**: `tstapler/stapler-squad`
