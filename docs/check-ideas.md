@@ -50,9 +50,46 @@ evidenced finding — they're placed in the untested section per Step 5.
 
 The skill's own suggested next signal — structural detection of
 Edit/Write immediately followed by another Edit to the same file within the
-same or next turn, as a proxy for "got it wrong on the first try" — has not
-yet been implemented or run. That's the natural next step before trusting
-this list further.
+same or next turn, as a proxy for "got it wrong on the first try" — has now
+been run (2026-08-15). It also came back null.
+
+## Structural edit-churn mining — also came back null (2026-08-15)
+
+Scanned all 3,427 `~/.claude/projects/*/*.jsonl` transcript files for
+Edit/Write tool_use calls followed by another Edit to the same `file_path`
+within a small gap (≤8 lines apart in the transcript after tightening from
+an initial ≤60-line pass): 2,957 matches across ~40+ repos/worktrees.
+
+A diversity-weighted manual sample of 33 matches (≤2 per repo), read against
+the actual `old_string`/`new_string` diffs, found a true "got it wrong, had
+to redo" rate of only ~6% (2/33):
+
+- ~55% (18/33): normal incremental multi-hunk edits within one turn (e.g.
+  adding a function body then its docstring) — not corrections.
+- ~30% (10/33): `pr-ship`/triage scratch-file (`/tmp/pr-ship-*.md`)
+  sequential checklist updates as a workflow skill progresses — status
+  tracking, not mistakes.
+- ~6% (2/33): genuine "oops, fix it" edits, but neither reaches the 2+
+  independent-occurrence bar:
+  - kibitzer `src/check.rs` — an Edit accidentally deleted a
+    `#[cfg(test)] mod diff_scoping_tests` block, then a second Edit
+    re-inserted it. One occurrence, looks like an isolated editing accident.
+  - go-git `mmapindex_test.go` / `mmap_truncation_test.go` — removing a
+    `context`/`os/exec` usage left a now-unused import, cleaned up in the
+    very next edit. Reinforces the existing "Dead/unused imports after an
+    edit" untested idea below, but is one session/repo — not an independent
+    second occurrence.
+
+Zero matches, in the sample or in a broader manual scan of the wider
+2,957-row set by file path, touched dependency direction, layering,
+circular imports, or module-boundary violations — no architecture-relevant
+signal at all, not even at single-occurrence strength.
+
+**Both of the skill's suggested mining approaches (free-text correction
+phrases and structural edit-churn) have now been exhausted with a null
+result.** Neither should be re-run as-is; a different signal (e.g. narrower
+single-repo scope, or mining actual bug-fix commit messages instead of
+session transcripts) would be needed before this section can be populated.
 
 ## Evidenced candidates
 
@@ -84,5 +121,14 @@ first.
   bigger, problem than one just introduced); would need the git-HEAD
   baseline comparison kibitzer already has, applied to a regex/entropy scan
   instead of an exit-code check.
+- **Duplicated code blocks (copy-paste/DRY)** — a run of several consecutive
+  lines repeated elsewhere in the same file, the kind of thing a
+  `dupl`/`jscpd`-style clone detector flags. Feasible as a language-agnostic,
+  single-file line-window hash comparison (no tree-sitter grammar needed),
+  same per-file `Checker` shape as the existing native checks — diff-scoping
+  and the git-HEAD baseline downgrade in `src/check.rs` apply for free since
+  they key off `Finding.line`, not the checker itself. Implemented as
+  `duplicate-code` (`src/duplicate_code.rs`) on 2026-08-19, ahead of a
+  confirmed transcript occurrence — flag if it turns out noisy in practice.
 
 None of these have a confirmed transcript occurrence backing them yet.
