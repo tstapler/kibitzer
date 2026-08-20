@@ -129,6 +129,10 @@ first.
   and the git-HEAD baseline downgrade in `src/check.rs` apply for free since
   they key off `Finding.line`, not the checker itself. Implemented as
   `duplicate-code` (`src/duplicate_code.rs`) on 2026-08-19, ahead of a
-  confirmed transcript occurrence — flag if it turns out noisy in practice.
+  confirmed transcript occurrence. A full-corpus backtest did turn up
+  real duplication, but with volume inflated by flagging every extra copy of
+  a block past the first repeat — since a lot of two-copy repetition is
+  benign, defensible fixture/boilerplate, the checker now only flags once a
+  block occurs 3+ times, reporting all occurrence lines in one finding.
 
 None of these have a confirmed transcript occurrence backing them yet.

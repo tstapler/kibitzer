@@ -717,7 +717,7 @@ mod tests {
                       \tresult := conn.Fetch(id)\n\
                       \tlog.Printf(\"fetched %v\", result)\n\
                       \treturn conn.Validate(result)\n";
-        let content = format!("package main\n\n{block}\n{block}");
+        let content = format!("package main\n\n{block}\n{block}\n{block}");
         let lines = vec![tool_use(
             "w1",
             "Write",
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn run_backtest_only_new_drops_pre_existing_findings() {
-        // Two identical duplicate-triggering files, seeded then re-edited elsewhere
+        // Three identical duplicate-triggering blocks, seeded then re-edited elsewhere
         // in the file: the duplication already existed before this edit, so
         // --only-new should drop it.
         let block = "func doWork(id string) error {\n\
@@ -743,7 +743,7 @@ mod tests {
                       \tresult := conn.Fetch(id)\n\
                       \tlog.Printf(\"fetched %v\", result)\n\
                       \treturn conn.Validate(result)\n";
-        let before = format!("package main\n\n{block}\n{block}");
+        let before = format!("package main\n\n{block}\n{block}\n{block}");
         let after = format!("{before}\n// trailing comment\n");
         let lines = vec![
             tool_use(
