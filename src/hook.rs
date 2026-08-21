@@ -16,6 +16,13 @@ struct HookInput {
     hook_event_name: String,
     #[serde(default)]
     tool_input: ToolInput,
+    /// Uniquely identifies the underlying tool call. Claude Code invokes every
+    /// matching hook registration independently (e.g. a global and a project-level
+    /// `PostToolUse` entry both matching `Edit|Write`), each with the same
+    /// `tool_use_id` — used to dedupe so checks don't run and report twice for one
+    /// edit. Absent for callers that don't send it, in which case dedup is skipped.
+    #[serde(default)]
+    tool_use_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +97,15 @@ pub fn run_hook() -> Result<ExitCode> {
         .read_to_string(&mut raw)
         .context("reading hook input from stdin")?;
     let input: HookInput = serde_json::from_str(&raw).context("parsing hook input JSON")?;
+
+    if let Some(tool_use_id) = &input.tool_use_id {
+        if !crate::dedup::claim(tool_use_id) {
+            // Another hook registration (e.g. a global + project-level entry both
+            // matching this tool) already claimed this exact tool call. Exit quietly
+            // rather than running checks and reporting the same findings twice.
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
 
     let Some(file_path) = input.tool_input.file_path.clone() else {
         return Ok(ExitCode::SUCCESS);

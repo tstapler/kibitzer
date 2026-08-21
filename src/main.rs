@@ -5,6 +5,7 @@ mod check;
 mod checker;
 mod config;
 mod daemon;
+mod dedup;
 mod duplicate_code;
 mod glob;
 mod go_blank_imports;
