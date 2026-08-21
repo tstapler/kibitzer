@@ -127,11 +127,17 @@ pub fn run_hook() -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
 
-    let context = failures
+    let mut context = failures
         .iter()
         .map(|r| format!("{}: {}", r.check_name, r.describe()))
         .collect::<Vec<_>>()
         .join("\n");
+    context.push_str(
+        "\n\nIf any of the above looks like a false positive (fired on content the edit \
+         didn't actually introduce, or on a pattern the check misidentifies), see \
+         docs/reporting-false-positives.md for how to file it — don't just note it in \
+         passing.",
+    );
 
     let payload = json!({
         "hookSpecificOutput": {
