@@ -4,7 +4,7 @@
 
 [package]
 name = "kibitzer"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "Advisory, diff-aware code/doc quality checks for AI agents, CI, and local dev"
 repository = "https://github.com/tstapler/kibitzer"
