@@ -267,6 +267,81 @@ fn dir_key(dir: &Path) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// Java / Kotlin import node-kind verification (Epic 4.1) — real `to_sexp()` output
+// pinned ahead of the extraction code (Story 4.2.2/4.2.3), per this codebase's
+// verification discipline (`docs/syntax-rules.md`, `rules.rs`'s `LangRuleConfig` doc
+// comment). No `build_java`/`build_kotlin` exist yet; the findings below are what
+// Epic 4.2's implementer builds against.
+//
+// **Java** (`tree-sitter-java` 0.23.5, matches `Cargo.lock`): every import form —
+// plain, wildcard, and `import static` — parses to the *same* node kind,
+// `import_declaration`, with **positional** (unfielded) children:
+// - Plain: `(import_declaration (scoped_identifier ...))` — one positional child, the
+//   dotted path.
+// - Wildcard (`import com.example.infra.*;`): `(import_declaration (scoped_identifier
+//   ...) (asterisk))` — a second positional child, a **named** `asterisk` node. Unlike
+//   Kotlin below, Java's wildcard marker is visible in `to_sexp()`/named-child
+//   inspection directly.
+// - `import static com.example.infra.Constants.MAX;`: **not** distinguishable from a
+//   plain import by node kind or by any named child — `to_sexp()` is
+//   `(import_declaration (scoped_identifier ...))`, identical in shape to a plain
+//   import of the same path depth. The `static` keyword *is* present as an
+//   **anonymous** (unnamed) token child at raw position 1 (`import`, `static`,
+//   `scoped_identifier`, `;`) — confirmed via `Node::child(1)` (not
+//   `named_child`/`to_sexp()`), so distinguishing `import static` requires a raw
+//   (unnamed-included) child walk or a source-text check for `import static `, not a
+//   `to_sexp()`-based check. This confirms pitfalls.md's flag that it "must be
+//   confirmed via live `to_sexp()`, not assumed" — it is real and it is *not*
+//   detectable from `to_sexp()` output alone.
+// - Malformed source (missing `;` after a field, unclosed class body — see
+//   `java_malformed_source_recovery_shape` below): tree-sitter-java recovers with a
+//   single flat `ERROR` node wrapping the malformed declaration's tokens
+//   (`(ERROR (modifiers) (identifier) (modifiers) (type_identifier) (identifier))`),
+//   **not** a `MISSING` node — any leading valid syntax (the import line here) still
+//   parses cleanly outside the `ERROR` node.
+//
+// **Kotlin** (`tree-sitter-kotlin-ng` 1.1.0, matches `Cargo.lock`): every import form
+// is the single node kind `import` (not `import_header`/`import_list` — that's the
+// unrelated `fwcd/tree-sitter-kotlin` fork), with **positional** (unfielded) children,
+// same no-named-fields situation `syntax-rules.md` already documents for Kotlin's
+// function nodes:
+// - Plain: `(import (qualified_identifier ...))` — one positional child.
+// - Wildcard (`import com.example.infra.*`): **also** `(import (qualified_identifier
+//   ...))` with the *same* named-child shape as a plain import one path segment
+//   shorter (`com.example.infra.*` and a plain `import com.example.infra` both dump
+//   to the identical `(import (qualified_identifier (identifier) (identifier)
+//   (identifier)))`, verified by direct comparison) — the trailing `.*` is two
+//   **anonymous** tokens (`.` then `*`), invisible to `to_sexp()`/named-child
+//   inspection. Unlike Java's named `asterisk` node, Kotlin's wildcard marker is
+//   genuinely undetectable from `to_sexp()` alone; the real disambiguation is a raw
+//   (unnamed-included) child walk checking whether the `import` node's *last* raw
+//   child has kind `"*"` (verified: the wildcard import's raw children are `import`,
+//   `qualified_identifier`, `.`, `*` — 4 total vs. the plain import's 2), or
+//   equivalently a source-text check for a trailing `.*`. This is exactly the node
+//   shape build-vs-buy.md flagged as unconfirmed from static schema data, and it is a
+//   **real trap for Epic 4.2**: a named-child-only or `to_sexp()`-substring-only
+//   extraction will silently mis-parse a wildcard import as a plain one.
+// - Aliased (`import com.example.infra.Legacy as LegacyClient`): `(import
+//   (qualified_identifier ...) (identifier))` — **two** positional children: the
+//   `qualified_identifier` (the full path *including* the aliased name, e.g.
+//   `com.example.infra.Legacy`) and a second positional `identifier` for the alias
+//   itself (`LegacyClient`), with the `as` keyword an anonymous token between them.
+// - Malformed source (`import com.example.infra.DbClient\n\nclass Order(val id:
+//   String\n` — unclosed parameter list): tree-sitter-kotlin-ng recovers with an
+//   explicit `MISSING ")"` node **inserted in place** inside the otherwise-intact
+//   `class_declaration`/`primary_constructor`/`class_parameters` tree — a
+//   structurally different recovery strategy from Java's flat `ERROR`-node wrapper
+//   above; both are real, verified outcomes of the "parser.parse() essentially never
+//   returns None" behavior adversarial-review.md flagged, but the *shape* of recovery
+//   differs per grammar and must not be assumed to generalize from one language to the
+//   other.
+//
+// See `declarations.rs`'s Kotlin section (Task 4.1.2c) for the `class_declaration`
+// vs. `object_declaration` verification (Kotlin's `interface` shares `class_declaration`
+// with `class`, distinguished only by an anonymous keyword child; `object` is a wholly
+// separate node kind).
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +436,200 @@ mod tests {
         assert!(graph.edges.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Epic 4.1 / Story 4.1.1: Java to_sexp() verification ---
+
+    fn parse_java(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("loading tree-sitter-java grammar");
+        parser.parse(src, None).expect("parsing Java fixture")
+    }
+
+    /// Task 4.1.1a — the exact fixture from plan.md's Story 4.1.1 acceptance criteria:
+    /// a plain qualified import, a wildcard import, and an `import static`, all real
+    /// `to_sexp()` output pinned per the doc comment above `dir_key`.
+    #[test]
+    fn java_import_to_sexp_fixture() {
+        let src = "package com.example.domain;\n\nimport com.example.infra.DbClient;\nimport com.example.infra.*;\nimport static com.example.infra.Constants.MAX;\n\npublic class Order {\n    public String id;\n}\n";
+        let tree = parse_java(src);
+        let sexp = tree.root_node().to_sexp();
+
+        assert!(!tree.root_node().has_error());
+        // Qualified import (also matches the `import static` form, which shares the
+        // exact same shape — see Task 4.1.1b below).
+        assert!(sexp.contains("(import_declaration (scoped_identifier"));
+        // Wildcard import carries a second positional, *named* `asterisk` child.
+        assert!(sexp.contains(
+            "(import_declaration (scoped_identifier scope: (scoped_identifier scope: (identifier) name: (identifier)) name: (identifier)) (asterisk))"
+        ));
+    }
+
+    /// Task 4.1.1b — `import static` is confirmed **not** distinguishable from a plain
+    /// import by node kind, `to_sexp()`, or any named child: both produce
+    /// `(import_declaration (scoped_identifier ...))`. The `static` keyword is present
+    /// only as an anonymous (unnamed) token at raw child position 1 — visible via
+    /// `Node::child(1)`, invisible to `named_child`/`to_sexp()`.
+    #[test]
+    fn java_import_static_is_not_distinguishable_via_to_sexp() {
+        let static_tree = parse_java("import static com.example.infra.Constants.MAX;\n");
+        let plain_tree = parse_java("import com.example.infra.DbClient;\n");
+
+        let static_import = static_tree.root_node().named_child(0).unwrap();
+        let plain_import = plain_tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(static_import.kind(), "import_declaration");
+        assert_eq!(plain_import.kind(), "import_declaration");
+        // Both have exactly one *named* child (the scoped_identifier) — `static`
+        // contributes nothing to the named-child shape.
+        assert_eq!(static_import.named_child_count(), 1);
+        assert_eq!(plain_import.named_child_count(), 1);
+
+        // The real disambiguation: raw (unnamed-included) child 1.
+        assert_eq!(static_import.child(1).unwrap().kind(), "static");
+        assert_ne!(plain_import.child(1).unwrap().kind(), "static");
+    }
+
+    /// Task 4.1.1c — malformed/truncated Java source (missing `;`, unclosed class
+    /// body) recovers as a single flat `ERROR` node wrapping the malformed
+    /// declaration; the syntactically valid leading `import` still parses cleanly
+    /// outside it. No `MISSING` node appears for this fragment — contrast with
+    /// Kotlin's `MISSING` recovery below.
+    #[test]
+    fn java_malformed_source_recovery_shape() {
+        let src =
+            "import com.example.infra.DbClient;\n\npublic class Order {\n    public String id\n";
+        let tree = parse_java(src);
+
+        assert!(tree.root_node().has_error());
+        let sexp = tree.root_node().to_sexp();
+        assert!(sexp.contains(
+            "(ERROR (modifiers) (identifier) (modifiers) (type_identifier) (identifier))"
+        ));
+        // The valid import ahead of the malformed fragment still parses as a clean,
+        // non-error import_declaration.
+        assert!(sexp.starts_with("(program (import_declaration (scoped_identifier"));
+    }
+
+    // --- Epic 4.1 / Story 4.1.2: Kotlin to_sexp() verification (highest-risk) ---
+
+    fn parse_kotlin(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .expect("loading tree-sitter-kotlin-ng grammar");
+        parser.parse(src, None).expect("parsing Kotlin fixture")
+    }
+
+    /// Task 4.1.2a — the exact fixture from plan.md's Story 4.1.2 acceptance criteria:
+    /// a plain import, a wildcard import, and an aliased import, all real `to_sexp()`
+    /// output pinned per the doc comment above `dir_key`.
+    #[test]
+    fn kotlin_import_to_sexp_fixture() {
+        let src = "package com.example.domain\n\nimport com.example.infra.DbClient\nimport com.example.infra.*\nimport com.example.infra.Legacy as LegacyClient\n\nclass Order(val id: String)\n";
+        let tree = parse_kotlin(src);
+        let sexp = tree.root_node().to_sexp();
+
+        assert!(!tree.root_node().has_error());
+        // Plain import: one positional `qualified_identifier` child, 4 segments.
+        assert!(sexp.contains(
+            "(import (qualified_identifier (identifier) (identifier) (identifier) (identifier)))"
+        ));
+        // Wildcard import: 3-segment `qualified_identifier` — the trailing `.*` is
+        // anonymous tokens, invisible here (see Task 4.1.2b test below for the real
+        // disambiguation).
+        assert!(
+            sexp.contains("(import (qualified_identifier (identifier) (identifier) (identifier)))")
+        );
+        // Aliased import: `qualified_identifier` + a second positional `identifier`
+        // for the alias name.
+        assert!(sexp.contains(
+            "(import (qualified_identifier (identifier) (identifier) (identifier) (identifier)) (identifier))"
+        ));
+    }
+
+    /// Task 4.1.2b — the real, verified aliased-import shape: `import a.b.C as D`
+    /// produces `(import (qualified_identifier ...) (identifier))`, where the
+    /// `qualified_identifier` includes the pre-alias name (`C`) and the second
+    /// positional `identifier` is the alias (`D`), with the `as` keyword an anonymous
+    /// token between them (not a named field).
+    #[test]
+    fn kotlin_aliased_import_has_two_positional_children() {
+        let tree = parse_kotlin("import com.example.infra.Legacy as LegacyClient\n");
+        let import_node = tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(import_node.kind(), "import");
+        assert_eq!(import_node.named_child_count(), 2);
+        assert_eq!(
+            import_node.named_child(0).unwrap().kind(),
+            "qualified_identifier"
+        );
+        assert_eq!(import_node.named_child(1).unwrap().kind(), "identifier");
+        assert_eq!(
+            import_node
+                .named_child(1)
+                .unwrap()
+                .utf8_text("import com.example.infra.Legacy as LegacyClient\n".as_bytes())
+                .unwrap(),
+            "LegacyClient"
+        );
+    }
+
+    /// Task 4.1.2b (continued) — the real trap flagged in the doc comment above
+    /// `dir_key`: a Kotlin wildcard import (`import a.b.*`) and a plain import one
+    /// segment shorter (`import a.b`) produce **byte-identical** `to_sexp()` output —
+    /// the wildcard `.*` is two anonymous tokens with no named-node representation.
+    /// The only reliable disambiguation is a raw (unnamed-included) child inspection:
+    /// the wildcard import's *last raw child* has kind `"*"`; the plain import has no
+    /// such trailing child.
+    #[test]
+    fn kotlin_wildcard_import_is_indistinguishable_from_shorter_plain_import_via_to_sexp() {
+        let wildcard_tree = parse_kotlin("import com.example.infra.*\n");
+        let plain_tree = parse_kotlin("import com.example.infra\n");
+
+        let wildcard_import = wildcard_tree.root_node().named_child(0).unwrap();
+        let plain_import = plain_tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(wildcard_import.to_sexp(), plain_import.to_sexp());
+        assert_eq!(wildcard_import.named_child_count(), 1);
+        assert_eq!(plain_import.named_child_count(), 1);
+
+        // Raw (unnamed-included) child counts differ: wildcard has `import`,
+        // `qualified_identifier`, `.`, `*` (4); plain has just `import`,
+        // `qualified_identifier` (2).
+        assert_eq!(wildcard_import.child_count(), 4);
+        assert_eq!(plain_import.child_count(), 2);
+        assert_eq!(
+            wildcard_import
+                .child(wildcard_import.child_count() as u32 - 1)
+                .unwrap()
+                .kind(),
+            "*"
+        );
+        assert_ne!(
+            plain_import
+                .child(plain_import.child_count() as u32 - 1)
+                .unwrap()
+                .kind(),
+            "*"
+        );
+    }
+
+    /// Task 4.1.2d — malformed/truncated Kotlin source (unclosed parameter list)
+    /// recovers with an explicit `MISSING ")"` node **inserted in place** inside the
+    /// otherwise-intact declaration tree — a different recovery strategy from Java's
+    /// flat `ERROR`-node wrapper (`java_malformed_source_recovery_shape` above); the
+    /// leading valid `import` still parses cleanly.
+    #[test]
+    fn kotlin_malformed_source_recovery_shape() {
+        let src = "import com.example.infra.DbClient\n\nclass Order(val id: String\n";
+        let tree = parse_kotlin(src);
+
+        assert!(tree.root_node().has_error());
+        let sexp = tree.root_node().to_sexp();
+        assert!(sexp.contains("(MISSING \")\")"));
+        assert!(sexp.starts_with("(source_file (import (qualified_identifier"));
     }
 }

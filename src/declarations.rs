@@ -342,6 +342,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Epic 4.1 / Task 4.1.2c: Kotlin class/interface/object to_sexp() verification ---
+    //
+    // Real `to_sexp()` output (`tree-sitter-kotlin-ng` 1.1.0, matching `Cargo.lock`),
+    // pinned ahead of the real Kotlin extraction landing in Story 4.3 — confirms the
+    // plan's Domain Glossary assumption *half* right:
+    // - `class Order(val id: String)` and `interface Repository { fun save() }` both
+    //   parse to the **same** node kind, `class_declaration`, with field `name` —
+    //   distinguished only by the raw (unnamed) keyword child at position 0 (`"class"`
+    //   vs. `"interface"`), same no-named-fields-for-everything-else situation
+    //   `syntax-rules.md` already documents for Kotlin's function nodes.
+    // - `object Singleton { val x = 1 }` does **not** share `class_declaration` — it
+    //   is a wholly separate node kind, `object_declaration`, also with field `name`.
+    //   This refutes a shared-node-kind-for-all-three assumption; `object` needs its
+    //   own match arm, not a keyword-child check alongside class/interface.
+    // - `abstract class Base` wraps the keyword in a preceding `modifiers
+    //   (inheritance_modifier)` node before the `"class"` keyword child — confirms
+    //   modifiers can precede the distinguishing keyword and must be skipped over
+    //   (search by kind, not by fixed positional index).
+
+    fn parse_kotlin(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .expect("loading tree-sitter-kotlin-ng grammar");
+        parser.parse(src, None).expect("parsing Kotlin fixture")
+    }
+
+    #[test]
+    fn kotlin_class_and_interface_share_class_declaration_node_kind() {
+        let class_tree = parse_kotlin("class Order(val id: String)\n");
+        let iface_tree = parse_kotlin("interface Repository {\n    fun save()\n}\n");
+
+        let class_node = class_tree.root_node().named_child(0).unwrap();
+        let iface_node = iface_tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(class_node.kind(), "class_declaration");
+        assert_eq!(iface_node.kind(), "class_declaration");
+
+        // Distinguishing keyword is the raw (unnamed) first child.
+        assert_eq!(class_node.child(0).unwrap().kind(), "class");
+        assert_eq!(iface_node.child(0).unwrap().kind(), "interface");
+    }
+
+    #[test]
+    fn kotlin_object_is_a_distinct_node_kind_from_class_declaration() {
+        let object_tree = parse_kotlin("object Singleton {\n    val x = 1\n}\n");
+        let object_node = object_tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(object_node.kind(), "object_declaration");
+        assert_ne!(object_node.kind(), "class_declaration");
+    }
+
+    #[test]
+    fn kotlin_abstract_class_wraps_keyword_in_a_preceding_modifiers_node() {
+        let tree = parse_kotlin("abstract class Base\n");
+        let class_node = tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(class_node.kind(), "class_declaration");
+        // The distinguishing "class"/"interface" keyword is no longer at raw index 0
+        // once modifiers precede it — a real extractor must search children by kind,
+        // not assume a fixed positional index.
+        assert_eq!(class_node.child(0).unwrap().kind(), "modifiers");
+        let has_class_keyword = (0..class_node.child_count())
+            .any(|i| class_node.child(i as u32).unwrap().kind() == "class");
+        assert!(has_class_keyword);
+    }
+
     // --- Story 2.1.2: JS/TS declaration extraction ---
 
     #[test]
