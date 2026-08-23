@@ -276,7 +276,7 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
             (Some(file), None) => format!("{}: ", file.display()),
             (None, _) => String::new(),
         };
-        println!("{location}[{name}] {}", finding.message);
+        println!("{location}{}", finding.message);
     }
     Ok(ExitCode::from(1))
 }
