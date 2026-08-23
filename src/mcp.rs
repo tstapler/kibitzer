@@ -138,6 +138,21 @@ fn recommendation_for(check_name: &str) -> Option<&'static str> {
              layer, or relocate the responsibility that requires it into a layer that's \
              already allowed to depend downward.",
         ),
+        "component-deps" => Some(
+            "component-deps: either relocate the offending code into a component already \
+             allowed to hold that dependency, or add it to the target component's \
+             may_depend_on list if the dependency is actually intended.",
+        ),
+        "content-rules" => Some(
+            "content-rules: move the offending declaration into a component whose \
+             allowed_kinds already permits its kind, or add that kind to the target \
+             component's allowed_kinds if it's actually intended to live there.",
+        ),
+        "naming-rules" => Some(
+            "naming-rules: rename the offending declaration to match its component's \
+             required pattern, or adjust the naming_rules pattern if the existing name is \
+             actually intended.",
+        ),
         _ => None,
     }
 }
@@ -335,7 +350,8 @@ impl KibitzerServer {
         if req.0.include_diagram {
             match crate::import_graph::build(&repo_root, &files) {
                 Ok(graph) => {
-                    let diagram = crate::mermaid::render_dependency_graph(&graph);
+                    let components = config.architecture.effective_components();
+                    let diagram = crate::mermaid::render_dependency_graph(&graph, &components);
                     if diagram.starts_with("graph TD") {
                         output.push_str("```mermaid\n");
                         output.push_str(&diagram);
@@ -412,6 +428,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    #[test]
+    fn recommendation_for_covers_all_five_native_architecture_checkers() {
+        assert!(recommendation_for("import-cycles").is_some());
+        assert!(recommendation_for("layering").is_some());
+        assert!(recommendation_for("component-deps").is_some());
+        assert!(recommendation_for("content-rules").is_some());
+        assert!(recommendation_for("naming-rules").is_some());
+        // `coupling` deliberately has no canned recommendation — see this file's own
+        // comment at `recommendation_for`'s definition and plan.md Story 6.2.1.
+        assert!(recommendation_for("coupling").is_none());
+    }
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

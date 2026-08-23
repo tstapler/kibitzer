@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::architecture_checks::find_cycles;
+use crate::config::{Component, component_of};
 use crate::import_graph::ImportGraph;
 
 /// Past this many nodes a Mermaid diagram stops being readable, so `render_dependency_graph`
@@ -25,9 +26,13 @@ fn slugify(node: &str) -> String {
     slug
 }
 
-/// Renders `graph` as a Mermaid dependency diagram. Returns a text-only fallback note
-/// instead of a diagram once the node count exceeds [`MAX_NODES`].
-pub fn render_dependency_graph(graph: &ImportGraph) -> String {
+/// Renders `graph` as a Mermaid dependency diagram, grouping nodes that resolve to a
+/// `components` entry (via [`crate::config::component_of`]) into `subgraph {name} ...
+/// end` blocks, in `components`' declaration order; a node matching no component
+/// renders outside any subgraph, exactly as before per-component grouping existed.
+/// Returns a text-only fallback note instead of a diagram once the node count exceeds
+/// [`MAX_NODES`].
+pub fn render_dependency_graph(graph: &ImportGraph, components: &[Component]) -> String {
     if graph.nodes.is_empty() {
         return "no import graph edges to diagram".to_string();
     }
@@ -54,9 +59,33 @@ pub fn render_dependency_graph(graph: &ImportGraph) -> String {
         edges.insert((edge.from.as_str(), edge.to.as_str()));
     }
 
+    let node_component: BTreeMap<&str, Option<&str>> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.as_str(), component_of(n, components)))
+        .collect();
+
     let mut out = String::from("graph TD\n");
+    for component in components {
+        let matched: Vec<&str> = graph
+            .nodes
+            .iter()
+            .map(String::as_str)
+            .filter(|n| node_component[n] == Some(component.name.as_str()))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("subgraph {}\n", component.name));
+        for node in matched {
+            out.push_str(&format!("    {}[\"{node}\"]\n", ids[node]));
+        }
+        out.push_str("end\n");
+    }
     for node in &graph.nodes {
-        out.push_str(&format!("    {}[\"{node}\"]\n", ids[node.as_str()]));
+        if node_component[node.as_str()].is_none() {
+            out.push_str(&format!("    {}[\"{node}\"]\n", ids[node.as_str()]));
+        }
     }
 
     let mut cycle_link_indices = Vec::new();
@@ -106,7 +135,7 @@ mod tests {
         graph.nodes.insert("b".to_string());
         graph.edges.push(edge("a", "b"));
 
-        let out = render_dependency_graph(&graph);
+        let out = render_dependency_graph(&graph, &[]);
         assert!(out.starts_with("graph TD\n"));
         assert!(out.contains("[\"a\"]"));
         assert!(out.contains("[\"b\"]"));
@@ -122,7 +151,7 @@ mod tests {
         graph.edges.push(edge("a", "b"));
         graph.edges.push(edge("b", "a"));
 
-        let out = render_dependency_graph(&graph);
+        let out = render_dependency_graph(&graph, &[]);
         assert!(out.contains("classDef cycle"));
         assert!(out.contains("linkStyle"));
     }
@@ -135,7 +164,7 @@ mod tests {
             .edges
             .push(edge("github.com/foo/bar-baz", "github.com/foo/bar-baz"));
 
-        let out = render_dependency_graph(&graph);
+        let out = render_dependency_graph(&graph, &[]);
         assert!(out.contains("[\"github.com/foo/bar-baz\"]"));
         assert!(!out.contains("github.com/foo/bar-baz["));
     }
@@ -144,9 +173,61 @@ mod tests {
     fn empty_graph_returns_note_not_empty_diagram() {
         let graph = ImportGraph::default();
         assert_eq!(
-            render_dependency_graph(&graph),
+            render_dependency_graph(&graph, &[]),
             "no import graph edges to diagram"
         );
+    }
+
+    #[test]
+    fn mermaid_diagram_groups_nodes_by_component() {
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("dogfood.example/app/domain".to_string());
+        graph.nodes.insert("dogfood.example/app/infra".to_string());
+        graph.nodes.insert("dogfood.example/app/other".to_string());
+        graph.edges.push(edge(
+            "dogfood.example/app/infra",
+            "dogfood.example/app/domain",
+        ));
+        let components = vec![
+            Component {
+                name: "domain".to_string(),
+                paths: vec!["**/domain".to_string()],
+            },
+            Component {
+                name: "infra".to_string(),
+                paths: vec!["**/infra".to_string()],
+            },
+        ];
+
+        let out = render_dependency_graph(&graph, &components);
+        assert!(out.contains("subgraph domain"));
+        assert!(out.contains("subgraph infra"));
+
+        let domain_id = slugify("dogfood.example/app/domain");
+        let infra_id = slugify("dogfood.example/app/infra");
+        let other_id = slugify("dogfood.example/app/other");
+
+        // Each subgraph block contains its own matched node's slugified id.
+        let domain_block = out
+            .split("subgraph domain\n")
+            .nth(1)
+            .and_then(|s| s.split("end\n").next())
+            .unwrap();
+        assert!(domain_block.contains(&domain_id));
+        let infra_block = out
+            .split("subgraph infra\n")
+            .nth(1)
+            .and_then(|s| s.split("end\n").next())
+            .unwrap();
+        assert!(infra_block.contains(&infra_id));
+
+        // The unmatched node renders outside any subgraph block, exactly as today.
+        assert!(out.contains(&other_id));
+        assert!(!domain_block.contains(&other_id));
+        assert!(!infra_block.contains(&other_id));
+
+        // Existing edge/cycle-highlighting lines are unchanged.
+        assert!(out.contains(&format!("{infra_id} --> {domain_id}")));
     }
 
     #[test]
@@ -155,7 +236,7 @@ mod tests {
         for i in 0..(MAX_NODES + 1) {
             graph.nodes.insert(format!("pkg{i}"));
         }
-        let out = render_dependency_graph(&graph);
+        let out = render_dependency_graph(&graph, &[]);
         assert!(out.contains("over the"));
         assert!(!out.starts_with("graph TD"));
     }
