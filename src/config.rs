@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILENAME: &str = "inspect.json";
@@ -147,9 +148,9 @@ pub struct ContentRule {
     pub allowed_kinds: Vec<String>,
 }
 
-/// Per-component, per-`DeclKind` regex pattern a declaration's name must match.
-// Consumed by `NamingChecker` starting Phase 3 — not yet read outside tests.
-#[allow(dead_code)]
+/// Per-component, per-`DeclKind` regex pattern a declaration's name must match. Consumed
+/// by `declaration_checks::NamingChecker` (Story 3.1.1); `pattern` is validated as a
+/// compilable regex at config-load time by `validate_naming_rule_patterns` below.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamingRule {
     pub component: String,
@@ -345,6 +346,26 @@ fn validate_component_references(config: &Config, config_path: &Path) -> Result<
     Ok(())
 }
 
+/// Task 3.1.1c: an invalid `NamingRule.pattern` regex is a config-load-time error, not a
+/// runtime panic — matches `config.rs`'s existing fail-fast conventions (same as
+/// `validate_component_references` above). `declaration_checks::NamingChecker` relies on
+/// every pattern it sees at `check()` time already being compilable.
+fn validate_naming_rule_patterns(config: &Config, config_path: &Path) -> Result<()> {
+    for rule in &config.architecture.naming_rules {
+        if let Err(err) = Regex::new(&rule.pattern) {
+            anyhow::bail!(
+                "{}: invalid naming rule pattern '{}' for component '{}' kind '{}': {}",
+                config_path.display(),
+                rule.pattern,
+                rule.component,
+                rule.kind,
+                err
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -369,6 +390,7 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
         }
     }
     validate_component_references(config, config_path)?;
+    validate_naming_rule_patterns(config, config_path)?;
     for check in &config.checks {
         let set_count = [
             check.command.is_some(),
@@ -751,6 +773,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("undefined component 'doamin'"));
         assert!(msg.contains("(did you mean 'domain'?)"));
+    }
+
+    // --- Story 3.1.1: naming rule regex validity ---
+
+    #[test]
+    fn rejects_invalid_naming_rule_regex() {
+        let err = parse(
+            r#"{"architecture": {"components": [{"name":"infra","paths":["**/infra"]}], "naming_rules": [{"component": "infra", "kind": "struct", "pattern": "(unclosed"}]}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid naming rule pattern"));
     }
 
     // --- Epic 1.2: dual-registry dispatch (`AnyArchitectureChecker`) ---
