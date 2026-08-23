@@ -108,8 +108,8 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
 /// (which need the structured line/message, not that string form) both call this
 /// instead of duplicating the parse-then-check sequence.
 pub fn run_checker(checker_name: &str, file: &Path, source: &str) -> Result<Vec<Finding>> {
-    let checker =
-        lookup(checker_name).ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
+    let checker = lookup(checker_name)
+        .ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
     let cache = GrammarCache::new();
     run_checker_with_cache(checker.as_ref(), file, source, &cache)
 }

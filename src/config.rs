@@ -360,10 +360,9 @@ mod tests {
 
     #[test]
     fn whole_repo_command_check_is_not_per_file() {
-        let config = parse(
-            r#"{"checks": [{"name": "n", "command": "true", "severity": "advisory"}]}"#,
-        )
-        .unwrap();
+        let config =
+            parse(r#"{"checks": [{"name": "n", "command": "true", "severity": "advisory"}]}"#)
+                .unwrap();
         assert_eq!(config.checks[0].kind(), CheckKind::WholeRepoCommand);
         assert!(!config.checks[0].is_per_file());
     }

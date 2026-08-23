@@ -206,7 +206,11 @@ fn main() -> Result<ExitCode> {
                         finding.file_path.display(),
                         finding.line,
                         finding.checker,
-                        if finding.pre_existing { " (pre-existing)" } else { "" },
+                        if finding.pre_existing {
+                            " (pre-existing)"
+                        } else {
+                            ""
+                        },
                         finding.message
                     );
                 }

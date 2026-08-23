@@ -98,13 +98,13 @@ pub fn run_hook() -> Result<ExitCode> {
         .context("reading hook input from stdin")?;
     let input: HookInput = serde_json::from_str(&raw).context("parsing hook input JSON")?;
 
-    if let Some(tool_use_id) = &input.tool_use_id {
-        if !crate::dedup::claim(tool_use_id) {
-            // Another hook registration (e.g. a global + project-level entry both
-            // matching this tool) already claimed this exact tool call. Exit quietly
-            // rather than running checks and reporting the same findings twice.
-            return Ok(ExitCode::SUCCESS);
-        }
+    if let Some(tool_use_id) = &input.tool_use_id
+        && !crate::dedup::claim(tool_use_id)
+    {
+        // Another hook registration (e.g. a global + project-level entry both
+        // matching this tool) already claimed this exact tool call. Exit quietly
+        // rather than running checks and reporting the same findings twice.
+        return Ok(ExitCode::SUCCESS);
     }
 
     let Some(file_path) = input.tool_input.file_path.clone() else {
@@ -232,7 +232,11 @@ func TestX(t *testing.T) {\n\
         let ranges = compute_changed_lines(&tool_input, &path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(ranges, vec![(5, 5), (8, 8)]);
-        assert!(!ranges.iter().any(|&(start, end)| (start..=end).contains(&2)));
+        assert!(
+            !ranges
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&2))
+        );
     }
 
     #[test]

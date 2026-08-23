@@ -208,11 +208,13 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
                     self.strongconnect(&successor);
                     let successor_low = self.lowlink[&successor];
                     let node_low = self.lowlink[node];
-                    self.lowlink.insert(node.to_string(), node_low.min(successor_low));
+                    self.lowlink
+                        .insert(node.to_string(), node_low.min(successor_low));
                 } else if *self.on_stack.get(&successor).unwrap_or(&false) {
                     let successor_index = self.indices[&successor];
                     let node_low = self.lowlink[node];
-                    self.lowlink.insert(node.to_string(), node_low.min(successor_index));
+                    self.lowlink
+                        .insert(node.to_string(), node_low.min(successor_index));
                 }
             }
 
@@ -251,9 +253,7 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     tarjan
         .sccs
         .into_iter()
-        .filter(|scc| {
-            scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0])
-        })
+        .filter(|scc| scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0]))
         .collect()
 }
 
@@ -401,7 +401,11 @@ mod tests {
 
         let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default());
 
-        assert!(findings.iter().any(|f| f.message.contains("hub") && f.message.contains("imports")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("hub") && f.message.contains("imports"))
+        );
     }
 
     #[test]
@@ -416,7 +420,11 @@ mod tests {
 
         let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default());
 
-        assert!(findings.iter().any(|f| f.message.contains("core") && f.message.contains("imported by")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("core") && f.message.contains("imported by"))
+        );
     }
 
     #[test]

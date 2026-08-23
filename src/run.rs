@@ -4,8 +4,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 use crate::check::{
-    CheckResult, run_architecture_check, run_check, run_checks_for_trigger,
-    walk_and_collect_files,
+    CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_config};
 

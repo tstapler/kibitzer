@@ -121,8 +121,8 @@ fn build_go(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -> Re
         .context("loading tree-sitter-go grammar")?;
 
     for (file, pkg) in &file_packages {
-        let source = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         let tree = parser
             .parse(&source, None)
             .with_context(|| format!("parsing {} with tree-sitter-go", file.display()))?;
@@ -205,9 +205,11 @@ fn resolve_relative_import(
     for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
         candidates.push(base.join(format!("index.{ext}")));
     }
-    candidates
-        .into_iter()
-        .find_map(|c| c.canonicalize().ok().and_then(|canon| known.get(&canon).cloned()))
+    candidates.into_iter().find_map(|c| {
+        c.canonicalize()
+            .ok()
+            .and_then(|canon| known.get(&canon).cloned())
+    })
 }
 
 fn build_js(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
@@ -221,8 +223,8 @@ fn build_js(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
     }
 
     for file in files {
-        let source = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
 
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -260,11 +262,7 @@ fn build_js(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
 
 fn dir_key(dir: &Path) -> String {
     let s = dir.to_string_lossy().replace('\\', "/");
-    if s.is_empty() {
-        ".".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { ".".to_string() } else { s }
 }
 
 #[cfg(test)]
@@ -310,14 +308,18 @@ mod tests {
 
         assert!(graph.nodes.contains("example.com/app/a"));
         assert!(graph.nodes.contains("example.com/app/b"));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "example.com/app/a" && e.to == "example.com/app/b"));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "example.com/app/b" && e.to == "example.com/app/a"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "example.com/app/a" && e.to == "example.com/app/b")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "example.com/app/b" && e.to == "example.com/app/a")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -326,7 +328,11 @@ mod tests {
     fn go_import_of_stdlib_package_is_ignored() {
         let dir = tmp_dir("go-stdlib");
         write(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
-        let a = write(&dir, "a/a.go", "package a\n\nimport \"fmt\"\n\nfunc F() { fmt.Println() }\n");
+        let a = write(
+            &dir,
+            "a/a.go",
+            "package a\n\nimport \"fmt\"\n\nfunc F() { fmt.Println() }\n",
+        );
 
         let graph = build(&dir, &[a]).unwrap();
 
@@ -338,8 +344,16 @@ mod tests {
     #[test]
     fn ts_import_graph_finds_a_two_module_cycle() {
         let dir = tmp_dir("ts-cycle");
-        let a = write(&dir, "a/index.ts", "import { g } from '../b/index';\nexport function f() {}\n");
-        let b = write(&dir, "b/index.ts", "import { f } from '../a/index';\nexport function g() {}\n");
+        let a = write(
+            &dir,
+            "a/index.ts",
+            "import { g } from '../b/index';\nexport function f() {}\n",
+        );
+        let b = write(
+            &dir,
+            "b/index.ts",
+            "import { f } from '../a/index';\nexport function g() {}\n",
+        );
 
         let graph = build(&dir, &[a, b]).unwrap();
 

@@ -50,9 +50,10 @@ fn sweep(dir: &std::path::Path) {
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(age) = meta.modified().and_then(|m| now.duration_since(m).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })) else {
+        let Ok(age) = meta
+            .modified()
+            .and_then(|m| now.duration_since(m).map_err(std::io::Error::other))
+        else {
             continue;
         };
         if age > MAX_AGE {

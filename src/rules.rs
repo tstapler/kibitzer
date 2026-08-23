@@ -239,7 +239,12 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             // distinct "async" node kind wraps it).
             function_kinds: &["function_definition"],
             if_kind: "if_statement",
-            nesting_kinds: &["for_statement", "while_statement", "match_statement", "lambda"],
+            nesting_kinds: &[
+                "for_statement",
+                "while_statement",
+                "match_statement",
+                "lambda",
+            ],
             else_wrapper_kinds: &[],
             // Python's `elif` is a distinct `elif_clause` node (not an `if_statement`
             // wrapped in an `else_clause` like JS/TS) but carries the same
@@ -404,11 +409,12 @@ fn max_nesting_depth(node: Node, current_depth: usize, cfg: &LangRuleConfig) -> 
     let mut max_depth = current_depth;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        let child_depth = if child.kind() == cfg.if_kind || cfg.nesting_kinds.contains(&child.kind()) {
-            current_depth + 1
-        } else {
-            current_depth
-        };
+        let child_depth =
+            if child.kind() == cfg.if_kind || cfg.nesting_kinds.contains(&child.kind()) {
+                current_depth + 1
+            } else {
+                current_depth
+            };
         max_depth = max_depth.max(max_nesting_depth(child, child_depth, cfg));
     }
     max_depth
@@ -420,7 +426,10 @@ fn max_nesting_depth(node: Node, current_depth: usize, cfg: &LangRuleConfig) -> 
 /// `condition` — for Kotlin's `if_expression`, which names only `condition`.
 fn if_branches(if_node: Node<'_>) -> (Option<Node<'_>>, Option<Node<'_>>) {
     if let Some(consequence) = if_node.child_by_field_name("consequence") {
-        return (Some(consequence), if_node.child_by_field_name("alternative"));
+        return (
+            Some(consequence),
+            if_node.child_by_field_name("alternative"),
+        );
     }
 
     let condition_id = if_node.child_by_field_name("condition").map(|n| n.id());
@@ -836,9 +845,10 @@ mod tests {
 
     #[test]
     fn ts_destructured_and_rest_params_each_count_as_one() {
-        let findings =
-            check_ts_source("function f(a: string, {b, c}: {b: string, c: string}, ...rest: number[]) {}\n")
-                .unwrap();
+        let findings = check_ts_source(
+            "function f(a: string, {b, c}: {b: string, c: string}, ...rest: number[]) {}\n",
+        )
+        .unwrap();
         assert!(
             !findings
                 .iter()
@@ -1012,8 +1022,7 @@ mod tests {
 
     #[test]
     fn py_flags_long_parameter_list() {
-        let findings =
-            check_py_source("def f(a, b, c, d, e, f, g):\n    return a\n").unwrap();
+        let findings = check_py_source("def f(a, b, c, d, e, f, g):\n    return a\n").unwrap();
         assert!(
             findings
                 .iter()
@@ -1025,8 +1034,7 @@ mod tests {
     fn py_positional_and_keyword_separators_do_not_count_as_parameters() {
         // `/` and `*` are marker nodes, not parameters — five real parameters here,
         // which must stay at the >5 threshold despite the two separators present.
-        let findings =
-            check_py_source("def f(a, b, /, c, *, d, e):\n    return a\n").unwrap();
+        let findings = check_py_source("def f(a, b, /, c, *, d, e):\n    return a\n").unwrap();
         assert!(
             !findings
                 .iter()
@@ -1158,8 +1166,7 @@ mod tests {
 
     #[test]
     fn java_allows_short_parameter_list() {
-        let findings =
-            check_java_source("class C {\n    void f(int a, int b) {}\n}\n").unwrap();
+        let findings = check_java_source("class C {\n    void f(int a, int b) {}\n}\n").unwrap();
         assert!(
             !findings
                 .iter()
@@ -1247,10 +1254,9 @@ mod tests {
 
     #[test]
     fn kotlin_flags_long_parameter_list() {
-        let findings = check_kotlin_source(
-            "fun f(a: Int, b: Int, c: Int, d: Int, e: Int, g: Int) {}\n",
-        )
-        .unwrap();
+        let findings =
+            check_kotlin_source("fun f(a: Int, b: Int, c: Int, d: Int, e: Int, g: Int) {}\n")
+                .unwrap();
         assert!(
             findings
                 .iter()
@@ -1272,8 +1278,7 @@ mod tests {
     fn kotlin_vararg_modifier_does_not_inflate_parameter_count() {
         // `vararg` produces a sibling `parameter_modifiers` node, not one nested inside
         // `parameter` — `kotlin_param_count` must filter to `kind() == "parameter"` only.
-        let findings =
-            check_kotlin_source("fun f(a: Int, vararg b: Int) {}\n").unwrap();
+        let findings = check_kotlin_source("fun f(a: Int, vararg b: Int) {}\n").unwrap();
         assert!(
             !findings
                 .iter()
