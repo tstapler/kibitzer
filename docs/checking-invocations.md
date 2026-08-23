@@ -1,8 +1,9 @@
 # Checking whether kibitzer actually ran
 
 kibitzer's `hook` subcommand is wired into Claude Code as a `PostToolUse`
-hook (registered per-project in that project's `.claude/settings.json`, not
-globally). To find out what it has actually done on this machine, read
+hook, via `kibitzer install` — per-project (`.claude/settings.json`) by
+default, or `kibitzer install --global` for `~/.claude/settings.json`. To
+find out what it has actually done on this machine, read
 Claude Code's own session transcripts
 (`~/.claude/projects/<project-slug>/*.jsonl`) — every hook run is recorded
 there as a typed `attachment`, and that's the only trustworthy source.

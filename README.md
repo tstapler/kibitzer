@@ -19,10 +19,20 @@ brew install tstapler/tap/kibitzer
 cargo install --path .
 ```
 
+Then wire up the `PostToolUse` hook — `kibitzer install` merges it into an existing
+`settings.json` rather than overwriting it, and is idempotent (safe to re-run):
+
+```bash
+kibitzer install             # this project only: <cwd>/.claude/settings.json
+kibitzer install --global    # every project: ~/.claude/settings.json
+kibitzer install --dry-run   # preview the resulting file without writing it
+```
+
 ## Usage
 
 ```bash
 kibitzer run [dir] --trigger batch   # batch mode: check every file under dir
+kibitzer install [--global] [--dry-run]  # wire the PostToolUse hook into settings.json
 kibitzer hook                        # Claude Code PostToolUse hook, reads event off stdin
 kibitzer mcp                         # serve as an MCP server over stdio
 kibitzer lsp                         # serve as an LSP server over stdio (diagnostics)

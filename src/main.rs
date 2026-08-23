@@ -13,6 +13,7 @@ mod go_error_context;
 mod go_ignored_error;
 mod hook;
 mod import_graph;
+mod install;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;
@@ -59,6 +60,17 @@ enum Command {
     Check {
         #[command(subcommand)]
         check: CheckCommand,
+    },
+    /// Install kibitzer's PostToolUse hook into a Claude Code settings.json, merging
+    /// with whatever hooks are already configured there.
+    Install {
+        /// Install into ~/.claude/settings.json (all projects) instead of
+        /// <cwd>/.claude/settings.json (this project only).
+        #[arg(long)]
+        global: bool,
+        /// Print what would be written instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -221,5 +233,6 @@ fn main() -> Result<ExitCode> {
                 }
             }
         },
+        Command::Install { global, dry_run } => install::run_install(global, dry_run),
     }
 }
