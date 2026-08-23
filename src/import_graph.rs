@@ -31,19 +31,34 @@ impl ImportGraph {
 }
 
 /// Build the import graph over `files` (already filtered to files kibitzer is scoped
-/// to). Only Go and TypeScript/JavaScript are extracted for now — Python/Kotlin/Java
-/// import extraction can follow the same per-language dispatch pattern later.
+/// to). Go, TypeScript/JavaScript, Java, and Kotlin are extracted; Python import
+/// extraction can follow the same per-language dispatch pattern later (it does not fit
+/// the Go/Java/Kotlin "qualified name" family — see `build_qualified_name_language`'s
+/// doc comment).
 pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
     let mut graph = ImportGraph::default();
 
     let go_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "go")).collect();
     if !go_files.is_empty() {
-        build_go(repo_root, &go_files, &mut graph)?;
+        build_qualified_name_language(repo_root, &go_files, &mut graph, &go_lang_config())?;
     }
 
     let js_files: Vec<&PathBuf> = files.iter().filter(|f| is_js_like(f)).collect();
     if !js_files.is_empty() {
         build_js(&js_files, &mut graph)?;
+    }
+
+    let java_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "java")).collect();
+    if !java_files.is_empty() {
+        build_qualified_name_language(repo_root, &java_files, &mut graph, &java_lang_config())?;
+    }
+
+    let kotlin_files: Vec<&PathBuf> = files
+        .iter()
+        .filter(|f| has_ext(f, "kt") || has_ext(f, "kts"))
+        .collect();
+    if !kotlin_files.is_empty() {
+        build_qualified_name_language(repo_root, &kotlin_files, &mut graph, &kotlin_lang_config())?;
     }
 
     Ok(graph)
@@ -58,6 +73,116 @@ pub(crate) fn is_js_like(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs")
     )
+}
+
+// ---------------------------------------------------------------------------------
+// Shared "qualified name" import family: Go, Java, Kotlin.
+//
+// All three resolve imports the same way — a file declares its own package identity,
+// import statements name other qualified paths, and an edge is added only when the
+// imported path resolves to a package identity some *other* file in this run declared
+// (the graph-membership guard: pre-mortem.md P1 #3(i)). What differs per language is
+// (a) how a file's own package identity is computed and (b) how import statements are
+// walked/extracted from that language's grammar — both captured in
+// `QualifiedImportLangConfig` below, mirroring `rules.rs::LangRuleConfig`'s
+// table-driven-generic-function precedent (`body_finder`/`params_finder`).
+// ---------------------------------------------------------------------------------
+
+/// Per-language table for `build_qualified_name_language`. See the module doc comment
+/// above for why Go/Java/Kotlin share one resolver while Python (`build_python`, when
+/// added) does not: Python's relative-dot-counting + `__init__.py`-heuristic resolution
+/// is a genuinely different algorithm, not a config variant of this one.
+struct QualifiedImportLangConfig {
+    /// Node kind of this grammar's package declaration, where it has one used by
+    /// `package_identity` (informational/documentation for readers — Go's
+    /// `package_identity` fn below ignores its parsed tree entirely; see its doc
+    /// comment for why).
+    #[allow(dead_code)]
+    package_decl_kind: &'static str,
+    /// Node kind of this grammar's import statement — informational for readers;
+    /// `collect_imports` embeds its own kind check since walk/extraction specifics
+    /// differ per grammar (see `rules.rs::LangRuleConfig`'s `if_kind` for the same
+    /// documentation-only-field precedent).
+    #[allow(dead_code)]
+    import_stmt_kind: &'static str,
+    /// Loads this grammar's tree-sitter `Language`.
+    language: fn() -> tree_sitter::Language,
+    /// This file's own package/module identity — the `graph.nodes` key and the `from`
+    /// side of any edge produced by its imports. `None` means the file is skipped
+    /// entirely (no node, no edges) — e.g. Go outside a resolvable module.
+    package_identity:
+        fn(repo_root: &Path, file: &Path, tree: &tree_sitter::Tree, src: &[u8]) -> Option<String>,
+    /// Every (normalized import target, 1-based line) pair in the tree. Implementations
+    /// must exclude imports that don't name a package at all (e.g. Java's `import
+    /// static`, which names a member) — such imports must never appear in the output,
+    /// not even as a wrong/malformed entry.
+    collect_imports: fn(root: Node, src: &[u8], out: &mut Vec<(String, usize)>),
+}
+
+/// Dot-to-slash package-identity normalization, shared by Java and Kotlin (whose
+/// dotted `package`/`import` paths need to match Go's already-`/`-separated identities
+/// and this codebase's `/`-segment `Component.paths` globs — see Story 4.2.2's
+/// `normalized_java_identity_matches_slash_globs` acceptance criterion).
+fn normalize_package_identity(dotted: &str) -> String {
+    dotted.replace('.', "/")
+}
+
+/// Refactor of the pre-Epic-4.2 `build_go`'s core loop (Story 4.2.1), now parameterized
+/// by `cfg` instead of hardcoded Go node kinds. Preserves `build_go`'s exact
+/// edge-construction invariant (pre-mortem.md P1 #3(i)): an edge from `pkg` to
+/// `import_path` is added only when `import_path != pkg` (no self-edges) **and**
+/// `import_path` is already present in `graph.nodes` — i.e. resolved to a package built
+/// from a walked repo-local file. An import of an external/third-party package can
+/// never become a graph edge, for any language driven by this function, because it was
+/// never inserted into `graph.nodes` in the first place.
+fn build_qualified_name_language(
+    repo_root: &Path,
+    files: &[&PathBuf],
+    graph: &mut ImportGraph,
+    cfg: &QualifiedImportLangConfig,
+) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&(cfg.language)())
+        .context("loading tree-sitter grammar")?;
+
+    // Pass 1: parse every file and register its own package identity in `graph.nodes`
+    // *before* pass 2 looks anything up there — an import can only resolve to a package
+    // identity contributed by some file in this same run, regardless of which file
+    // (earlier or later in `files`) declares it.
+    let mut file_packages: Vec<(&PathBuf, String, tree_sitter::Tree, String)> = Vec::new();
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let tree = parser
+            .parse(&source, None)
+            .with_context(|| format!("parsing {}", file.display()))?;
+
+        if let Some(pkg) = (cfg.package_identity)(repo_root, file, &tree, source.as_bytes()) {
+            graph.nodes.insert(pkg.clone());
+            file_packages.push((file, pkg, tree, source));
+        }
+    }
+
+    // Pass 2: extract each file's imports and add an edge only for those that resolve
+    // to a `graph.nodes` entry (the graph-membership guard).
+    for (file, pkg, tree, source) in &file_packages {
+        let mut imports = Vec::new();
+        (cfg.collect_imports)(tree.root_node(), source.as_bytes(), &mut imports);
+
+        for (import_path, line) in imports {
+            if &import_path != pkg && graph.nodes.contains(&import_path) {
+                graph.edges.push(ImportEdge {
+                    from: pkg.clone(),
+                    to: import_path,
+                    file: (*file).clone(),
+                    line,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------
@@ -84,6 +209,22 @@ fn go_package_import_path(module_path: &str, repo_root: &Path, file: &Path) -> O
     }
 }
 
+/// Go's package identity is **not** derived from parsing the file's `package_clause`
+/// node — that node names only the local package name (e.g. `a`), not the full import
+/// path other files reference it by (e.g. `example.com/app/a`). It comes from
+/// `go.mod`'s `module` directive plus the file's repo-relative directory, exactly as
+/// pre-refactor `build_go` computed it. `tree`/`_src` are accepted-but-unused only to
+/// satisfy `QualifiedImportLangConfig::package_identity`'s shared signature.
+fn go_package_identity(
+    repo_root: &Path,
+    file: &Path,
+    _tree: &tree_sitter::Tree,
+    _src: &[u8],
+) -> Option<String> {
+    let module_path = go_module_path(repo_root)?;
+    go_package_import_path(&module_path, repo_root, file)
+}
+
 fn collect_go_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
     if node.kind() == "import_spec"
         && let Some(path_node) = node.child_by_field_name("path")
@@ -100,49 +241,14 @@ fn collect_go_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
     }
 }
 
-fn build_go(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
-    let Some(module_path) = go_module_path(repo_root) else {
-        // Not inside a resolvable Go module (no go.mod, or no `module` directive) —
-        // there's nothing to map import paths back to local packages against.
-        return Ok(());
-    };
-
-    let mut file_packages: Vec<(&PathBuf, String)> = Vec::new();
-    for file in files {
-        if let Some(pkg) = go_package_import_path(&module_path, repo_root, file) {
-            graph.nodes.insert(pkg.clone());
-            file_packages.push((file, pkg));
-        }
+fn go_lang_config() -> QualifiedImportLangConfig {
+    QualifiedImportLangConfig {
+        package_decl_kind: "package_clause",
+        import_stmt_kind: "import_spec",
+        language: || tree_sitter_go::LANGUAGE.into(),
+        package_identity: go_package_identity,
+        collect_imports: collect_go_imports,
     }
-
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .context("loading tree-sitter-go grammar")?;
-
-    for (file, pkg) in &file_packages {
-        let source = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
-        let tree = parser
-            .parse(&source, None)
-            .with_context(|| format!("parsing {} with tree-sitter-go", file.display()))?;
-
-        let mut imports = Vec::new();
-        collect_go_imports(tree.root_node(), source.as_bytes(), &mut imports);
-
-        for (import_path, line) in imports {
-            if &import_path != pkg && graph.nodes.contains(&import_path) {
-                graph.edges.push(ImportEdge {
-                    from: pkg.clone(),
-                    to: import_path,
-                    file: (*file).clone(),
-                    line,
-                });
-            }
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------------
@@ -268,11 +374,176 @@ fn dir_key(dir: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------------
+// Java (Story 4.2.2) — built against Epic 4.1's verified findings below.
+// ---------------------------------------------------------------------------------
+
+/// Strip a dotted qualified name's trailing member/class segment, leaving the package
+/// portion — e.g. `"com.example.infra.DbClient"` -> `"com.example.infra"`. Used for
+/// plain (non-wildcard) imports, where the qualified name is `pkg.Symbol`; a wildcard
+/// import's qualified name is already just the package (no symbol segment to strip).
+fn strip_last_segment(dotted: &str) -> &str {
+    match dotted.rsplit_once('.') {
+        Some((pkg, _member)) => pkg,
+        None => dotted,
+    }
+}
+
+/// Java's package identity comes from the file's `package_declaration` node — verified
+/// via real `to_sexp()` output during development: `(program (package_declaration
+/// (scoped_identifier ...)) ...)` — `package_declaration`'s dotted name is its single
+/// positional (unfielded) child, same no-named-fields situation as `import_declaration`.
+fn java_package_identity(
+    _repo_root: &Path,
+    _file: &Path,
+    tree: &tree_sitter::Tree,
+    src: &[u8],
+) -> Option<String> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let package_decl = root
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "package_declaration")?;
+    let name_node = package_decl.named_child(0)?;
+    let text = name_node.utf8_text(src).ok()?;
+    Some(normalize_package_identity(text))
+}
+
+/// Walks every `import_declaration` (Java's single node kind for plain, wildcard, and
+/// `import static` forms alike — Story 4.1.1's verified finding) and extracts the
+/// package portion of each **non-static** import.
+///
+/// `import static` is excluded here, at the source: it names a member (a field or
+/// method), not a package, so treating it as a package-graph edge would be wrong
+/// (pre-mortem.md P1 #3). It is **not** distinguishable from a plain import via
+/// `to_sexp()` or named-child inspection — both produce
+/// `(import_declaration (scoped_identifier ...))` — so detection here uses a raw
+/// (unnamed-included) child scan for the anonymous `"static"` token, per the verified
+/// finding in the doc comment block below.
+fn collect_java_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
+    if node.kind() == "import_declaration" {
+        let mut is_static = false;
+        for i in 0..node.child_count() as u32 {
+            if node.child(i).map(|c| c.kind()) == Some("static") {
+                is_static = true;
+                break;
+            }
+        }
+
+        if !is_static
+            && let Some(name_node) = node.named_child(0)
+            && let Ok(text) = name_node.utf8_text(src)
+        {
+            // A second positional *named* child of kind `asterisk` marks a wildcard
+            // import (Story 4.1.1's verified finding) — its qualified name is already
+            // the package, with no trailing member segment to strip.
+            let is_wildcard = node
+                .named_child(1)
+                .map(|c| c.kind() == "asterisk")
+                .unwrap_or(false);
+            let package_dotted = if is_wildcard {
+                text
+            } else {
+                strip_last_segment(text)
+            };
+            out.push((
+                normalize_package_identity(package_dotted),
+                node.start_position().row + 1,
+            ));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_java_imports(child, src, out);
+    }
+}
+
+fn java_lang_config() -> QualifiedImportLangConfig {
+    QualifiedImportLangConfig {
+        package_decl_kind: "package_declaration",
+        import_stmt_kind: "import_declaration",
+        language: || tree_sitter_java::LANGUAGE.into(),
+        package_identity: java_package_identity,
+        collect_imports: collect_java_imports,
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Kotlin (Story 4.2.2) — built against Epic 4.1's verified findings below.
+// ---------------------------------------------------------------------------------
+
+/// Kotlin's package identity comes from the file's `package_header` node (verified via
+/// real `to_sexp()` output during development: `(source_file (package_header
+/// (qualified_identifier ...)) ...)` — `package_header`'s dotted name is its single
+/// positional (unfielded) child, same shape as Java's `package_declaration`).
+fn kotlin_package_identity(
+    _repo_root: &Path,
+    _file: &Path,
+    tree: &tree_sitter::Tree,
+    src: &[u8],
+) -> Option<String> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let package_header = root
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "package_header")?;
+    let name_node = package_header.named_child(0)?;
+    let text = name_node.utf8_text(src).ok()?;
+    Some(normalize_package_identity(text))
+}
+
+/// Walks every `import` node (Kotlin's single node kind for plain, wildcard, and
+/// aliased forms alike — Story 4.1.2's verified finding) and extracts each one's
+/// package portion.
+///
+/// A wildcard import (`import a.b.*`) is **byte-identical** in `to_sexp()`/named-child
+/// shape to a plain import one segment shorter (`import a.b`) — the trailing `.*` is
+/// two anonymous tokens (Story 4.1.2's verified real trap). Disambiguation here uses a
+/// raw (unnamed-included) child check: the wildcard import's *last raw child* has kind
+/// `"*"`. An aliased import (`import a.b.C as D`) carries a second positional
+/// `identifier` child for the alias — irrelevant to package resolution, since the first
+/// child's qualified name already includes the pre-alias symbol segment to strip, same
+/// as a plain import.
+fn collect_kotlin_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
+    if node.kind() == "import"
+        && let Some(name_node) = node.named_child(0)
+        && let Ok(text) = name_node.utf8_text(src)
+    {
+        let is_wildcard = node.child_count() > 0
+            && node
+                .child(node.child_count() as u32 - 1)
+                .map(|c| c.kind() == "*")
+                .unwrap_or(false);
+        let package_dotted = if is_wildcard {
+            text
+        } else {
+            strip_last_segment(text)
+        };
+        out.push((
+            normalize_package_identity(package_dotted),
+            node.start_position().row + 1,
+        ));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_kotlin_imports(child, src, out);
+    }
+}
+
+fn kotlin_lang_config() -> QualifiedImportLangConfig {
+    QualifiedImportLangConfig {
+        package_decl_kind: "package_header",
+        import_stmt_kind: "import",
+        language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
+        package_identity: kotlin_package_identity,
+        collect_imports: collect_kotlin_imports,
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Java / Kotlin import node-kind verification (Epic 4.1) — real `to_sexp()` output
 // pinned ahead of the extraction code (Story 4.2.2/4.2.3), per this codebase's
 // verification discipline (`docs/syntax-rules.md`, `rules.rs`'s `LangRuleConfig` doc
-// comment). No `build_java`/`build_kotlin` exist yet; the findings below are what
-// Epic 4.2's implementer builds against.
+// comment). Findings below are what Epic 4.2's implementation above was built against.
 //
 // **Java** (`tree-sitter-java` 0.23.5, matches `Cargo.lock`): every import form —
 // plain, wildcard, and `import static` — parses to the *same* node kind,
@@ -299,7 +570,10 @@ fn dir_key(dir: &Path) -> String {
 //   single flat `ERROR` node wrapping the malformed declaration's tokens
 //   (`(ERROR (modifiers) (identifier) (modifiers) (type_identifier) (identifier))`),
 //   **not** a `MISSING` node — any leading valid syntax (the import line here) still
-//   parses cleanly outside the `ERROR` node.
+//   parses cleanly outside the `ERROR` node. (A missing `;` on an *import* statement
+//   itself is a different, also-verified case — see
+//   `java_import_graph_malformed_source_never_extracts_a_wrong_edge` below: that one
+//   recovers with a `MISSING ";"` node inserted in place, not a flat `ERROR` wrapper.)
 //
 // **Kotlin** (`tree-sitter-kotlin-ng` 1.1.0, matches `Cargo.lock`): every import form
 // is the single node kind `import` (not `import_header`/`import_list` — that's the
@@ -631,5 +905,318 @@ mod tests {
         let sexp = tree.root_node().to_sexp();
         assert!(sexp.contains("(MISSING \")\")"));
         assert!(sexp.starts_with("(source_file (import (qualified_identifier"));
+    }
+
+    // --- Epic 4.2 / Story 4.2.1: graph-membership guard survives the refactor ---
+
+    /// Task 4.2.1e — regression test proving `build_qualified_name_language` preserves
+    /// pre-refactor `build_go`'s edge-construction invariant (pre-mortem.md P1 #3(i)):
+    /// an import of an external/third-party package (never inserted into `graph.nodes`)
+    /// never becomes a graph edge, even though it is a syntactically valid import
+    /// sitting right next to a local one.
+    #[test]
+    fn build_qualified_name_language_never_creates_edges_to_non_graph_nodes() {
+        let dir = tmp_dir("go-external-import");
+        write(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let a = write(&dir, "a/a.go", "package a\n\nfunc F() {}\n");
+        let b = write(
+            &dir,
+            "b/b.go",
+            "package b\n\nimport (\n\t\"example.com/app/a\"\n\t\"github.com/some-vendor/infra-client\"\n)\n\nfunc G() { a.F() }\n",
+        );
+
+        let graph = build(&dir, &[a, b]).unwrap();
+
+        assert!(graph.nodes.contains("example.com/app/a"));
+        assert!(graph.nodes.contains("example.com/app/b"));
+        assert!(!graph.nodes.contains("github.com/some-vendor/infra-client"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "example.com/app/b" && e.to == "example.com/app/a"));
+        assert!(!graph
+            .edges
+            .iter()
+            .any(|e| e.to == "github.com/some-vendor/infra-client"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Epic 4.2 / Story 4.2.2: Java + Kotlin import extraction ---
+
+    #[test]
+    fn java_import_graph_finds_a_two_package_cycle_with_normalized_identity() {
+        let dir = tmp_dir("java-cycle");
+        let order = write(
+            &dir,
+            "src/main/java/com/example/domain/Order.java",
+            "package com.example.domain;\n\nimport com.example.infra.DbClient;\n\npublic class Order {\n    public String id;\n}\n",
+        );
+        let db_client = write(
+            &dir,
+            "src/main/java/com/example/infra/DbClient.java",
+            "package com.example.infra;\n\nimport com.example.domain.Order;\n\npublic class DbClient {\n    public Order order;\n}\n",
+        );
+
+        let graph = build(&dir, &[order, db_client]).unwrap();
+
+        assert!(graph.nodes.contains("com/example/domain"));
+        assert!(graph.nodes.contains("com/example/infra"));
+        assert!(!graph.nodes.contains("com.example.domain"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "com/example/infra" && e.to == "com/example/domain"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kotlin_import_graph_handles_plain_wildcard_and_aliased_imports() {
+        let dir = tmp_dir("kotlin-forms");
+        let order = write(
+            &dir,
+            "domain/Order.kt",
+            "package com.example.domain\n\nimport com.example.infra.DbClient\n\nclass Order(val id: String)\n",
+        );
+        let db_client = write(
+            &dir,
+            "infra/DbClient.kt",
+            "package com.example.infra\n\nimport com.example.domain.*\nimport com.example.util.Helper as UtilHelper\n\nclass DbClient\n",
+        );
+        let helper = write(
+            &dir,
+            "util/Helper.kt",
+            "package com.example.util\n\nclass Helper\n",
+        );
+
+        let graph = build(&dir, &[order, db_client, helper]).unwrap();
+
+        assert!(graph.nodes.contains("com/example/domain"));
+        assert!(graph.nodes.contains("com/example/infra"));
+        assert!(graph.nodes.contains("com/example/util"));
+        // Plain import (Order.kt -> DbClient).
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra"));
+        // Wildcard import (DbClient.kt -> com.example.domain.*).
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "com/example/infra" && e.to == "com/example/domain"));
+        // Aliased import (DbClient.kt -> com.example.util.Helper as UtilHelper).
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "com/example/infra" && e.to == "com/example/util"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalized_java_identity_matches_slash_globs() {
+        use crate::config::{Component, component_of};
+
+        let dir = tmp_dir("java-glob");
+        let order = write(
+            &dir,
+            "src/main/java/com/example/domain/Order.java",
+            "package com.example.domain;\n\npublic class Order {}\n",
+        );
+        let db_client = write(
+            &dir,
+            "src/main/java/com/example/infra/DbClient.java",
+            "package com.example.infra;\n\npublic class DbClient {}\n",
+        );
+
+        let graph = build(&dir, &[order, db_client]).unwrap();
+
+        let components = vec![Component {
+            name: "domain".to_string(),
+            paths: vec!["**/domain".to_string()],
+        }];
+        assert_eq!(
+            component_of("com/example/domain", &components),
+            Some("domain")
+        );
+        assert!(graph.nodes.contains("com/example/domain"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-mortem.md P1 #3(i) for Java specifically: an external import whose final
+    /// segment happens to be spelled/cased like a `Component` name (`Component`) proves
+    /// nothing about it being a real, locally-declared package — it must never enter
+    /// `graph.nodes` or `graph.edges`.
+    #[test]
+    fn java_import_graph_excludes_external_third_party_imports_from_graph_nodes() {
+        let dir = tmp_dir("java-external");
+        let order = write(
+            &dir,
+            "src/main/java/com/example/domain/Order.java",
+            "package com.example.domain;\n\nimport com.example.infra.DbClient;\nimport org.springframework.stereotype.Component;\n\npublic class Order {}\n",
+        );
+        let db_client = write(
+            &dir,
+            "src/main/java/com/example/infra/DbClient.java",
+            "package com.example.infra;\n\npublic class DbClient {}\n",
+        );
+
+        let graph = build(&dir, &[order, db_client]).unwrap();
+
+        assert!(graph.nodes.contains("com/example/domain"));
+        assert!(graph.nodes.contains("com/example/infra"));
+        assert!(!graph.nodes.contains("org/springframework/stereotype"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra"));
+        assert!(!graph
+            .edges
+            .iter()
+            .any(|e| e.to == "org/springframework/stereotype"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-mortem.md P1 #3(ii): every import in a multi-import file is extracted, not
+    /// just the first or last — 2 local imports (each producing an edge with the
+    /// correct target and line number) and 2 external imports (excluded), never
+    /// duplicated or misattributed.
+    #[test]
+    fn java_import_graph_extracts_every_import_in_a_multi_import_file() {
+        let dir = tmp_dir("java-multi-import");
+        let order = write(
+            &dir,
+            "src/main/java/com/example/domain/Order.java",
+            "package com.example.domain;\n\nimport com.example.infra.DbClient;\nimport com.example.util.Helper;\nimport org.springframework.stereotype.Component;\nimport java.util.List;\n\npublic class Order {}\n",
+        );
+        let db_client = write(
+            &dir,
+            "src/main/java/com/example/infra/DbClient.java",
+            "package com.example.infra;\n\npublic class DbClient {}\n",
+        );
+        let helper = write(
+            &dir,
+            "src/main/java/com/example/util/Helper.java",
+            "package com.example.util;\n\npublic class Helper {}\n",
+        );
+
+        let graph = build(&dir, &[order, db_client, helper]).unwrap();
+
+        let from_domain: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == "com/example/domain")
+            .collect();
+        assert_eq!(
+            from_domain.len(),
+            2,
+            "expected exactly 2 edges, got {from_domain:?}"
+        );
+        assert!(from_domain
+            .iter()
+            .any(|e| e.to == "com/example/infra" && e.line == 3));
+        assert!(from_domain
+            .iter()
+            .any(|e| e.to == "com/example/util" && e.line == 4));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real, verified outcome (checked via `to_sexp()`/`has_error()` during
+    /// development, not assumed): a Java import statement missing its trailing `;`
+    /// recovers with a `(MISSING ";")` node **inserted in place** — the same
+    /// per-node-repair style Story 4.1.2 already documented for Kotlin's unclosed
+    /// parameter list, and notably *not* the flat `ERROR`-wrapper style
+    /// `java_malformed_source_recovery_shape` pinned for a broken class-body field.
+    /// Because the surrounding `import_declaration` stays structurally intact, its
+    /// `scoped_identifier` child is still cleanly extractable — so this fixture lands
+    /// on neither acceptance-criterion outcome (a) (only the well-formed edge) nor (b)
+    /// (empty): tree-sitter's per-import repair is good enough that **both** imports
+    /// extract correctly. That still satisfies the acceptance criterion's actual
+    /// invariant — never a truncated/mismatched target or a line misattributed to the
+    /// wrong import — which this test asserts directly on both edges.
+    #[test]
+    fn java_import_graph_malformed_source_never_extracts_a_wrong_edge() {
+        let dir = tmp_dir("java-malformed");
+        let order = write(
+            &dir,
+            "src/main/java/com/example/domain/Order.java",
+            "package com.example.domain;\n\nimport com.example.infra.DbClient;\nimport com.example.infra.Helper\n\npublic class Order {}\n",
+        );
+        let db_client = write(
+            &dir,
+            "src/main/java/com/example/infra/DbClient.java",
+            "package com.example.infra;\n\npublic class DbClient {}\n",
+        );
+
+        let graph = build(&dir, &[order, db_client]).unwrap();
+
+        let from_domain: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == "com/example/domain")
+            .collect();
+        assert_eq!(
+            from_domain.len(),
+            2,
+            "expected both imports' edges, got {from_domain:?}"
+        );
+        assert!(
+            from_domain.iter().all(|e| e.to == "com/example/infra"),
+            "every edge target must be the real package, never truncated/mismatched: {from_domain:?}"
+        );
+        assert!(
+            from_domain.iter().any(|e| e.line == 3),
+            "well-formed import's edge must keep its own line: {from_domain:?}"
+        );
+        assert!(
+            from_domain.iter().any(|e| e.line == 4),
+            "malformed import's edge, if produced, must carry its own line, not the well-formed import's: {from_domain:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-mortem.md P1 #3(ii), Kotlin: reuses Story 4.1.2's verified malformed-source
+    /// fixture (unclosed parameter list) — the well-formed leading `import` still
+    /// parses cleanly outside the `MISSING ")"` recovery, so it extracts the correct
+    /// edge and nothing else.
+    #[test]
+    fn kotlin_import_graph_malformed_source_never_extracts_a_wrong_edge() {
+        let dir = tmp_dir("kotlin-malformed");
+        let order = write(
+            &dir,
+            "domain/Order.kt",
+            "package com.example.domain\n\nimport com.example.infra.DbClient\n\nclass Order(val id: String\n",
+        );
+        let db_client = write(
+            &dir,
+            "infra/DbClient.kt",
+            "package com.example.infra\n\nclass DbClient\n",
+        );
+
+        let graph = build(&dir, &[order, db_client]).unwrap();
+
+        let from_domain: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == "com/example/domain")
+            .collect();
+        assert_eq!(
+            from_domain.len(),
+            1,
+            "expected exactly the well-formed edge, got {from_domain:?}"
+        );
+        assert_eq!(from_domain[0].to, "com/example/infra");
+        assert_eq!(from_domain[0].line, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
