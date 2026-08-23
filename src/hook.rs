@@ -232,7 +232,11 @@ func TestX(t *testing.T) {\n\
         let ranges = compute_changed_lines(&tool_input, &path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(ranges, vec![(5, 5), (8, 8)]);
-        assert!(!ranges.iter().any(|&(start, end)| (start..=end).contains(&2)));
+        assert!(
+            !ranges
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&2))
+        );
     }
 
     #[test]

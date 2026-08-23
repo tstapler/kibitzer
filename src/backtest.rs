@@ -168,7 +168,9 @@ impl BacktestCache {
 
 pub fn default_cache_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("kibitzer").join("backtest-cache.json");
+        return PathBuf::from(dir)
+            .join("kibitzer")
+            .join("backtest-cache.json");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
@@ -365,17 +367,17 @@ fn reconstruct_snapshots(transcript: &Path) -> Result<(Vec<Snapshot>, usize)> {
         if line.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let Some(content) = line
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-        else {
+        let Some(content) = line.pointer("/message/content").and_then(Value::as_array) else {
             continue;
         };
         for block in content {
             if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                 continue;
             }
-            let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let input = block.get("input").cloned().unwrap_or(Value::Null);
             let Some(file_path) = input
                 .get("file_path")
@@ -489,10 +491,7 @@ fn index_tool_results(lines: &[Value]) -> HashMap<String, String> {
         if line.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        let Some(content) = line
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-        else {
+        let Some(content) = line.pointer("/message/content").and_then(Value::as_array) else {
             continue;
         };
         for block in content {
@@ -542,7 +541,11 @@ fn parse_cat_n(raw: &str) -> Option<String> {
 /// single first-occurrence replacement, since most edits aren't `replace_all` and
 /// treating one as unreconstructable would undercount far more often than treating
 /// a non-`replace_all` edit as one would overcount).
-fn apply_edit(known: Option<&String>, old_string: &str, new_string: &str) -> Option<(String, String)> {
+fn apply_edit(
+    known: Option<&String>,
+    old_string: &str,
+    new_string: &str,
+) -> Option<(String, String)> {
     let before = known?.clone();
     if !before.contains(old_string) {
         return None;
@@ -725,8 +728,13 @@ mod tests {
         )];
         let file = write_transcript(&lines);
         let path = file.path().to_path_buf();
-        let report =
-            run_backtest(&[path], &["duplicate-code".to_string()], false, &mut BacktestCache::default()).unwrap();
+        let report = run_backtest(
+            &[path],
+            &["duplicate-code".to_string()],
+            false,
+            &mut BacktestCache::default(),
+        )
+        .unwrap();
         assert_eq!(report.findings.len(), 1);
         assert!(!report.findings[0].pre_existing);
         assert_eq!(report.stats.transcripts_scanned, 1);
@@ -763,7 +771,13 @@ mod tests {
         ];
         let file = write_transcript(&lines);
         let path = file.path().to_path_buf();
-        let report = run_backtest(&[path], &["duplicate-code".to_string()], true, &mut BacktestCache::default()).unwrap();
+        let report = run_backtest(
+            &[path],
+            &["duplicate-code".to_string()],
+            true,
+            &mut BacktestCache::default(),
+        )
+        .unwrap();
         // Only the Write's snapshot has no `before` to compare against, so it's the
         // only one counted as new; the Edit's identical duplication already existed.
         assert_eq!(report.findings.len(), 1);
@@ -780,8 +794,13 @@ mod tests {
         )];
         let file = write_transcript(&lines);
         let path = file.path().to_path_buf();
-        let report =
-            run_backtest(&[path], &["markdown-link-integrity".to_string()], false, &mut BacktestCache::default()).unwrap();
+        let report = run_backtest(
+            &[path],
+            &["markdown-link-integrity".to_string()],
+            false,
+            &mut BacktestCache::default(),
+        )
+        .unwrap();
         assert_eq!(report.findings.len(), 0);
         assert_eq!(report.stats.snapshots_checked, 0);
     }
