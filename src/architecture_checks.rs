@@ -341,6 +341,7 @@ mod tests {
         graph.edges.push(edge("app/infra", "app/domain"));
         let config = ArchitectureConfig {
             layers: vec!["domain".to_string(), "infra".to_string()],
+            ..Default::default()
         };
 
         let findings = LayeringChecker.check(&graph, &config);
@@ -357,6 +358,7 @@ mod tests {
         graph.edges.push(edge("app/domain", "app/infra"));
         let config = ArchitectureConfig {
             layers: vec!["domain".to_string(), "infra".to_string()],
+            ..Default::default()
         };
 
         assert!(LayeringChecker.check(&graph, &config).is_empty());
@@ -370,6 +372,7 @@ mod tests {
         graph.edges.push(edge("app/vendor/lib", "app/other/lib"));
         let config = ArchitectureConfig {
             layers: vec!["domain".to_string(), "infra".to_string()],
+            ..Default::default()
         };
 
         assert!(LayeringChecker.check(&graph, &config).is_empty());

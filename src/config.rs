@@ -115,6 +115,48 @@ impl Check {
     }
 }
 
+/// A named, glob-mapped set of graph-node/file-path identifiers — the unit
+/// `DependencyRule`/`ContentRule`/`NamingRule` reference.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Component {
+    pub name: String,
+    // Read by `component_of`/`ComponentDependencyChecker` starting Phase 1 — not yet
+    // consumed outside tests, hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// Per-component allow-list (`may_depend_on`) and/or deny-list (`deny_depend_on`) of
+/// other component names. Deny wins when both apply to the same target.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DependencyRule {
+    pub component: String,
+    #[serde(default)]
+    pub may_depend_on: Option<Vec<String>>,
+    #[serde(default)]
+    pub deny_depend_on: Vec<String>,
+}
+
+/// Per-component allowed-declaration-kind list, e.g. "domain may only contain struct".
+// Consumed by `ContentChecker` starting Phase 2 — not yet read outside tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentRule {
+    pub component: String,
+    pub allowed_kinds: Vec<String>,
+}
+
+/// Per-component, per-`DeclKind` regex pattern a declaration's name must match.
+// Consumed by `NamingChecker` starting Phase 3 — not yet read outside tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamingRule {
+    pub component: String,
+    pub kind: String,
+    pub pattern: String,
+}
+
 /// Project-wide settings consumed by `architecture_checker`s that need more than the
 /// import graph itself — currently just the declared layer order for `layering`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -125,8 +167,182 @@ pub struct ArchitectureConfig {
     /// edge from a package in an earlier layer to one in a later layer is expected
     /// (higher layers depend on lower ones); an edge running the other way — a later
     /// layer reaching back into an earlier one — is flagged.
+    ///
+    /// `layers` desugars into `components`/`dependency_rules` via
+    /// [`ArchitectureConfig::effective_components`]/[`ArchitectureConfig::effective_dependency_rules`]
+    /// — declaring a component with the same name as a layer is a config-load error.
     #[serde(default)]
     pub layers: Vec<String>,
+    /// Named components that `dependency_rules`/`content_rules`/`naming_rules` reference
+    /// by name. See [`ArchitectureConfig::effective_components`] for how these combine
+    /// with `layers`-desugared components.
+    #[serde(default)]
+    pub components: Vec<Component>,
+    /// Per-component dependency allow/deny rules. See
+    /// [`ArchitectureConfig::effective_dependency_rules`] for how these combine with
+    /// `layers`-desugared rules.
+    #[serde(default)]
+    pub dependency_rules: Vec<DependencyRule>,
+    /// Per-component allowed-declaration-kind rules.
+    #[serde(default)]
+    pub content_rules: Vec<ContentRule>,
+    /// Per-component, per-kind naming pattern rules.
+    #[serde(default)]
+    pub naming_rules: Vec<NamingRule>,
+}
+
+/// One `Component` per layer name, reproducing `layer_of()`'s "segment anywhere"
+/// exact-match semantics as glob patterns: a bare segment match, a prefix match, a
+/// suffix match, and an anywhere-nested match.
+fn desugar_layers_to_components(layers: &[String]) -> Vec<Component> {
+    layers
+        .iter()
+        .map(|layer| Component {
+            name: layer.clone(),
+            paths: vec![
+                layer.clone(),
+                format!("{layer}/**"),
+                format!("**/{layer}"),
+                format!("**/{layer}/**"),
+            ],
+        })
+        .collect()
+}
+
+/// One `DependencyRule` per layer (not one per pair): a layer may depend on itself and
+/// every layer declared after it, matching `layering`'s "higher layers depend on lower
+/// ones" convention.
+// Consumed by `effective_dependency_rules`, itself consumed by `ComponentDependencyChecker`
+// starting Phase 1 — not yet called outside tests.
+#[allow(dead_code)]
+fn desugar_layers_to_rules(layers: &[String]) -> Vec<DependencyRule> {
+    layers
+        .iter()
+        .enumerate()
+        .map(|(i, layer)| DependencyRule {
+            component: layer.clone(),
+            may_depend_on: Some(layers[i..].to_vec()),
+            deny_depend_on: vec![],
+        })
+        .collect()
+}
+
+impl ArchitectureConfig {
+    /// Explicitly declared `components`, plus `layers` desugared into `Component`s —
+    /// the backward-compat seam so every new checker gets `layers` support for free.
+    pub fn effective_components(&self) -> Vec<Component> {
+        self.components
+            .iter()
+            .cloned()
+            .chain(desugar_layers_to_components(&self.layers))
+            .collect()
+    }
+
+    /// Explicitly declared `dependency_rules`, plus `layers` desugared into
+    /// `DependencyRule`s.
+    // Consumed by `ComponentDependencyChecker` starting Phase 1 — not yet called
+    // outside tests.
+    #[allow(dead_code)]
+    pub fn effective_dependency_rules(&self) -> Vec<DependencyRule> {
+        self.dependency_rules
+            .iter()
+            .cloned()
+            .chain(desugar_layers_to_rules(&self.layers))
+            .collect()
+    }
+}
+
+/// Resolves `node` to the name of the first component (in declaration order) whose
+/// `paths` glob-matches it, mirroring `layer_of()`'s "first in declaration order"
+/// resolution. Returns `None` if `node` matches no declared component — ignored,
+/// matching `layer_of()`'s existing "no match = ignored" precedent.
+// Consumed by `ComponentDependencyChecker`/`ContentChecker`/`NamingChecker` starting
+// Phase 1 — not yet called outside tests.
+#[allow(dead_code)]
+pub fn component_of<'a>(node: &str, components: &'a [Component]) -> Option<&'a str> {
+    components
+        .iter()
+        .find(|c| crate::glob::matches_scope(node, &c.paths))
+        .map(|c| c.name.as_str())
+}
+
+/// Classic Levenshtein edit-distance DP, hand-rolled to avoid a new dependency for a
+/// small, self-contained algorithm.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (a_len, b_len) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; b_len + 1]; a_len + 1];
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a_len {
+        for j in 1..=b_len {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[a_len][b_len]
+}
+
+/// Collects every component name referenced across `dependency_rules` (`component`,
+/// `may_depend_on` entries, `deny_depend_on` entries), `content_rules`, and
+/// `naming_rules`; bails on the first one not present in `effective_components()`,
+/// with a Levenshtein-distance-≤2 suggestion when one exists.
+fn validate_component_references(config: &Config, config_path: &Path) -> Result<()> {
+    let components = config.architecture.effective_components();
+    let known: Vec<&str> = components.iter().map(|c| c.name.as_str()).collect();
+
+    let mut referenced: Vec<&str> = Vec::new();
+    for rule in &config.architecture.dependency_rules {
+        referenced.push(rule.component.as_str());
+        if let Some(may) = &rule.may_depend_on {
+            referenced.extend(may.iter().map(String::as_str));
+        }
+        referenced.extend(rule.deny_depend_on.iter().map(String::as_str));
+    }
+    for rule in &config.architecture.content_rules {
+        referenced.push(rule.component.as_str());
+    }
+    for rule in &config.architecture.naming_rules {
+        referenced.push(rule.component.as_str());
+    }
+
+    for name in referenced {
+        if known.contains(&name) {
+            continue;
+        }
+        let declared = known.join(", ");
+        let suggestion = known
+            .iter()
+            .map(|k| (*k, levenshtein(name, k)))
+            .filter(|(_, d)| *d <= 2)
+            .min_by_key(|(_, d)| *d)
+            .map(|(k, _)| k);
+        match suggestion {
+            Some(s) => anyhow::bail!(
+                "{}: architecture rule references undefined component '{}' — declared \
+                 components are: {} (did you mean '{}'?)",
+                config_path.display(),
+                name,
+                declared,
+                s
+            ),
+            None => anyhow::bail!(
+                "{}: architecture rule references undefined component '{}' — declared \
+                 components are: {}",
+                config_path.display(),
+                name,
+                declared
+            ),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +354,21 @@ pub struct Config {
 }
 
 fn validate(config: &Config, config_path: &Path) -> Result<()> {
+    for layer in &config.architecture.layers {
+        if config
+            .architecture
+            .components
+            .iter()
+            .any(|c| &c.name == layer)
+        {
+            anyhow::bail!(
+                "{}: component '{}' is declared both explicitly and via 'layers'",
+                config_path.display(),
+                layer
+            );
+        }
+    }
+    validate_component_references(config, config_path)?;
     for check in &config.checks {
         let set_count = [
             check.command.is_some(),
@@ -360,11 +591,176 @@ mod tests {
 
     #[test]
     fn whole_repo_command_check_is_not_per_file() {
-        let config = parse(
-            r#"{"checks": [{"name": "n", "command": "true", "severity": "advisory"}]}"#,
-        )
-        .unwrap();
+        let config =
+            parse(r#"{"checks": [{"name": "n", "command": "true", "severity": "advisory"}]}"#)
+                .unwrap();
         assert_eq!(config.checks[0].kind(), CheckKind::WholeRepoCommand);
         assert!(!config.checks[0].is_per_file());
+    }
+
+    // --- Story 0.1.1: Component/DependencyRule/ContentRule/NamingRule schema ---
+
+    #[test]
+    fn component_parses_name_and_paths() {
+        let config = parse(
+            r#"{"architecture": {"components": [{"name": "domain", "paths": ["**/domain", "**/domain/**"]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.architecture.components[0].name, "domain");
+        assert_eq!(
+            config.architecture.components[0].paths,
+            vec!["**/domain".to_string(), "**/domain/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn existing_layers_only_config_still_parses_with_empty_new_fields() {
+        let config = parse(r#"{"architecture": {"layers": ["domain", "infra"]}}"#).unwrap();
+        assert!(config.architecture.components.is_empty());
+        assert!(config.architecture.dependency_rules.is_empty());
+        assert!(config.architecture.content_rules.is_empty());
+        assert!(config.architecture.naming_rules.is_empty());
+        assert_eq!(
+            config.architecture.layers,
+            vec!["domain".to_string(), "infra".to_string()]
+        );
+    }
+
+    // --- Story 0.1.2: layers desugar accessors + component_of resolver ---
+
+    fn three_layer_config() -> ArchitectureConfig {
+        ArchitectureConfig {
+            layers: vec!["handlers".into(), "domain".into(), "infra".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layers_desugar_to_four_glob_patterns_per_layer() {
+        let config = three_layer_config();
+        let components = config.effective_components();
+        let domain = components
+            .iter()
+            .find(|c| c.name == "domain")
+            .expect("domain component present");
+        assert_eq!(
+            domain.paths,
+            vec![
+                "domain".to_string(),
+                "domain/**".to_string(),
+                "**/domain".to_string(),
+                "**/domain/**".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn layers_desugar_to_suffix_allow_lists_not_pairwise() {
+        let config = three_layer_config();
+        let rules = config.effective_dependency_rules();
+        let domain_rule = rules
+            .iter()
+            .find(|r| r.component == "domain")
+            .expect("domain rule present");
+        assert_eq!(
+            domain_rule.may_depend_on,
+            Some(vec!["domain".to_string(), "infra".to_string()])
+        );
+    }
+
+    #[test]
+    fn component_of_returns_first_declaration_order_match() {
+        let components = vec![
+            Component {
+                name: "handlers".into(),
+                paths: vec!["**/handlers".into()],
+            },
+            Component {
+                name: "domain".into(),
+                paths: vec!["**/domain".into()],
+            },
+        ];
+        assert_eq!(
+            component_of("dogfood.example/app/domain", &components),
+            Some("domain")
+        );
+    }
+
+    #[test]
+    fn component_of_returns_none_for_unmatched_node() {
+        let components = vec![
+            Component {
+                name: "handlers".into(),
+                paths: vec!["**/handlers".into()],
+            },
+            Component {
+                name: "domain".into(),
+                paths: vec!["**/domain".into()],
+            },
+        ];
+        assert_eq!(
+            component_of("dogfood.example/app/vendor", &components),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_layer_and_component_name_collision() {
+        let err = parse(
+            r#"{"architecture": {"layers": ["domain"], "components": [{"name": "domain", "paths": ["x/**"]}]}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("component 'domain' is declared both explicitly and via 'layers'")
+        );
+    }
+
+    // --- Story 0.1.3: validate rule references ---
+
+    #[test]
+    fn rejects_unknown_component_in_dependency_rule() {
+        let err = parse(
+            r#"{"architecture": {"components": [{"name":"handlers","paths":["**/handlers"]}], "dependency_rules": [{"component": "hanlders", "may_depend_on": []}]}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            ".claude/inspect.json: architecture rule references undefined component 'hanlders' \
+             — declared components are: handlers (did you mean 'handlers'?)"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_component_in_content_rule() {
+        let err = parse(
+            r#"{"architecture": {"components": [{"name":"domain","paths":["**/domain"]}], "content_rules": [{"component": "doamin", "allowed_kinds": ["struct"]}]}}"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("undefined component 'doamin'"));
+        assert!(msg.contains("(did you mean 'domain'?)"));
+    }
+
+    #[test]
+    fn rejects_unknown_component_in_naming_rule() {
+        let err = parse(
+            r#"{"architecture": {"components": [{"name":"domain","paths":["**/domain"]}], "naming_rules": [{"component": "doamin", "kind": "struct", "pattern": "^[A-Z]"}]}}"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("undefined component 'doamin'"));
+        assert!(msg.contains("(did you mean 'domain'?)"));
+    }
+
+    #[test]
+    fn unknown_component_error_omits_suggestion_when_no_close_match() {
+        let err = parse(
+            r#"{"architecture": {"components": [{"name":"domain","paths":["**/domain"]}], "dependency_rules": [{"component": "zzzzzzzzzz", "may_depend_on": []}]}}"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("undefined component 'zzzzzzzzzz'"));
+        assert!(!msg.contains("did you mean"));
     }
 }
