@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -72,6 +73,56 @@ const SYNTAX_RULES_CHECKERS: &[&str] = &[
     "syntax-rules-java",
     "syntax-rules-kotlin",
 ];
+
+/// The 7 finding categories every `ArchFinding` message now self-tags with a mandatory
+/// `[category]` bracket prefix (Story 6.1.1) — in the declaration order the breakdown
+/// line below renders them in. `component` is the checker-independent zero-match-
+/// advisory tag `zero_match_advisory<T>` emits (Story 1.1.3), distinct from
+/// `component-deps`: `ContentChecker`/`NamingChecker` emit it too, not just
+/// `ComponentDependencyChecker`.
+const FINDING_CATEGORIES: [&str; 7] = [
+    "import-cycle",
+    "layering",
+    "coupling",
+    "component-deps",
+    "content",
+    "naming",
+    "component",
+];
+
+/// Parses each output line's mandatory `[category]` bracket prefix (Story 6.1.1) and
+/// counts occurrences per category. A line with no recognized category tag — a per-file
+/// complexity finding from `SYNTAX_RULES_CHECKERS`, or an `error running ...` line — is
+/// not counted. A line is credited to at most one category (the first match in
+/// `FINDING_CATEGORIES` order), since every finding carries exactly one category tag.
+fn category_breakdown(lines: &[String]) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for line in lines {
+        for category in FINDING_CATEGORIES {
+            if line.contains(&format!("[{category}]")) {
+                *counts.entry(category.to_string()).or_insert(0) += 1;
+                break;
+            }
+        }
+    }
+    counts
+}
+
+/// Renders `category_breakdown`'s counts as the one-line summary shown immediately
+/// under the aggregate count line (Story 6.1.2), in `FINDING_CATEGORIES`' declared
+/// order, omitting categories with zero findings. `None` when nothing was categorized
+/// (e.g. a clean repo with no findings at all).
+fn format_category_breakdown(counts: &BTreeMap<String, usize>) -> Option<String> {
+    let parts: Vec<String> = FINDING_CATEGORIES
+        .iter()
+        .filter_map(|cat| counts.get(*cat).map(|n| format!("{cat}: {n}")))
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("  {}", parts.join(", ")))
+    }
+}
 
 /// Canned per-rule-id recommendation text for findings whose message doesn't already
 /// embed one (coupling/long-function/deep-nesting/long-parameter-list all do, inline).
@@ -234,6 +285,10 @@ impl KibitzerServer {
             finding_count,
             files.len()
         );
+        if let Some(breakdown) = format_category_breakdown(&category_breakdown(&lines)) {
+            output.push_str(&breakdown);
+            output.push('\n');
+        }
         if lines.is_empty() {
             output.push_str("no findings\n");
         } else {
@@ -367,7 +422,8 @@ mod tests {
   "architecture": { "layers": ["handlers", "domain"] },
   "checks": [
     { "name": "import-cycles", "architecture_checker": "import-cycles", "severity": "advisory" },
-    { "name": "layering", "architecture_checker": "layering", "severity": "advisory" }
+    { "name": "layering", "architecture_checker": "layering", "severity": "advisory" },
+    { "name": "component-deps", "architecture_checker": "component-deps", "severity": "advisory" }
   ]
 }"#,
         )
@@ -412,6 +468,218 @@ mod tests {
         );
         assert!(output.contains("## Recommendations"));
         assert!(output.contains("## Dependency graph"));
+        // Story 6.1.2: per-category count breakdown line, immediately under the
+        // aggregate count line. `component-deps` is included in this fixture
+        // deliberately — design/ux.md flagged plan.md's own illustrative breakdown
+        // example as omitting it; `write_fixture`'s `layers` config desugars into an
+        // equivalent `component-deps` violation on the same `domain` -> `handlers`
+        // edge `layering` also flags (documented overlap, plan.md Pattern Decisions
+        // "Post-merge overlap between layering and component-deps").
+        assert!(
+            output.contains(
+                "architecture assessment: 3 finding(s) across 4 file(s)\n  import-cycle: 1, layering: 1, component-deps: 1\n"
+            ),
+            "expected count line immediately followed by the category breakdown, got:\n{output}"
+        );
+    }
+
+    /// Story 6.1.1/6.1.2 (UX Criterion 3, `validation.md`): a fixture producing at
+    /// least one finding in every one of the 7 categories — `import-cycle`, `layering`,
+    /// `coupling`, `component-deps`, `content`, `naming`, and the checker-independent
+    /// `component` zero-match-advisory tag — so the breakdown line and the
+    /// mandatory-bracket-prefix guarantee are proven across the full category set, not
+    /// just the two or three any single earlier fixture happened to exercise.
+    fn write_every_category_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("cyclea")).unwrap();
+        std::fs::create_dir_all(dir.join("cycleb")).unwrap();
+        std::fs::create_dir_all(dir.join("l1")).unwrap();
+        std::fs::create_dir_all(dir.join("l2")).unwrap();
+        std::fs::create_dir_all(dir.join("hub")).unwrap();
+        std::fs::create_dir_all(dir.join("svcs")).unwrap();
+        std::fs::create_dir_all(dir.join("ext")).unwrap();
+        std::fs::create_dir_all(dir.join("contentcomp")).unwrap();
+        std::fs::create_dir_all(dir.join("namingcomp")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        // `import-cycle`: cyclea <-> cycleb.
+        std::fs::write(
+            dir.join("cyclea/cyclea.go"),
+            "package cyclea\n\nimport \"fixture/cycleb\"\n\nfunc A() { cycleb.B() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cycleb/cycleb.go"),
+            "package cycleb\n\nimport \"fixture/cyclea\"\n\nfunc B() { cyclea.A() }\n",
+        )
+        .unwrap();
+
+        // `layering`: layers = ["l1", "l2"], l2 (lower) importing l1 (higher) reverses
+        // the declared order. Also produces a duplicate `component-deps` finding via
+        // `layers`' desugar into `effective_dependency_rules()` (documented overlap,
+        // same as `write_fixture` above) — harmless here since this test only asserts
+        // per-category presence, not exact counts.
+        std::fs::write(dir.join("l1/l1.go"), "package l1\n\nfunc F() {}\n").unwrap();
+        std::fs::write(
+            dir.join("l2/l2.go"),
+            "package l2\n\nimport \"fixture/l1\"\n\nfunc G() { l1.F() }\n",
+        )
+        .unwrap();
+
+        // `coupling`: hub fans out to 11 distinct packages, over
+        // `architecture_checks::MAX_FAN_OUT` (10, private to that module).
+        const FAN_OUT: usize = 11;
+        let mut hub_imports = String::new();
+        let mut hub_calls = String::new();
+        for n in 0..FAN_OUT {
+            let dep_dir = dir.join(format!("dep{n}"));
+            std::fs::create_dir_all(&dep_dir).unwrap();
+            std::fs::write(
+                dep_dir.join(format!("dep{n}.go")),
+                format!("package dep{n}\n\nfunc F() {{}}\n"),
+            )
+            .unwrap();
+            hub_imports.push_str(&format!("\t\"fixture/dep{n}\"\n"));
+            hub_calls.push_str(&format!("\tdep{n}.F()\n"));
+        }
+        std::fs::write(
+            dir.join("hub/hub.go"),
+            format!("package hub\n\nimport (\n{hub_imports})\n\nfunc Use() {{\n{hub_calls}}}\n"),
+        )
+        .unwrap();
+
+        // `component-deps`: svcs -> ext, only "svcs" is on svcs's allow-list.
+        std::fs::write(
+            dir.join("svcs/svcs.go"),
+            "package svcs\n\nimport \"fixture/ext\"\n\nfunc Use() { ext.Do() }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ext/ext.go"), "package ext\n\nfunc Do() {}\n").unwrap();
+
+        // `content`: contentcomp only allows "struct", but declares a function.
+        std::fs::write(
+            dir.join("contentcomp/contentcomp.go"),
+            "package contentcomp\n\nfunc NotAllowed() {}\n",
+        )
+        .unwrap();
+
+        // `naming`: namingcomp requires struct names matching "^Good.*$", declares "Bad".
+        std::fs::write(
+            dir.join("namingcomp/namingcomp.go"),
+            "package namingcomp\n\ntype Bad struct{}\n",
+        )
+        .unwrap();
+
+        // `component`: "ghost" is declared but its glob matches no import-graph node and
+        // no declaration, so `component-deps`/`content-rules`/`naming-rules` each emit
+        // the shared zero-match-component advisory (Story 1.1.3) for it independently.
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{
+  "architecture": {
+    "layers": ["l1", "l2"],
+    "components": [
+      {"name": "svcs", "paths": ["**/svcs", "**/svcs/**"]},
+      {"name": "ext", "paths": ["**/ext", "**/ext/**"]},
+      {"name": "contentcomp", "paths": ["**/contentcomp", "**/contentcomp/**"]},
+      {"name": "namingcomp", "paths": ["**/namingcomp", "**/namingcomp/**"]},
+      {"name": "ghost", "paths": ["**/ghost", "**/ghost/**"]}
+    ],
+    "dependency_rules": [
+      {"component": "svcs", "may_depend_on": ["svcs"]}
+    ],
+    "content_rules": [
+      {"component": "contentcomp", "allowed_kinds": ["struct"]}
+    ],
+    "naming_rules": [
+      {"component": "namingcomp", "kind": "struct", "pattern": "^Good.*$"}
+    ]
+  },
+  "checks": [
+    { "name": "import-cycles", "architecture_checker": "import-cycles", "severity": "advisory" },
+    { "name": "layering", "architecture_checker": "layering", "severity": "advisory" },
+    { "name": "coupling", "architecture_checker": "coupling", "severity": "advisory" },
+    { "name": "component-deps", "architecture_checker": "component-deps", "severity": "advisory" },
+    { "name": "content-rules", "architecture_checker": "content-rules", "severity": "advisory" },
+    { "name": "naming-rules", "architecture_checker": "naming-rules", "severity": "advisory" }
+  ]
+}"#,
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "init"],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn architecture_assessment_every_category_finding_has_bracket_prefix() {
+        let dir = tmp_dir("every-category");
+        write_every_category_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                include_diagram: false,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Every one of the 7 categories fired at least once...
+        for category in FINDING_CATEGORIES {
+            assert!(
+                output.contains(&format!("[{category}]")),
+                "expected a [{category}] finding, got:\n{output}"
+            );
+        }
+        // ...and the breakdown line lists all 7 in declaration order, immediately under
+        // the aggregate count line.
+        let breakdown_line = output
+            .lines()
+            .nth(1)
+            .expect("output has a second line (the breakdown)");
+        let expected_order: Vec<&str> = FINDING_CATEGORIES
+            .iter()
+            .filter(|cat| breakdown_line.contains(&format!("{cat}: ")))
+            .copied()
+            .collect();
+        assert_eq!(
+            expected_order,
+            FINDING_CATEGORIES.to_vec(),
+            "expected every category present in declaration order, got:\n{breakdown_line}"
+        );
+
+        // Every finding line (starts with `[blocking]`/`[advisory]`) carries a second,
+        // category bracket somewhere in the line — the mandatory prefix Story 6.1.1
+        // guarantees uniformly across all 7 categories.
+        let finding_lines: Vec<&str> = output
+            .lines()
+            .skip(2) // count line + breakdown line
+            .take_while(|l| l.starts_with('['))
+            .collect();
+        assert!(
+            !finding_lines.is_empty(),
+            "expected finding lines, got:\n{output}"
+        );
+        for line in finding_lines {
+            assert!(
+                FINDING_CATEGORIES
+                    .iter()
+                    .any(|cat| line.contains(&format!("[{cat}]"))),
+                "finding line missing a recognized [category] tag: {line}"
+            );
+        }
     }
 
     /// Task 2.2.2b: `content-rules`-configured fixture — a `domain` component whose

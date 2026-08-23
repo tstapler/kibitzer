@@ -67,7 +67,7 @@ impl ArchitectureChecker for ImportCycleChecker {
                 ArchFinding {
                     file: edge.map(|e| e.file.clone()),
                     line: edge.map(|e| e.line),
-                    message: format!("import cycle: {}", path.join(" -> ")),
+                    message: format!("[import-cycle] import cycle: {}", path.join(" -> ")),
                     severity_override: None,
                 }
             })
@@ -114,8 +114,8 @@ impl ArchitectureChecker for LayeringChecker {
                         file: Some(edge.file.clone()),
                         line: Some(edge.line),
                         message: format!(
-                            "layering violation: {} (layer '{}') imports {} (layer '{}') — \
-                             '{}' is declared as a lower layer than '{}'",
+                            "[layering] layering violation: {} (layer '{}') imports {} \
+                             (layer '{}') — '{}' is declared as a lower layer than '{}'",
                             edge.from,
                             config.layers[from_layer],
                             edge.to,
@@ -364,11 +364,13 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
                     self.strongconnect(&successor);
                     let successor_low = self.lowlink[&successor];
                     let node_low = self.lowlink[node];
-                    self.lowlink.insert(node.to_string(), node_low.min(successor_low));
+                    self.lowlink
+                        .insert(node.to_string(), node_low.min(successor_low));
                 } else if *self.on_stack.get(&successor).unwrap_or(&false) {
                     let successor_index = self.indices[&successor];
                     let node_low = self.lowlink[node];
-                    self.lowlink.insert(node.to_string(), node_low.min(successor_index));
+                    self.lowlink
+                        .insert(node.to_string(), node_low.min(successor_index));
                 }
             }
 
@@ -407,9 +409,7 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     tarjan
         .sccs
         .into_iter()
-        .filter(|scc| {
-            scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0])
-        })
+        .filter(|scc| scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0]))
         .collect()
 }
 
@@ -459,6 +459,12 @@ mod tests {
         let findings = ImportCycleChecker.check(&graph, &ArchitectureConfig::default());
 
         assert_eq!(findings.len(), 1);
+        // Story 6.1.1: mandatory `[import-cycle]` bracket prefix.
+        assert!(
+            findings[0]
+                .message
+                .starts_with("[import-cycle] import cycle: ")
+        );
         assert!(findings[0].message.contains("import cycle"));
     }
 
@@ -513,7 +519,12 @@ mod tests {
         let findings = LayeringChecker.check(&graph, &config);
 
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("layering violation"));
+        // Story 6.1.1: mandatory `[layering]` bracket prefix.
+        assert_eq!(
+            findings[0].message,
+            "[layering] layering violation: app/infra (layer 'infra') imports app/domain \
+             (layer 'domain') — 'infra' is declared as a lower layer than 'domain'"
+        );
     }
 
     #[test]
@@ -570,7 +581,11 @@ mod tests {
 
         let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default());
 
-        assert!(findings.iter().any(|f| f.message.contains("hub") && f.message.contains("imports")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("hub") && f.message.contains("imports"))
+        );
     }
 
     #[test]
@@ -585,7 +600,11 @@ mod tests {
 
         let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default());
 
-        assert!(findings.iter().any(|f| f.message.contains("core") && f.message.contains("imported by")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("core") && f.message.contains("imported by"))
+        );
     }
 
     #[test]
