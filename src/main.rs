@@ -6,6 +6,7 @@ mod checker;
 mod config;
 mod daemon;
 mod declaration_checks;
+mod declarations;
 mod dedup;
 mod duplicate_code;
 mod glob;

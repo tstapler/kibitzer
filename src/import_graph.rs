@@ -53,7 +53,7 @@ fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some(ext)
 }
 
-fn is_js_like(path: &Path) -> bool {
+pub(crate) fn is_js_like(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs")
@@ -153,7 +153,7 @@ fn js_module_dir(file: &Path) -> PathBuf {
     file.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
-fn js_ts_language(file: &Path) -> tree_sitter::Language {
+pub(crate) fn js_ts_language(file: &Path) -> tree_sitter::Language {
     match file.extension().and_then(|e| e.to_str()) {
         Some("tsx") => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Some("ts") => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
