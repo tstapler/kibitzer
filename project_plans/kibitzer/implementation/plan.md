@@ -1766,6 +1766,8 @@ synthetic fixture — that `component-deps` can replace a `depguard` rule I actu
 **Files**: none in kibitzer's own repo (verification against an external clone) — the local
 `.claude/inspect.json` snippet used for the run is scratch, not committed.
 
+**Executed 2026-08-23, findings: see `phase-7-adoption-proof.md`.**
+
 ##### Task 7.2.1a: Clone `tstapler/stapler-squad` read-only to a scratch directory and run `golangci-lint run --enable-only depguard ./...` to capture the real, current baseline verdict for `no_server_in_core` (~10 min)
 - Files: none (external clone, read-only)
 
@@ -1810,6 +1812,8 @@ example — while being honest about where kibitzer's schema is weaker than `dep
 **Files**: none in kibitzer's own repo (verification against an external clone); scratch
 `.claude/inspect.json` snippet, not committed.
 
+**Executed 2026-08-23, findings: see `phase-7-adoption-proof.md`.**
+
 ##### Task 7.2.2a: Write the scratch `.claude/inspect.json` architecture block above and run `kibitzer check architecture component-deps <clone-dir>` for real (~10 min)
 - Files: none (scratch config, not committed)
 
@@ -1832,3 +1836,5 @@ even after adopting `component-deps` for the other two rules, **so that** the pl
   replacement — a global/unscoped deny-rule category is a plausible future scope item but is
   explicitly **not** added to this plan now, to avoid scope-creeping the schema over one example.
 **Files**: none (documentation-only, satisfied by this plan.md section itself).
+
+**Executed 2026-08-23, findings: see `phase-7-adoption-proof.md`.**
