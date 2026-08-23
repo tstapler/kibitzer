@@ -631,6 +631,89 @@ mod tests {
         assert!(has_class_keyword);
     }
 
+    // --- Epic 5.1 / Story 5.1.1: Python class_definition/function_definition
+    // to_sexp() verification ("one additional shape variant" beyond the six import
+    // node kinds verified in `import_graph.rs`) ---
+    //
+    // Real `to_sexp()` output (`tree-sitter-python` 0.23.6, matching `Cargo.lock`),
+    // pinned ahead of the real Python extraction landing in Story 5.3.1:
+    // - `class Order:` produces node kind `class_definition` with a named `name` field
+    //   (`identifier`) and a named `body` field (`block`) — proper fields, same as
+    //   Go/JS's straightforward `child_by_field_name` pattern, not Kotlin's positional
+    //   children.
+    // - `def validate(...) -> bool:` at module level produces node kind
+    //   `function_definition`, also with named `name`/`parameters`/`body` fields (plus
+    //   an optional `return_type` field when a `->` annotation is present).
+    // - A method nested inside a class (`__init__` inside `class Order:`) is **not** a
+    //   direct child of `module` — it sits two levels deeper:
+    //   `module → class_definition → body (block) → function_definition`. A top-level
+    //   function (`validate`) is one level deep: `module → function_definition`
+    //   directly. This structural difference — not node kind, both are
+    //   `function_definition` — is exactly what Story 5.3.1's "the nested `__init__`
+    //   is not extracted as a separate top-level declaration" requires: only walk
+    //   `module`'s direct named children, don't recurse into `class_definition`'s body.
+
+    fn parse_python(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("loading tree-sitter-python grammar");
+        parser.parse(src, None).expect("parsing Python fixture")
+    }
+
+    /// Story 5.3.1's fixture, parsed and asserted on real `to_sexp()`-derived structure
+    /// (not just node kind — the whole point of this test is confirming the *nesting
+    /// depth* distinction between a top-level function and a class method).
+    #[test]
+    fn python_class_and_function_definition_shapes() {
+        let src = "class Order:\n    def __init__(self, id: str):\n        self.id = id\n\ndef validate(order: Order) -> bool:\n    return bool(order.id)\n";
+        let tree = parse_python(src);
+        let root = tree.root_node();
+        assert!(!root.has_error());
+
+        // Module-level children: class_definition, then function_definition — exactly
+        // 2, confirming the nested __init__ is NOT a direct child of module.
+        assert_eq!(root.named_child_count(), 2);
+
+        let class_node = root.named_child(0).unwrap();
+        assert_eq!(class_node.kind(), "class_definition");
+        assert_eq!(
+            class_node
+                .child_by_field_name("name")
+                .unwrap()
+                .utf8_text(src.as_bytes())
+                .unwrap(),
+            "Order"
+        );
+
+        let top_level_fn = root.named_child(1).unwrap();
+        assert_eq!(top_level_fn.kind(), "function_definition");
+        assert_eq!(
+            top_level_fn
+                .child_by_field_name("name")
+                .unwrap()
+                .utf8_text(src.as_bytes())
+                .unwrap(),
+            "validate"
+        );
+
+        // The nested __init__ is two levels below module: class_definition -> body
+        // (block) -> function_definition. Confirms the exclusion boundary a top-level-
+        // only walk must respect.
+        let class_body = class_node.child_by_field_name("body").unwrap();
+        assert_eq!(class_body.kind(), "block");
+        let nested_method = class_body.named_child(0).unwrap();
+        assert_eq!(nested_method.kind(), "function_definition");
+        assert_eq!(
+            nested_method
+                .child_by_field_name("name")
+                .unwrap()
+                .utf8_text(src.as_bytes())
+                .unwrap(),
+            "__init__"
+        );
+    }
+
     // --- Story 2.1.2: JS/TS declaration extraction ---
 
     #[test]

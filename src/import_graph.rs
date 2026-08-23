@@ -621,6 +621,79 @@ fn kotlin_lang_config() -> QualifiedImportLangConfig {
 // with `class`, distinguished only by an anonymous keyword child; `object` is a wholly
 // separate node kind).
 
+// ---------------------------------------------------------------------------------
+// Python import node-kind verification (Epic 5.1 / Story 5.1.1) — real `to_sexp()`
+// output pinned ahead of the extraction code (Story 5.2.1), per this codebase's
+// verification discipline (`docs/syntax-rules.md`, `rules.rs`'s `LangRuleConfig` doc
+// comment, and the Java/Kotlin precedent immediately above). No `build_python` exists
+// yet; the findings below are what Epic 5.2's implementer builds against. Verified
+// against `tree-sitter-python` 0.23.6, matching `Cargo.lock`.
+//
+// research/build-vs-buy.md §4 and research/pitfalls.md §1 predicted six distinct import
+// node kinds from the grammar's `node-types.json` (not run through a live parser at
+// research time). All six are confirmed present, with one refinement pitfalls.md didn't
+// surface: `aliased_import` is never a standalone import — it always appears *nested*
+// inside `import_statement`'s or `import_from_statement`'s `name` field, replacing the
+// plain `dotted_name` there.
+//
+// - `import os` → `import_statement`, single required field `name` (accepts
+//   `dotted_name` or `aliased_import`, and can repeat for `import os, sys`):
+//   `(import_statement name: (dotted_name (identifier)))`.
+// - `import os as o` (top-level aliased form) → same `import_statement` node kind, but
+//   the `name` field's child is `aliased_import` instead of `dotted_name`:
+//   `(import_statement name: (aliased_import name: (dotted_name (identifier)) alias:
+//   (identifier)))` — confirmed via `python_top_level_aliased_import_shape` below.
+// - `from app.infra import db_client` → `import_from_statement`, fields `module_name`
+//   (required, `dotted_name` or `relative_import`) and `name` (optional, repeatable,
+//   `dotted_name` or `aliased_import`):
+//   `(import_from_statement module_name: (dotted_name (identifier) (identifier)) name:
+//   (dotted_name (identifier)))`.
+// - `from app.infra import db_client as db` → same `import_from_statement` node kind,
+//   `name` field's child is `aliased_import` (same nesting pattern as the top-level
+//   form above): `(import_from_statement module_name: (dotted_name (identifier)
+//   (identifier)) name: (aliased_import name: (dotted_name (identifier)) alias:
+//   (identifier)))`.
+// - `from . import sibling` / `from ..domain import Order` (relative) → `module_name`
+//   field's child is `relative_import`, wrapping `import_prefix` (the leading dots) and
+//   an optional `dotted_name` (present only when a package follows the dots):
+//   `(import_from_statement module_name: (relative_import (import_prefix)) name:
+//   (dotted_name (identifier)))` for `from . import sibling` (no `dotted_name` inside
+//   `relative_import` — one named child), and `(import_from_statement module_name:
+//   (relative_import (import_prefix) (dotted_name (identifier))) name: (dotted_name
+//   (identifier)))` for `from ..domain import Order` (two named children). **Dot count
+//   is not encoded in `to_sexp()`/node kind at all** — `import_prefix`'s *raw source
+//   text* is exactly N `.` characters (verified: `"."`, `".."`, `"..."` for one/two/three
+//   leading dots respectively, via `Node::utf8_text`, both with and without a trailing
+//   package name) — Story 5.2.1b's dot-counting must read `import_prefix`'s source text
+//   length, not infer it from tree structure.
+// - `from app.infra import *` (wildcard) → `import_from_statement` again, but `name` is
+//   *absent* and an unfielded (positional) `wildcard_import` child appears instead:
+//   `(import_from_statement module_name: (dotted_name (identifier) (identifier))
+//   (wildcard_import))` — a walk that only reads the `name` field will silently miss
+//   this form's target entirely; the presence of a local project name to bind is simply
+//   absent, so this is (as pitfalls.md guessed) a package-level "import everything from
+//   X" that still resolves via `module_name` alone, same as any other `import_from_statement`.
+// - `from __future__ import annotations` → **`future_import_statement`**, a wholly
+//   separate top-level node kind from `import_from_statement` (confirms pitfalls.md's
+//   prediction) — no `module_name` field at all, just `name`:
+//   `(future_import_statement name: (dotted_name (identifier)))`. A walk matching only
+//   `import_from_statement`/`import_statement` will silently skip `__future__` imports
+//   rather than mishandling them — which is the *correct* outcome per Story 5.2.1's
+//   acceptance criteria (zero graph edges for `__future__`), but only if the walk
+//   explicitly excludes this kind rather than never having considered it.
+// - Malformed source (`import os\n\ndef broken(\n` — unclosed parameter list): recovers
+//   as `(module (import_statement name: (dotted_name (identifier))) (ERROR (identifier)))`
+//   — the well-formed leading `import` parses cleanly outside a single flat `ERROR` node
+//   wrapping the truncated `def`'s name, same "ERROR wraps just the malformed tail"
+//   recovery shape as Java's (not Kotlin's in-place `MISSING` style).
+//
+// See `declarations.rs`'s Python section (Epic 5.1's "one additional shape variant") for
+// the `class_definition`/`function_definition` verification, including confirmation that
+// a class's nested method sits two levels below `module` (`module` → `class_definition`
+// → `body` (block) → `function_definition`), one level deeper than a module-level
+// function (`module` → `function_definition` directly) — the structural distinction
+// Story 5.3.1 needs to exclude nested methods from top-level extraction.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,5 +1318,119 @@ mod tests {
         assert_eq!(from_domain[0].line, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Epic 5.1 / Story 5.1.1: Python to_sexp() verification ---
+
+    fn parse_python(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("loading tree-sitter-python grammar");
+        parser.parse(src, None).expect("parsing Python fixture")
+    }
+
+    /// Task 5.1.1a — the exact fixture from plan.md's Story 5.1.1 acceptance criteria,
+    /// covering all six import node kinds. Real `to_sexp()` output pinned per the doc
+    /// comment above `dir_key`.
+    #[test]
+    fn python_import_to_sexp_fixture() {
+        let src = "import os\nfrom app.infra import db_client\nfrom app.infra import db_client as db\nfrom . import sibling\nfrom ..domain import Order\nfrom app.infra import *\nfrom __future__ import annotations\n";
+        let tree = parse_python(src);
+        let sexp = tree.root_node().to_sexp();
+
+        assert!(!tree.root_node().has_error());
+        // import_statement (plain)
+        assert!(sexp.contains("(import_statement name: (dotted_name (identifier)))"));
+        // import_from_statement (plain from-import)
+        assert!(sexp.contains(
+            "(import_from_statement module_name: (dotted_name (identifier) (identifier)) name: (dotted_name (identifier)))"
+        ));
+        // aliased_import, nested inside import_from_statement's name field
+        assert!(sexp.contains(
+            "(import_from_statement module_name: (dotted_name (identifier) (identifier)) name: (aliased_import name: (dotted_name (identifier)) alias: (identifier)))"
+        ));
+        // relative_import with import_prefix only (no dotted_name — "from . import x")
+        assert!(sexp.contains(
+            "(import_from_statement module_name: (relative_import (import_prefix)) name: (dotted_name (identifier)))"
+        ));
+        // relative_import with import_prefix + dotted_name ("from ..domain import Order")
+        assert!(sexp.contains(
+            "(import_from_statement module_name: (relative_import (import_prefix) (dotted_name (identifier))) name: (dotted_name (identifier)))"
+        ));
+        // wildcard_import — unfielded, no `name` field present
+        assert!(sexp.contains(
+            "(import_from_statement module_name: (dotted_name (identifier) (identifier)) (wildcard_import))"
+        ));
+        // future_import_statement — distinct top-level node kind, no module_name field
+        assert!(sexp.contains("(future_import_statement name: (dotted_name (identifier)))"));
+    }
+
+    /// Task 5.1.1b — the top-level aliased-import form (`import x as y`, as opposed to
+    /// plan.md's `from x import y as z`): same `import_statement` node kind as a plain
+    /// import, with the `name` field's child being `aliased_import` instead of
+    /// `dotted_name`. Confirms `aliased_import` is never a standalone node — it always
+    /// nests inside another import node's `name` field.
+    #[test]
+    fn python_top_level_aliased_import_shape() {
+        let tree = parse_python("import os as o\n");
+        let import_node = tree.root_node().named_child(0).unwrap();
+
+        assert_eq!(import_node.kind(), "import_statement");
+        let name_field = import_node.child_by_field_name("name").unwrap();
+        assert_eq!(name_field.kind(), "aliased_import");
+        assert_eq!(
+            name_field
+                .child_by_field_name("alias")
+                .unwrap()
+                .utf8_text("import os as o\n".as_bytes())
+                .unwrap(),
+            "o"
+        );
+    }
+
+    /// Task 5.1.1b (continued) — dot count for a relative import is not encoded in
+    /// node kind or `to_sexp()` shape at all; `import_prefix`'s raw source text is
+    /// exactly N `.` characters, with or without a trailing package name. Grounds
+    /// Story 5.2.1b's "count leading dots" resolution in verified real output.
+    #[test]
+    fn python_relative_import_prefix_dot_count_is_in_source_text() {
+        for (src, expected_dots, has_dotted_name) in [
+            ("from . import sibling\n", ".", false),
+            ("from ..domain import Order\n", "..", true),
+            ("from ... import x\n", "...", false),
+        ] {
+            let tree = parse_python(src);
+            let import_from = tree.root_node().named_child(0).unwrap();
+            assert_eq!(import_from.kind(), "import_from_statement");
+            let module_name = import_from.child_by_field_name("module_name").unwrap();
+            assert_eq!(module_name.kind(), "relative_import");
+
+            let prefix = module_name.named_child(0).unwrap();
+            assert_eq!(prefix.kind(), "import_prefix");
+            assert_eq!(prefix.utf8_text(src.as_bytes()).unwrap(), expected_dots);
+
+            assert_eq!(
+                module_name.named_child_count(),
+                if has_dotted_name { 2 } else { 1 },
+                "relative_import's second named child (dotted_name) is present only when a package follows the dots: {src:?}"
+            );
+        }
+    }
+
+    /// Task 5.1.1a (malformed source) — a truncated `def` after a well-formed `import`
+    /// recovers as a flat `ERROR` node wrapping just the malformed tail; the leading
+    /// `import` still parses cleanly outside it. Same "ERROR wraps only the bad part"
+    /// recovery shape as Java's `java_malformed_source_recovery_shape` above (contrast
+    /// with Kotlin's in-place `MISSING` node style).
+    #[test]
+    fn python_malformed_source_recovery_shape() {
+        let src = "import os\n\ndef broken(\n";
+        let tree = parse_python(src);
+
+        assert!(tree.root_node().has_error());
+        let sexp = tree.root_node().to_sexp();
+        assert!(sexp.contains("(ERROR (identifier))"));
+        assert!(sexp.starts_with("(module (import_statement name: (dotted_name (identifier)))"));
     }
 }
