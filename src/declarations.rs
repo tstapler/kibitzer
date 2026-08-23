@@ -3,8 +3,8 @@
 //! every top-level declaration (struct/class/interface/enum/function) across the repo,
 //! feeding `declaration_checks`'s `ContentChecker` (Story 2.2.1) and `NamingChecker`
 //! (Phase 3). Go and JS/TS first, mirroring `import_graph.rs`'s own initial-language
-//! scope before Python/Java/Kotlin were added in later phases (Java/Kotlin land in
-//! Epic 4.3 below).
+//! scope before Java/Kotlin/Python were added in later phases (Java/Kotlin land in
+//! Epic 4.3, Python in Epic 5.3, both below).
 
 use std::path::{Path, PathBuf};
 
@@ -28,6 +28,12 @@ use crate::config::{Component, component_of};
 /// No `Object` variant exists for Kotlin's `object` declarations — see
 /// `collect_kotlin_declarations`'s doc comment for why `object` maps onto `Class`
 /// instead of a new variant.
+///
+/// `Struct`/`Interface`/`Enum` are never produced for Python (Story 5.3.1): Python has
+/// no struct/interface/enum node kind distinct from `class_definition` (an
+/// `abc.ABC`/`Protocol`/`enum.Enum` subclass is still, syntactically, a `class`), so
+/// every Python class maps onto `Class` — matching Java's `Function`-inapplicable note
+/// above as the same kind of documented, not silently half-supported, scope limit.
 // Consumed by `declaration_checks::ContentChecker` starting Story 2.2.1 and
 // `NamingChecker` starting Phase 3 — not yet called from `main`'s reachable paths
 // outside tests (same forward-scaffolding precedent as `config.rs`'s `ContentRule`/
@@ -67,8 +73,7 @@ pub struct DeclarationGraph {
 }
 
 /// Build the declaration graph over `files` (already filtered to files kibitzer is
-/// scoped to). Go, TypeScript/JavaScript, Java, and Kotlin are extracted; Python can
-/// follow the same per-language dispatch pattern later (Phase 5).
+/// scoped to). Go, TypeScript/JavaScript, Java, Kotlin, and Python are extracted.
 // Consumed by `check.rs`'s `AnyArchitectureChecker::Declaration` arm starting Story
 // 2.2.1, once `declaration_checks::lookup` returns `Some` for the first time — not yet
 // called outside tests.
@@ -101,6 +106,11 @@ pub fn build(
     let kotlin_files: Vec<&PathBuf> = files.iter().filter(|f| is_kotlin_like(f)).collect();
     if !kotlin_files.is_empty() {
         build_kotlin_declarations(repo_root, &kotlin_files, components, &mut graph)?;
+    }
+
+    let python_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "py")).collect();
+    if !python_files.is_empty() {
+        build_python_declarations(repo_root, &python_files, components, &mut graph)?;
     }
 
     Ok(graph)
@@ -469,6 +479,113 @@ fn build_kotlin_declarations(
         let component = resolve_component(repo_root, file, components);
         let mut decls = Vec::new();
         collect_kotlin_declarations(tree.root_node(), source.as_bytes(), &mut decls);
+        for (name, kind, line) in decls {
+            graph.declarations.push(Declaration {
+                name,
+                kind,
+                file: (*file).clone(),
+                line,
+                component: component.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------
+// Python
+// ---------------------------------------------------------------------------------
+
+/// Classifies a single `class_definition`/`function_definition` node — shared by the
+/// direct match arm below and by the `decorated_definition` unwrap, so a decorator
+/// can never change how the wrapped declaration is classified.
+fn classify_python_definition(node: Node, src: &[u8]) -> Option<(String, DeclKind, usize)> {
+    let kind = match node.kind() {
+        "class_definition" => DeclKind::Class,
+        "function_definition" => DeclKind::Function,
+        _ => return None,
+    };
+    let name = node.child_by_field_name("name")?.utf8_text(src).ok()?;
+    Some((name.to_string(), kind, node.start_position().row + 1))
+}
+
+/// Only `module`'s **direct named children** are considered — this walk deliberately
+/// does not recurse into a `class_definition`'s or `function_definition`'s own `body`,
+/// which is what keeps a nested method (e.g. `__init__` inside a class) from being
+/// extracted as if it were a top-level declaration. Verified against real
+/// `tree-sitter-python` 0.23.6 `to_sexp()` output (Story 5.1.1, this file's
+/// `python_class_and_function_definition_shapes` test above):
+///
+/// - `class_definition` and `function_definition` both carry a named `name` field
+///   (`identifier`) directly, same `child_by_field_name` shape as Go/JS/Java —
+///   `classify_python_definition` handles both.
+/// - A top-level function sits one level below `module`; a method nested inside a
+///   class sits two levels below (`module → class_definition → body (block) →
+///   function_definition`). Because this function only iterates `module`'s own
+///   `named_children()` and never descends into a matched node's `body`, the nested
+///   case is structurally unreachable here — this is what makes the walk depth-aware
+///   rather than a blind recursive kind-match (which would also find `__init__`).
+/// - A decorated top-level declaration (`@dataclass\nclass Order: ...` or
+///   `@app.route(...)\ndef handler(): ...`) does **not** produce a `class_definition`/
+///   `function_definition` as `module`'s direct child — it wraps in a
+///   `decorated_definition` node instead, confirmed via `tree-sitter-python`
+///   0.23.6's `node-types.json` (`decorated_definition` has a required `definition`
+///   field of type `class_definition`/`function_definition`, plus one-or-more
+///   `decorator` children). A depth-aware walk that only matched on
+///   `class_definition`/`function_definition` node kind would silently drop every
+///   decorated top-level declaration — the same silent-misclassification risk
+///   pre-mortem #3 flagged for Java/Kotlin's positional walks, here from an unhandled
+///   node kind rather than a positional miss. So `decorated_definition` is unwrapped
+///   via its `definition` field and the inner node is classified the normal way,
+///   still without recursing into that node's own `body` — decorators never hide or
+///   reclassify what they wrap, matching Java's "annotations don't shift positional
+///   classification" precedent (`java_declarations_annotation_does_not_shift_positional_classification`).
+fn collect_python_declarations(root: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "class_definition" | "function_definition" => {
+                if let Some(decl) = classify_python_definition(child, src) {
+                    out.push(decl);
+                }
+            }
+            "decorated_definition" => {
+                if let Some(inner) = child.child_by_field_name("definition")
+                    && let Some(decl) = classify_python_definition(inner, src)
+                {
+                    out.push(decl);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fresh `tree_sitter::Parser` per file, matching `build_go_declarations`/
+/// `build_js_ts_declarations`/`build_java_declarations`/`build_kotlin_declarations`'s
+/// own precedent above.
+fn build_python_declarations(
+    repo_root: &Path,
+    files: &[&PathBuf],
+    components: &[Component],
+    graph: &mut DeclarationGraph,
+) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("loading tree-sitter-python grammar")?;
+
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let tree = parser
+            .parse(&source, None)
+            .with_context(|| format!("parsing {} with tree-sitter-python", file.display()))?;
+
+        let component = resolve_component(repo_root, file, components);
+        let mut decls = Vec::new();
+        collect_python_declarations(tree.root_node(), source.as_bytes(), &mut decls);
         for (name, kind, line) in decls {
             graph.declarations.push(Declaration {
                 name,
@@ -959,6 +1076,127 @@ mod tests {
                 .declarations
                 .iter()
                 .all(|d| (d.name == "Order" || d.name == "Broken") && d.kind == DeclKind::Class)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Epic 5.3 / Story 5.3.1: Python declaration extraction ---
+
+    /// Story 5.3.1's AC fixture verbatim: `Order` (class, line 1) and `validate`
+    /// (top-level function, line 5) are extracted; the nested `__init__` method is not.
+    #[test]
+    fn python_declarations_finds_class_and_module_level_function_only() {
+        let dir = tmp_dir("python-class-fn");
+        let path = write(
+            &dir,
+            "app/domain/order.py",
+            "class Order:\n    def __init__(self, id: str):\n        self.id = id\n\ndef validate(order: Order) -> bool:\n    return bool(order.id)\n",
+        );
+        let components = vec![Component {
+            name: "domain".into(),
+            paths: vec!["**/domain".into(), "**/domain/**".into()],
+        }];
+
+        let graph = build(&dir, std::slice::from_ref(&path), &components).unwrap();
+
+        assert!(graph.declarations.contains(&Declaration {
+            name: "Order".to_string(),
+            kind: DeclKind::Class,
+            file: path.clone(),
+            line: 1,
+            component: Some("domain".to_string()),
+        }));
+        assert!(graph.declarations.contains(&Declaration {
+            name: "validate".to_string(),
+            kind: DeclKind::Function,
+            file: path.clone(),
+            line: 5,
+            component: Some("domain".to_string()),
+        }));
+        // The nested __init__ must never appear as its own top-level declaration.
+        assert!(!graph.declarations.iter().any(|d| d.name == "__init__"));
+        assert_eq!(graph.declarations.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shape-variant test (this story's Java/Kotlin-annotation precedent, applied to
+    /// Python's own wrapping construct): a decorated top-level class/function wraps in
+    /// a `decorated_definition` node rather than exposing `class_definition`/
+    /// `function_definition` directly as `module`'s child (confirmed via real
+    /// `to_sexp()` output — see `collect_python_declarations`'s doc comment). A walk
+    /// that only matched on `class_definition`/`function_definition` kind would
+    /// silently drop both declarations below; this asserts the unwrap keeps them.
+    #[test]
+    fn python_declarations_decorator_does_not_hide_top_level_declaration() {
+        let dir = tmp_dir("python-decorated");
+        let path = write(
+            &dir,
+            "app/domain/order.py",
+            "@dataclass\nclass Order:\n    id: str\n\n@app.route(\"/x\")\ndef handler():\n    pass\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class && d.line == 2)
+        );
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "handler" && d.kind == DeclKind::Function && d.line == 6)
+        );
+        assert_eq!(graph.declarations.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_declarations_malformed_source_never_misclassifies() {
+        // Reuses Story 4.1.1/4.1.2's malformed-source shape (unclosed parameter list)
+        // applied to a second declaration following a well-formed first one.
+        //
+        // Verified real behavior (this file's `zzz_probe_python_shapes`-style
+        // verification, run directly against `to_sexp()`): unlike Java/Kotlin's
+        // `MISSING` recovery, tree-sitter-python's error recovery here does *not* keep
+        // the broken declaration's outer node intact — `def broken(` with no closing
+        // paren produces `(module (class_definition ...) (ERROR (identifier)))`, i.e.
+        // `Broken`'s would-be `function_definition` is swallowed entirely into a bare
+        // `ERROR` node at `module` level, not a `function_definition` with an internal
+        // `MISSING` token. Since this walk only matches `class_definition`/
+        // `function_definition`/`decorated_definition` by kind, the `ERROR` node is
+        // simply skipped — `broken` is never extracted at all, rather than extracted
+        // under the wrong kind or wrong name. This still satisfies the invariant this
+        // story's malformed-source tests all check: no Declaration with a wrong kind or
+        // wrong name is ever silently accepted as correct; the well-formed declaration
+        // before the malformed one is unaffected.
+        let dir = tmp_dir("python-malformed");
+        let path = write(
+            &dir,
+            "app/order.py",
+            "class Order:\n    pass\n\ndef broken(\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class)
+        );
+        // No wrong kind/name ever accepted: whatever else is present, nothing is
+        // misclassified.
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .all(|d| d.name == "Order" && d.kind == DeclKind::Class)
         );
 
         let _ = std::fs::remove_dir_all(&dir);
