@@ -78,10 +78,8 @@ impl DeclarationChecker for ContentChecker {
                     file: Some(decl.file.clone()),
                     line: Some(decl.line),
                     message: format!(
-                        "[content] {}:{}: '{}' ({kind}) is not allowed in component '{component}' \
+                        "[content] '{}' ({kind}) is not allowed in component '{component}' \
                          — allowed kinds: {}",
-                        decl.file.display(),
-                        decl.line,
                         decl.name,
                         rule.allowed_kinds.join(", ")
                     ),
@@ -147,12 +145,9 @@ impl DeclarationChecker for NamingChecker {
                     file: Some(decl.file.clone()),
                     line: Some(decl.line),
                     message: format!(
-                        "[naming] {}:{}: {kind} '{}' in component '{component}' does not match \
+                        "[naming] {kind} '{}' in component '{component}' does not match \
                          required pattern '{}'",
-                        decl.file.display(),
-                        decl.line,
-                        decl.name,
-                        rule.pattern
+                        decl.name, rule.pattern
                     ),
                     severity_override: None,
                 })
@@ -265,8 +260,8 @@ mod tests {
         assert_eq!(findings[0].line, Some(8));
         assert_eq!(
             findings[0].message,
-            "[content] domain/domain.go:8: 'Validate' (function) is not allowed in component \
-             'domain' — allowed kinds: struct"
+            "[content] 'Validate' (function) is not allowed in component 'domain' — allowed \
+             kinds: struct"
         );
     }
 
@@ -377,8 +372,8 @@ mod tests {
         assert_eq!(findings[0].line, Some(4));
         assert_eq!(
             findings[0].message,
-            "[naming] infra/infra.go:4: struct 'OrderStore' in component 'infra' does not \
-             match required pattern '.*Repository$|.*Client$'"
+            "[naming] struct 'OrderStore' in component 'infra' does not match required \
+             pattern '.*Repository$|.*Client$'"
         );
     }
 
