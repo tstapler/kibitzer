@@ -31,10 +31,11 @@ impl ImportGraph {
 }
 
 /// Build the import graph over `files` (already filtered to files kibitzer is scoped
-/// to). Go, TypeScript/JavaScript, Java, and Kotlin are extracted; Python import
-/// extraction can follow the same per-language dispatch pattern later (it does not fit
-/// the Go/Java/Kotlin "qualified name" family — see `build_qualified_name_language`'s
-/// doc comment).
+/// to). Go, TypeScript/JavaScript, Java, Kotlin, and Python are all extracted via
+/// per-language dispatch below. Python uses a bespoke resolver (`build_python`)
+/// rather than `build_qualified_name_language`'s shared family — it does not fit the
+/// Go/Java/Kotlin "qualified name" family (see that function's doc comment, and
+/// `build_python`'s own doc comment for why).
 pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
     let mut graph = ImportGraph::default();
 
@@ -59,6 +60,11 @@ pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
         .collect();
     if !kotlin_files.is_empty() {
         build_qualified_name_language(repo_root, &kotlin_files, &mut graph, &kotlin_lang_config())?;
+    }
+
+    let python_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "py")).collect();
+    if !python_files.is_empty() {
+        build_python(repo_root, &python_files, &mut graph)?;
     }
 
     Ok(graph)
@@ -693,6 +699,240 @@ fn kotlin_lang_config() -> QualifiedImportLangConfig {
 // → `body` (block) → `function_definition`), one level deeper than a module-level
 // function (`module` → `function_definition` directly) — the structural distinction
 // Story 5.3.1 needs to exclude nested methods from top-level extraction.
+
+// ---------------------------------------------------------------------------------
+// Python (Epic 5.2 / Story 5.2.1) — bespoke resolver, deliberately not a
+// `QualifiedImportLangConfig` variant. Python has no parsed package-declaration node
+// (identity comes from directory structure + `__init__.py` presence, not a tree
+// node), relative imports resolve by counting leading dots rather than matching a
+// qualified name, and absolute imports resolve via a heuristic package-tree walk
+// rather than an exact declaration-vs-import match — three algorithms genuinely
+// different from `build_qualified_name_language`'s single "declare identity, match
+// import path" shape, not config variants of it. Built against the verified
+// `to_sexp()` findings in the doc comment block immediately above.
+// ---------------------------------------------------------------------------------
+
+/// Task 5.2.1a — a file's own package identity, computed from directory structure
+/// rather than a parsed declaration (Python has none): walk upward from the file's
+/// own directory while each ancestor still contains an `__init__.py`, and take the
+/// dotted path from the first ancestor that does *not* (the "first non-package
+/// ancestor" — the package tree's root boundary) down to the file's own directory,
+/// normalized via `normalize_package_identity` for consistency with every other
+/// language's `/`-separated node keys. `None` if the file's own directory isn't
+/// itself a package (no `__init__.py`) — mirrors `QualifiedImportLangConfig`'s
+/// "skip the file entirely, no node, no edges" convention for Go/Java/Kotlin.
+fn python_package_of(repo_root: &Path, file: &Path) -> Option<String> {
+    let file_dir = file.parent()?;
+    if !file_dir.join("__init__.py").is_file() {
+        return None;
+    }
+
+    let mut topmost = file_dir.to_path_buf();
+    while let Some(parent) = topmost.parent() {
+        if parent == repo_root
+            || !parent.starts_with(repo_root)
+            || !parent.join("__init__.py").is_file()
+        {
+            break;
+        }
+        topmost = parent.to_path_buf();
+    }
+
+    let boundary = topmost.parent().unwrap_or(repo_root);
+    let rel = file_dir.strip_prefix(boundary).ok()?;
+    let segments: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+    Some(normalize_package_identity(&segments.join(".")))
+}
+
+/// Task 5.2.1c — absolute-import resolution against the heuristic package tree. Both
+/// `import_from_statement`'s `module_name` field and a plain `import_statement`'s
+/// `name` field already exclude any imported symbol — Python's grammar keeps those
+/// separate (unlike Java's `import pkg.Class`, which needs `strip_last_segment`) — so
+/// resolution here is a straight dot-to-slash normalize-and-membership-check against
+/// `graph.nodes`, the same invariant `build_qualified_name_language`'s pass 2 enforces
+/// (pre-mortem.md P1 #3(i)): an import can only become an edge if it names a package
+/// some file in this run actually declared.
+fn resolve_python_absolute_import(dotted: &str, known: &BTreeSet<String>) -> Option<String> {
+    let normalized = normalize_package_identity(dotted);
+    known.contains(&normalized).then_some(normalized)
+}
+
+/// Task 5.2.1b — relative-import resolution by counting leading dots, grounded in
+/// Story 5.1.1's verified finding (`python_relative_import_prefix_dot_count_is_in_source_text`):
+/// dot count lives only in `import_prefix`'s raw source text, never in tree shape or
+/// node kind. One dot means "the current package" — the importing file's own
+/// directory; each additional dot pops one more directory level. Reuses `build_js`'s
+/// `resolve_relative_import` precedent directly (a canonicalized-directory lookup
+/// map), since Python's relative imports name packages, not files — there's no
+/// extension/`index`-file resolution to layer on top the way JS needs.
+fn resolve_python_relative_import(
+    from_file: &Path,
+    dots: usize,
+    dotted_suffix: &str,
+    known: &std::collections::HashMap<PathBuf, String>,
+) -> Option<String> {
+    let mut base = from_file.parent()?.to_path_buf();
+    for _ in 1..dots {
+        base = base.parent()?.to_path_buf();
+    }
+    if !dotted_suffix.is_empty() {
+        base = base.join(dotted_suffix.replace('.', "/"));
+    }
+    known.get(&base.canonicalize().ok()?).cloned()
+}
+
+/// Each import target `collect_python_imports` finds, tagged by which of the two
+/// resolvers (`resolve_python_absolute_import` / `resolve_python_relative_import`)
+/// handles it.
+enum PythonImportTarget {
+    Absolute(String),
+    Relative { dots: usize, suffix: String },
+}
+
+/// Task 5.2.1d — walks `import_statement` and `import_from_statement` (plain,
+/// aliased, relative, and wildcard forms alike — a wildcard import's target still
+/// resolves via its `module_name` field alone, exactly like any other
+/// `import_from_statement`, per the verified finding in the doc comment block above:
+/// the absent `name` field only means there's no single local symbol to bind, not
+/// that the module path is unresolvable). `future_import_statement` is explicitly
+/// excluded: it is a wholly separate node kind with no `module_name` field, and per
+/// Story 5.2.1's acceptance criteria must produce zero edges and no error — excluded
+/// at the source rather than mishandled as an unresolvable local import.
+fn collect_python_imports(node: Node, src: &[u8], out: &mut Vec<(PythonImportTarget, usize)>) {
+    match node.kind() {
+        "import_statement" => {
+            let mut cursor = node.walk();
+            for name_node in node.children_by_field_name("name", &mut cursor) {
+                let dotted_node = if name_node.kind() == "aliased_import" {
+                    name_node.child_by_field_name("name")
+                } else {
+                    Some(name_node)
+                };
+                if let Some(dotted_node) = dotted_node
+                    && let Ok(text) = dotted_node.utf8_text(src)
+                {
+                    out.push((
+                        PythonImportTarget::Absolute(text.to_string()),
+                        node.start_position().row + 1,
+                    ));
+                }
+            }
+        }
+        "import_from_statement" => {
+            if let Some(module_name) = node.child_by_field_name("module_name") {
+                let line = node.start_position().row + 1;
+                match module_name.kind() {
+                    "dotted_name" => {
+                        if let Ok(text) = module_name.utf8_text(src) {
+                            out.push((PythonImportTarget::Absolute(text.to_string()), line));
+                        }
+                    }
+                    "relative_import" => {
+                        let mut dots = 0usize;
+                        let mut suffix = String::new();
+                        let mut rcursor = module_name.walk();
+                        for child in module_name.named_children(&mut rcursor) {
+                            match child.kind() {
+                                "import_prefix" => {
+                                    if let Ok(text) = child.utf8_text(src) {
+                                        dots = text.chars().filter(|&c| c == '.').count();
+                                    }
+                                }
+                                "dotted_name" => {
+                                    if let Ok(text) = child.utf8_text(src) {
+                                        suffix = text.to_string();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        out.push((PythonImportTarget::Relative { dots, suffix }, line));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // `future_import_statement` falls through here, deliberately unhandled — see
+        // this function's doc comment.
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_python_imports(child, src, out);
+    }
+}
+
+/// Task 5.2.1e — Python's bespoke `build()` entry point, wired into `.py` dispatch
+/// above. Two passes, the same graph-membership-guard shape as
+/// `build_qualified_name_language` (pre-mortem.md P1 #3(i)): pass 1 registers every
+/// file's own package identity (and, for relative-import resolution, its
+/// canonicalized directory) before pass 2 looks anything up — an import can resolve
+/// to a package declared by any file in this run regardless of walk order — and
+/// pass 2 adds an edge only when resolution actually finds a `graph.nodes` entry.
+fn build_python(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("loading tree-sitter-python grammar")?;
+
+    let mut file_data: Vec<(&PathBuf, String, tree_sitter::Tree, String)> = Vec::new();
+    let mut known_dirs: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let tree = parser
+            .parse(&source, None)
+            .with_context(|| format!("parsing {}", file.display()))?;
+
+        if let Some(pkg) = python_package_of(repo_root, file) {
+            graph.nodes.insert(pkg.clone());
+            if let Some(dir) = file.parent().and_then(|d| d.canonicalize().ok()) {
+                known_dirs.insert(dir, pkg.clone());
+            }
+            file_data.push((file, pkg, tree, source));
+        }
+    }
+
+    for (file, pkg, tree, source) in &file_data {
+        let mut imports = Vec::new();
+        collect_python_imports(tree.root_node(), source.as_bytes(), &mut imports);
+
+        for (target, line) in imports {
+            let resolved = match target {
+                PythonImportTarget::Absolute(dotted) => {
+                    resolve_python_absolute_import(&dotted, &graph.nodes)
+                }
+                PythonImportTarget::Relative { dots, suffix } => {
+                    resolve_python_relative_import(file, dots, &suffix, &known_dirs)
+                }
+            };
+            if let Some(to) = resolved
+                && &to != pkg
+            {
+                graph.edges.push(ImportEdge {
+                    from: pkg.clone(),
+                    to,
+                    file: (*file).clone(),
+                    line,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1432,5 +1672,136 @@ mod tests {
         let sexp = tree.root_node().to_sexp();
         assert!(sexp.contains("(ERROR (identifier))"));
         assert!(sexp.starts_with("(module (import_statement name: (dotted_name (identifier)))"));
+    }
+
+    // --- Epic 5.2 / Story 5.2.1: Python import extraction ---
+
+    /// Story 5.2.1's first acceptance criterion: a relative import one level up into a
+    /// sibling package (`from ..infra import db_client`) produces an edge from the
+    /// importing file's own package to the resolved sibling — the non-trivial case,
+    /// since same-directory relative imports produce no cross-node edge at all (same
+    /// "skip same-dir" convention as `build_js`'s `to_dir != from_dir` check).
+    #[test]
+    fn python_relative_import_resolves_to_sibling_package() {
+        let dir = tmp_dir("python-relative");
+        let app_init = write(&dir, "app/__init__.py", "");
+        let domain_init = write(&dir, "app/domain/__init__.py", "");
+        let validator = write(
+            &dir,
+            "app/domain/validator.py",
+            "from ..infra import db_client\n",
+        );
+        let infra_init = write(&dir, "app/infra/__init__.py", "");
+
+        let graph = build(&dir, &[app_init, domain_init, validator, infra_init]).unwrap();
+
+        assert!(graph.nodes.contains("app/domain"));
+        assert!(graph.nodes.contains("app/infra"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app/domain" && e.to == "app/infra")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 5.2.1's second acceptance criterion: an absolute import
+    /// (`from app.infra import db_client`) resolves via the `__init__.py`-rooted
+    /// heuristic, normalized dot-to-slash the same way Java/Kotlin's qualified names
+    /// are, so the resulting node key matches `app/domain`'s directory-based identity.
+    #[test]
+    fn python_absolute_import_resolves_via_init_py_heuristic() {
+        let dir = tmp_dir("python-absolute");
+        let app_init = write(&dir, "app/__init__.py", "");
+        let domain_init = write(&dir, "app/domain/__init__.py", "");
+        let order = write(
+            &dir,
+            "app/domain/order.py",
+            "from app.infra import db_client\n",
+        );
+        let infra_init = write(&dir, "app/infra/__init__.py", "");
+
+        let graph = build(&dir, &[app_init, domain_init, order, infra_init]).unwrap();
+
+        assert!(graph.nodes.contains("app/domain"));
+        assert!(graph.nodes.contains("app/infra"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app/domain" && e.to == "app/infra")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Story 5.2.1's third acceptance criterion: `from __future__ import annotations`
+    /// produces zero graph edges and no error — regression-guards Story 5.1.1's
+    /// finding that a naive walk matching only `import_from_statement` would miss
+    /// `future_import_statement` entirely (here, `collect_python_imports` excludes it
+    /// explicitly, so this is proven rather than accidental).
+    #[test]
+    fn python_future_import_produces_no_edge() {
+        let dir = tmp_dir("python-future");
+        let pkg_init = write(&dir, "pkg/__init__.py", "");
+        let mod_file = write(&dir, "pkg/mod.py", "from __future__ import annotations\n");
+
+        let graph = build(&dir, &[pkg_init, mod_file]).unwrap();
+
+        assert!(graph.edges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Judgment call beyond plan.md's 3 named tests, locking in the doc comment's
+    /// verified finding above `collect_python_imports`: a wildcard import
+    /// (`from app.infra import *`) still resolves via its `module_name` field alone,
+    /// exactly like any other `import_from_statement` — it must not be silently
+    /// skipped alongside `future_import_statement` just because its `name` field is
+    /// absent.
+    #[test]
+    fn python_wildcard_import_resolves_via_module_name() {
+        let dir = tmp_dir("python-wildcard");
+        let app_init = write(&dir, "app/__init__.py", "");
+        let domain_init = write(&dir, "app/domain/__init__.py", "");
+        let order = write(&dir, "app/domain/order.py", "from app.infra import *\n");
+        let infra_init = write(&dir, "app/infra/__init__.py", "");
+
+        let graph = build(&dir, &[app_init, domain_init, order, infra_init]).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app/domain" && e.to == "app/infra")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Judgment call beyond plan.md's 3 named tests, mirroring the Java/Go graph-
+    /// membership-guard tests already in this file (pre-mortem.md P1 #3(i)): an
+    /// absolute import of a package no file in this run declared (no `__init__.py`
+    /// registered it) must never become a graph node or edge, even though its dotted
+    /// path is syntactically well-formed and superficially plausible.
+    #[test]
+    fn python_import_of_external_package_creates_no_edge() {
+        let dir = tmp_dir("python-external");
+        let app_init = write(&dir, "app/__init__.py", "");
+        let domain_init = write(&dir, "app/domain/__init__.py", "");
+        let order = write(
+            &dir,
+            "app/domain/order.py",
+            "from django.db import models\n",
+        );
+
+        let graph = build(&dir, &[app_init, domain_init, order]).unwrap();
+
+        assert!(!graph.nodes.contains("django/db"));
+        assert!(graph.edges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
