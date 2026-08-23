@@ -1,0 +1,64 @@
+{
+  "architecture": {
+    "components": [
+      {
+        "name": "handlers",
+        "paths": ["**/handlers", "**/handlers/**"]
+      },
+      {
+        "name": "domain",
+        "paths": ["**/domain", "**/domain/**"]
+      },
+      {
+        "name": "infra",
+        "paths": ["**/infra", "**/infra/**"]
+      }
+    ],
+    "dependency_rules": [
+      {
+        "component": "handlers",
+        "may_depend_on": ["handlers", "domain"]
+      },
+      {
+        "component": "domain",
+        "may_depend_on": ["domain"]
+      }
+    ],
+    "content_rules": [
+      {
+        "component": "domain",
+        "allowed_kinds": ["struct"]
+      }
+    ],
+    "naming_rules": [
+      {
+        "component": "infra",
+        "kind": "struct",
+        "pattern": "^.*(Repository|Client)$"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "name": "dogfood-component-deps",
+      "architecture_checker": "component-deps",
+      "severity": "advisory",
+      "scope": ["testdata/dogfood-architecture/**"],
+      "triggers": ["batch"]
+    },
+    {
+      "name": "dogfood-content-rules",
+      "architecture_checker": "content-rules",
+      "severity": "advisory",
+      "scope": ["testdata/dogfood-architecture/**"],
+      "triggers": ["batch"]
+    },
+    {
+      "name": "dogfood-naming-rules",
+      "architecture_checker": "naming-rules",
+      "severity": "advisory",
+      "scope": ["testdata/dogfood-architecture/**"],
+      "triggers": ["batch"]
+    }
+  ]
+}
