@@ -224,13 +224,41 @@ impl KibitzerServer {
             if result.passed {
                 continue;
             }
-            let level = match result.severity {
-                Severity::Blocking => "blocking",
-                Severity::Advisory => "advisory",
-            };
-            for finding_line in result.output.lines().filter(|l| !l.is_empty()) {
-                lines.push(format!("[{level}] {finding_line}"));
-                finding_count += 1;
+            // Render each finding's EFFECTIVE severity — `severity_override.unwrap_or(check.severity)`
+            // — rather than `result.severity` once for the whole `Check`. Without this, a
+            // zero-match-component advisory (`severity_override: Some(Advisory)`, set
+            // unconditionally by `zero_match_advisory`/every checker) would inherit
+            // whatever severity the user configured for the enclosing `Check` — so a
+            // `component-deps` check set to `"severity": "blocking"` renders its own
+            // harmless zero-match advisories as `[blocking]`, defeating the guarantee
+            // `ArchFinding.severity_override` exists to provide. `result.findings` (populated
+            // by `run_architecture_check`) carries the per-finding data; fall back to the
+            // old flattened-`output` rendering only if `findings` is unexpectedly empty
+            // (e.g. an old cached `CheckResult` predating this field, or a future
+            // architecture-checker source that doesn't populate it).
+            if result.findings.is_empty() {
+                let level = match result.severity {
+                    Severity::Blocking => "blocking",
+                    Severity::Advisory => "advisory",
+                };
+                for finding_line in result.output.lines().filter(|l| !l.is_empty()) {
+                    lines.push(format!("[{level}] {finding_line}"));
+                    finding_count += 1;
+                }
+            } else {
+                for finding in &result.findings {
+                    let level = match finding.severity_override.unwrap_or(result.severity) {
+                        Severity::Blocking => "blocking",
+                        Severity::Advisory => "advisory",
+                    };
+                    let location = match (&finding.file, finding.line) {
+                        (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
+                        (Some(file), None) => format!("{}: ", file.display()),
+                        (None, _) => String::new(),
+                    };
+                    lines.push(format!("[{level}] {location}{}", finding.message));
+                    finding_count += 1;
+                }
             }
             if let Some(rec) = recommendation_for(&check.name) {
                 recommendations.push(rec);
@@ -769,5 +797,153 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(output.contains("no findings"), "got:\n{output}");
+    }
+
+    /// The end-to-end test for the `severity_override` wiring gap: before this fix,
+    /// `architecture_assessment` derived one `level` per `Check` from `result.severity`
+    /// and stamped it on every line of `result.output` — so a `component-deps` check
+    /// configured `"severity": "blocking"` rendered its own harmless zero-match-component
+    /// advisory (`ArchFinding.severity_override: Some(Severity::Advisory)`, set
+    /// unconditionally by `zero_match_advisory`) as `[blocking]`. Unlike the
+    /// `architecture_checks.rs`/`declaration_checks.rs` unit tests that only assert on
+    /// `ArchFinding` values in isolation, this exercises the real, user/agent-facing MCP
+    /// tool output.
+    ///
+    /// Deliberately NOT a git repo: `run_architecture_check`'s "predates your edits"
+    /// git-HEAD-baseline downgrade only fires for a `Blocking`-severity check whose
+    /// findings are non-empty, and this fixture's `severity: "blocking"` config plus its
+    /// always-present zero-match finding would satisfy that trigger — if this were a git
+    /// repo with the same state committed, the baseline would *also* downgrade
+    /// `CheckResult.severity` to `Advisory` for an unrelated reason, which would make the
+    /// `[advisory]` assertion below pass even without this fix's `severity_override`
+    /// wiring. Staying a non-repo keeps `check_native_against_git_head_repo` a clean
+    /// `None` (not a git repo — no baseline to compare against), so `result.severity`
+    /// stays `Blocking` end to end and the only thing that can make the finding line
+    /// read `[advisory]` is `finding.severity_override`.
+    fn write_zero_match_only_component_deps_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+        // No imports at all: `ComponentDependencyChecker` has no edges to flag as a real
+        // violation. The only finding is the zero-match advisory for "ghost", whose glob
+        // matches no import-graph node.
+        std::fs::write(dir.join("pkg/pkg.go"), "package pkg\n\nfunc F() {}\n").unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{
+  "architecture": {
+    "components": [{"name": "ghost", "paths": ["**/ghost", "**/ghost/**"]}]
+  },
+  "checks": [
+    { "name": "component-deps", "architecture_checker": "component-deps", "severity": "blocking" }
+  ]
+}"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn architecture_assessment_renders_zero_match_advisory_as_advisory_under_a_blocking_check()
+     {
+        let dir = tmp_dir("zero-match-under-blocking");
+        write_zero_match_only_component_deps_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                include_diagram: false,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The real rendered output line: `[advisory]`, never `[blocking]`, despite the
+        // enclosing `component-deps` check being configured `"severity": "blocking"`.
+        let finding_line = output
+            .lines()
+            .find(|l| l.contains("[component]"))
+            .unwrap_or_else(|| panic!("expected a [component] zero-match finding, got:\n{output}"));
+        assert!(
+            finding_line.starts_with("[advisory]"),
+            "zero-match advisory rendered with the wrong level, expected `[advisory] ...`, got: {finding_line}"
+        );
+        assert!(
+            !finding_line.contains("[blocking]"),
+            "zero-match advisory must never render [blocking]: {finding_line}"
+        );
+        // No hard failure anywhere in the assessment output: with only a zero-match
+        // advisory and no real component-deps violation, nothing in the rendered output
+        // is tagged [blocking] at all.
+        assert!(
+            !output.contains("[blocking]"),
+            "expected no [blocking] finding anywhere in output, got:\n{output}"
+        );
+        assert!(
+            output.contains("architecture assessment: 1 finding(s)"),
+            "got:\n{output}"
+        );
+    }
+
+    /// Regression guard alongside the test above: a check configured `"severity":
+    /// "blocking"` against a fixture with a REAL violation (not a zero-match advisory)
+    /// must still render `[blocking]` — `severity_override` only ever narrows a finding
+    /// toward `Advisory`, it never suppresses a genuine violation's severity.
+    #[tokio::test]
+    async fn architecture_assessment_still_renders_a_real_blocking_violation_as_blocking() {
+        let dir = tmp_dir("real-violation-stays-blocking");
+        std::fs::create_dir_all(dir.join("svcs")).unwrap();
+        std::fs::create_dir_all(dir.join("ext")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.join("svcs/svcs.go"),
+            "package svcs\n\nimport \"fixture/ext\"\n\nfunc Use() { ext.Do() }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ext/ext.go"), "package ext\n\nfunc Do() {}\n").unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{
+  "architecture": {
+    "components": [
+      {"name": "svcs", "paths": ["**/svcs", "**/svcs/**"]},
+      {"name": "ext", "paths": ["**/ext", "**/ext/**"]}
+    ],
+    "dependency_rules": [{"component": "svcs", "may_depend_on": []}]
+  },
+  "checks": [
+    { "name": "component-deps", "architecture_checker": "component-deps", "severity": "blocking" }
+  ]
+}"#,
+        )
+        .unwrap();
+        // Deliberately NOT a git repo, same reasoning as the fixture above — keeps
+        // `check_native_against_git_head_repo` a clean `None` so `result.severity` isn't
+        // touched by the unrelated "predates your edits" baseline logic, isolating what
+        // this test actually asserts.
+
+        let server = KibitzerServer::new();
+        let output = server
+            .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                include_diagram: false,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let finding_line = output
+            .lines()
+            .find(|l| l.contains("[component-deps]"))
+            .unwrap_or_else(|| {
+                panic!("expected a [component-deps] violation finding, got:\n{output}")
+            });
+        assert!(
+            finding_line.starts_with("[blocking]"),
+            "real violation must still render [blocking], got: {finding_line}"
+        );
     }
 }

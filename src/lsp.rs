@@ -174,6 +174,7 @@ mod tests {
             output: output.to_string(),
             message: None,
             command: "true".to_string(),
+            findings: Vec::new(),
         }
     }
 
