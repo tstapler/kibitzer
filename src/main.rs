@@ -5,6 +5,7 @@ mod check;
 mod checker;
 mod config;
 mod daemon;
+mod declaration_checks;
 mod dedup;
 mod duplicate_code;
 mod glob;
@@ -21,7 +22,7 @@ mod primitive_obsession;
 mod rules;
 mod run;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -66,6 +67,11 @@ enum Command {
 enum CheckCommand {
     /// Run a natively implemented checker (see `checker::registry()`) against a file.
     Native { name: String, file: PathBuf },
+    /// Run a whole-repo architecture/declaration checker (see
+    /// `architecture_checks::registry()`/`declaration_checks::registry()`, resolved via
+    /// `check::lookup_any_architecture_checker`) directly against a directory, without
+    /// needing a `.claude/inspect.json` check entry for it.
+    Architecture { name: String, dir: PathBuf },
     /// List natively implemented checkers available to reference from
     /// `.claude/inspect.json`'s `checker` field.
     List,
@@ -172,6 +178,7 @@ fn main() -> Result<ExitCode> {
                     Ok(ExitCode::from(1))
                 }
             }
+            CheckCommand::Architecture { name, dir } => run_architecture_cli(&name, &dir),
             CheckCommand::Backtest {
                 name,
                 transcripts_dir,
@@ -217,5 +224,137 @@ fn main() -> Result<ExitCode> {
                 }
             }
         },
+    }
+}
+
+/// `kibitzer check architecture <name> <dir>` (Story 1.2.2): runs one whole-repo
+/// architecture/declaration checker directly against `dir`, bypassing `.claude/inspect.json`'s
+/// `checks` list entirely — `name` only needs to be registered in
+/// `architecture_checks::registry()`/`declaration_checks::registry()`, not referenced by
+/// any configured check. `dir`'s own `.claude/inspect.json` (if any) still supplies the
+/// `ArchitectureConfig` (`components`/`dependency_rules`/etc.) the checker runs against,
+/// same as batch mode; an absent config just means an empty one (most checkers report no
+/// findings against zero declared components/rules).
+///
+/// Extracted as a plain function (rather than inlined in the `match` arm) so it's directly
+/// callable from `#[cfg(test)]` — `main.rs` has no subprocess-test precedent to match
+/// (Task 1.2.2c).
+fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
+    let Some(any_checker) = check::lookup_any_architecture_checker(name) else {
+        eprintln!("no architecture checker named '{name}' registered");
+        return Ok(ExitCode::from(1));
+    };
+
+    let files =
+        check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
+    let arch_config = config::find_config(dir)?
+        .map(|(config, _)| config.architecture)
+        .unwrap_or_default();
+
+    let findings = match any_checker {
+        check::AnyArchitectureChecker::Import(checker) => {
+            let graph = import_graph::build(dir, &files)
+                .with_context(|| format!("building import graph for {}", dir.display()))?;
+            checker.check(&graph, &arch_config)
+        }
+        check::AnyArchitectureChecker::Declaration(_checker) => {
+            // Same placeholder rationale as check.rs's run_architecture_check: no
+            // declaration_checks::lookup call can return Some until Phase 2, so this
+            // arm is unreachable today but must exist to compile against the enum.
+            eprintln!("declaration checker '{name}' is not yet implemented (Phase 2)");
+            return Ok(ExitCode::from(1));
+        }
+    };
+
+    if findings.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for finding in &findings {
+        let location = match (&finding.file, finding.line) {
+            (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
+            (Some(file), None) => format!("{}: ", file.display()),
+            (None, _) => String::new(),
+        };
+        println!("{location}[{name}] {}", finding.message);
+    }
+    Ok(ExitCode::from(1))
+}
+
+#[cfg(test)]
+mod architecture_cli_tests {
+    use super::*;
+
+    struct TempRepo {
+        dir: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "kibitzer-main-cli-test-{}-{name}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn write(&self, rel_path: &str, content: &str) {
+            let path = self.dir.join(rel_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // Proves criterion 8 / Task 1.2.2c generically against a checker guaranteed to be
+    // registered regardless of Epic 1.1's concurrent landing status: a Go import cycle
+    // between two packages, checked via the already-registered `import-cycles`
+    // architecture checker rather than the not-yet-necessarily-landed `component-deps`.
+    // The `testdata/dogfood-architecture` fixture named in validation.md's own acceptance
+    // criterion is Phase 7 scope and doesn't exist yet.
+    #[test]
+    fn cli_architecture_check_flags_violation_and_exits_nonzero() {
+        let repo = TempRepo::new("import-cycle");
+        repo.write("go.mod", "module kibitzer.example/cycletest\n\ngo 1.21\n");
+        repo.write(
+            "a/a.go",
+            "package a\n\nimport _ \"kibitzer.example/cycletest/b\"\n",
+        );
+        repo.write(
+            "b/b.go",
+            "package b\n\nimport _ \"kibitzer.example/cycletest/a\"\n",
+        );
+
+        let exit = run_architecture_cli("import-cycles", &repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
+    }
+
+    #[test]
+    fn cli_architecture_check_unknown_checker_exits_nonzero_with_message() {
+        let repo = TempRepo::new("unknown-checker");
+        let exit = run_architecture_cli("does-not-exist", &repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
+    }
+
+    #[test]
+    fn cli_architecture_check_passes_on_clean_directory() {
+        let repo = TempRepo::new("clean");
+        repo.write("go.mod", "module kibitzer.example/cleantest\n\ngo 1.21\n");
+        repo.write("a/a.go", "package a\n");
+
+        let exit = run_architecture_cli("import-cycles", &repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
     }
 }

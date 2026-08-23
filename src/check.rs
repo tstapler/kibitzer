@@ -778,11 +778,39 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     Some(result.ok()?.status.success())
 }
 
-/// Runs a whole-repo, in-process [`crate::architecture_checks::ArchitectureChecker`]
-/// against the import graph built from `files` — the native counterpart to
-/// `run_check`'s shell-out path for `WholeRepoNative` checks. `files` is expected to
-/// already be walked/collected by the caller (batch mode builds it once and reuses it
-/// across every whole-repo check, native or not).
+/// One check name resolved against either whole-repo checker registry: the existing
+/// import-graph-based [`crate::architecture_checks::ArchitectureChecker`]s
+/// (`import-cycles`/`layering`/`coupling`, and `component-deps` once Epic 1.1 lands), or
+/// the declaration-based checkers [`crate::declaration_checks`] will register starting
+/// Phase 2 (`content-rules`/`naming-rules`). [`run_architecture_check`] is the single
+/// dispatch point that branches on this so callers (`validate()`, batch execution, the
+/// `kibitzer check architecture` CLI verb) don't need to know which registry a given
+/// name lives in.
+pub enum AnyArchitectureChecker {
+    Import(Box<dyn crate::architecture_checks::ArchitectureChecker>),
+    Declaration(Box<dyn crate::declaration_checks::DeclarationChecker>),
+}
+
+/// Resolves `name` against [`crate::architecture_checks::registry()`] first, falling
+/// back to [`crate::declaration_checks::registry()`]'s (Phase-2-only, currently stubbed
+/// to always miss) lookup. Returns `None` when `name` isn't found in either — the
+/// "unknown architecture checker" case both `validate()` and `run_architecture_check`
+/// report.
+pub fn lookup_any_architecture_checker(name: &str) -> Option<AnyArchitectureChecker> {
+    if let Some(checker) = crate::architecture_checks::lookup(name) {
+        return Some(AnyArchitectureChecker::Import(checker));
+    }
+    crate::declaration_checks::lookup(name).map(AnyArchitectureChecker::Declaration)
+}
+
+/// Runs a whole-repo, in-process architecture/declaration checker resolved through
+/// [`lookup_any_architecture_checker`] — the native counterpart to `run_check`'s
+/// shell-out path for `WholeRepoNative` checks. `files` is expected to already be
+/// walked/collected by the caller (batch mode builds it once and reuses it across every
+/// whole-repo check, native or not).
+///
+/// Signature is unchanged from before the dual-registry dispatch was added (Epic 1.2) —
+/// every existing caller in `check.rs`/`mcp.rs` keeps working without modification.
 pub fn run_architecture_check(
     check: &Check,
     repo_root: &Path,
@@ -796,7 +824,7 @@ pub fn run_architecture_check(
 
     let cmd_str = format!("kibitzer check architecture {arch_name}");
 
-    let checker = match crate::architecture_checks::lookup(arch_name) {
+    let any_checker = match lookup_any_architecture_checker(arch_name) {
         Some(checker) => checker,
         None => {
             return Ok(CheckResult {
@@ -810,21 +838,43 @@ pub fn run_architecture_check(
         }
     };
 
-    let graph = match crate::import_graph::build(repo_root, files) {
-        Ok(graph) => graph,
-        Err(err) => {
+    let findings = match any_checker {
+        AnyArchitectureChecker::Import(checker) => {
+            let graph = match crate::import_graph::build(repo_root, files) {
+                Ok(graph) => graph,
+                Err(err) => {
+                    return Ok(CheckResult {
+                        check_name: check.name.clone(),
+                        severity: check.severity,
+                        passed: false,
+                        output: format!("{err:#}"),
+                        message: check.message.clone(),
+                        command: cmd_str,
+                    });
+                }
+            };
+            checker.check(&graph, arch_config)
+        }
+        AnyArchitectureChecker::Declaration(_checker) => {
+            // Placeholder until Phase 2 (Task 2.1.3b) replaces
+            // `declaration_checks::lookup`'s always-`None` stub with a real registry:
+            // this arm builds a `DeclarationGraph` via `crate::declarations::build(...)`
+            // (module doesn't exist yet) and calls `_checker.check(...)`. Unreachable
+            // today — `lookup_any_architecture_checker` can only ever produce
+            // `Declaration` once `declaration_checks::lookup` starts returning `Some`.
             return Ok(CheckResult {
                 check_name: check.name.clone(),
                 severity: check.severity,
                 passed: false,
-                output: format!("{err:#}"),
+                output: format!(
+                    "declaration checker '{arch_name}' is not yet implemented (Phase 2)"
+                ),
                 message: check.message.clone(),
                 command: cmd_str,
             });
         }
     };
 
-    let findings = checker.check(&graph, arch_config);
     let passed = findings.is_empty();
     let combined = findings
         .iter()
@@ -840,6 +890,13 @@ pub fn run_architecture_check(
     let mut message = check.message.clone();
 
     if !passed && severity == Severity::Blocking {
+        // NOTE (seam for Story 2.2.3, Phase 2): this baseline check only ever resolves
+        // `arch_name` against `architecture_checks::lookup` — a `Declaration`-kind
+        // checker can never reach this line today (the arm above returns early), so
+        // there's no dual-registry gap to close yet. Once Phase 2 makes the
+        // `Declaration` arm real, this call needs to dispatch through
+        // `lookup_any_architecture_checker` too, same as the check above — that's
+        // Story 2.2.3's fix, not this epic's.
         let baseline = check_native_against_git_head_repo(arch_name, repo_root, arch_config);
         if let Some(false) = baseline {
             severity = Severity::Advisory;

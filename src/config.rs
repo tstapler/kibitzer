@@ -406,7 +406,7 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
             );
         }
         if let Some(arch_name) = &check.architecture_checker {
-            if crate::architecture_checks::lookup(arch_name).is_none() {
+            if crate::check::lookup_any_architecture_checker(arch_name).is_none() {
                 anyhow::bail!(
                     "{}: check '{}' references unknown architecture checker '{}'",
                     config_path.display(),
@@ -751,6 +751,26 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("undefined component 'doamin'"));
         assert!(msg.contains("(did you mean 'domain'?)"));
+    }
+
+    // --- Epic 1.2: dual-registry dispatch (`AnyArchitectureChecker`) ---
+
+    // Story 1.2.1's acceptance criterion: `content-rules` isn't in either registry yet
+    // (it's Phase 2 scope, added by Task 2.1.3b), so `validate()` — now going through
+    // `lookup_any_architecture_checker` — must still report it as unknown rather than
+    // finding it in `declaration_checks`'s always-`None` stub or crashing. Re-verify
+    // this test once Phase 2 lands `content-rules`; it should then need updating to a
+    // still-unregistered name to keep testing the "not found in either registry" path.
+    #[test]
+    fn rejects_content_rules_as_unknown_before_phase_2_registers_it() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "architecture_checker": "content-rules", "severity": "advisory", "triggers": ["batch"]}]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown architecture checker 'content-rules'")
+        );
     }
 
     #[test]
