@@ -755,21 +755,20 @@ mod tests {
 
     // --- Epic 1.2: dual-registry dispatch (`AnyArchitectureChecker`) ---
 
-    // Story 1.2.1's acceptance criterion: `content-rules` isn't in either registry yet
-    // (it's Phase 2 scope, added by Task 2.1.3b), so `validate()` — now going through
-    // `lookup_any_architecture_checker` — must still report it as unknown rather than
-    // finding it in `declaration_checks`'s always-`None` stub or crashing. Re-verify
-    // this test once Phase 2 lands `content-rules`; it should then need updating to a
-    // still-unregistered name to keep testing the "not found in either registry" path.
+    // Story 1.2.1's original acceptance criterion expected this to fail (`content-rules`
+    // wasn't in either registry yet — Phase 2 scope). Story 2.2.1 registers it in
+    // `declaration_checks::registry()`, so `validate()` — going through
+    // `lookup_any_architecture_checker` — now finds it and this input parses
+    // successfully (Task 2.2.2a).
     #[test]
-    fn rejects_content_rules_as_unknown_before_phase_2_registers_it() {
-        let err = parse(
+    fn accepts_content_rules_architecture_checker() {
+        let config = parse(
             r#"{"checks": [{"name": "n", "architecture_checker": "content-rules", "severity": "advisory", "triggers": ["batch"]}]}"#,
         )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unknown architecture checker 'content-rules'")
+        .unwrap();
+        assert_eq!(
+            config.checks[0].architecture_checker.as_deref(),
+            Some("content-rules")
         );
     }
 

@@ -414,6 +414,70 @@ mod tests {
         assert!(output.contains("## Dependency graph"));
     }
 
+    /// Task 2.2.2b: `content-rules`-configured fixture — a `domain` component whose
+    /// `ContentRule` only allows `struct`, and a `Validate` function declared inside it,
+    /// so `architecture_assessment` surfaces a real `[content]` finding end to end
+    /// (config parse -> `run_architecture_check`'s Declaration dispatch ->
+    /// `ContentChecker` -> MCP tool output).
+    fn write_content_rules_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("domain")).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.join("domain/domain.go"),
+            "package domain\n\ntype Order struct {\n\tID string\n}\n\n\
+             func Validate(o Order) error { return nil }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{
+  "architecture": {
+    "components": [{"name": "domain", "paths": ["**/domain", "**/domain/**"]}],
+    "content_rules": [{"component": "domain", "allowed_kinds": ["struct"]}]
+  },
+  "checks": [
+    { "name": "content-rules", "architecture_checker": "content-rules", "severity": "advisory" }
+  ]
+}"#,
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "init"],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn architecture_assessment_reports_content_rules_findings() {
+        let dir = tmp_dir("content-rules");
+        write_content_rules_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                include_diagram: false,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            output.contains("[content]"),
+            "expected a content-rules finding, got:\n{output}"
+        );
+    }
+
     #[tokio::test]
     async fn architecture_assessment_reports_no_findings_for_clean_repo() {
         let dir = tmp_dir("clean-repo");

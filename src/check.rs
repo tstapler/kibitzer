@@ -855,23 +855,22 @@ pub fn run_architecture_check(
             };
             checker.check(&graph, arch_config)
         }
-        AnyArchitectureChecker::Declaration(_checker) => {
-            // Placeholder until Phase 2 (Task 2.1.3b) replaces
-            // `declaration_checks::lookup`'s always-`None` stub with a real registry:
-            // this arm builds a `DeclarationGraph` via `crate::declarations::build(...)`
-            // (module doesn't exist yet) and calls `_checker.check(...)`. Unreachable
-            // today — `lookup_any_architecture_checker` can only ever produce
-            // `Declaration` once `declaration_checks::lookup` starts returning `Some`.
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!(
-                    "declaration checker '{arch_name}' is not yet implemented (Phase 2)"
-                ),
-                message: check.message.clone(),
-                command: cmd_str,
-            });
+        AnyArchitectureChecker::Declaration(checker) => {
+            let components = arch_config.effective_components();
+            let graph = match crate::declarations::build(repo_root, files, &components) {
+                Ok(graph) => graph,
+                Err(err) => {
+                    return Ok(CheckResult {
+                        check_name: check.name.clone(),
+                        severity: check.severity,
+                        passed: false,
+                        output: format!("{err:#}"),
+                        message: check.message.clone(),
+                        command: cmd_str,
+                    });
+                }
+            };
+            checker.check(&graph, arch_config)
         }
     };
 
@@ -890,13 +889,6 @@ pub fn run_architecture_check(
     let mut message = check.message.clone();
 
     if !passed && severity == Severity::Blocking {
-        // NOTE (seam for Story 2.2.3, Phase 2): this baseline check only ever resolves
-        // `arch_name` against `architecture_checks::lookup` — a `Declaration`-kind
-        // checker can never reach this line today (the arm above returns early), so
-        // there's no dual-registry gap to close yet. Once Phase 2 makes the
-        // `Declaration` arm real, this call needs to dispatch through
-        // `lookup_any_architecture_checker` too, same as the check above — that's
-        // Story 2.2.3's fix, not this epic's.
         let baseline = check_native_against_git_head_repo(arch_name, repo_root, arch_config);
         if let Some(false) = baseline {
             severity = Severity::Advisory;
@@ -919,14 +911,22 @@ pub fn run_architecture_check(
 }
 
 /// Native-checker counterpart to [`check_against_git_head_repo`]: snapshots HEAD the same
-/// way, but builds the import graph and runs the architecture checker in-process against
-/// the snapshot instead of shelling out.
+/// way, but builds the import/declaration graph and runs the architecture/declaration
+/// checker in-process against the snapshot instead of shelling out.
+///
+/// Story 2.2.3 (BLOCKER fix): dispatches through [`lookup_any_architecture_checker`] —
+/// the same dual-registry resolution [`run_architecture_check`] uses — instead of only
+/// ever searching [`crate::architecture_checks::lookup`]. Before this fix, a
+/// Declaration-kind checker (`content-rules`/`naming-rules`) could never be found here,
+/// so this function always returned `None` for them and the "predates your edits"
+/// downgrade in [`run_architecture_check`] never fired for a blocking-severity
+/// `content-rules`/`naming-rules` check.
 fn check_native_against_git_head_repo(
     arch_name: &str,
     repo_root: &Path,
     arch_config: &crate::config::ArchitectureConfig,
 ) -> Option<bool> {
-    let checker = crate::architecture_checks::lookup(arch_name)?;
+    let any_checker = lookup_any_architecture_checker(arch_name)?;
 
     let nonce = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let snapshot_dir = std::env::temp_dir().join(format!(
@@ -976,10 +976,18 @@ fn check_native_against_git_head_repo(
     }
 
     let files = walk_and_collect_files(&snapshot_dir).ok();
-    let result = files.and_then(|files| {
-        crate::import_graph::build(&snapshot_dir, &files)
-            .ok()
-            .map(|graph| checker.check(&graph, arch_config).is_empty())
+    let result = files.and_then(|files| match any_checker {
+        AnyArchitectureChecker::Import(checker) => {
+            crate::import_graph::build(&snapshot_dir, &files)
+                .ok()
+                .map(|graph| checker.check(&graph, arch_config).is_empty())
+        }
+        AnyArchitectureChecker::Declaration(checker) => {
+            let components = arch_config.effective_components();
+            crate::declarations::build(&snapshot_dir, &files, &components)
+                .ok()
+                .map(|graph| checker.check(&graph, arch_config).is_empty())
+        }
     });
 
     let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1369,6 +1377,9 @@ mod git_head_integration_tests {
 
         fn write_and_commit(&self, rel_path: &str, content: &str, msg: &str) {
             let path = self.dir.join(rel_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             std::fs::write(&path, content).unwrap();
             run(&self.dir, &["add", rel_path]);
             run(&self.dir, &["commit", "-q", "-m", msg]);
@@ -1592,6 +1603,184 @@ mod git_head_integration_tests {
         repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
 
         let result = run_check(&repo_wide_bad_marker_check(), &repo.dir, &repo.dir, None).unwrap();
+        assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Advisory);
+        assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    // --- Story 2.2.3: git-HEAD-baseline downgrade for Declaration-kind checkers
+    // (BLOCKER fix) ---
+
+    fn content_rules_check() -> Check {
+        Check {
+            name: "content-rules".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("content-rules".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("content rule violation".to_string()),
+            output_format: None,
+        }
+    }
+
+    fn domain_content_rules_arch_config() -> crate::config::ArchitectureConfig {
+        crate::config::ArchitectureConfig {
+            components: vec![crate::config::Component {
+                name: "domain".to_string(),
+                paths: vec!["**/domain".to_string(), "**/domain/**".to_string()],
+            }],
+            content_rules: vec![crate::config::ContentRule {
+                component: "domain".to_string(),
+                allowed_kinds: vec!["struct".to_string()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn content_rules_blocking_violation_downgrades_when_it_predates_head() {
+        let repo = TempRepo::new("content-rules-predates-head");
+        repo.write_and_commit(
+            "domain/domain.go",
+            "package domain\n\ntype Order struct {\n\tID string\n}\n\n\
+             func Validate(o Order) error { return nil }\n",
+            "init",
+        );
+        // Unrelated uncommitted edit — the content-rules violation itself is
+        // untouched by it, i.e. it predates this "current edit."
+        repo.write_uncommitted("README.md", "unrelated edit\n");
+
+        let arch_config = domain_content_rules_arch_config();
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+
+        let result =
+            run_architecture_check(&content_rules_check(), &repo.dir, &files, &arch_config)
+                .unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Advisory);
+        assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    #[test]
+    fn content_rules_blocking_violation_stays_blocking_when_new_since_head() {
+        let repo = TempRepo::new("content-rules-new-since-head");
+        repo.write_and_commit(
+            "domain/domain.go",
+            "package domain\n\ntype Order struct {\n\tID string\n}\n",
+            "init",
+        );
+        // Uncommitted edit introduces the violating function — absent at HEAD.
+        repo.write_uncommitted(
+            "domain/domain.go",
+            "package domain\n\ntype Order struct {\n\tID string\n}\n\n\
+             func Validate(o Order) error { return nil }\n",
+        );
+
+        let arch_config = domain_content_rules_arch_config();
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+
+        let result =
+            run_architecture_check(&content_rules_check(), &repo.dir, &files, &arch_config)
+                .unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Blocking);
+        assert!(!result.message.unwrap().contains("predates your edits"));
+    }
+
+    fn naming_rules_check() -> Check {
+        Check {
+            name: "naming-rules".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("naming-rules".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("naming rule violation".to_string()),
+            output_format: None,
+        }
+    }
+
+    #[test]
+    fn naming_rules_blocking_violation_downgrades_when_it_predates_head() {
+        let repo = TempRepo::new("naming-rules-predates-head");
+        repo.write_and_commit(
+            "infra/infra.go",
+            "package infra\n\ntype OrderStore struct {\n\tID string\n}\n",
+            "init",
+        );
+        repo.write_uncommitted("README.md", "unrelated edit\n");
+
+        let arch_config = crate::config::ArchitectureConfig {
+            components: vec![crate::config::Component {
+                name: "infra".to_string(),
+                paths: vec!["**/infra".to_string(), "**/infra/**".to_string()],
+            }],
+            naming_rules: vec![crate::config::NamingRule {
+                component: "infra".to_string(),
+                kind: "struct".to_string(),
+                pattern: ".*Repository$|.*Client$".to_string(),
+            }],
+            ..Default::default()
+        };
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+
+        let result =
+            run_architecture_check(&naming_rules_check(), &repo.dir, &files, &arch_config).unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Advisory);
+        assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    fn layering_check() -> Check {
+        Check {
+            name: "layering".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("layering".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("layering violation".to_string()),
+            output_format: None,
+        }
+    }
+
+    // Regression guard: `check_native_against_git_head_repo` had zero prior test
+    // coverage (verified — no existing test in this module names `layering`,
+    // `import-cycles`, or `coupling`), so Task 2.2.3a/b's rewrite (dispatching through
+    // `lookup_any_architecture_checker` and branching on the enum) needs its own new
+    // test proving the Import-kind path still behaves exactly as before.
+    #[test]
+    fn import_kind_checker_head_baseline_downgrade_still_works_through_dual_registry_dispatch() {
+        let repo = TempRepo::new("import-kind-regression");
+        repo.write_and_commit("go.mod", "module fixture\ngo 1.21\n", "init");
+        repo.write_and_commit(
+            "handlers/handlers.go",
+            "package handlers\n\nfunc Do() {}\n",
+            "add handlers",
+        );
+        repo.write_and_commit(
+            "domain/domain.go",
+            "package domain\n\nimport \"fixture/handlers\"\n\nfunc Do() { handlers.Do() }\n",
+            "add domain violating layering",
+        );
+        repo.write_uncommitted("README.md", "unrelated edit\n");
+
+        let arch_config = crate::config::ArchitectureConfig {
+            layers: vec!["handlers".to_string(), "domain".to_string()],
+            ..Default::default()
+        };
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+
+        let result =
+            run_architecture_check(&layering_check(), &repo.dir, &files, &arch_config).unwrap();
+
         assert!(!result.passed);
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));

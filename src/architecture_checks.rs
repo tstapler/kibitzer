@@ -256,7 +256,7 @@ fn component_dependency_finding(
 /// helper with their own wording (plan.md Story 1.1.3's shared-helper requirement).
 /// `severity_override` is always `Some(Severity::Advisory)` — this never masquerades as a
 /// blocking finding, regardless of the enclosing `Check.severity`.
-fn zero_match_advisory<T>(
+pub(crate) fn zero_match_advisory<T>(
     declared: &[T],
     is_matched: impl Fn(&T) -> bool,
     describe: impl Fn(&T) -> String,
