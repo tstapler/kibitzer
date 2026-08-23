@@ -258,12 +258,11 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
                 .with_context(|| format!("building import graph for {}", dir.display()))?;
             checker.check(&graph, &arch_config)
         }
-        check::AnyArchitectureChecker::Declaration(_checker) => {
-            // Same placeholder rationale as check.rs's run_architecture_check: no
-            // declaration_checks::lookup call can return Some until Phase 2, so this
-            // arm is unreachable today but must exist to compile against the enum.
-            eprintln!("declaration checker '{name}' is not yet implemented (Phase 2)");
-            return Ok(ExitCode::from(1));
+        check::AnyArchitectureChecker::Declaration(checker) => {
+            let components = arch_config.effective_components();
+            let graph = declarations::build(dir, &files, &components)
+                .with_context(|| format!("building declaration graph for {}", dir.display()))?;
+            checker.check(&graph, &arch_config)
         }
     };
 
@@ -357,5 +356,28 @@ mod architecture_cli_tests {
 
         let exit = run_architecture_cli("import-cycles", &repo.dir).unwrap();
         assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    // Regression test for the Declaration arm of `run_architecture_cli`, which used to
+    // print a Phase-2-era stub message ("not yet implemented (Phase 2)") for every
+    // Declaration-kind checker instead of building a DeclarationGraph and dispatching,
+    // even after ContentChecker/NamingChecker landed. `check.rs::run_architecture_check`
+    // (the batch/MCP dispatch path) already did this correctly; this proves the CLI verb
+    // now matches it for `naming-rules`.
+    #[test]
+    fn cli_architecture_check_dispatches_naming_rules_declaration_checker() {
+        let repo = TempRepo::new("naming-rules");
+        repo.write("go.mod", "module kibitzer.example/namingtest\n\ngo 1.21\n");
+        repo.write(
+            ".claude/inspect.json",
+            r#"{"architecture": {"components": [{"name": "infra", "paths": ["**/infra", "**/infra/**"]}], "naming_rules": [{"component": "infra", "kind": "struct", "pattern": "^.*(Repository|Client)$"}]}}"#,
+        );
+        repo.write(
+            "infra/infra.go",
+            "package infra\n\ntype OrderStore struct{}\n",
+        );
+
+        let exit = run_architecture_cli("naming-rules", &repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
     }
 }
