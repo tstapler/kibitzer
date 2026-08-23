@@ -88,6 +88,11 @@ pub(crate) fn is_js_like(path: &Path) -> bool {
 // table-driven-generic-function precedent (`body_finder`/`params_finder`).
 // ---------------------------------------------------------------------------------
 
+/// Each `(normalized import target, 1-based line)` pair a `collect_imports` fn appends
+/// to its output — factored into a named type purely to satisfy
+/// `clippy::type_complexity` on the `collect_imports` field below.
+type ImportTarget = (String, usize);
+
 /// Per-language table for `build_qualified_name_language`. See the module doc comment
 /// above for why Go/Java/Kotlin share one resolver while Python (`build_python`, when
 /// added) does not: Python's relative-dot-counting + `__init__.py`-heuristic resolution
@@ -116,7 +121,7 @@ struct QualifiedImportLangConfig {
     /// must exclude imports that don't name a package at all (e.g. Java's `import
     /// static`, which names a member) — such imports must never appear in the output,
     /// not even as a wrong/malformed entry.
-    collect_imports: fn(root: Node, src: &[u8], out: &mut Vec<(String, usize)>),
+    collect_imports: fn(root: Node, src: &[u8], out: &mut Vec<ImportTarget>),
 }
 
 /// Dot-to-slash package-identity normalization, shared by Java and Kotlin (whose
@@ -930,14 +935,18 @@ mod tests {
         assert!(graph.nodes.contains("example.com/app/a"));
         assert!(graph.nodes.contains("example.com/app/b"));
         assert!(!graph.nodes.contains("github.com/some-vendor/infra-client"));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "example.com/app/b" && e.to == "example.com/app/a"));
-        assert!(!graph
-            .edges
-            .iter()
-            .any(|e| e.to == "github.com/some-vendor/infra-client"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "example.com/app/b" && e.to == "example.com/app/a")
+        );
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.to == "github.com/some-vendor/infra-client")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -963,14 +972,18 @@ mod tests {
         assert!(graph.nodes.contains("com/example/domain"));
         assert!(graph.nodes.contains("com/example/infra"));
         assert!(!graph.nodes.contains("com.example.domain"));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra"));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "com/example/infra" && e.to == "com/example/domain"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "com/example/infra" && e.to == "com/example/domain")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1000,20 +1013,26 @@ mod tests {
         assert!(graph.nodes.contains("com/example/infra"));
         assert!(graph.nodes.contains("com/example/util"));
         // Plain import (Order.kt -> DbClient).
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra")
+        );
         // Wildcard import (DbClient.kt -> com.example.domain.*).
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "com/example/infra" && e.to == "com/example/domain"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "com/example/infra" && e.to == "com/example/domain")
+        );
         // Aliased import (DbClient.kt -> com.example.util.Helper as UtilHelper).
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "com/example/infra" && e.to == "com/example/util"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "com/example/infra" && e.to == "com/example/util")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1072,14 +1091,18 @@ mod tests {
         assert!(graph.nodes.contains("com/example/domain"));
         assert!(graph.nodes.contains("com/example/infra"));
         assert!(!graph.nodes.contains("org/springframework/stereotype"));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra"));
-        assert!(!graph
-            .edges
-            .iter()
-            .any(|e| e.to == "org/springframework/stereotype"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "com/example/domain" && e.to == "com/example/infra")
+        );
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|e| e.to == "org/springframework/stereotype")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1119,12 +1142,16 @@ mod tests {
             2,
             "expected exactly 2 edges, got {from_domain:?}"
         );
-        assert!(from_domain
-            .iter()
-            .any(|e| e.to == "com/example/infra" && e.line == 3));
-        assert!(from_domain
-            .iter()
-            .any(|e| e.to == "com/example/util" && e.line == 4));
+        assert!(
+            from_domain
+                .iter()
+                .any(|e| e.to == "com/example/infra" && e.line == 3)
+        );
+        assert!(
+            from_domain
+                .iter()
+                .any(|e| e.to == "com/example/util" && e.line == 4)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
