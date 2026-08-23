@@ -120,9 +120,19 @@ struct QualifiedImportLangConfig {
     language: fn() -> tree_sitter::Language,
     /// This file's own package/module identity — the `graph.nodes` key and the `from`
     /// side of any edge produced by its imports. `None` means the file is skipped
-    /// entirely (no node, no edges) — e.g. Go outside a resolvable module.
-    package_identity:
-        fn(repo_root: &Path, file: &Path, tree: &tree_sitter::Tree, src: &[u8]) -> Option<String>,
+    /// entirely (no node, no edges) — e.g. Go outside a resolvable module. The final
+    /// `cache` parameter is a per-`build_qualified_name_language`-call memo, used only
+    /// by Go's `go_package_identity` (its nearest-`go.mod` upward search is worth
+    /// caching per directory); Java's and Kotlin's implementations accept and ignore it,
+    /// the same accepted-but-unused-parameter convention `_tree`/`_src` (Go) and
+    /// `_repo_root` (Java/Kotlin) already use.
+    package_identity: fn(
+        repo_root: &Path,
+        file: &Path,
+        tree: &tree_sitter::Tree,
+        src: &[u8],
+        cache: &mut PackageIdentityCache,
+    ) -> Option<String>,
     /// Every (normalized import target, 1-based line) pair in the tree. Implementations
     /// must exclude imports that don't name a package at all (e.g. Java's `import
     /// static`, which names a member) — such imports must never appear in the output,
@@ -157,6 +167,11 @@ fn build_qualified_name_language(
         .set_language(&(cfg.language)())
         .context("loading tree-sitter grammar")?;
 
+    // Owns this call's `go.mod` lookup cache (see `PackageIdentityCache`'s doc comment)
+    // — one cache per `build()` invocation, not global/thread-local state, so results
+    // never leak across unrelated `build()` calls (e.g. between test fixtures).
+    let mut identity_cache = PackageIdentityCache::new();
+
     // Pass 1: parse every file and register its own package identity in `graph.nodes`
     // *before* pass 2 looks anything up there — an import can only resolve to a package
     // identity contributed by some file in this same run, regardless of which file
@@ -169,7 +184,13 @@ fn build_qualified_name_language(
             .parse(&source, None)
             .with_context(|| format!("parsing {}", file.display()))?;
 
-        if let Some(pkg) = (cfg.package_identity)(repo_root, file, &tree, source.as_bytes()) {
+        if let Some(pkg) = (cfg.package_identity)(
+            repo_root,
+            file,
+            &tree,
+            source.as_bytes(),
+            &mut identity_cache,
+        ) {
             graph.nodes.insert(pkg.clone());
             file_packages.push((file, pkg, tree, source));
         }
@@ -200,18 +221,67 @@ fn build_qualified_name_language(
 // Go
 // ---------------------------------------------------------------------------------
 
-fn go_module_path(repo_root: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(repo_root.join("go.mod")).ok()?;
-    contents.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("module ")
-            .map(|rest| rest.trim().to_string())
-    })
+/// Per-`build_qualified_name_language`-call memo for `find_go_mod_upward`, keyed by the
+/// directory the search started from (a Go file's own directory) to `(module path,
+/// directory containing the resolving go.mod)`, or `None` when no `go.mod` was found.
+/// Files sharing a directory (the overwhelmingly common case — a Go package is a
+/// directory) hit this cache instead of re-reading and re-parsing the same `go.mod`.
+/// Also threaded through `QualifiedImportLangConfig::package_identity`'s shared
+/// signature so Java/Kotlin's implementations can accept-and-ignore it (see that field's
+/// doc comment).
+type PackageIdentityCache = std::collections::HashMap<PathBuf, Option<(String, PathBuf)>>;
+
+/// Searches upward from `start_dir` for the nearest `go.mod`, the same algorithm real Go
+/// tooling uses to resolve a file's module (`go env GOMOD` / `go list -m`: check each
+/// ancestor directory in turn, stopping at the first `go.mod` found). Bounded to
+/// `repo_root` — the tree kibitzer actually scanned — rather than walking all the way to
+/// the filesystem root, since kibitzer has no business reading `go.mod` files outside
+/// the repo it was invoked against. Returns the `module` directive's path plus the
+/// directory that contains the resolving `go.mod`, since that directory (not
+/// necessarily `repo_root`) is what a file's import path is computed relative to —
+/// needed once the nearest `go.mod` isn't at `repo_root` itself, e.g. a Go module nested
+/// under a larger, non-Go-rooted repo.
+fn find_go_mod_upward(start_dir: &Path, repo_root: &Path) -> Option<(String, PathBuf)> {
+    let mut dir = start_dir;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(dir.join("go.mod"))
+            && let Some(module) = contents.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("module ")
+                    .map(|rest| rest.trim().to_string())
+            })
+        {
+            return Some((module, dir.to_path_buf()));
+        }
+
+        if dir == repo_root {
+            return None;
+        }
+        match dir.parent() {
+            Some(parent) if parent.starts_with(repo_root) => dir = parent,
+            _ => return None,
+        }
+    }
 }
 
-fn go_package_import_path(module_path: &str, repo_root: &Path, file: &Path) -> Option<String> {
+/// Cached wrapper around `find_go_mod_upward` — see `PackageIdentityCache`'s doc
+/// comment.
+fn go_module_for_dir(
+    start_dir: &Path,
+    repo_root: &Path,
+    cache: &mut PackageIdentityCache,
+) -> Option<(String, PathBuf)> {
+    if let Some(cached) = cache.get(start_dir) {
+        return cached.clone();
+    }
+    let result = find_go_mod_upward(start_dir, repo_root);
+    cache.insert(start_dir.to_path_buf(), result.clone());
+    result
+}
+
+fn go_package_import_path(module_path: &str, module_dir: &Path, file: &Path) -> Option<String> {
     let dir = file.parent()?;
-    let rel = dir.strip_prefix(repo_root).unwrap_or(dir);
+    let rel = dir.strip_prefix(module_dir).unwrap_or(dir);
     let rel_str = rel.to_string_lossy().replace('\\', "/");
     if rel_str.is_empty() {
         Some(module_path.to_string())
@@ -222,18 +292,22 @@ fn go_package_import_path(module_path: &str, repo_root: &Path, file: &Path) -> O
 
 /// Go's package identity is **not** derived from parsing the file's `package_clause`
 /// node — that node names only the local package name (e.g. `a`), not the full import
-/// path other files reference it by (e.g. `example.com/app/a`). It comes from
-/// `go.mod`'s `module` directive plus the file's repo-relative directory, exactly as
-/// pre-refactor `build_go` computed it. `tree`/`_src` are accepted-but-unused only to
-/// satisfy `QualifiedImportLangConfig::package_identity`'s shared signature.
+/// path other files reference it by (e.g. `example.com/app/a`). It comes from the
+/// nearest `go.mod`'s `module` directive (searched upward from the file's own
+/// directory, per `find_go_mod_upward`) plus the file's directory relative to *that*
+/// `go.mod`'s directory — not always `repo_root`, once a Go module is nested under a
+/// larger repo. `tree`/`_src` are accepted-but-unused only to satisfy
+/// `QualifiedImportLangConfig::package_identity`'s shared signature.
 fn go_package_identity(
     repo_root: &Path,
     file: &Path,
     _tree: &tree_sitter::Tree,
     _src: &[u8],
+    cache: &mut PackageIdentityCache,
 ) -> Option<String> {
-    let module_path = go_module_path(repo_root)?;
-    go_package_import_path(&module_path, repo_root, file)
+    let dir = file.parent()?;
+    let (module_path, module_dir) = go_module_for_dir(dir, repo_root, cache)?;
+    go_package_import_path(&module_path, &module_dir, file)
 }
 
 fn collect_go_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
@@ -406,6 +480,7 @@ fn java_package_identity(
     _file: &Path,
     tree: &tree_sitter::Tree,
     src: &[u8],
+    _cache: &mut PackageIdentityCache,
 ) -> Option<String> {
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -489,6 +564,7 @@ fn kotlin_package_identity(
     _file: &Path,
     tree: &tree_sitter::Tree,
     src: &[u8],
+    _cache: &mut PackageIdentityCache,
 ) -> Option<String> {
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -1004,6 +1080,54 @@ mod tests {
         let graph = build(&dir, &[a]).unwrap();
 
         assert!(graph.edges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the real dogfood-architecture gap: `repo_root` (the
+    /// directory kibitzer was invoked against) has **no** `go.mod` at all — it's a
+    /// polyglot repo root, mirroring kibitzer's own repo root relative to
+    /// `testdata/dogfood-architecture/`'s nested Go module — but a subdirectory two
+    /// levels down does. `go_package_identity` must find that nested `go.mod` by
+    /// searching upward from each file's own directory, not just check
+    /// `repo_root/go.mod` and give up. Both files' internal imports of each other must
+    /// still resolve to real graph edges.
+    #[test]
+    fn go_import_graph_finds_nested_module_below_a_non_go_repo_root() {
+        let dir = tmp_dir("go-nested-module");
+        // No go.mod at `dir` itself — only under the nested `nested-module` subdir.
+        write(
+            &dir,
+            "nested-module/go.mod",
+            "module nested.example/mod\n\ngo 1.21\n",
+        );
+        let a = write(
+            &dir,
+            "nested-module/a/a.go",
+            "package a\n\nimport \"nested.example/mod/b\"\n\nfunc F() { b.G() }\n",
+        );
+        let b = write(
+            &dir,
+            "nested-module/b/b.go",
+            "package b\n\nimport \"nested.example/mod/a\"\n\nfunc G() { a.F() }\n",
+        );
+
+        let graph = build(&dir, &[a, b]).unwrap();
+
+        assert!(graph.nodes.contains("nested.example/mod/a"));
+        assert!(graph.nodes.contains("nested.example/mod/b"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "nested.example/mod/a" && e.to == "nested.example/mod/b")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "nested.example/mod/b" && e.to == "nested.example/mod/a")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
