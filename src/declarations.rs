@@ -3,7 +3,8 @@
 //! every top-level declaration (struct/class/interface/enum/function) across the repo,
 //! feeding `declaration_checks`'s `ContentChecker` (Story 2.2.1) and `NamingChecker`
 //! (Phase 3). Go and JS/TS first, mirroring `import_graph.rs`'s own initial-language
-//! scope before Python/Java/Kotlin were added in later phases.
+//! scope before Python/Java/Kotlin were added in later phases (Java/Kotlin land in
+//! Epic 4.3 below).
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,16 @@ use crate::config::{Component, component_of};
 /// `ContentRule`/`NamingRule`'s `allowed_kinds`/`kind` string parsing (Story 2.2.1) has a
 /// stable variant set to validate against from the start, matching plan.md Task 2.1.1a's
 /// literal enum definition.
+///
+/// `Function` is never produced for Java (Story 4.3.1): Java has no top-level functions
+/// outside a class/interface body, unlike Go/JS/TS/Kotlin, so method declarations are
+/// out of scope for Java content/naming rules in this module — documented here rather
+/// than silently half-supported. Kotlin *does* have top-level `fun`s, but extracting
+/// them is outside this story's verified scope too (no AC/test names this story).
+///
+/// No `Object` variant exists for Kotlin's `object` declarations — see
+/// `collect_kotlin_declarations`'s doc comment for why `object` maps onto `Class`
+/// instead of a new variant.
 // Consumed by `declaration_checks::ContentChecker` starting Story 2.2.1 and
 // `NamingChecker` starting Phase 3 — not yet called from `main`'s reachable paths
 // outside tests (same forward-scaffolding precedent as `config.rs`'s `ContentRule`/
@@ -56,8 +67,8 @@ pub struct DeclarationGraph {
 }
 
 /// Build the declaration graph over `files` (already filtered to files kibitzer is
-/// scoped to). Only Go and TypeScript/JavaScript are extracted for now — Python/Java/
-/// Kotlin can follow the same per-language dispatch pattern later (Phase 4/5).
+/// scoped to). Go, TypeScript/JavaScript, Java, and Kotlin are extracted; Python can
+/// follow the same per-language dispatch pattern later (Phase 5).
 // Consumed by `check.rs`'s `AnyArchitectureChecker::Declaration` arm starting Story
 // 2.2.1, once `declaration_checks::lookup` returns `Some` for the first time — not yet
 // called outside tests.
@@ -82,11 +93,25 @@ pub fn build(
         build_js_ts_declarations(repo_root, &js_files, components, &mut graph)?;
     }
 
+    let java_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "java")).collect();
+    if !java_files.is_empty() {
+        build_java_declarations(repo_root, &java_files, components, &mut graph)?;
+    }
+
+    let kotlin_files: Vec<&PathBuf> = files.iter().filter(|f| is_kotlin_like(f)).collect();
+    if !kotlin_files.is_empty() {
+        build_kotlin_declarations(repo_root, &kotlin_files, components, &mut graph)?;
+    }
+
     Ok(graph)
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some(ext)
+}
+
+fn is_kotlin_like(path: &Path) -> bool {
+    has_ext(path, "kt") || has_ext(path, "kts")
 }
 
 /// Resolves `file`'s repo-relative path to a component name via the same
@@ -247,6 +272,203 @@ fn build_js_ts_declarations(
         let component = resolve_component(repo_root, file, components);
         let mut decls = Vec::new();
         collect_js_ts_declarations(tree.root_node(), source.as_bytes(), &mut decls);
+        for (name, kind, line) in decls {
+            graph.declarations.push(Declaration {
+                name,
+                kind,
+                file: (*file).clone(),
+                line,
+                component: component.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------
+// Java
+// ---------------------------------------------------------------------------------
+
+/// Recursively walks the tree collecting `(name, kind, line)` triples. Verified against
+/// tree-sitter-java 0.23.5's real `to_sexp()` output (this file's test module): unlike
+/// Kotlin below, `class_declaration`, `interface_declaration`, and `record_declaration`
+/// are each their own dedicated node kind — no shared-kind keyword disambiguation is
+/// needed — and each carries a `name` field directly, e.g. `public interface Repository
+/// {}` parses as `(interface_declaration (modifiers) name: (identifier)
+/// body: (interface_body))`.
+///
+/// A leading annotation (`@Deprecated`, `@FunctionalInterface`) nests inside the
+/// declaration node's own `modifiers` child and does not shift or hide the `name` field —
+/// confirmed via real `to_sexp()` output: `(class_declaration (modifiers
+/// (marker_annotation name: (identifier))) name: (identifier) body: (class_body))`. So,
+/// unlike Kotlin's positional keyword scan, Java's classification is pure
+/// `node.kind()` dispatch plus `child_by_field_name("name")` — the same shape Go/JS/TS
+/// already use — and is unaffected by annotations for exactly that reason.
+///
+/// `record_declaration` maps to `DeclKind::Class`: this module's schema (`DeclKind`) has
+/// no dedicated "record" variant, and a Java record is fundamentally a restricted class
+/// (javac itself compiles a record to a `final class`), making `Class` the closest
+/// existing category rather than an invented one.
+///
+/// Java has no top-level functions outside a class/interface/record body — method
+/// declarations are intentionally never extracted here (see `DeclKind`'s doc comment).
+fn collect_java_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
+    let kind = match node.kind() {
+        "class_declaration" | "record_declaration" => Some(DeclKind::Class),
+        "interface_declaration" => Some(DeclKind::Interface),
+        _ => None,
+    };
+    if let Some(kind) = kind
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(src)
+    {
+        out.push((name.to_string(), kind, node.start_position().row + 1));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_java_declarations(child, src, out);
+    }
+}
+
+/// Fresh `tree_sitter::Parser` per file, matching `build_go_declarations`/
+/// `build_js_ts_declarations`'s own precedent above.
+fn build_java_declarations(
+    repo_root: &Path,
+    files: &[&PathBuf],
+    components: &[Component],
+    graph: &mut DeclarationGraph,
+) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .context("loading tree-sitter-java grammar")?;
+
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let tree = parser
+            .parse(&source, None)
+            .with_context(|| format!("parsing {} with tree-sitter-java", file.display()))?;
+
+        let component = resolve_component(repo_root, file, components);
+        let mut decls = Vec::new();
+        collect_java_declarations(tree.root_node(), source.as_bytes(), &mut decls);
+        for (name, kind, line) in decls {
+            graph.declarations.push(Declaration {
+                name,
+                kind,
+                file: (*file).clone(),
+                line,
+                component: component.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------
+// Kotlin
+// ---------------------------------------------------------------------------------
+
+/// Recursively walks the tree collecting `(name, kind, line)` triples. Verified against
+/// tree-sitter-kotlin-ng 1.1.0's real `to_sexp()` output (Task 4.1.2c, this file's test
+/// module, plus further verification for this story below):
+///
+/// - `class` and `interface` share **one** node kind, `class_declaration` — distinguished
+///   only by an anonymous (field-less) keyword token child whose kind is the literal
+///   `"class"` or `"interface"`. That keyword can be preceded by a `modifiers` node
+///   (e.g. `abstract class Foo`, or an annotation like `@Suppress("unused")`), so it's
+///   found by scanning raw children for kind, never by a fixed positional index.
+/// - `object` declarations are a wholly separate node kind, `object_declaration` — not a
+///   `class_declaration` variant, so it needs its own match arm rather than a keyword
+///   check alongside class/interface.
+///
+/// `object_declaration` maps to `DeclKind::Class`: `DeclKind` has no `Object` variant,
+/// and `declaration_checks::kind_name()`'s match over `DeclKind` is exhaustive and lives
+/// in a file outside this story's `src/declarations.rs`-only scope — adding a new variant
+/// here would leave that match non-exhaustive with no in-scope way to fix it. `Class` is
+/// the closest existing category semantically (a Kotlin `object` compiles to a singleton
+/// JVM class), and is used here as the only in-scope mapping once a new variant is ruled
+/// out — not an arbitrary, unexamined choice.
+///
+/// Kotlin, unlike Java, does have top-level free functions (`fun`) — but no AC/test name
+/// in Story 4.3.1 calls for extracting them, so `DeclKind::Function` is intentionally
+/// never produced here either, matching this story's verified scope (class/interface/
+/// object only, mirroring `DeclKind`'s doc comment).
+///
+/// Verified further (this file's malformed-source tests below): a single-line brace body
+/// immediately following the header (e.g. `interface Repository { fun save() }`, all on
+/// one line) can itself misparse internally in this grammar version — the body comes back
+/// as `enum_class_body` wrapping an `ERROR` node instead of a clean `class_body` — while a
+/// multi-line body (`{` then a newline) parses cleanly. Regardless, the *outer*
+/// `class_declaration`/`object_declaration` node's own `kind()`, keyword child, and
+/// `name` field stay fully intact in both cases, because this walk only ever reads the
+/// declaration node's own direct children — never anything inside its body — so
+/// classification here is unaffected either way.
+fn collect_kotlin_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
+    match node.kind() {
+        "class_declaration" => {
+            let mut kw_cursor = node.walk();
+            let keyword_kind = node
+                .children(&mut kw_cursor)
+                .find(|c| c.kind() == "class" || c.kind() == "interface")
+                .map(|c| c.kind());
+            let kind = match keyword_kind {
+                Some("class") => Some(DeclKind::Class),
+                Some("interface") => Some(DeclKind::Interface),
+                _ => None,
+            };
+            if let Some(kind) = kind
+                && let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(name) = name_node.utf8_text(src)
+            {
+                out.push((name.to_string(), kind, node.start_position().row + 1));
+            }
+        }
+        "object_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(name) = name_node.utf8_text(src)
+            {
+                out.push((
+                    name.to_string(),
+                    DeclKind::Class,
+                    node.start_position().row + 1,
+                ));
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_kotlin_declarations(child, src, out);
+    }
+}
+
+/// Fresh `tree_sitter::Parser` per file, matching `build_go_declarations`/
+/// `build_js_ts_declarations`/`build_java_declarations`'s own precedent above.
+fn build_kotlin_declarations(
+    repo_root: &Path,
+    files: &[&PathBuf],
+    components: &[Component],
+    graph: &mut DeclarationGraph,
+) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .context("loading tree-sitter-kotlin-ng grammar")?;
+
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let tree = parser
+            .parse(&source, None)
+            .with_context(|| format!("parsing {} with tree-sitter-kotlin-ng", file.display()))?;
+
+        let component = resolve_component(repo_root, file, components);
+        let mut decls = Vec::new();
+        collect_kotlin_declarations(tree.root_node(), source.as_bytes(), &mut decls);
         for (name, kind, line) in decls {
             graph.declarations.push(Declaration {
                 name,
@@ -430,6 +652,231 @@ mod tests {
             && d.kind == DeclKind::Class
             && d.file == order_ts_path
             && d.line == 2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Epic 4.3 / Story 4.3.1: Java + Kotlin declaration extraction ---
+
+    #[test]
+    fn java_declarations_distinguishes_class_and_interface() {
+        let dir = tmp_dir("java-class-interface");
+        let path = write(
+            &dir,
+            "com/example/infra/DbClient.java",
+            "package com.example.infra;\n\npublic interface Repository {}\n\npublic class DbClient implements Repository {}\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Repository" && d.kind == DeclKind::Interface && d.file == path)
+        );
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "DbClient" && d.kind == DeclKind::Class && d.file == path)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kotlin_declarations_distinguishes_class_interface_object() {
+        let dir = tmp_dir("kotlin-class-interface-object");
+        // Story 4.1.2c's verified fixture shapes (multi-line bodies — see
+        // `collect_kotlin_declarations`'s doc comment for why single-line bodies are
+        // avoided here), combined into one file.
+        let path = write(
+            &dir,
+            "domain/Order.kt",
+            "class Order(val id: String)\n\ninterface Repository {\n    fun save()\n}\n\nobject Singleton {\n    val x = 1\n}\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class && d.file == path)
+        );
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Repository" && d.kind == DeclKind::Interface && d.file == path)
+        );
+        // `object` maps to `Class` — see `collect_kotlin_declarations`'s doc comment.
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Singleton" && d.kind == DeclKind::Class && d.file == path)
+        );
+        assert_eq!(graph.declarations.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn java_declarations_annotation_does_not_shift_positional_classification() {
+        let dir = tmp_dir("java-annotated");
+        let path = write(
+            &dir,
+            "com/example/domain/Order.java",
+            "package com.example.domain;\n\n@Deprecated\npublic class Order {}\n\n@FunctionalInterface\npublic interface Validator { boolean validate(Order o); }\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class)
+        );
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Validator" && d.kind == DeclKind::Interface)
+        );
+        // Neither misclassified as the other, nor dropped.
+        assert!(
+            !graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Interface)
+        );
+        assert!(
+            !graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Validator" && d.kind == DeclKind::Class)
+        );
+        assert_eq!(graph.declarations.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kotlin_declarations_annotation_does_not_shift_positional_classification() {
+        let dir = tmp_dir("kotlin-annotated");
+        let path = write(
+            &dir,
+            "domain/Order.kt",
+            "@Suppress(\"unused\")\nclass Order(val id: String)\n\n@Suppress(\"unused\")\ninterface Repository {\n    fun save()\n}\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class)
+        );
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Repository" && d.kind == DeclKind::Interface)
+        );
+        assert!(
+            !graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Interface)
+        );
+        assert!(
+            !graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Repository" && d.kind == DeclKind::Class)
+        );
+        assert_eq!(graph.declarations.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn java_declarations_malformed_source_never_misclassifies() {
+        // Reuses Story 4.1.1's malformed-source shape (unclosed class body) applied to
+        // a *second* declaration following a well-formed first one, per this story's AC.
+        //
+        // Verified real behavior (neither of the AC's literal (a)/(b) options): the
+        // grammar recovers by inserting a `MISSING "}"` node inside `Broken`'s
+        // `class_body`, leaving *both* `class_declaration` nodes' own `kind()` and
+        // `name` field fully intact — so both `Order` and `Broken` come back correctly
+        // classified as `Class` with their correct names. This still satisfies the AC's
+        // actual invariant ("never a Declaration with a wrong kind or a wrong name
+        // silently accepted as correct") — `Broken` genuinely is a class named `Broken`,
+        // even though its body's closing brace is missing — it's just a third outcome
+        // the AC's (a)/(b) framing didn't anticipate.
+        let dir = tmp_dir("java-malformed");
+        let path = write(
+            &dir,
+            "com/example/domain/Order.java",
+            "public class Order {}\n\npublic class Broken {\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class)
+        );
+        // No wrong kind/name ever accepted: whatever else is present, nothing is
+        // misclassified.
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .all(|d| (d.name == "Order" || d.name == "Broken") && d.kind == DeclKind::Class)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kotlin_declarations_malformed_source_never_misclassifies() {
+        // Reuses Story 4.1.2's malformed-source shape (unclosed parameter list,
+        // `MISSING ")"` recovery) applied to a second declaration after a well-formed
+        // first one, per this story's AC.
+        //
+        // Verified real behavior, same shape as the Java case above: the `MISSING ")"`
+        // node nests inside `Broken`'s `class_parameters`, leaving both
+        // `class_declaration` nodes' own `kind()`, keyword child, and `name` field
+        // intact — both `Order` and `Broken` come back correctly classified as `Class`.
+        // No wrong kind or wrong name is ever silently accepted.
+        let dir = tmp_dir("kotlin-malformed");
+        let path = write(
+            &dir,
+            "domain/Order.kt",
+            "class Order(val id: String)\n\nclass Broken(val id: String\n",
+        );
+
+        let graph = build(&dir, std::slice::from_ref(&path), &[]).unwrap();
+
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .any(|d| d.name == "Order" && d.kind == DeclKind::Class)
+        );
+        assert!(
+            graph
+                .declarations
+                .iter()
+                .all(|d| (d.name == "Order" || d.name == "Broken") && d.kind == DeclKind::Class)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
