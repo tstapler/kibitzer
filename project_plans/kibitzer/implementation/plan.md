@@ -6,7 +6,7 @@ import-graph coverage, built on kibitzer's existing `ArchitectureChecker`/`Impor
 **Date**: 2026-08-22
 **Status**: Ready for implementation
 **ADRs**: [ADR-001: content/naming rules get a third checker trait, not a widened `ArchitectureChecker`](../decisions/ADR-001-declaration-checker-third-trait.md)
-**Total Appetite**: ~24–32 hours across 8 phases. Sized as one feature-branch effort merged in
+**Total Appetite**: ~26–34 hours across 8 phases. Sized as one feature-branch effort merged in
 phase order (each phase is independently mergeable/revertable — see Sequencing below); not a
 commitment to ship all 4 gaps in one PR if time runs out after Phase 3.
 
@@ -19,7 +19,7 @@ commitment to ship all 4 gaps in one PR if time runs out after Phase 3.
 | 4 | Gap 4a: Java + Kotlin import/decl coverage | M (highest risk: Kotlin has no reference queries) | 4–5 |
 | 5 | Gap 4b: Python import/decl coverage | M | 3–4 |
 | 6 | UX polish (bracket-prefix, counts, mermaid) | S | 2 |
-| 7 | Dogfooding | S | 2 |
+| 7 | Dogfooding (synthetic fixture + real `stapler-squad` migration proof) | S/M | 3.5–4.5 |
 
 **Sequencing rationale**: Phase 0 locks the `Component`/`DependencyRule`/`ContentRule`/`NamingRule`
 schema *together*, per pitfalls.md's sequencing warning — Phase 0's Story 0.1.1 explicitly
@@ -78,6 +78,7 @@ and dogfooding close out once every rule category exists to demonstrate.
 | Java/Kotlin/Python graph-node identity | Normalize dot-separated package identity to `/`-separated at graph-build time (`normalize_package_identity`) | New catch, this plan (not in prior research) | Leave Java/Kotlin identity dot-separated (`com.example.domain`), require users to write dot-separated component globs | `glob_to_regex`/`matches_scope` is `/`-segment-aware only (`**/domain/**`) — a dot-separated identity string has *zero* `/` characters, so **no glob pattern in the new schema could ever match a Java/Kotlin package** without this normalization. This is a correctness bug in the schema as described by architecture.md if left unaddressed — caught during this planning pass, see Unresolved Questions |
 | Zero-match advisory severity (design/ux.md's headline gap: zero-match findings could render `[blocking]`) | Option (a): `ArchFinding.severity_override: Option<Severity>`, set unconditionally to `Advisory` by every zero-match finding; `CheckResult` gains a parallel `findings: Vec<ArchFinding>` field so `mcp.rs` reads per-finding severity instead of only the flattened `output: String` (Story 1.1.3) | design/ux.md, "Verified, headline gap" section | (b) Split zero-match findings into a separate always-advisory output channel/section | (a) keeps `ArchFinding` as the one finding shape every checker returns (matches UX AC 9: "no new finding shape"), and reuses two existing precedents — `Severity` already derives `Serialize`/`Deserialize` (`src/config.rs:9`), and `CheckResult` already caches additive `#[serde(default)]` fields to `cache.json` (the `command` field, `src/check.rs:26-32`); (b) would need a second finding vector threaded through every checker's return type and every call site that already assumes one `Vec<ArchFinding>`, a larger diff for the same outcome |
 | Git-HEAD-baseline downgrade for Declaration-kind checkers | `check_native_against_git_head_repo` dispatches through `lookup_any_architecture_checker` (Story 1.2.1) and branches on `AnyArchitectureChecker::Import`/`Declaration`, building the matching graph type (`ImportGraph` or `DeclarationGraph`) against the git-HEAD snapshot (Story 2.2.3) | adversarial-review.md's BLOCKER finding | Leave `content-rules`/`naming-rules` without the HEAD-baseline downgrade (accept the inconsistency) | Without this, a blocking `content-rules`/`naming-rules` check always blocks on any violation, including ones that predate the current edit — unlike every other native architecture checker. `component-deps` (Import-kind, Phase 1) already gets this correctly today since `architecture_checks::lookup` already covers it — confirmed by reading `src/check.rs:867-931` directly — so only the two Declaration-kind checkers, which don't exist until Phase 2/3, needed a fix; it lands in Phase 2 (Story 2.2.3) once `declaration_checks::registry()` is real |
+| Dependency-rule edge-target validity ("graph-membership guard") | `ComponentDependencyChecker::check()` requires `graph.nodes.contains(&edge.to) && graph.nodes.contains(&edge.from)` before resolving either side via `component_of()` — an explicit, checker-level re-assertion of the invariant `build_go`/`build_js`/`build_qualified_name_language` already establish at graph-construction time (an edge only ever targets a node built from a walked repo-local file) | pre-mortem.md P1 #3(i) | Trust that every `ImportGraph` builder (present and future, including Phase 4/5's language extractors) will always preserve that invariant, with no independent check at the consumer | A consumer-side check is one extra `.contains()` per edge and fails safe if a future extractor bug ever lets an edge target an unresolved/external path — without it, a `Component.paths` glob that happens to textually match a third-party import path's segment (e.g. `**/infra/**` matching `some-vendor/infra-client`) would silently produce a false-positive `component-deps` violation against code that was never part of the project |
 | Java-import positional walk | `kind()`-filtered positional child walk (no field names) | pitfalls.md §1 / build-vs-buy.md §4 (verified via real `node-types.json`) | Reuse Go/JS's `child_by_field_name("path"/"source")` pattern | `import_declaration` "declares no named fields at all" — confirmed via the grammar's own schema, not assumed by analogy |
 | Kotlin-import walk | Same `kind()`-filtered positional walk, node kind `"import"` (not `"import_header"`) | build-vs-buy.md §4 (verified via `gh api` against the actual pinned `tree-sitter-grammars/tree-sitter-kotlin`) | Trust the `fwcd/tree-sitter-kotlin` fork's `import_header` node name (an older, different grammar) | Two research passes disagreed until the pinned grammar's real source was fetched — this plan uses the verified answer, not the first guess |
 
@@ -147,6 +148,20 @@ No data migration, no config-file rewrite tooling needed.
    added (matches architecture.md's own "no enforcement needed at parse time" call) — worth a
    `docs/` note recommending `component-deps` supersede `layering` for new configs, but writing
    that doc is out of this plan's scope (no doc file named in requirements.md's Scope).
+
+## Post-Ship Follow-up (Requires User Input)
+
+**Real-repo adoption proof — RESOLVED 2026-08-23.** (pre-mortem.md P1 #5)
+
+This section originally posed an open question for Tyler ("which real repo, if any, currently uses
+`go-arch-lint`/`depguard`/`arch-go`, and would you migrate it as the adoption proof?"). Tyler answered
+it directly: `tstapler/stapler-squad` — a real, actively-maintained Go project with a real
+`depguard` config in `.golangci.yml` (3 rules, fetched via `gh api
+repos/tstapler/stapler-squad/contents/.golangci.yml`). That answer is no longer an open question —
+it is now **Epic 7.2** below (`stapler-squad` depguard migration), landed alongside the synthetic
+`testdata/dogfood-architecture/` fixture (Epic 7.1), not in place of it. The synthetic fixture still
+earns its place: kibitzer's own CI checks out kibitzer's own repo, and a real external repo can't be
+a hermetic, checked-in test fixture for that — see Epic 7.1's rationale, unchanged.
 
 ## Dependency Visualization
 
@@ -372,6 +387,30 @@ depguard/go-arch-lint-equivalent enforcement natively.
 - An edge where either endpoint matches no component is ignored (existing precedent, unchanged).
   - *Given* `graph.edges = [edge("dogfood.example/app/domain", "fmt")]` and no component matches `"fmt"`,
     *When* checked, *Then* no finding is produced.
+- **(pre-mortem.md P1 #3(i))** An edge whose target string is not itself an actual `graph.nodes`
+  entry — i.e. wasn't built from a walked repo-local file, such as an external/third-party import —
+  is never treated as a dependency-rule violation, even when a declared `Component.paths` glob
+  syntactically matches the string. Verified against `src/import_graph.rs`: `build_go` only inserts
+  a graph node for a resolved local package (`graph.nodes.insert(pkg.clone())`, line 113) and only
+  ever pushes an edge when `graph.nodes.contains(&import_path)` already holds (line 134); `build_js`
+  likewise only inserts local directories as nodes (line 220) and only resolves edges for relative
+  (`./`/`../`) specifiers against `known_files`, skipping bare/package specifiers outright (lines
+  240-242) — so today, an edge's `to` is *already* guaranteed to be a real graph node by construction
+  for both existing extractors. This criterion makes that invariant an explicit, independently-
+  checked property of `ComponentDependencyChecker` itself (defense-in-depth), rather than an implicit
+  assumption a future language extractor (Phase 4/5's `build_qualified_name_language`) could silently
+  break.
+  - *Given* `components = [Component{name:"infra", paths: vec!["**/infra/**".into()]}]`,
+    `dependency_rules = [DependencyRule{component:"domain".into(), may_depend_on: Some(vec!["domain".into()]), deny_depend_on: vec![]}]`,
+    and `graph = ImportGraph{nodes: BTreeSet::from(["dogfood.example/app/domain".into()]), edges: vec![ImportEdge{from: "dogfood.example/app/domain".into(), to: "some-vendor/infra-client".into(), file: "domain/domain.go".into(), line: 5}]}`
+    (`"some-vendor/infra-client"` is an external/unresolved import path — absent from `graph.nodes`,
+    matching how `build_go`/`build_js` would actually treat it; this test constructs the edge
+    directly, since today's extractors would never let it reach `graph.edges` in the first place, to
+    prove the checker doesn't rely solely on that invariant holding elsewhere),
+    *When* `ComponentDependencyChecker.check(&graph, &config)` runs, *Then* it returns **zero**
+    findings — `"some-vendor/infra-client"` textually matches the `infra` component's `**/infra/**`
+    glob, but because it isn't present in `graph.nodes`, it's never resolved to a component or
+    evaluated against any rule.
 **Files**: `src/architecture_checks.rs`
 
 ##### Task 1.1.1a: `ComponentDependencyChecker` struct + `check()` core logic (~5 min)
@@ -386,10 +425,23 @@ depguard/go-arch-lint-equivalent enforcement natively.
 - Add `Box::new(ComponentDependencyChecker)` to the `vec![...]` in `registry()`.
 - Files: `src/architecture_checks.rs`
 
-##### Task 1.1.1c: Unit tests for the 5 acceptance criteria above (~5 min, may split into 2 tasks if over budget)
+##### Task 1.1.1c: Unit tests for the first 5 acceptance criteria above (~5 min, may split into 2 tasks if over budget)
 - `component_deps_flags_disallowed_edge`, `component_deps_deny_wins_over_allow`,
   `component_deps_denies_by_default_with_no_rule`, `component_deps_ignores_same_component_edges`,
   `component_deps_ignores_unmapped_nodes`.
+- Files: `src/architecture_checks.rs`
+
+##### Task 1.1.1d: Graph-membership guard on edge targets before component resolution (~3 min)
+- In `check()`, before calling `component_of` on `edge.to`/`edge.from`, require
+  `graph.nodes.contains(&edge.to) && graph.nodes.contains(&edge.from)` — skip the edge (no finding)
+  if either side isn't an actual `graph.nodes` entry. Doc-comment this as deliberate defense-in-depth
+  (see the acceptance criterion above for the verified `build_go`/`build_js` precedent this restates
+  explicitly rather than assumes).
+- Files: `src/architecture_checks.rs`
+
+##### Task 1.1.1e: Unit test for the graph-membership guard (~3 min)
+- `component_deps_ignores_glob_matching_external_import_not_in_graph_nodes` per the acceptance
+  criterion above.
 - Files: `src/architecture_checks.rs`
 
 #### Story 1.1.2: `layers`-desugar golden regression tests
@@ -1061,6 +1113,16 @@ shapes, not assumption.
     and `(import_declaration (asterisk)` (for the wildcard import) — exact strings pinned from the
     real run, pasted into the extraction module's doc comment (per `rules.rs`'s established
     discipline), not typed from memory.
+- **(pre-mortem.md P1 #3(ii) / adversarial-review.md's malformed-source Concern)** A deliberately
+  malformed/incomplete Java source fixture is parsed and its real error-recovery `to_sexp()` shape is
+  captured and pinned — grounding Story 4.2.2/4.3.1's extraction-level malformed-source tests in a
+  verified tree shape, not a guess.
+  - *Given* a truncated fragment (e.g. `import com.example.infra.DbClient;\n\npublic class Order {\n    public String id\n`
+    — missing semicolon after `id`, unclosed `class` body), *When* parsed with
+    `tree_sitter_java::LANGUAGE` and `.to_sexp()` is called, *Then* the output is captured and
+    documented (does it contain an `ERROR` node, a `MISSING` node, or both — pinned verbatim from the
+    real run per adversarial-review.md's concern that "`parser.parse()` essentially never returns
+    `None` for a syntax error" and produces an error-recovery tree instead).
 **Files**: `src/import_graph.rs` (doc comment + test, ahead of the real extraction code landing in Story 4.2.2)
 
 ##### Task 4.1.1a: Write the fixture source + `to_sexp()`-dumping test (~5 min)
@@ -1074,6 +1136,12 @@ shapes, not assumption.
 - From the real `to_sexp()` output, determine whether `import static` is distinguishable from a
   regular scoped import at the node-kind level; write the finding into the doc comment either way
   (pitfalls.md flagged this must be "confirmed via live `to_sexp()`," not assumed).
+- Files: `src/import_graph.rs`
+
+##### Task 4.1.1c: Malformed Java source `to_sexp()` dump + doc comment (~4 min)
+- Parse the truncated fragment from the acceptance criterion above, dump and pin the real
+  `to_sexp()` output (ERROR/MISSING node shape) into a doc comment above the future malformed-source
+  extraction tests' location (Story 4.2.2/4.3.1).
 - Files: `src/import_graph.rs`
 
 #### Story 4.1.2: Kotlin `to_sexp()` fixture (highest-risk sub-task in this plan — no reference queries exist anywhere)
@@ -1099,6 +1167,13 @@ node names (`import_header`, confirmed wrong per build-vs-buy.md).
     the real dump shows — pinned verbatim, not guessed) for the plain import, and the *actual*
     representation of the aliased form (`as LegacyClient`) is captured and documented — this is the
     one node shape build-vs-buy.md explicitly flagged as "not confirmed from static schema data."
+- **(pre-mortem.md P1 #3(ii) / adversarial-review.md's malformed-source Concern)** A deliberately
+  malformed/incomplete Kotlin source fixture is parsed and its real error-recovery `to_sexp()` shape
+  is captured and pinned, same purpose as Story 4.1.1's Java equivalent.
+  - *Given* a truncated fragment (e.g. `import com.example.infra.DbClient\n\nclass Order(val id: String\n`
+    — unclosed parameter list, missing closing paren), *When* parsed with
+    `tree_sitter_kotlin_ng::LANGUAGE` and `.to_sexp()` is called, *Then* the output is captured and
+    documented (ERROR/MISSING node shape, pinned verbatim from the real run).
 **Files**: `src/import_graph.rs`
 
 ##### Task 4.1.2a: Write the fixture source + `to_sexp()`-dumping test (~5 min)
@@ -1118,6 +1193,12 @@ node names (`import_header`, confirmed wrong per build-vs-buy.md).
   extraction relies on it.
 - Files: `src/import_graph.rs` (or `src/declarations.rs` if that module already exists by this point in real implementation order)
 
+##### Task 4.1.2d: Malformed Kotlin source `to_sexp()` dump + doc comment (~4 min)
+- Parse the truncated fragment from the acceptance criterion above, dump and pin the real
+  `to_sexp()` output into a doc comment above the future malformed-source extraction tests' location
+  (Story 4.2.2/4.3.1).
+- Files: `src/import_graph.rs`
+
 ### Epic 4.2: Shared Qualified-Name Import Family (Go refactor + Java + Kotlin)
 **Goal**: One generic resolver (architecture.md §5's `QualifiedImportLangConfig`) driving Go
 (refactored), Java, and Kotlin import extraction — 3 small tables, 1 shared implementation.
@@ -1132,6 +1213,17 @@ node names (`import_header`, confirmed wrong per build-vs-buy.md).
   - *Given* the existing `go_import_graph_finds_a_two_package_cycle` fixture (unchanged),
     *When* `build()` is called (now internally routing through `build_qualified_name_language` with
     a Go `QualifiedImportLangConfig`), *Then* the assertions in that test (unmodified) still pass.
+- **(pre-mortem.md P1 #3(i))** `build_qualified_name_language` preserves `build_go`'s pre-refactor
+  edge-construction invariant: an edge is only ever added when its target string is already present
+  in `graph.nodes` (i.e. resolved to a package built from a walked repo-local file) — an import of an
+  external/third-party package never becomes a graph edge, for any language driven by this shared
+  function. This is the generic-resolver-level guarantee that Story 1.1.1's new graph-membership
+  guard defends against ever silently breaking for Java/Kotlin (Story 4.2.2).
+  - *Given* a Go file importing both a local package (present in `graph.nodes`) and an external
+    package (e.g. `"github.com/some-vendor/infra-client"`, never inserted into `graph.nodes`), *When*
+    `build_qualified_name_language` runs, *Then* `graph.edges` contains an edge to the local package
+    only — no edge is created for the external import — exactly matching `build_go`'s pre-refactor
+    behavior (verified against `src/import_graph.rs:134`, `graph.nodes.contains(&import_path)`).
 **Files**: `src/import_graph.rs`
 
 ##### Task 4.2.1a: `QualifiedImportLangConfig` struct (~4 min)
@@ -1155,6 +1247,11 @@ node names (`import_header`, confirmed wrong per build-vs-buy.md).
 ##### Task 4.2.1d: Run existing Go test suite, confirm zero regressions (~3 min)
 - `cargo test import_graph::` — verification task, no new code if green.
 - Files: `src/import_graph.rs` (verification only)
+
+##### Task 4.2.1e: Regression test proving the graph-membership invariant survives the refactor (~3 min)
+- `build_qualified_name_language_never_creates_edges_to_non_graph_nodes` (Go-driven fixture) per the
+  acceptance criterion above.
+- Files: `src/import_graph.rs`
 
 #### Story 4.2.2: Java + Kotlin import extraction via the shared family
 **As a** kibitzer user with a Java or Kotlin project, **I want** import-graph edges extracted,
@@ -1180,6 +1277,32 @@ node names (`import_header`, confirmed wrong per build-vs-buy.md).
     *When* `component_of("com/example/domain", &[that component])` is called, *Then* it returns
     `Some("domain")` — proving the normalization decision from Pattern Decisions actually closes
     the gap it was written to close.
+- **(pre-mortem.md P1 #3(i))** The graph-membership invariant (Story 4.2.1) holds for Java/Kotlin
+  too: an import of an external/third-party package never becomes a `graph.nodes` or `graph.edges`
+  entry, even when a locally-declared `Component`'s glob would textually match a segment of its
+  normalized path.
+  - *Given* a Java file in package `com.example.domain` importing both `com.example.infra.DbClient`
+    (local) and `org.springframework.stereotype.Component` (external — note the deliberately
+    matching final segment `"Component"`/`"component"`-shaped name, chosen to stress-test that
+    string-similarity to a `Component` name proves nothing), *When* `import_graph::build()` runs,
+    *Then* `graph.nodes` contains `"com/example/domain"` and `"com/example/infra"` but **not**
+    `"org/springframework/stereotype"`, and `graph.edges` contains no edge targeting it.
+- **(pre-mortem.md P1 #3(ii))** Every import statement in a multi-import file is extracted — not
+  just the first or last.
+  - *Given* a Java file with 4 import statements (2 resolving to local packages present in
+    `graph.nodes`, 2 external/unresolved), *When* `import_graph::build()` runs, *Then* `graph.edges`
+    contains exactly 2 edges — one per local import — each with the correct target and line number
+    (not duplicated, not misattributed to the wrong import's line).
+- **(pre-mortem.md P1 #3(ii))** Malformed/incomplete Java and Kotlin source never causes a *wrong*
+  edge to be silently accepted as correct — only the exact expected edges, or zero edges.
+  - *Given* a Java file containing one well-formed local import followed by a syntactically broken
+    second import (e.g. a missing semicolon, reusing Story 4.1.1's malformed-source `to_sexp()`
+    fixture), *When* `import_graph::build()` runs, *Then* the returned `graph.edges` either (a)
+    contains exactly the edge for the well-formed import and nothing for the broken one, or (b) is
+    empty — never an edge with a truncated/mismatched target string or a line number attributed to
+    the wrong import. Document which of (a)/(b) the real tree-sitter error-recovery behavior actually
+    produces, verified by running it (not assumed).
+  - Same test, Kotlin, reusing Story 4.1.2's malformed-source fixture.
 **Files**: `src/import_graph.rs`
 
 ##### Task 4.2.2a: `normalize_package_identity(dotted: &str) -> String` helper (~2 min)
@@ -1206,6 +1329,22 @@ node names (`import_header`, confirmed wrong per build-vs-buy.md).
   `normalized_java_identity_matches_slash_globs`.
 - Files: `src/import_graph.rs`
 
+##### Task 4.2.2f: Unit test for external-import exclusion in Java (~3 min)
+- `java_import_graph_excludes_external_third_party_imports_from_graph_nodes` per the
+  graph-membership acceptance criterion above.
+- Files: `src/import_graph.rs`
+
+##### Task 4.2.2g: Unit test for multi-import-block extraction correctness (Java) (~4 min)
+- `java_import_graph_extracts_every_import_in_a_multi_import_file` per the acceptance criterion
+  above.
+- Files: `src/import_graph.rs`
+
+##### Task 4.2.2h: Unit tests for malformed-source resilience, Java and Kotlin (~5 min)
+- `java_import_graph_malformed_source_never_extracts_a_wrong_edge`,
+  `kotlin_import_graph_malformed_source_never_extracts_a_wrong_edge` — each asserts the exact
+  expected-edges-or-empty outcome per the acceptance criterion above, not merely "doesn't panic."
+- Files: `src/import_graph.rs`
+
 ### Epic 4.3: Java + Kotlin Declaration Extraction
 **Goal**: Content/naming rules (Phases 2–3) work on Java/Kotlin too, not just Go/JS.
 
@@ -1226,6 +1365,26 @@ dependency rules to content/naming too.
   verified node shape.
   - *Given* the Kotlin fixture from Story 4.1.2c, *When* built, *Then* `Order` is `Class`,
     `Repository` is `Interface`.
+- **(pre-mortem.md P1 #3(ii))** An annotated declaration is still correctly classified by kind — the
+  annotation must not shift the positional child walk's classification, given Java/Kotlin's
+  `kind()`-filtered positional walk (no field names, per Pattern Decisions) is exactly the shape most
+  exposed to this risk.
+  - *Given* `com/example/domain/Order.java` containing `@Deprecated\npublic class Order {}` and
+    `@FunctionalInterface\npublic interface Validator { boolean validate(Order o); }`, *When*
+    `declarations::build()` runs, *Then* the graph contains `Declaration{name: "Order", kind: DeclKind::Class, ...}`
+    and `Declaration{name: "Validator", kind: DeclKind::Interface, ...}` — neither is misclassified as
+    the other kind, nor silently dropped, because of the leading annotation.
+  - Same test, Kotlin, using an `@Suppress(...)`-annotated `class`/`interface` pair.
+- **(pre-mortem.md P1 #3(ii))** Malformed/incomplete source never causes a declaration to be silently
+  misclassified — only the exact expected declarations, or zero.
+  - *Given* a Java file containing one well-formed declaration (`public class Order {}`) followed by a
+    syntactically broken second declaration (reusing Story 4.1.1's malformed-source `to_sexp()`
+    fixture, e.g. `public class Broken {` with no closing brace), *When* `declarations::build()` runs,
+    *Then* the returned declarations either (a) contain exactly `Declaration{name: "Order", kind: DeclKind::Class, ...}`
+    and nothing for the broken one, or (b) are empty — never a `Declaration` with a wrong `kind` or a
+    wrong `name` silently accepted as correct. Document which of (a)/(b) actually happens, verified by
+    running it.
+  - Same test, Kotlin, reusing Story 4.1.2's malformed-source fixture.
 **Files**: `src/declarations.rs`
 
 ##### Task 4.3.1a: Java declaration walk (~5 min)
@@ -1239,6 +1398,19 @@ dependency rules to content/naming too.
 
 ##### Task 4.3.1d: Unit tests (~4 min)
 - `java_declarations_distinguishes_class_and_interface`, `kotlin_declarations_distinguishes_class_interface_object`.
+- Files: `src/declarations.rs`
+
+##### Task 4.3.1e: Unit tests for annotated-declaration classification, Java and Kotlin (~5 min)
+- `java_declarations_annotation_does_not_shift_positional_classification`,
+  `kotlin_declarations_annotation_does_not_shift_positional_classification` per the acceptance
+  criterion above.
+- Files: `src/declarations.rs`
+
+##### Task 4.3.1f: Unit tests for malformed-source declaration extraction, Java and Kotlin (~5 min)
+- `java_declarations_malformed_source_never_misclassifies`,
+  `kotlin_declarations_malformed_source_never_misclassifies` — each asserts the exact
+  expected-declarations-or-empty outcome per the acceptance criterion above, not merely "doesn't
+  panic."
 - Files: `src/declarations.rs`
 
 ---
@@ -1555,3 +1727,108 @@ just standalone CLI invocation).
 ##### Task 7.1.2c: Run `kibitzer run . --trigger batch` at the repo root, verify real output (~4 min)
 - Same "run it, don't read it" discipline as Task 7.1.1d.
 - Files: none (verification)
+
+### Epic 7.2: Real-Repo Adoption Proof — `stapler-squad` `depguard` Migration
+**Goal**: Answer the triad review's Product-lens gap ("nothing confirms you'll actually replace
+depguard/go-arch-lint/arch-go anywhere real") with a real target, per the resolved Post-Ship
+Follow-up above. `tstapler/stapler-squad`'s real `.golangci.yml` has a `depguard` section with 3
+rules (fetched via `gh api repos/tstapler/stapler-squad/contents/.golangci.yml`); this epic migrates
+the two rules that fit kibitzer's `Component`/`DependencyRule` schema and explicitly documents why
+the third does not. This is **verification only** — it proves kibitzer's `component-deps` checker
+agrees with `depguard`'s current verdict on real code. It does **not** edit `stapler-squad`'s
+`.golangci.yml`, remove `depguard` from its CI, or commit any kibitzer config into that repo — cutting
+`stapler-squad`'s actual CI over to kibitzer is a separate, later decision for Tyler once he's seen
+the checker agree with reality, not part of this feature.
+
+#### Story 7.2.1: Migrate `no_server_in_core` to `component-deps`
+**As** Tyler, **I want** kibitzer's `component-deps` checker to express the same rule as
+`stapler-squad`'s `depguard.rules.no_server_in_core`, **so that** I have real evidence — not just a
+synthetic fixture — that `component-deps` can replace a `depguard` rule I actually run today.
+**Acceptance Criteria**:
+- A local (uncommitted — not part of `stapler-squad`'s own checked-in config) `.claude/inspect.json`
+  architecture block, run against a real read-only clone of `tstapler/stapler-squad` at HEAD,
+  expresses `no_server_in_core` as:
+  `Component{name: "core", paths: vec!["session/**".into(), "config/**".into(), "log/**".into()]}`,
+  `Component{name: "server", paths: vec!["server/**".into()]}`,
+  `DependencyRule{component: "core".into(), may_depend_on: None, deny_depend_on: vec!["server".into()]}`.
+  - *Given* that config and a real clone of `tstapler/stapler-squad` at HEAD, *When*
+    `golangci-lint run --enable-only depguard ./...` runs inside the clone (establishing
+    `depguard`'s actual current verdict for `no_server_in_core` — not assumed clean), *and*
+    `kibitzer check architecture component-deps <stapler-squad-clone-dir>` runs (Story 1.2.2's CLI
+    verb) against the same HEAD, *Then* both report the same verdict: if `depguard` currently
+    reports zero violations for this rule, `component-deps` must also report zero; any divergence is
+    a finding to investigate and document in the task's real output, not silently dismissed as
+    passing.
+- `depguard`'s two `deny` entries (`.../server` and `.../server/**`) collapse into one
+  `deny_depend_on: ["server"]` entry, since kibitzer's `component_of()` already matches any file
+  under a component's `paths` glob (including subpackages) — no separate rule needed for the
+  `server/**` case `depguard` had to spell out explicitly.
+**Files**: none in kibitzer's own repo (verification against an external clone) — the local
+`.claude/inspect.json` snippet used for the run is scratch, not committed.
+
+##### Task 7.2.1a: Clone `tstapler/stapler-squad` read-only to a scratch directory and run `golangci-lint run --enable-only depguard ./...` to capture the real, current baseline verdict for `no_server_in_core` (~10 min)
+- Files: none (external clone, read-only)
+
+##### Task 7.2.1b: Write the scratch `.claude/inspect.json` architecture block above and run `kibitzer check architecture component-deps <clone-dir>` for real, capture output (~10 min)
+- "Run it, don't read it" per this plan's Evidence-and-Claims standard — actually execute against
+  the real clone, don't predict the output.
+- Files: none (scratch config in the external clone, not committed)
+
+##### Task 7.2.1c: Compare the two real outputs, document agreement or divergence (~10 min)
+- Files: none (verification)
+
+#### Story 7.2.2: Migrate `no_ent_in_services` to `component-deps` — and document the negation-glob gap
+**As** Tyler, **I want** kibitzer's `component-deps` checker to express
+`stapler-squad`'s `depguard.rules.no_ent_in_services`, **so that** I have a second real migration
+example — while being honest about where kibitzer's schema is weaker than `depguard`'s.
+**Acceptance Criteria**:
+- `no_ent_in_services` expresses as `Component{name: "services", paths:
+  vec!["server/services/**".into()]}`, `Component{name: "ent", paths:
+  vec!["session/ent/**".into()]}`, `DependencyRule{component: "services".into(), may_depend_on: None,
+  deny_depend_on: vec!["ent".into()]}`.
+- **Confirmed limitation, not silently worked around**: `depguard`'s real `no_ent_in_services.files`
+  list grandfather-excludes 10 specific files via negation globs (`!**/server/services/error_registry.go`,
+  `analytics_escape_service.go`, `analytics_escape_service_test.go`, `workflow_service_test.go`,
+  `workflow_service.go`, `backlog_service.go`, `backlog_service_query.go`,
+  `backlog_service_lifecycle.go`, `backlog_service_triage.go`, `session_service.go` — comment:
+  "removed-in: refactor/storage-interface-cleanup (P6)"). Verified by reading
+  `src/glob.rs::matches_scope`/`glob_to_regex` (kibitzer's existing glob engine, already used by
+  `Check.scope` today): neither function special-cases a leading `!` — a pattern like
+  `"!**/foo.go"` is compiled as a literal glob whose regex requires the path to *start with the
+  character `!`*, so it can never match a real repo-relative path. **`Component.paths` has no
+  exclusion mechanism today.** This means kibitzer's `services` component, as defined above, includes
+  all 10 grandfathered files, and `component-deps` will flag every one of them that actually imports
+  `session/ent` as a *new* violation `depguard` currently treats as excluded.
+  - *Given* the config above and the real `stapler-squad` clone, *When*
+    `kibitzer check architecture component-deps <clone-dir>` runs, *Then* the task records exactly
+    how many of the 10 grandfathered files it flags (real count from real output, not predicted) and
+    states this divergence explicitly in the story's outcome — it is **evidence of a real schema gap
+    this migration surfaced**, not a bug in the migration and not something silently patched over by
+    inventing negation-glob support in `Component.paths` as an undocumented side quest. Adding
+    exclusion-glob support to `Component.paths` is a legitimate future scope item but is explicitly
+    **not** added by this story.
+**Files**: none in kibitzer's own repo (verification against an external clone); scratch
+`.claude/inspect.json` snippet, not committed.
+
+##### Task 7.2.2a: Write the scratch `.claude/inspect.json` architecture block above and run `kibitzer check architecture component-deps <clone-dir>` for real (~10 min)
+- Files: none (scratch config, not committed)
+
+##### Task 7.2.2b: Diff against `golangci-lint run --enable-only depguard ./...`'s real current verdict for `no_ent_in_services`; count and list which of the 10 grandfathered files kibitzer newly flags (~15 min)
+- Files: none (verification)
+
+#### Story 7.2.3: Document why `no_ioutil` is not migrated
+**As** Tyler, **I want** an explicit record of why `depguard.rules.no_ioutil` stays on `depguard`
+even after adopting `component-deps` for the other two rules, **so that** the plan doesn't overclaim
+`component-deps` as a 100% `depguard` replacement.
+**Acceptance Criteria**:
+- `no_ioutil` (`files: ["$all"]`, denying `io/ioutil` repo-wide) is a **global, unscoped** ban — it
+  has no source component, unlike `no_server_in_core`/`no_ent_in_services`. Every `DependencyRule` in
+  kibitzer's schema is keyed by a source `component`; there is no "applies everywhere regardless of
+  component" concept in the plan as written. This rule is explicitly **not** migrated to
+  `component-deps`.
+- One sentence is added to Epic 7.2's summary (already present above) noting `no_ioutil` stays on
+  `depguard`/`golangci-lint` in `stapler-squad` even after the other two rules migrate, and that this
+  is evidence kibitzer's dependency-rule model, as currently scoped, is not a full `depguard`
+  replacement — a global/unscoped deny-rule category is a plausible future scope item but is
+  explicitly **not** added to this plan now, to avoid scope-creeping the schema over one example.
+**Files**: none (documentation-only, satisfied by this plan.md section itself).

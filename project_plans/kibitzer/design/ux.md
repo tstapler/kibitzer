@@ -284,21 +284,36 @@ checker's side effect.
    closest declared name within edit-distance 2, omitting the suggestion clause
    when none is close enough — **met**, verified against Task 0.1.3a/b.
 3. Every finding line is grep-able by category via a mandatory `[category]` bracket
-   prefix, uniform across all six categories — **met only after Phase 6 ships**
-   (Story 6.1.1 retrofits `import-cycle`/`layering`; the other four already have it
-   from Phases 1–3).
+   prefix, uniform across all seven categories (`import-cycle`, `layering`,
+   `coupling`, `component-deps`, `content`, `naming`, plus the checker-independent
+   `component` tag zero-match advisories use — see #5/#6 below) — **met only after
+   Phase 6 ships** (Story 6.1.1 retrofits `import-cycle`/`layering`; the others
+   already have it from Phases 1–3). *(Corrected 2026-08-22: originally said "six
+   categories" before the Phase 4 repair loop introduced the distinct `[component]`
+   tag — see #5/#6.)*
 4. A per-category count breakdown line appears under the aggregate finding count in
    `architecture_assessment` output — **met** (Story 6.1.2), with the minor
    incompleteness noted above (illustrative example/fixture omits `component-deps`).
 5. No advisory finding masquerades as a blocking error, and no blocking error is
-   silently downgraded to an advisory — **not met**: zero-match advisories
-   (Stories 1.1.3, 3.1.2) inherit the configuring `Check`'s severity verbatim
-   (`src/mcp.rs:176–183`), so a `component-deps`/`naming-rules` check configured as
-   `blocking` turns its own zero-match advisories into build-breaking errors. Flag
-   for implementation; not silently papered over.
+   silently downgraded to an advisory — **met as of the Phase 3 repair loop**
+   *(corrected 2026-08-22 — originally "not met" when this design pass was written;
+   the gap it names is real and was the headline finding of this document, but
+   `plan.md`'s repair loop resolved it before implementation, not after: `Story
+   1.1.3` adds `ArchFinding.severity_override: Option<Severity>`, and
+   `mcp.rs::architecture_assessment` renders each finding's level as
+   `severity_override.unwrap_or(check.severity)` instead of always using the
+   check's configured severity — zero-match advisories set this field
+   unconditionally to `Advisory`, so they can no longer inherit a `blocking`
+   `Check` severity. Verified present in `plan.md`'s Pattern Decisions table and
+   `validation.md`'s named tests.)*
 6. A component's zero-match-glob advisory fires regardless of which rule category
-   (`dependency_rules`/`content_rules`/`naming_rules`) references it — **not met**:
-   currently scoped to `ComponentDependencyChecker` only.
+   (`dependency_rules`/`content_rules`/`naming_rules`) references it — **met as of
+   the Phase 3 repair loop** *(corrected 2026-08-22 — originally "not met," scoped
+   to `ComponentDependencyChecker` only, when this design pass was written. The
+   same repair loop that fixed #5 introduced a shared `zero_match_advisory<T>`
+   helper reused by `ContentChecker` (Task 2.2.1d/e) and `NamingChecker` (Tasks
+   3.1.2c/d) — the advisory now fires under a checker-independent `[component]`
+   tag regardless of which rule category triggered the check run. See #3 above.)*
 7. Deny-by-default and deny-wins-over-allow are the documented, tested precedence
    rules for `dependency_rules` — **met** (Story 1.1.1, Pattern Decisions table).
 8. The `kibitzer check architecture <name> <dir>` CLI verb prints one
@@ -318,10 +333,15 @@ checker's side effect.
 
 ## Summary of gaps between `research/ux.md` and `implementation/plan.md`
 
-| # | Gap | Severity | Where |
-|---|---|---|---|
-| 1 | Zero-match advisory findings inherit the configuring Check's severity — can render `[blocking]` | **High** — violates the explicit a/c design requirement and this task's own acceptance criterion | Stories 1.1.3, 3.1.2; `src/mcp.rs:176–183` |
-| 2 | Zero-match-component-glob advisory only fires via `ComponentDependencyChecker`, not for content/naming-only configs | Medium | Story 1.1.3 (Task 1.1.3a) |
+*(Status column added 2026-08-22, post-Phase-3-repair-loop and Phase-4 triad
+review — gaps 1 and 2 below were found by this design pass and then resolved by
+`plan.md` before implementation started; this table is a historical record of
+what was found, not a description of what ships.)*
+
+| # | Gap | Severity | Where | Status |
+|---|---|---|---|---|
+| 1 | Zero-match advisory findings inherit the configuring Check's severity — can render `[blocking]` | **High** — violates the explicit a/c design requirement and this task's own acceptance criterion | Stories 1.1.3, 3.1.2; `src/mcp.rs:176–183` | **Resolved** — `ArchFinding.severity_override` (Story 1.1.3) |
+| 2 | Zero-match-component-glob advisory only fires via `ComponentDependencyChecker`, not for content/naming-only configs | Medium | Story 1.1.3 (Task 1.1.3a) | **Resolved** — shared `zero_match_advisory<T>` helper, `[component]` tag (Story 1.1.3, Tasks 2.2.1d/e, 3.1.2c/d) |
 | 3 | "Unknown architecture checker" / new CLI unknown-checker errors lack a next-action clause, unlike the sibling per-file-checker error | Medium — pre-existing gap, extended not closed | `src/config.rs:177–184` (pre-existing); Story 1.2.2's new CLI error |
 | 4 | Advisory message shape uses the firing checker's own category tag (`[component-deps]`, `[naming]`) rather than research's proposed dedicated "architecture config" pseudo-category | Low | Stories 1.1.3, 3.1.2 vs. `research/ux.md` §2 |
 | 5 | Config schema field names/casing (`may_depend_on`/`deny_depend_on`, snake_case) diverge from research's illustrative `mayDependOn`/`mayNotDependOn` (camelCase) mockup | Low — deliberate, consistent with kibitzer's own conventions, just worth documenting accurately | Story 0.1.1 vs. `research/ux.md` §1 |
