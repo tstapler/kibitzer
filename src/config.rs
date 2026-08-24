@@ -222,8 +222,16 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
         if candidate.is_file() {
             let raw = std::fs::read_to_string(&candidate)
                 .with_context(|| format!("reading {}", candidate.display()))?;
-            let config: Config = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", candidate.display()))?;
+            let config: Config = serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "parsing {} (kibitzer {}, resolved from {})",
+                    candidate.display(),
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::current_exe()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string())
+                )
+            })?;
             validate(&config, &candidate)?;
             return Ok(Some((config, dir)));
         }
