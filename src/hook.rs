@@ -30,6 +30,8 @@ struct ToolInput {
     file_path: Option<PathBuf>,
     /// Present for the Edit tool.
     new_string: Option<String>,
+    /// Present for the Edit tool — the text being replaced.
+    old_string: Option<String>,
     /// Present for the Write tool — a full-file rewrite, so it's treated as
     /// unscoped (`changed_lines = None`) rather than diffed against anything.
     content: Option<String>,
@@ -40,6 +42,25 @@ struct ToolInput {
 #[derive(Debug, Deserialize)]
 struct EditItem {
     new_string: String,
+    old_string: Option<String>,
+}
+
+/// Builds the "what was actually written" summary logged alongside each hook
+/// firing, straight from the already-parsed tool input.
+fn build_edit_summary(tool_input: &ToolInput) -> crate::hook_log::EditSummary {
+    if let Some(content) = &tool_input.content {
+        crate::hook_log::EditSummary::write(content)
+    } else if let Some(edits) = &tool_input.edits {
+        let pairs: Vec<(Option<&str>, &str)> = edits
+            .iter()
+            .map(|e| (e.old_string.as_deref(), e.new_string.as_str()))
+            .collect();
+        crate::hook_log::EditSummary::multi_edit(&pairs)
+    } else if let Some(new_string) = &tool_input.new_string {
+        crate::hook_log::EditSummary::edit(tool_input.old_string.as_deref(), new_string)
+    } else {
+        crate::hook_log::EditSummary::Unknown
+    }
 }
 
 /// Derive 1-indexed, inclusive changed-line ranges in the *current* (post-edit)
@@ -118,19 +139,30 @@ pub fn run_hook() -> Result<ExitCode> {
         &input.hook_event_name,
         changed_lines.as_deref(),
     )?;
-    if results.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
 
     let failures: Vec<_> = results.iter().filter(|r| !r.passed).collect();
-    if failures.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
     let blocking: Vec<_> = failures
         .iter()
         .filter(|r| r.severity == Severity::Blocking)
         .collect();
+
+    crate::hook_log::record(
+        input.tool_use_id.as_deref(),
+        &input.cwd,
+        &input.hook_event_name,
+        &file_path,
+        changed_lines.as_deref(),
+        &build_edit_summary(&input.tool_input),
+        &results,
+        !blocking.is_empty(),
+    );
+
+    if results.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if failures.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
 
     if !blocking.is_empty() {
         for result in &blocking {
@@ -181,6 +213,7 @@ mod compute_changed_lines_tests {
         let path = write_temp("unique", "line1\nline2\ntarget line\nline4\n");
         let tool_input = ToolInput {
             file_path: None,
+            old_string: None,
             new_string: Some("target line".to_string()),
             content: None,
             edits: None,
@@ -195,6 +228,7 @@ mod compute_changed_lines_tests {
         let path = write_temp("ambiguous", "dup line\nother\ndup line\n");
         let tool_input = ToolInput {
             file_path: None,
+            old_string: None,
             new_string: Some("dup line".to_string()),
             content: None,
             edits: None,
@@ -225,6 +259,7 @@ func TestX(t *testing.T) {\n\
         let path = write_temp("dup-boilerplate", content);
         let tool_input = ToolInput {
             file_path: None,
+            old_string: None,
             new_string: Some("\t\tsvc := New(x)".to_string()),
             content: None,
             edits: None,
@@ -244,6 +279,7 @@ func TestX(t *testing.T) {\n\
         let path = write_temp("write", "whatever\n");
         let tool_input = ToolInput {
             file_path: None,
+            old_string: None,
             new_string: None,
             content: Some("whatever\n".to_string()),
             edits: None,

@@ -45,8 +45,30 @@ log — e.g. `docs/go-primitive-obsession-false-positives.md`,
 
 Do not edit or delete existing entries you didn't investigate — append only.
 A maintainer triages the log periodically and turns confirmed, high-signal
-entries into fixes (see e.g. the `2026-08-18` entry in
-`docs/go-primitive-obsession-false-positives.md`, fixed by commit `065f6ef`).
+entries into fixes.
+
+## Removing resolved entries
+
+Once a logged entry's root cause has been fixed by a shipped commit — the
+same mechanism, re-tested, no longer reproduces — delete the entry rather
+than leaving it to accumulate. The commit that fixed it is the durable
+record (cite it in the commit message that removes the entry); git history
+for this file preserves the deleted text if it's ever needed again. Only
+remove an entry once you've confirmed the fix actually covers it: re-read
+the checker's current source (or re-run the backtest) and check that the
+specific mechanism the entry describes is what changed, not just that
+"some fix landed nearby."
+
+Do not remove an entry just because:
+- the checker it names was rewritten for unrelated reasons, if the specific
+  failure mode described is still present or unverified against the new code
+- a fix landed in a *different* system than the one the entry blames (e.g.
+  the entry blames a repo's own shelled-out `doc_report.py`/`markdownlint-cli2`
+  setup — a fix to kibitzer's native checker doesn't resolve it until that
+  repo actually migrates to the native checker)
+- the entry itself flags open questions or unverified corroboration (missing
+  source access, "not fully explained," etc.) — resolve the open question
+  first, don't drop the entry because it's inconvenient to chase down
 
 ## What this is not
 

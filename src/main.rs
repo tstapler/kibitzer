@@ -12,6 +12,7 @@ mod go_blank_imports;
 mod go_error_context;
 mod go_ignored_error;
 mod hook;
+mod hook_log;
 mod import_graph;
 mod install;
 mod lsp;
