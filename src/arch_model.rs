@@ -145,16 +145,23 @@ fn language_for_path(path: &Path) -> Option<Language> {
     }
 }
 
-/// The package/directory key a file groups under: its parent directory, expressed as a
-/// `/`-separated path relative to `repo_root`. Mirrors `import_graph.rs`'s JS `dir_key`
-/// convention uniformly across every language (including Go) rather than Go's real
-/// module-qualified import path — `build_model` takes no disk I/O (per its contract:
-/// callers pass already-read `(path, source)` pairs), so it can't read `go.mod` to
-/// compute a module-qualified path the way `import_graph::build` does. Callers that want
-/// package keys to align exactly with a real `ImportGraph`'s Go nodes need to have built
-/// that graph with directory-relative (not module-qualified) keys too, or accept that the
-/// two won't line up 1:1 for Go — `import_edges` is still attached verbatim either way.
-fn package_key_for_file(repo_root: &Path, file: &Path) -> String {
+/// The package/directory key a file groups under. `ImportGraph` is the single source of
+/// truth for this mapping (`import_graph.file_packages`), since it already computes the
+/// per-language key — Go's module-qualified import path (from `go.mod`), JS/TS's
+/// repo-relative directory — while walking each file for import extraction. Consulting it
+/// here (rather than re-deriving the key from the path alone) is what keeps
+/// `PackageNode::path` equal to `ImportEdge::from`/`to` for a package that has edges.
+///
+/// Falls back to a plain repo-root-relative directory path only for files `import_graph`
+/// didn't map — i.e. languages `import_graph.rs` doesn't extract imports for yet. Today
+/// every such file is already uncounted-for-symbols too (`symbol_extract.rs` doesn't cover
+/// them either), so this fallback is unreachable in practice, but it's kept so a file isn't
+/// silently dropped from grouping if `import_graph.rs` support lags future
+/// `language_for_path` additions.
+fn package_key_for_file(repo_root: &Path, file: &Path, import_graph: &ImportGraph) -> String {
+    if let Some(key) = import_graph.file_packages.get(file) {
+        return key.clone();
+    }
     let dir = file.parent().unwrap_or(Path::new("."));
     let rel = dir.strip_prefix(repo_root).unwrap_or(dir);
     let s = rel.to_string_lossy().replace('\\', "/");
@@ -200,7 +207,7 @@ pub fn build_model(
             continue;
         }
 
-        let package_path = package_key_for_file(repo_root, path);
+        let package_path = package_key_for_file(repo_root, path, import_graph);
         let package = packages
             .entry(package_path.clone())
             .or_insert_with(|| PackageNode {
@@ -678,21 +685,54 @@ mod tests {
         let model = build_model(&dir, &files, &import_graph, &PruneConfig::default()).unwrap();
 
         assert_eq!(model.packages.len(), 3);
-        let domain = model.package("domain").expect("domain package exists");
+        // Go package keys are module-qualified import paths (matching `ImportGraph`'s
+        // node keys), not plain repo-relative directories.
+        let domain = model
+            .package("example.com/app/domain")
+            .expect("domain package exists under its module-qualified key");
         assert_eq!(domain.symbols.len(), 1);
         assert_eq!(domain.symbols[0].name, "A");
 
-        let handlers = model.package("handlers").expect("handlers package exists");
+        let handlers = model
+            .package("example.com/app/handlers")
+            .expect("handlers package exists under its module-qualified key");
         assert_eq!(handlers.symbols.len(), 1);
         assert_eq!(handlers.symbols[0].name, "H");
 
-        let web = model.package("web").expect("web package exists");
+        // JS/TS package keys come from `ImportGraph::file_packages` too — its `dir_key`
+        // convention uses the file's actual parent directory path, not one relative to
+        // `repo_root`, so look up the expected key via the same map rather than
+        // hardcoding it here.
+        let web_key = import_graph
+            .file_packages
+            .get(&ts_a)
+            .expect("ts_a mapped in file_packages")
+            .clone();
+        let web = model
+            .package(&web_key)
+            .expect("web package exists under its file_packages key");
         assert_eq!(web.symbols.len(), 1);
         assert_eq!(web.symbols[0].name, "Widget");
 
         assert_eq!(model.import_edges.len(), import_graph.edges.len());
         assert_eq!(model.pruning.total_files_scanned, 3);
         assert_eq!(model.pruning.unsupported_language_files, 0);
+
+        // `ArchModel::package()` resolves an `ImportEdge` endpoint directly — the
+        // contract this fix restores: `PackageNode` keys must match `ImportGraph` node
+        // keys so a consumer can look up an edge's `from`/`to` and get the real package.
+        assert_eq!(import_graph.edges.len(), 1);
+        let edge = &import_graph.edges[0];
+        assert_eq!(edge.from, "example.com/app/handlers");
+        assert_eq!(edge.to, "example.com/app/domain");
+        assert!(
+            model.package(&edge.from).is_some(),
+            "package() should resolve edge.from"
+        );
+        assert!(
+            model.package(&edge.to).is_some(),
+            "package() should resolve edge.to"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

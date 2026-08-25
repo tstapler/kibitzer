@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -23,6 +23,13 @@ pub struct ImportEdge {
 pub struct ImportGraph {
     pub nodes: BTreeSet<String>,
     pub edges: Vec<ImportEdge>,
+    /// Every file this graph extracted imports for, mapped to the package/node key it
+    /// was grouped under — the single source of truth for a file's package key, per
+    /// language (Go: module-qualified import path; JS/TS: repo-relative directory).
+    /// `arch_model::build_model` consults this so its own package grouping always
+    /// matches this graph's node keys instead of re-deriving (and potentially
+    /// mismatching) them.
+    pub file_packages: BTreeMap<PathBuf, String>,
 }
 
 impl ImportGraph {
@@ -112,6 +119,7 @@ fn build_go(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -> Re
     for file in files {
         if let Some(pkg) = go_package_import_path(&module_path, repo_root, file) {
             graph.nodes.insert(pkg.clone());
+            graph.file_packages.insert((*file).clone(), pkg.clone());
             file_packages.push((file, pkg));
         }
     }
@@ -220,7 +228,9 @@ fn build_js(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
         .collect();
 
     for file in files {
-        graph.nodes.insert(dir_key(&js_module_dir(file)));
+        let key = dir_key(&js_module_dir(file));
+        graph.nodes.insert(key.clone());
+        graph.file_packages.insert((*file).clone(), key);
     }
 
     for file in files {
@@ -362,6 +372,35 @@ mod tests {
         let b_dir = dir_key(&dir.join("b"));
         assert!(graph.edges.iter().any(|e| e.from == a_dir && e.to == b_dir));
         assert!(graph.edges.iter().any(|e| e.from == b_dir && e.to == a_dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_packages_maps_go_files_to_module_qualified_keys() {
+        let dir = tmp_dir("go-file-packages");
+        write(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let a = write(&dir, "domain/a.go", "package domain\n\nfunc A() {}\n");
+
+        let graph = build(&dir, std::slice::from_ref(&a)).unwrap();
+
+        assert_eq!(
+            graph.file_packages.get(&a),
+            Some(&"example.com/app/domain".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_packages_maps_ts_files_to_directory_keys() {
+        let dir = tmp_dir("ts-file-packages");
+        let a = write(&dir, "web/index.ts", "export function f() {}\n");
+
+        let graph = build(&dir, std::slice::from_ref(&a)).unwrap();
+
+        let expected = dir_key(&dir.join("web"));
+        assert_eq!(graph.file_packages.get(&a), Some(&expected));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
