@@ -9,9 +9,7 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::arch_model::{
-    ModelCache, ModelCacheKey, ModelLevel, PruneConfig, SymbolKind, SymbolNode,
-};
+use crate::arch_model::{ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model};
 use crate::check::{
     run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
@@ -426,33 +424,31 @@ impl KibitzerServer {
         };
         let limit = req.limit.clamp(1, 1000);
 
-        let files = match walk_and_collect_files(&repo_root) {
-            Ok(f) => f,
-            Err(e) => return json_error(format!("error walking repo: {e}")),
+        // `None` legitimately means "start from page 1"; a non-numeric cursor is corrupt
+        // input and must surface as an error rather than silently reset to page 1.
+        let offset: usize = match req.cursor.as_deref() {
+            None => 0,
+            Some(c) => match c.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return json_error(format!("invalid cursor: {c:?}")),
+            },
         };
 
-        let key = ModelCacheKey {
-            repo_root: repo_root.clone(),
-            include_private: req.include_private,
-        };
+        // The model build (whole-repo walk + tree-sitter parse) is synchronous/blocking;
+        // run it off the async call stack so it doesn't block this Tokio worker thread.
+        let cache = Arc::clone(&self.model_cache);
         let build_root = repo_root.clone();
-        let build_files = files.clone();
         let include_private = req.include_private;
-        let model = match self.model_cache.get_or_build(key, &files, move || {
-            let import_graph = crate::import_graph::build(&build_root, &build_files)?;
-            let sources: Vec<(PathBuf, String)> = build_files
-                .iter()
-                .filter_map(|p| std::fs::read_to_string(p).ok().map(|s| (p.clone(), s)))
-                .collect();
-            crate::arch_model::build_model(
-                &build_root,
-                &sources,
-                &import_graph,
-                &PruneConfig { include_private },
-            )
-        }) {
-            Ok(m) => m,
-            Err(e) => return json_error(format!("error building architecture model: {e}")),
+        let model = match tokio::task::spawn_blocking(move || {
+            load_cached_model(&cache, &build_root, include_private)
+        })
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return json_error(format!("error building architecture model: {e}")),
+            Err(e) => {
+                return json_error(format!("architecture model build task failed: {e}"));
+            }
         };
 
         let scope: Vec<String> = req.scope.iter().cloned().collect();
@@ -476,11 +472,6 @@ impl KibitzerServer {
         }
 
         let total_matched = matches.len();
-        let offset: usize = req
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse::<usize>().ok())
-            .unwrap_or(0);
         let page: Vec<(String, SymbolNode)> =
             matches.into_iter().skip(offset).take(limit).collect();
         let returned = page.len();
@@ -538,50 +529,39 @@ impl KibitzerServer {
             Err(e) => return json_error(format!("error reading config: {e}")),
         };
 
-        let files = match walk_and_collect_files(&repo_root) {
-            Ok(f) => f,
-            Err(e) => return json_error(format!("error walking repo: {e}")),
-        };
-
         // Always resolved against the default (`include_private: false`) model: the
         // "exists but pruned" resolution step (Story 3.1.2 AC3) depends on
         // `pruning.pruned_symbol_ids`, which is only populated on that model. This also
         // shares the same `ModelCacheKey` `list_architecture_symbols` uses by default, so
         // the two tools share one cache slot within a session.
-        let key = ModelCacheKey {
-            repo_root: repo_root.clone(),
-            include_private: false,
-        };
+        //
+        // The model build (whole-repo walk + tree-sitter parse) is synchronous/blocking;
+        // run it off the async call stack so it doesn't block this Tokio worker thread.
+        let cache = Arc::clone(&self.model_cache);
         let build_root = repo_root.clone();
-        let build_files = files.clone();
-        let model = match self.model_cache.get_or_build(key, &files, move || {
-            let import_graph = crate::import_graph::build(&build_root, &build_files)?;
-            let sources: Vec<(PathBuf, String)> = build_files
-                .iter()
-                .filter_map(|p| std::fs::read_to_string(p).ok().map(|s| (p.clone(), s)))
-                .collect();
-            crate::arch_model::build_model(
-                &build_root,
-                &sources,
-                &import_graph,
-                &PruneConfig {
-                    include_private: false,
-                },
-            )
-        }) {
-            Ok(m) => m,
-            Err(e) => return json_error(format!("error building architecture model: {e}")),
+        let model = match tokio::task::spawn_blocking(move || {
+            load_cached_model(&cache, &build_root, false)
+        })
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return json_error(format!("error building architecture model: {e}")),
+            Err(e) => {
+                return json_error(format!("architecture model build task failed: {e}"));
+            }
         };
 
         if let Some(pkg) = model.package(&req.node) {
             let value = serde_json::json!({ "kind": "package", "package": pkg });
-            return serde_json::to_string(&value).unwrap_or_default();
+            return serde_json::to_string(&value)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
         }
 
         for pkg in model.packages.values() {
             if let Some(sym) = pkg.symbols.iter().find(|s| s.id == req.node) {
                 let value = serde_json::json!({ "kind": "symbol", "symbol": sym });
-                return serde_json::to_string(&value).unwrap_or_default();
+                return serde_json::to_string(&value)
+                    .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
             }
         }
 
@@ -600,7 +580,8 @@ impl KibitzerServer {
                 "exists_but_pruned": false,
             })
         };
-        serde_json::to_string(&value).unwrap_or_default()
+        serde_json::to_string(&value)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
 }
 
