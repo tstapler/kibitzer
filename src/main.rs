@@ -23,6 +23,7 @@ mod mermaid;
 mod primitive_obsession;
 mod rules;
 mod run;
+mod symbol_extract;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
