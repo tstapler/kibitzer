@@ -14,7 +14,10 @@ const MAX_NODES: usize = 150;
 /// Turns a package/module path into a Mermaid-safe node ID. Mermaid node IDs can't
 /// contain `/`, `.`, `-`, or start with a digit, all of which are common in real import
 /// paths (`github.com/foo/bar`, `./lib-utils`).
-fn slugify(node: &str) -> String {
+///
+/// `pub(crate)`: reused by `arch_diagram.rs`'s `render_component_diagram` so package/symbol
+/// paths get the same Mermaid-safe ID treatment instead of a second slugify implementation.
+pub(crate) fn slugify(node: &str) -> String {
     let mut slug: String = node
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
