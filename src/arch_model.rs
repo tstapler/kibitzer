@@ -207,6 +207,13 @@ pub fn build_model(
             continue;
         }
 
+        let cache = GrammarCache::new();
+        let tree = cache.parse(language, source)?;
+        if tree.root_node().has_error() {
+            files_with_parse_errors.push(path.clone());
+            continue;
+        }
+
         let package_path = package_key_for_file(repo_root, path, import_graph);
         let package = packages
             .entry(package_path.clone())
@@ -216,13 +223,6 @@ pub fn build_model(
                 symbols: Vec::new(),
             });
         package.files.push(path.clone());
-
-        let cache = GrammarCache::new();
-        let tree = cache.parse(language, source)?;
-        if tree.root_node().has_error() {
-            files_with_parse_errors.push(path.clone());
-            continue;
-        }
 
         let symbols = extract_symbols_for_file(language, source, &tree, &package_path);
         for symbol in symbols {
@@ -655,6 +655,12 @@ mod tests {
         assert_eq!(
             model.pruning.files_with_parse_errors,
             vec![PathBuf::from("/repo/pkg/broken.go")]
+        );
+        assert_eq!(
+            pkg.files,
+            vec![PathBuf::from("/repo/pkg/good.go")],
+            "a parse-error file gets the same treatment as a generated file — excluded from \
+             PackageNode.files, not just from symbols"
         );
     }
 
