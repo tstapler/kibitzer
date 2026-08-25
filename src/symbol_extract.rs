@@ -87,9 +87,67 @@ fn js_ts_is_exported(node: Node, _source: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Empty config for languages Epic 1.2 doesn't cover yet (Python/Java/Kotlin — Phase 5).
-/// Returns no symbols rather than panicking, so a mixed-language repo containing files in
-/// a not-yet-supported language doesn't crash `build_model` (Epic 1.3) once it's wired up.
+/// Python: exported iff the name doesn't start with `_` (PEP 8 module-level convention).
+fn python_is_exported(node: Node, source: &str) -> bool {
+    node.child_by_field_name("name")
+        .map(|n| node_text(n, source))
+        .map(|text| !text.starts_with('_'))
+        .unwrap_or(false)
+}
+
+/// Returns `node`'s first direct (positional, not field-based) child of the given kind —
+/// the same "don't assume a field exists, look it up by kind" workaround `rules.rs`'s
+/// `kotlin_body`/`kotlin_params` establish, applied here to Java/Kotlin's `modifiers`
+/// node (verified via `to_sexp()`/`field_name_for_child`: `modifiers` is a positional
+/// child of `class_declaration`/`interface_declaration`/`method_declaration`, not a
+/// field — e.g. `(class_declaration (modifiers (public)) name: ... )`).
+fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).find(|c| c.kind() == kind)
+}
+
+/// Java: exported iff a `public` modifier is present among `modifiers`'s children.
+/// Package-private/no-modifier declarations are `exported: false`.
+fn java_is_exported(node: Node, _source: &str) -> bool {
+    find_child_by_kind(node, "modifiers")
+        .map(|m| find_child_by_kind(m, "public").is_some())
+        .unwrap_or(false)
+}
+
+/// Kotlin's default visibility is public (the inverse of Java's default) — exported iff
+/// neither a `private` nor `internal` `visibility_modifier` is present. Verified via
+/// `to_sexp()`: `modifiers` wraps a `visibility_modifier` node whose own child is the
+/// literal keyword (`private`/`internal`/`public`); a declaration with no `modifiers`
+/// child at all has no visibility keyword in source and is public by default.
+fn kotlin_is_exported(node: Node, _source: &str) -> bool {
+    let Some(modifiers) = find_child_by_kind(node, "modifiers") else {
+        return true;
+    };
+    let mut cursor = modifiers.walk();
+    !modifiers
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "visibility_modifier")
+        .any(|vis| {
+            find_child_by_kind(vis, "private").is_some()
+                || find_child_by_kind(vis, "internal").is_some()
+        })
+}
+
+/// Kotlin has no distinct `interface_declaration` node kind — `interface` is a
+/// positional keyword child of `class_declaration` (`kind() == "interface"`) rather than
+/// a modifier or field, verified via `to_sexp()` (this was explicitly *not* assumed, per
+/// the pitfalls research's warning that Kotlin already broke one assumption in
+/// `rules.rs`). A plain class's first keyword child is `"class"` instead.
+fn kotlin_is_interface(node: Node) -> bool {
+    find_child_by_kind(node, "interface").is_some()
+}
+
+/// Empty config for languages not covered yet. Returns no symbols rather than panicking,
+/// so a mixed-language repo containing files in a not-yet-supported language doesn't
+/// crash `build_model` (Epic 1.3). Unused now that Python/Java/Kotlin (Phase 5) are all
+/// wired in `lang_symbol_config`, but kept as a documented fallback shape rather than
+/// deleted, since `Language` may grow further later.
+#[allow(dead_code)]
 fn unimplemented_config() -> LangSymbolConfig {
     LangSymbolConfig {
         type_kinds: &[],
@@ -136,7 +194,47 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             name_finder: field_name,
             is_exported: js_ts_is_exported,
         },
-        Language::Python | Language::Java | Language::Kotlin => unimplemented_config(),
+        Language::Python => LangSymbolConfig {
+            // `class_definition` is checked here (not via the universal
+            // `class_declaration` branch `classify_node` special-cases — Python's kind
+            // literal is different) — matching JS's `interface_kinds`-empty precedent
+            // since Python has no first-class interface node (`Protocol` is a library
+            // convention, not grammar-level).
+            type_kinds: &["class_definition"],
+            interface_kinds: &[],
+            function_kinds: &["function_definition"],
+            name_finder: field_name,
+            is_exported: python_is_exported,
+        },
+        Language::Java => LangSymbolConfig {
+            // `class_declaration` is redundantly listed even though `classify_node`'s
+            // universal branch already classifies it as `Type` — self-documents Story
+            // 5.2.1's AC directly in the table.
+            type_kinds: &[
+                "class_declaration",
+                "enum_declaration",
+                "record_declaration",
+            ],
+            interface_kinds: &["interface_declaration"],
+            // Java has no free functions — every `method_declaration` classifies as
+            // `Method` in `classify_node`'s language-specific branch below, never
+            // `Function`.
+            function_kinds: &["method_declaration"],
+            name_finder: field_name,
+            is_exported: java_is_exported,
+        },
+        Language::Kotlin => LangSymbolConfig {
+            // Kotlin's `class_declaration` also covers interfaces (see
+            // `kotlin_is_interface`) — `classify_node`'s universal
+            // `kind == "class_declaration"` branch is guarded by a Kotlin-specific check
+            // before defaulting to `Type`, so `type_kinds`/`interface_kinds` are both left
+            // empty here; the real dispatch lives in `classify_node`.
+            type_kinds: &[],
+            interface_kinds: &[],
+            function_kinds: &["function_declaration"],
+            name_finder: field_name,
+            is_exported: kotlin_is_exported,
+        },
     }
 }
 
@@ -156,6 +254,15 @@ fn strip_generic_params(name: &str) -> String {
     }
 }
 
+/// Accepted v1 limitation (Epic 5.2 goal, `plan.md`): this owner-qualified id scheme
+/// resolves same-named methods on *different* types, but doesn't disambiguate Java
+/// method **overloading** — two methods with the same name and parent but different
+/// parameter lists (e.g. `save(String)`/`save(String, int)` on one class) collide on the
+/// same id, since arity/parameter types aren't part of it. Whichever overload
+/// `extract_symbols_for_file` visits last for a given `parent`/`name` pair is the one
+/// that survives in `PackageNode::symbols` (last-extraction-wins) — an explicit v1
+/// decision, not an undiscovered gap. Not fixed speculatively; revisit only if a real
+/// ambiguous-lookup report comes in.
 fn build_id(package_path: &str, parent: Option<&str>, name: &str) -> String {
     match parent {
         Some(p) => format!("{package_path}::{p}.{name}"),
@@ -181,12 +288,18 @@ fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
     Some(node_text(ident, source).to_string())
 }
 
-/// TS/JS method/parent detection: walk up ancestors to the enclosing `class_declaration`
-/// and read its `name` field.
-fn enclosing_class_name(node: Node, source: &str) -> Option<String> {
+/// Method/parent detection for TS/JS/Python/Java/Kotlin: walk up ancestors (skipping
+/// transparently through wrapper nodes like Python's `decorated_definition`, since we
+/// only test each ancestor's own `kind()`) until one matches `target_kinds`, then read
+/// its `name` field. TS/JS pass `&["class_declaration"]`; Python passes
+/// `&["class_definition"]`; Java passes every type-declaration kind a method can live in
+/// (`class_declaration`/`interface_declaration`/`enum_declaration`/`record_declaration`);
+/// Kotlin passes `&["class_declaration"]` (covers both class and interface, since Kotlin
+/// has no distinct interface node kind — see `kotlin_is_interface`).
+fn enclosing_kind_name(node: Node, source: &str, target_kinds: &[&str]) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if n.kind() == "class_declaration" {
+        if target_kinds.contains(&n.kind()) {
             return n
                 .child_by_field_name("name")
                 .map(|nm| node_text(nm, source).to_string());
@@ -195,6 +308,13 @@ fn enclosing_class_name(node: Node, source: &str) -> Option<String> {
     }
     None
 }
+
+const JAVA_TYPE_KINDS: &[&str] = &[
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration",
+];
 
 /// Go's `type_declaration` can wrap multiple `type_spec` children (a grouped
 /// `type (...)` block) — each is classified and emitted independently.
@@ -242,11 +362,20 @@ fn classify_node(
     let kind = node.kind();
 
     let symbol_kind = if kind == "class_declaration" {
-        // Universal across TS/Tsx/JS regardless of `type_kinds`/`interface_kinds`
+        // Universal across TS/Tsx/JS/Java regardless of `type_kinds`/`interface_kinds`
         // membership — Story 1.2.1's AC groups class_declaration under Type for every
         // JS-family language, including JS itself (whose type_kinds/interface_kinds are
-        // both empty).
-        SymbolKind::Type
+        // both empty). Kotlin is the one exception: it has no distinct
+        // `interface_declaration` node kind, so a `class_declaration` whose first
+        // positional child is the `interface` keyword must classify as `Interface`
+        // instead (see `kotlin_is_interface`) — guarded here rather than folded into the
+        // universal case, since every other language's `class_declaration` is never an
+        // interface.
+        if language == Language::Kotlin && kotlin_is_interface(node) {
+            SymbolKind::Interface
+        } else {
+            SymbolKind::Type
+        }
     } else if cfg.interface_kinds.contains(&kind) {
         SymbolKind::Interface
     } else if cfg.type_kinds.contains(&kind) {
@@ -254,6 +383,25 @@ fn classify_node(
     } else if cfg.function_kinds.contains(&kind) {
         if language == Language::Go {
             if node.child_by_field_name("receiver").is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        } else if language == Language::Java {
+            // Java has no free functions — `method_declaration` is always a Method,
+            // never a Function; every one has a parent type (accepted v1 limitation:
+            // overloaded methods on the same type collide on this owner-qualified id —
+            // see the module-level note near `build_id`/Epic 5.2's goal in plan.md,
+            // last-extraction-wins in `PackageNode::symbols`, not fixed for v1).
+            SymbolKind::Method
+        } else if language == Language::Kotlin {
+            if enclosing_kind_name(node, source, &["class_declaration"]).is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        } else if language == Language::Python {
+            if enclosing_kind_name(node, source, &["class_definition"]).is_some() {
                 SymbolKind::Method
             } else {
                 SymbolKind::Function
@@ -273,10 +421,12 @@ fn classify_node(
     let line = node.start_position().row + 1;
 
     let parent = if symbol_kind == SymbolKind::Method {
-        if language == Language::Go {
-            go_receiver_type_name(node, source)
-        } else {
-            enclosing_class_name(node, source)
+        match language {
+            Language::Go => go_receiver_type_name(node, source),
+            Language::Java => enclosing_kind_name(node, source, JAVA_TYPE_KINDS),
+            Language::Kotlin => enclosing_kind_name(node, source, &["class_declaration"]),
+            Language::Python => enclosing_kind_name(node, source, &["class_definition"]),
+            _ => enclosing_kind_name(node, source, &["class_declaration"]),
         }
     } else {
         None
@@ -544,5 +694,126 @@ mod tests {
         let shape = find_by_name(&symbols, "Shape");
         assert_eq!(shape.kind, SymbolKind::Interface);
         assert!(shape.exported);
+    }
+
+    // --- Epic 5.1: Python ---
+
+    #[test]
+    fn python_class_and_nested_method_extract_with_owner_qualified_parent() {
+        let symbols = extract(
+            Language::Python,
+            "class Widget:\n    def render(self): pass\n",
+            "pkg",
+        );
+        let widget = find_by_name(&symbols, "Widget");
+        assert_eq!(widget.kind, SymbolKind::Type);
+
+        let render = find_by_name(&symbols, "render");
+        assert_eq!(render.kind, SymbolKind::Method);
+        assert_eq!(render.parent, Some("Widget".to_string()));
+    }
+
+    #[test]
+    fn python_underscore_prefixed_function_is_not_exported() {
+        let symbols = extract(Language::Python, "def _helper(): pass\n", "pkg");
+        assert!(!find_by_name(&symbols, "_helper").exported);
+    }
+
+    #[test]
+    fn python_decorated_class_definition_is_still_extracted_as_type() {
+        let symbols = extract(
+            Language::Python,
+            "@dataclass\nclass Point:\n    x: int\n",
+            "pkg",
+        );
+        let point = find_by_name(&symbols, "Point");
+        assert_eq!(point.kind, SymbolKind::Type);
+    }
+
+    #[test]
+    fn python_has_no_interface_kind() {
+        let cfg = lang_symbol_config(Language::Python);
+        assert!(cfg.interface_kinds.is_empty());
+    }
+
+    // --- Epic 5.2: Java ---
+
+    #[test]
+    fn java_public_interface_and_its_abstract_method_extract_correctly() {
+        let symbols = extract(
+            Language::Java,
+            "public interface Shape { double area(); }",
+            "com.acme.app",
+        );
+        let shape = find_by_name(&symbols, "Shape");
+        assert_eq!(shape.kind, SymbolKind::Interface);
+        assert!(shape.exported);
+
+        let area = find_by_name(&symbols, "area");
+        assert_eq!(area.kind, SymbolKind::Method);
+        assert_eq!(area.parent, Some("Shape".to_string()));
+    }
+
+    #[test]
+    fn java_class_without_public_modifier_is_not_exported() {
+        let symbols = extract(Language::Java, "class Helper { void run() {} }", "pkg");
+        assert!(!find_by_name(&symbols, "Helper").exported);
+    }
+
+    #[test]
+    fn java_record_extracts_as_type_symbol() {
+        let symbols = extract(Language::Java, "record Point(int x, int y) {}", "pkg");
+        let point = find_by_name(&symbols, "Point");
+        assert_eq!(point.kind, SymbolKind::Type);
+    }
+
+    #[test]
+    fn java_never_produces_a_function_kind() {
+        let symbols = extract(Language::Java, "class Helper { void run() {} }", "pkg");
+        assert!(symbols.iter().all(|s| s.kind != SymbolKind::Function));
+    }
+
+    // --- Epic 5.3: Kotlin ---
+
+    #[test]
+    fn kotlin_interface_extracts_as_interface_symbol_not_type() {
+        let symbols = extract(
+            Language::Kotlin,
+            "interface Repository {\n    fun save()\n}\n",
+            "pkg",
+        );
+        let repo = find_by_name(&symbols, "Repository");
+        assert_eq!(repo.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn kotlin_private_class_is_not_exported_but_default_visibility_is() {
+        let symbols = extract(
+            Language::Kotlin,
+            "private class Internal\nclass Public\n",
+            "pkg",
+        );
+        assert!(!find_by_name(&symbols, "Internal").exported);
+        assert!(find_by_name(&symbols, "Public").exported);
+    }
+
+    #[test]
+    fn kotlin_method_in_class_gets_owner_qualified_parent() {
+        let symbols = extract(
+            Language::Kotlin,
+            "class Box {\n    fun open(): Unit {}\n}\n",
+            "pkg",
+        );
+        let open = find_by_name(&symbols, "open");
+        assert_eq!(open.kind, SymbolKind::Method);
+        assert_eq!(open.parent, Some("Box".to_string()));
+    }
+
+    #[test]
+    fn kotlin_top_level_function_classifies_as_function_not_method() {
+        let symbols = extract(Language::Kotlin, "fun topLevel() {}\n", "pkg");
+        let f = find_by_name(&symbols, "topLevel");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.parent, None);
     }
 }
