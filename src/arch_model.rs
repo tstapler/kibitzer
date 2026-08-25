@@ -5,15 +5,13 @@
 //! mapper, the diagram renderer) shares these types instead of reimplementing them.
 //!
 //! Epic 1.1 (this file) is types-only: nothing constructs these yet. `build_model`
-//! (Epic 1.3) is the first real caller, hence the blanket `dead_code` allow below.
-
-#![allow(dead_code)]
+//! (Epic 1.3) is the first real caller.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::checker::{GrammarCache, Language};
@@ -132,7 +130,7 @@ pub fn looks_generated(source: &str) -> bool {
 /// than reused, since those helpers are private to that module and this feature's plan
 /// scopes `import_graph.rs` to read-only). Files with no recognized extension return
 /// `None` and are counted as `unsupported_language_files`, not silently dropped.
-fn language_for_path(path: &Path) -> Option<Language> {
+pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("go") => Some(Language::Go),
         Some("ts") => Some(Language::TypeScript),
@@ -228,7 +226,7 @@ pub fn build_model(
         for symbol in symbols {
             if !prune.include_private && !symbol.exported {
                 private_symbols_skipped += 1;
-                pruned_symbol_ids.push(symbol.id.clone());
+                pruned_symbol_ids.push(symbol.id);
                 continue;
             }
             package.symbols.push(SymbolNode {
@@ -265,6 +263,10 @@ impl ArchModel {
     /// exactly equals `name` — a repo can have same-named symbols in different packages
     /// (that's exactly what the owner-qualified `id` scheme exists to disambiguate), so
     /// this returns all matches rather than the first.
+    ///
+    /// Planned API surface for an MCP/LSP "find symbol by name" lookup that hasn't been
+    /// wired up to a caller yet.
+    #[allow(dead_code)]
     pub fn find_symbol(&self, name: &str) -> Vec<(&str, &SymbolNode)> {
         self.packages
             .iter()
@@ -362,15 +364,25 @@ impl ModelCache {
             .map(|p| (p.clone(), crate::cache::stamp(p)))
             .collect();
 
-        let mut slot = self.slot.lock().expect("ModelCache mutex poisoned");
-        if let Some((cached_key, cached)) = slot.as_ref()
-            && *cached_key == key
-            && cached.stamps == current_stamps
         {
-            return Ok(Arc::clone(&cached.model));
+            let slot = self.slot.lock().expect("ModelCache mutex poisoned");
+            if let Some((cached_key, cached)) = slot.as_ref()
+                && *cached_key == key
+                && cached.stamps == current_stamps
+            {
+                return Ok(Arc::clone(&cached.model));
+            }
         }
 
+        // `build` (a whole-repo walk + tree-sitter parse) runs unlocked so it never
+        // serializes concurrent callers behind it, and — since this is called from
+        // `async fn`s in mcp.rs — never blocks the async runtime while holding the lock.
+        // A second concurrent caller that also decided to rebuild here just does
+        // redundant work; the last writer to reacquire the lock below wins, matching
+        // this cache's existing single-slot, no-generation-counter semantics.
         let model = Arc::new(build()?);
+
+        let mut slot = self.slot.lock().expect("ModelCache mutex poisoned");
         *slot = Some((
             key,
             CachedModel {
@@ -380,6 +392,70 @@ impl ModelCache {
         ));
         Ok(model)
     }
+}
+
+// ---------------------------------------------------------------------------------
+// Wave 2 prep: shared file-collection + cached-model-loading helpers
+// ---------------------------------------------------------------------------------
+
+/// Walks `repo_root`, builds its `ImportGraph`, and reads every walked file's contents that
+/// `read_to_string` succeeds on (binary/non-UTF8 files are silently skipped, not fatal — a
+/// repo with an image or other binary asset shouldn't crash a whole-repo build). This exact
+/// walk+graph+read sequence was duplicated in `arch_export.rs::collect_files`,
+/// `arch_diagram.rs::collect_files` (byte-for-byte identical to each other), and inlined again
+/// inside `mcp.rs`'s two `ModelCache::get_or_build` closures and `lsp.rs::build_index` — this
+/// is the shared version those call sites are meant to switch to.
+///
+/// Not yet called anywhere in this crate: Wave 2 wires up the call sites above.
+#[allow(dead_code)]
+pub(crate) fn collect_repo_files(
+    repo_root: &Path,
+) -> Result<(ImportGraph, Vec<(PathBuf, String)>)> {
+    let all_files = crate::check::walk_and_collect_files(repo_root)
+        .with_context(|| format!("walking {}", repo_root.display()))?;
+
+    let graph = crate::import_graph::build(repo_root, &all_files)
+        .with_context(|| format!("building import graph for {}", repo_root.display()))?;
+
+    let files: Vec<(PathBuf, String)> = all_files
+        .into_iter()
+        .filter_map(|f| std::fs::read_to_string(&f).ok().map(|s| (f, s)))
+        .collect();
+
+    Ok((graph, files))
+}
+
+/// Returns the cached `ArchModel` for `(repo_root, include_private)`, rebuilding it via
+/// `collect_repo_files` + `build_model` on a cache miss/staleness. Synchronous and blocking
+/// (file walk, disk reads, and tree-sitter parsing all happen here on a miss) — a caller on
+/// the async runtime (`mcp.rs`, `lsp.rs`) must wrap this in `tokio::task::spawn_blocking`
+/// itself; this function does not spawn anything on its own.
+///
+/// Not yet called anywhere in this crate: Wave 2 wires up `mcp.rs`'s two call sites and
+/// `lsp.rs::build_index` to use this instead of their own near-identical inline closures.
+#[allow(dead_code)]
+pub(crate) fn load_cached_model(
+    cache: &ModelCache,
+    repo_root: &Path,
+    include_private: bool,
+) -> Result<Arc<ArchModel>> {
+    let file_paths = crate::check::walk_and_collect_files(repo_root)
+        .with_context(|| format!("walking {}", repo_root.display()))?;
+
+    let key = ModelCacheKey {
+        repo_root: repo_root.to_path_buf(),
+        include_private,
+    };
+
+    cache.get_or_build(key, &file_paths, || {
+        let (import_graph, files) = collect_repo_files(repo_root)?;
+        build_model(
+            repo_root,
+            &files,
+            &import_graph,
+            &PruneConfig { include_private },
+        )
+    })
 }
 
 #[cfg(test)]
