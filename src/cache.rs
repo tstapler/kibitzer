@@ -10,15 +10,16 @@ use crate::check::CheckResult;
 use crate::config::Severity;
 
 /// A cheap fingerprint of a file's on-disk state, used to invalidate cache entries
-/// without hashing file contents.
+/// without hashing file contents. `pub(crate)` so `arch_model.rs`'s `ModelCache` can
+/// reuse this fingerprinting instead of reimplementing mtime/len stamping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct Stamp {
+pub(crate) struct Stamp {
     mtime_secs: u64,
     mtime_nanos: u32,
     len: u64,
 }
 
-fn stamp(path: &Path) -> Option<Stamp> {
+pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let dur = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;

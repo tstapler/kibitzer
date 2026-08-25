@@ -1083,6 +1083,16 @@ const SKIP_DIRS: &[&str] = &[
     "dist",
     "build",
     ".next",
+    // Python virtualenv/bytecode-cache dirs (Epic 5.1).
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    // Java/Kotlin Gradle/Maven build dirs (Epic 5.2/5.3) — Kotlin/Gradle projects share
+    // these same dirs with Java, so no Kotlin-specific additions are needed.
+    ".gradle",
+    ".mvn",
+    "out",
 ];
 
 fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {

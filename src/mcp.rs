@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -8,6 +9,9 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::arch_model::{
+    ArchModel, ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model,
+};
 use crate::check::{
     run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
@@ -17,6 +21,11 @@ use crate::glob::matches_scope;
 #[derive(Debug, Clone)]
 pub struct KibitzerServer {
     tool_router: ToolRouter<Self>,
+    /// Single-slot, in-process cache shared by `list_architecture_symbols` and
+    /// `get_architecture_node` (ADR-002) — `Arc`-wrapped so cloning `KibitzerServer` (the
+    /// MCP framework's handler-clone convention) shares one cache instance, not a fresh
+    /// empty one per clone.
+    model_cache: Arc<ModelCache>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -58,6 +67,96 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ListArchitectureSymbolsRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// Optional glob (relative to the repo root, `**` supported) restricting which
+    /// packages are in scope. Defaults to the whole repo (no scope filter).
+    #[serde(default)]
+    scope: Option<String>,
+    /// Restrict results to symbols belonging to exactly this package path (an
+    /// `ArchModel::package` key, e.g. a Go module-qualified import path or a JS/TS
+    /// directory path). Defaults to no package filter (all packages considered).
+    #[serde(default)]
+    package: Option<String>,
+    /// Restrict results to one symbol kind: "type", "interface", "function", or
+    /// "method". Defaults to no kind filter (all kinds returned).
+    #[serde(default)]
+    kind: Option<String>,
+    /// "component" or "code". Defaults to "code" (individual symbols returned);
+    /// "component" returns packages with `symbols` cleared, so it always yields zero
+    /// symbol matches — pass "code" (or omit `level`) to see symbols.
+    #[serde(default = "default_level")]
+    level: String,
+    /// Whether to include unexported/private symbols. Defaults to false (exported-only,
+    /// matching every other pruning default in this tool).
+    #[serde(default)]
+    include_private: bool,
+    /// Maximum number of symbols to return in one page. Defaults to 200; values above
+    /// 1000 are clamped down to 1000.
+    #[serde(default = "default_limit")]
+    limit: usize,
+    /// Opaque pagination cursor from a previous response's `next_cursor`. Defaults to
+    /// `None`, which starts from the first match.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+fn default_level() -> String {
+    "code".to_string()
+}
+
+fn default_limit() -> usize {
+    200
+}
+
+#[derive(Serialize)]
+struct SymbolListEntry {
+    package: String,
+    symbol: SymbolNode,
+}
+
+#[derive(Serialize)]
+struct ListArchitectureSymbolsResponse {
+    total_matched: usize,
+    returned: usize,
+    next_cursor: Option<String>,
+    /// True when `total_matched == 0`, `include_private` was false, and the pruning
+    /// summary shows symbols were excluded by that default (scoped to `package`'s
+    /// prefix when set) — distinguishes "nothing here" from "hidden by the exported-only
+    /// default." See Story 3.1.1's pre-mortem P2 #2 finding.
+    possibly_pruned: bool,
+    symbols: Vec<SymbolListEntry>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct GetArchitectureNodeRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// The node to resolve: tried first as an exact `ArchModel::package` path, then as a
+    /// `SymbolNode::id` (`"<package>::<Name>"`, or `"<package>::<Type>.<Method>"` for an
+    /// owner-qualified method).
+    node: String,
+}
+
+/// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain
+/// string) so a caller of these two JSON-returning tools never has to branch on response
+/// shape between the success and failure path, per ADR-001.
+fn json_error(message: String) -> String {
+    serde_json::to_string(&serde_json::json!({ "error": message }))
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize error\"}".to_string())
+}
+
+fn symbol_kind_matches(kind: SymbolKind, want: &str) -> bool {
+    match kind {
+        SymbolKind::Type => want.eq_ignore_ascii_case("type"),
+        SymbolKind::Interface => want.eq_ignore_ascii_case("interface"),
+        SymbolKind::Function => want.eq_ignore_ascii_case("function"),
+        SymbolKind::Method => want.eq_ignore_ascii_case("method"),
+    }
+}
+
 /// Names of the natively registered per-file complexity checkers (one per language) that
 /// an architecture assessment runs across every in-scope file, alongside whichever
 /// `architecture_checker`s the repo's `.claude/inspect.json` configures. Kept as a fixed
@@ -96,6 +195,7 @@ impl KibitzerServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            model_cache: Arc::new(ModelCache::new()),
         }
     }
 
@@ -297,6 +397,194 @@ impl KibitzerServer {
             Err(e) => format!("error running checks: {e}"),
         }
     }
+
+    /// Resolves `path`'s nearest `.claude/inspect.json` repo root, or a `json_error`-ready
+    /// message otherwise. Shared by `list_architecture_symbols`/`get_architecture_node`,
+    /// which previously each inlined this same `find_config` dispatch.
+    fn resolve_repo_root(path: &Path) -> Result<PathBuf, String> {
+        match find_config(path) {
+            Ok(Some((_, root))) => Ok(root),
+            Ok(None) => Err("no .claude/inspect.json found above this path".to_string()),
+            Err(e) => Err(format!("error reading config: {e}")),
+        }
+    }
+
+    /// Loads the cached `ArchModel` for `repo_root` via `spawn_blocking` (the build is
+    /// synchronous/blocking — whole-repo walk, disk reads, tree-sitter parsing — so it must
+    /// not run inline on the async call stack). Shared by `list_architecture_symbols`/
+    /// `get_architecture_node`, which previously each inlined this same dispatch.
+    async fn load_model_off_stack(
+        &self,
+        repo_root: PathBuf,
+        include_private: bool,
+    ) -> Result<Arc<ArchModel>, String> {
+        let cache = Arc::clone(&self.model_cache);
+        tokio::task::spawn_blocking(move || load_cached_model(&cache, &repo_root, include_private))
+            .await
+            .map_err(|e| format!("architecture model build task failed: {e}"))?
+            .map_err(|e| format!("error building architecture model: {e}"))
+    }
+
+    #[tool(
+        description = "Query the repo's architecture model for a paginated, filtered slice of \
+                        symbols (by package/kind/name) — returns JSON \
+                        ({total_matched, returned, next_cursor, possibly_pruned, symbols}), \
+                        not prose. Use this for a scoped lookup ('what does package X export?') \
+                        instead of the whole-repo architecture_assessment report."
+    )]
+    async fn list_architecture_symbols(
+        &self,
+        req: Parameters<ListArchitectureSymbolsRequest>,
+    ) -> String {
+        let req = req.0;
+        let path = PathBuf::from(&req.path);
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
+        };
+
+        let level = if req.level.eq_ignore_ascii_case("component") {
+            ModelLevel::Component
+        } else {
+            ModelLevel::Code
+        };
+        let limit = req.limit.clamp(1, 1000);
+
+        // `None` legitimately means "start from page 1"; a non-numeric cursor is corrupt
+        // input and must surface as an error rather than silently reset to page 1.
+        let offset: usize = match req.cursor.as_deref() {
+            None => 0,
+            Some(c) => match c.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return json_error(format!("invalid cursor: {c:?}")),
+            },
+        };
+
+        let model = match self
+            .load_model_off_stack(repo_root, req.include_private)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+
+        let scope: Vec<String> = req.scope.iter().cloned().collect();
+        let filtered = model.filtered(&scope, level);
+
+        let mut matches: Vec<(String, SymbolNode)> = Vec::new();
+        for (pkg_path, pkg) in &filtered.packages {
+            if let Some(want_pkg) = &req.package
+                && pkg_path != want_pkg
+            {
+                continue;
+            }
+            for sym in &pkg.symbols {
+                if let Some(k) = &req.kind
+                    && !symbol_kind_matches(sym.kind, k)
+                {
+                    continue;
+                }
+                matches.push((pkg_path.clone(), sym.clone()));
+            }
+        }
+
+        let total_matched = matches.len();
+        let page: Vec<(String, SymbolNode)> =
+            matches.into_iter().skip(offset).take(limit).collect();
+        let returned = page.len();
+        let next_offset = offset + returned;
+        let next_cursor = if next_offset < total_matched {
+            Some(next_offset.to_string())
+        } else {
+            None
+        };
+
+        let possibly_pruned = total_matched == 0
+            && !req.include_private
+            && match &req.package {
+                Some(pkg) => {
+                    let prefix = format!("{pkg}::");
+                    model
+                        .pruning
+                        .pruned_symbol_ids
+                        .iter()
+                        .any(|id| id.starts_with(&prefix))
+                }
+                None => !model.pruning.pruned_symbol_ids.is_empty(),
+            };
+
+        let symbols: Vec<SymbolListEntry> = page
+            .into_iter()
+            .map(|(package, symbol)| SymbolListEntry { package, symbol })
+            .collect();
+
+        let response = ListArchitectureSymbolsResponse {
+            total_matched,
+            returned,
+            next_cursor,
+            possibly_pruned,
+            symbols,
+        };
+        serde_json::to_string(&response)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Resolve one architecture node by exact reference — a package path or a \
+                        symbol id — and return it as JSON ({\"kind\": \"package\"|\"symbol\"|\"not_found\", ...}). \
+                        Use this for a single follow-up lookup after list_architecture_symbols; \
+                        for a whole-repo report use architecture_assessment instead."
+    )]
+    async fn get_architecture_node(&self, req: Parameters<GetArchitectureNodeRequest>) -> String {
+        let req = req.0;
+        let path = PathBuf::from(&req.path);
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
+        };
+
+        // Always resolved against the default (`include_private: false`) model: the
+        // "exists but pruned" resolution step (Story 3.1.2 AC3) depends on
+        // `pruning.pruned_symbol_ids`, which is only populated on that model. This also
+        // shares the same `ModelCacheKey` `list_architecture_symbols` uses by default, so
+        // the two tools share one cache slot within a session.
+        let model = match self.load_model_off_stack(repo_root, false).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+
+        if let Some(pkg) = model.package(&req.node) {
+            let value = serde_json::json!({ "kind": "package", "package": pkg });
+            return serde_json::to_string(&value)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
+        }
+
+        for pkg in model.packages.values() {
+            if let Some(sym) = pkg.symbols.iter().find(|s| s.id == req.node) {
+                let value = serde_json::json!({ "kind": "symbol", "symbol": sym });
+                return serde_json::to_string(&value)
+                    .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
+            }
+        }
+
+        let exists_but_pruned = model.pruning.pruned_symbol_ids.contains(&req.node);
+        let value = if exists_but_pruned {
+            serde_json::json!({
+                "kind": "not_found",
+                "node": req.node,
+                "exists_but_pruned": true,
+                "hint": "retry with include_private: true",
+            })
+        } else {
+            serde_json::json!({
+                "kind": "not_found",
+                "node": req.node,
+                "exists_but_pruned": false,
+            })
+        };
+        serde_json::to_string(&value)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -307,7 +595,11 @@ impl ServerHandler for KibitzerServer {
             instructions: Some(
                 "kibitzer: cross-language code/doc inspection. Use list_checks to discover \
                  configured checks, run_checks to inspect a single file, and \
-                 architecture_assessment for a whole-repo structural + complexity review."
+                 architecture_assessment for a whole-repo structural + complexity review \
+                 (all three return prose). For a scoped query into the repo's architecture \
+                 model instead of a whole-repo report, use list_architecture_symbols (a \
+                 paginated, filtered symbol slice) or get_architecture_node (one package or \
+                 symbol by exact reference) — both return JSON, not prose."
                     .to_string(),
             ),
             ..Default::default()
@@ -375,7 +667,16 @@ mod tests {
         for args in [
             vec!["init", "-q"],
             vec!["add", "-A"],
-            vec!["commit", "-q", "-m", "init"],
+            vec![
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
         ] {
             let status = Command::new("git")
                 .args(&args)
@@ -437,5 +738,396 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(output.contains("no findings"), "got:\n{output}");
+    }
+
+    // --- Epic 3.1: list_architecture_symbols / get_architecture_node ---
+
+    /// Builds a Go repo (module "fixture") with four packages exercising the ACs below:
+    /// `widgets` (3 exported funcs), `many` (5 exported funcs, for pagination),
+    /// `hidden` (2 unexported-only funcs, for the `possibly_pruned` case), and `shapes`
+    /// (two types `A`/`B` each with a same-named `Close` method, for the
+    /// owner-qualified-id collision case).
+    fn write_arch_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        std::fs::create_dir_all(dir.join("widgets")).unwrap();
+        std::fs::write(
+            dir.join("widgets/w.go"),
+            "package widgets\n\nfunc A() {}\nfunc B() {}\nfunc C() {}\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.join("many")).unwrap();
+        std::fs::write(
+            dir.join("many/m.go"),
+            "package many\n\nfunc F1() {}\nfunc F2() {}\nfunc F3() {}\nfunc F4() {}\nfunc F5() {}\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.join("hidden")).unwrap();
+        std::fs::write(
+            dir.join("hidden/h.go"),
+            "package hidden\n\nfunc a() {}\nfunc b() {}\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.join("shapes")).unwrap();
+        std::fs::write(
+            dir.join("shapes/s.go"),
+            "package shapes\n\ntype A struct{}\n\nfunc (a A) Close() {}\n\ntype B struct{}\n\nfunc (b B) Close() {}\n",
+        )
+        .unwrap();
+    }
+
+    fn list_req(
+        dir: &std::path::Path,
+        package: Option<&str>,
+        limit: usize,
+    ) -> ListArchitectureSymbolsRequest {
+        list_req_with_cursor(dir, package, limit, None)
+    }
+
+    fn list_req_with_cursor(
+        dir: &std::path::Path,
+        package: Option<&str>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> ListArchitectureSymbolsRequest {
+        ListArchitectureSymbolsRequest {
+            path: dir.display().to_string(),
+            scope: None,
+            package: package.map(|p| p.to_string()),
+            kind: None,
+            level: default_level(),
+            include_private: false,
+            limit,
+            cursor,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_returns_total_matched_and_json_symbols() {
+        let dir = tmp_dir("list-total-matched");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(list_req(
+                &dir,
+                Some("fixture/widgets"),
+                default_limit(),
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        assert_eq!(json["total_matched"], 3, "got: {json}");
+        assert_eq!(json["returned"], 3, "got: {json}");
+        assert!(json["next_cursor"].is_null(), "got: {json}");
+        assert_eq!(json["symbols"].as_array().unwrap().len(), 3, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_returns_empty_array_for_zero_matches_not_error() {
+        let dir = tmp_dir("list-zero-matches");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(list_req(
+                &dir,
+                Some("does/not/exist"),
+                default_limit(),
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(json.get("error").is_none(), "unexpected error: {json}");
+        assert_eq!(json["total_matched"], 0, "got: {json}");
+        assert_eq!(json["symbols"].as_array().unwrap().len(), 0, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_paginates_full_set_via_next_cursor() {
+        let dir = tmp_dir("list-pagination");
+        write_arch_fixture(&dir);
+        let server = KibitzerServer::new();
+
+        let page1 = server
+            .list_architecture_symbols(Parameters(list_req(&dir, Some("fixture/many"), 2)))
+            .await;
+        let json1: serde_json::Value = serde_json::from_str(&page1).expect("valid JSON");
+        assert_eq!(json1["total_matched"], 5, "got: {json1}");
+        assert_eq!(json1["returned"], 2, "got: {json1}");
+        let cursor1 = json1["next_cursor"]
+            .as_str()
+            .expect("page 1 has next_cursor")
+            .to_string();
+
+        let page2 = server
+            .list_architecture_symbols(Parameters(list_req_with_cursor(
+                &dir,
+                Some("fixture/many"),
+                2,
+                Some(cursor1),
+            )))
+            .await;
+        let json2: serde_json::Value = serde_json::from_str(&page2).expect("valid JSON");
+        assert_eq!(json2["returned"], 2, "got: {json2}");
+        let cursor2 = json2["next_cursor"]
+            .as_str()
+            .expect("page 2 has next_cursor")
+            .to_string();
+
+        let page3 = server
+            .list_architecture_symbols(Parameters(list_req_with_cursor(
+                &dir,
+                Some("fixture/many"),
+                2,
+                Some(cursor2),
+            )))
+            .await;
+        let json3: serde_json::Value = serde_json::from_str(&page3).expect("valid JSON");
+        assert_eq!(json3["returned"], 1, "got: {json3}");
+        assert!(json3["next_cursor"].is_null(), "got: {json3}");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut names: Vec<String> = Vec::new();
+        for page in [&json1, &json2, &json3] {
+            for entry in page["symbols"].as_array().unwrap() {
+                names.push(entry["symbol"]["name"].as_str().unwrap().to_string());
+            }
+        }
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(
+            sorted_names,
+            vec!["F1", "F2", "F3", "F4", "F5"],
+            "union of all pages should equal the full 5-symbol set exactly once"
+        );
+        assert_eq!(names.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_possibly_pruned_true_for_all_private_package() {
+        let dir = tmp_dir("list-possibly-pruned");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(list_req(
+                &dir,
+                Some("fixture/hidden"),
+                default_limit(),
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["total_matched"], 0, "got: {json}");
+        assert_eq!(json["possibly_pruned"], true, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_kind_filter_returns_only_matching_kind() {
+        let dir = tmp_dir("list-kind-filter");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(ListArchitectureSymbolsRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                package: Some("fixture/shapes".to_string()),
+                kind: Some("method".to_string()),
+                level: default_level(),
+                include_private: false,
+                limit: default_limit(),
+                cursor: None,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        let symbols = json["symbols"].as_array().unwrap();
+        assert!(!symbols.is_empty(), "got: {json}");
+        for entry in symbols {
+            assert_eq!(entry["symbol"]["kind"], "method", "got: {json}");
+        }
+        // `shapes` has two `Close` methods and no other symbol kinds, so filtering to
+        // "method" must match exactly those two, not the types they're attached to.
+        assert_eq!(json["total_matched"], 2, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_level_component_returns_no_symbols() {
+        let dir = tmp_dir("list-level-component");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(ListArchitectureSymbolsRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                package: Some("fixture/widgets".to_string()),
+                kind: None,
+                level: "component".to_string(),
+                include_private: false,
+                limit: default_limit(),
+                cursor: None,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["total_matched"], 0, "got: {json}");
+        assert_eq!(json["symbols"].as_array().unwrap().len(), 0, "got: {json}");
+    }
+
+    #[test]
+    fn list_architecture_symbols_request_field_is_named_path() {
+        let symbols_req = ListArchitectureSymbolsRequest {
+            path: "some/path".to_string(),
+            scope: None,
+            package: None,
+            kind: None,
+            level: default_level(),
+            include_private: false,
+            limit: default_limit(),
+            cursor: None,
+        };
+        assert_eq!(symbols_req.path, "some/path");
+
+        let node_req = GetArchitectureNodeRequest {
+            path: "some/path".to_string(),
+            node: "pkg::Sym".to_string(),
+        };
+        assert_eq!(node_req.path, "some/path");
+    }
+
+    #[test]
+    fn list_architecture_symbols_tool_description_mentions_json_and_contrasts_assessment() {
+        let router = KibitzerServer::tool_router();
+        let tools = router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_architecture_symbols")
+            .expect("list_architecture_symbols is registered");
+        let desc = tool.description.as_ref().expect("has a description");
+        assert!(desc.contains("JSON"), "got: {desc}");
+        assert!(desc.contains("architecture_assessment"), "got: {desc}");
+    }
+
+    #[tokio::test]
+    async fn get_architecture_node_resolves_package_before_symbol_id() {
+        let dir = tmp_dir("node-resolves-package");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .get_architecture_node(Parameters(GetArchitectureNodeRequest {
+                path: dir.display().to_string(),
+                node: "fixture/widgets".to_string(),
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["kind"], "package", "got: {json}");
+        assert_eq!(json["package"]["path"], "fixture/widgets", "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn get_architecture_node_returns_not_found_echoing_queried_node() {
+        let dir = tmp_dir("node-not-found");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .get_architecture_node(Parameters(GetArchitectureNodeRequest {
+                path: dir.display().to_string(),
+                node: "does/not/exist".to_string(),
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["kind"], "not_found", "got: {json}");
+        assert_eq!(json["node"], "does/not/exist", "got: {json}");
+        assert_eq!(json["exists_but_pruned"], false, "got: {json}");
+        assert!(json.get("hint").is_none(), "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn get_architecture_node_reports_exists_but_pruned_for_a_pruned_private_symbol() {
+        let dir = tmp_dir("node-exists-but-pruned");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .get_architecture_node(Parameters(GetArchitectureNodeRequest {
+                path: dir.display().to_string(),
+                node: "fixture/hidden::a".to_string(),
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["kind"], "not_found", "got: {json}");
+        assert_eq!(json["exists_but_pruned"], true, "got: {json}");
+        assert_eq!(
+            json["hint"], "retry with include_private: true",
+            "got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_architecture_node_resolves_owner_qualified_method_not_colliding_sibling_type() {
+        let dir = tmp_dir("node-owner-qualified");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .get_architecture_node(Parameters(GetArchitectureNodeRequest {
+                path: dir.display().to_string(),
+                node: "fixture/shapes::A.Close".to_string(),
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["kind"], "symbol", "got: {json}");
+        assert_eq!(json["symbol"]["name"], "Close", "got: {json}");
+        assert_eq!(json["symbol"]["parent"], "A", "got: {json}");
+    }
+
+    #[test]
+    fn get_info_instructions_name_both_new_tools_and_json() {
+        let server = KibitzerServer::new();
+        let info = server.get_info();
+        let instructions = info.instructions.expect("has instructions");
+        assert!(
+            instructions.contains("list_architecture_symbols"),
+            "got: {instructions}"
+        );
+        assert!(
+            instructions.contains("get_architecture_node"),
+            "got: {instructions}"
+        );
+        assert!(instructions.contains("JSON"), "got: {instructions}");
     }
 }
