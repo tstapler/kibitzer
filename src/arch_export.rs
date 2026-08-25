@@ -7,10 +7,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use crate::arch_model::{ModelLevel, PruneConfig, build_model};
-use crate::check::walk_and_collect_files;
+use crate::arch_model::{ModelLevel, PruneConfig, build_model, collect_repo_files};
 use crate::config::find_config;
-use crate::import_graph;
 
 /// File extensions `build_model` (via `symbol_extract.rs`'s `LangSymbolConfig` table)
 /// recognizes. Duplicated here (not imported) from `arch_model.rs`'s private
@@ -34,24 +32,6 @@ fn has_supported_extension(path: &Path) -> bool {
     )
 }
 
-/// Walks `repo_root`, resolves the `ImportGraph`, and reads every file's contents that
-/// `read_to_string` succeeds on (binary/non-UTF8 files are silently skipped, not fatal —
-/// the export shouldn't crash because a repo has an image or other binary asset in it).
-fn collect_files(repo_root: &Path) -> Result<(import_graph::ImportGraph, Vec<(PathBuf, String)>)> {
-    let all_files = walk_and_collect_files(repo_root)
-        .with_context(|| format!("walking {}", repo_root.display()))?;
-
-    let graph = import_graph::build(repo_root, &all_files)
-        .with_context(|| format!("building import graph for {}", repo_root.display()))?;
-
-    let files: Vec<(PathBuf, String)> = all_files
-        .into_iter()
-        .filter_map(|f| std::fs::read_to_string(&f).ok().map(|s| (f, s)))
-        .collect();
-
-    Ok((graph, files))
-}
-
 /// Runs `kibitzer architecture export`. Always exits `ExitCode::SUCCESS` on a successful
 /// write, regardless of model contents (no pass/fail concept for export, per UX research);
 /// nonzero only on genuine I/O/config errors, propagated via `anyhow`.
@@ -67,9 +47,8 @@ pub fn run_export(
         None => path.clone(),
     };
 
-    let walked = walk_and_collect_files(&repo_root)
-        .with_context(|| format!("walking {}", repo_root.display()))?;
-    if !walked.iter().any(|f| has_supported_extension(f)) {
+    let (graph, files) = collect_repo_files(&repo_root)?;
+    if !files.iter().any(|(f, _)| has_supported_extension(f)) {
         println!(
             "no supported languages found under {}; nothing to export",
             path.display()
@@ -77,7 +56,6 @@ pub fn run_export(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (graph, files) = collect_files(&repo_root)?;
     let prune = PruneConfig { include_private };
     let model = build_model(&repo_root, &files, &graph, &prune)?;
 
