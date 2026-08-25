@@ -1,3 +1,4 @@
+mod arch_model;
 mod architecture_checks;
 mod backtest;
 mod cache;

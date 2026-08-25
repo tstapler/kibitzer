@@ -2,13 +2,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 /// A directed edge from one package/module directory to another, plus the specific
 /// import statement (file + line) that produced it — kept so findings derived from the
 /// graph can still point at a concrete location, per the `{file}:{line}: {message}`
 /// convention every other checker follows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportEdge {
     pub from: String,
     pub to: String,
