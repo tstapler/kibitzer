@@ -7,11 +7,9 @@ use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::arch_model::{
-    self, ArchModel, ModelCache, ModelCacheKey, PackageNode, PruneConfig, SymbolNode,
-};
-use crate::check::{CheckResult, run_checks_for_trigger, walk_and_collect_files};
-use crate::checker::{GrammarCache, Language};
+use crate::arch_model::{self, ArchModel, ModelCache, PackageNode, SymbolNode};
+use crate::check::{CheckResult, run_checks_for_trigger};
+use crate::checker::GrammarCache;
 use crate::config::{Severity, find_config};
 use crate::symbol_extract::extract_symbols_for_file;
 
@@ -96,23 +94,6 @@ fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
 // Epic 4.2: document_symbol — per-file, disk-based, no whole-repo build
 // ---------------------------------------------------------------------------------
 
-/// Maps a file extension to the `Language` used to parse it. Duplicated from
-/// `arch_model.rs`'s private (non-`pub`) `language_for_path` — same extension list, kept in
-/// sync manually — rather than exposed as a shared helper, since this feature's plan scopes
-/// `arch_model.rs` to its own epics only.
-fn language_for_path(path: &Path) -> Option<Language> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("go") => Some(Language::Go),
-        Some("ts") => Some(Language::TypeScript),
-        Some("tsx") => Some(Language::Tsx),
-        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Language::JavaScript),
-        Some("py") => Some(Language::Python),
-        Some("java") => Some(Language::Java),
-        Some("kt") | Some("kts") => Some(Language::Kotlin),
-        _ => None,
-    }
-}
-
 /// Maps `arch_model::SymbolKind` to the closest `lsp_types::SymbolKind` an editor
 /// understands. Shared by `document_symbol` and `symbol`.
 fn symbol_kind_to_lsp(kind: arch_model::SymbolKind) -> SymbolKind {
@@ -196,7 +177,7 @@ fn nest_document_symbols(symbols: &[SymbolNode]) -> Vec<DocumentSymbol> {
 /// broken file for correctness. There's no `PruningSummary` here to record the divergence
 /// in.
 fn document_symbols_for_file(path: &Path) -> Option<DocumentSymbolResponse> {
-    let language = language_for_path(path)?;
+    let language = arch_model::language_for_path(path)?;
     let source = std::fs::read_to_string(path).ok()?;
     let cache = GrammarCache::new();
     let tree = cache.parse(language, &source).ok()?;
@@ -232,22 +213,7 @@ enum IndexState {
 /// parsing all happen here, so this must only ever run inside `tokio::task::spawn_blocking`
 /// (see `Backend::spawn_indexed_build`), never directly on the async runtime.
 fn build_index(model_cache: &ModelCache, repo_root: &Path) -> anyhow::Result<Arc<ArchModel>> {
-    let file_paths = walk_and_collect_files(repo_root)?;
-    let import_graph = crate::import_graph::build(repo_root, &file_paths)?;
-    model_cache.get_or_build(
-        ModelCacheKey {
-            repo_root: repo_root.to_path_buf(),
-            include_private: false,
-        },
-        &file_paths,
-        || {
-            let sources: Vec<(PathBuf, String)> = file_paths
-                .iter()
-                .filter_map(|p| std::fs::read_to_string(p).ok().map(|s| (p.clone(), s)))
-                .collect();
-            arch_model::build_model(repo_root, &sources, &import_graph, &PruneConfig::default())
-        },
-    )
+    arch_model::load_cached_model(model_cache, repo_root, false)
 }
 
 #[allow(deprecated)]
@@ -392,9 +358,31 @@ impl Backend {
         let build_generation = Arc::clone(&self.build_generation);
         let rebuilding = Arc::clone(&self.rebuilding);
         tokio::task::spawn_blocking(move || {
-            let result = build();
+            // Catch a panic from `build()` (rather than letting it propagate and silently
+            // drop this task) so a bug in the walk/parse path fails the build visibly via
+            // `IndexState::Failed` instead of leaving `index_state` stuck in `Building`
+            // forever with only a stderr backtrace as a clue.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+                .unwrap_or_else(|panic_payload| {
+                    let message = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    Err(anyhow::anyhow!("panicked: {message}"))
+                });
+
+            // The generation check and the `index_state` write must happen under the same
+            // lock hold — checking outside the lock (as this used to) leaves a window where
+            // an older rebuild can pass its check, get preempted before locking, let a
+            // newer rebuild finish and swap in its result, and then resume and
+            // unconditionally overwrite that newer result. Locking first closes that
+            // window: whichever rebuild's check-and-write runs last under the lock is, by
+            // definition, the one that observes the current (monotonically increasing)
+            // `build_generation` value, so a strictly older generation can never win against
+            // a strictly newer one, regardless of completion order.
+            let mut state = index_state.lock().expect("index_state mutex poisoned");
             if build_generation.load(Ordering::SeqCst) == generation {
-                let mut state = index_state.lock().expect("index_state mutex poisoned");
                 *state = match result {
                     Ok(model) => IndexState::Ready(model),
                     Err(err) => IndexState::Failed(err.to_string()),
@@ -412,6 +400,16 @@ impl Backend {
     /// concurrent build triggered by a save that lands mid-walk buys nothing but wasted
     /// work and a second race to swap into `index_state` (see Story 4.3.0). Also a no-op
     /// while `Failed`, or if no workspace root is known.
+    ///
+    /// Also a no-op whenever a rebuild is already in flight (`rebuilding` is already
+    /// `true`), gated via `compare_exchange` rather than a bare `store` so a burst of rapid
+    /// `did_save`s (e.g. an editor's "save all") spawns at most one rebuild instead of one
+    /// per file. This doesn't lose a save's changes forever: `index_state` stays
+    /// `Ready(old_model)` for the whole in-flight rebuild, so every dropped trigger's save
+    /// is still on disk for the *next* rebuild to pick up — same disk-snapshot consistency
+    /// model `check_and_publish`'s diagnostics already rely on. Worst case, a save that
+    /// lands after the in-flight rebuild's walk already passed its file waits one more
+    /// `did_save` (from any file) to trigger the rebuild that picks it up.
     fn trigger_rebuild_if_ready(&self) {
         let is_ready = matches!(
             &*self.index_state.lock().expect("index_state mutex poisoned"),
@@ -428,7 +426,15 @@ impl Backend {
         let Some(root) = root else {
             return;
         };
-        self.rebuilding.store(true, Ordering::SeqCst);
+        if self
+            .rebuilding
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            // A rebuild is already in flight; it (or whichever rebuild it's superseded by)
+            // will pick up this save on a later trigger.
+            return;
+        }
         let model_cache = Arc::clone(&self.model_cache);
         self.spawn_indexed_build(move || build_index(&model_cache, &root));
     }
@@ -944,6 +950,38 @@ mod tests {
         assert!(matches!(
             &*backend.index_state.lock().unwrap(),
             IndexState::Building
+        ));
+    }
+
+    #[tokio::test]
+    async fn trigger_rebuild_if_ready_dedupes_rapid_calls_while_rebuild_in_flight() {
+        let backend = test_backend();
+        let repo_root = tmp_dir("dedup-rebuild-burst");
+        *backend.index_state.lock().unwrap() =
+            IndexState::Ready(Arc::new(arch_model_with_symbols(&repo_root, &["Initial"])));
+        *backend.workspace_root.lock().unwrap() = Some(repo_root.clone());
+
+        let generation_before = backend.build_generation.load(Ordering::SeqCst);
+
+        // Simulate a burst of `did_save` events (e.g. an editor's "save all") firing back to
+        // back, synchronously — before the first spawned rebuild has had a chance to run on
+        // the blocking pool and clear `rebuilding`. Only the first call should win the
+        // `compare_exchange` and actually spawn a build; the rest must no-op.
+        for _ in 0..5 {
+            backend.trigger_rebuild_if_ready();
+        }
+
+        assert_eq!(
+            backend.build_generation.load(Ordering::SeqCst),
+            generation_before + 1,
+            "a burst of rapid did_save triggers must spawn exactly one rebuild, not one per call"
+        );
+        assert!(backend.rebuilding.load(Ordering::SeqCst));
+
+        wait_until(|| !backend.rebuilding.load(Ordering::SeqCst)).await;
+        assert!(matches!(
+            &*backend.index_state.lock().unwrap(),
+            IndexState::Ready(_)
         ));
     }
 
