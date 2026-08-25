@@ -1,11 +1,9 @@
 //! Domain types for the shared, repo-scoped architecture model — `ArchModel` and its
-//! constituent types. Pure, serde-derived data; no file I/O and no tree-sitter walking
-//! lives here (that's `symbol_extract.rs` and the later `build_model` orchestration
-//! function). Every consumer (CLI `architecture export`, MCP query tools, LSP symbol
-//! mapper, the diagram renderer) shares these types instead of reimplementing them.
-//!
-//! Epic 1.1 (this file) is types-only: nothing constructs these yet. `build_model`
-//! (Epic 1.3) is the first real caller.
+//! constituent types — plus this crate's I/O-owning helper layer for building one:
+//! `collect_repo_files` (walk + import graph + file reads) and `load_cached_model`
+//! (cache lookup, falling back to `collect_repo_files` + `build_model`). Every consumer
+//! (CLI `architecture export`/`diagram`, MCP query tools, LSP symbol mapper/index) shares
+//! these instead of reimplementing walk-and-parse itself.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -400,14 +398,10 @@ impl ModelCache {
 
 /// Walks `repo_root`, builds its `ImportGraph`, and reads every walked file's contents that
 /// `read_to_string` succeeds on (binary/non-UTF8 files are silently skipped, not fatal — a
-/// repo with an image or other binary asset shouldn't crash a whole-repo build). This exact
-/// walk+graph+read sequence was duplicated in `arch_export.rs::collect_files`,
-/// `arch_diagram.rs::collect_files` (byte-for-byte identical to each other), and inlined again
-/// inside `mcp.rs`'s two `ModelCache::get_or_build` closures and `lsp.rs::build_index` — this
-/// is the shared version those call sites are meant to switch to.
-///
-/// Not yet called anywhere in this crate: Wave 2 wires up the call sites above.
-#[allow(dead_code)]
+/// repo with an image or other binary asset shouldn't crash a whole-repo build). Called from
+/// `arch_export.rs::run_export` and `arch_diagram.rs::run_diagram`; `load_cached_model` below
+/// inlines the same walk+graph+read sequence itself rather than calling this, to reuse the
+/// file list it already collected for the cache staleness check.
 pub(crate) fn collect_repo_files(
     repo_root: &Path,
 ) -> Result<(ImportGraph, Vec<(PathBuf, String)>)> {
@@ -425,15 +419,17 @@ pub(crate) fn collect_repo_files(
     Ok((graph, files))
 }
 
-/// Returns the cached `ArchModel` for `(repo_root, include_private)`, rebuilding it via
-/// `collect_repo_files` + `build_model` on a cache miss/staleness. Synchronous and blocking
-/// (file walk, disk reads, and tree-sitter parsing all happen here on a miss) — a caller on
-/// the async runtime (`mcp.rs`, `lsp.rs`) must wrap this in `tokio::task::spawn_blocking`
-/// itself; this function does not spawn anything on its own.
+/// Returns the cached `ArchModel` for `(repo_root, include_private)`, rebuilding it on a
+/// cache miss/staleness. Synchronous and blocking (file walk, disk reads, and tree-sitter
+/// parsing all happen here on a miss) — a caller on the async runtime (`mcp.rs`, `lsp.rs`)
+/// must wrap this in `tokio::task::spawn_blocking` itself; this function does not spawn
+/// anything on its own. Called from `mcp.rs`'s `list_architecture_symbols`/
+/// `get_architecture_node` and `lsp.rs::build_index`.
 ///
-/// Not yet called anywhere in this crate: Wave 2 wires up `mcp.rs`'s two call sites and
-/// `lsp.rs::build_index` to use this instead of their own near-identical inline closures.
-#[allow(dead_code)]
+/// The file walk below feeds both `ModelCache::get_or_build`'s staleness check and (on a
+/// miss) the build closure's file list — walking once and reusing `file_paths` for both,
+/// rather than calling `collect_repo_files` again inside the closure, which would walk the
+/// repo twice on every cache miss.
 pub(crate) fn load_cached_model(
     cache: &ModelCache,
     repo_root: &Path,
@@ -448,7 +444,12 @@ pub(crate) fn load_cached_model(
     };
 
     cache.get_or_build(key, &file_paths, || {
-        let (import_graph, files) = collect_repo_files(repo_root)?;
+        let import_graph = crate::import_graph::build(repo_root, &file_paths)
+            .with_context(|| format!("building import graph for {}", repo_root.display()))?;
+        let files: Vec<(PathBuf, String)> = file_paths
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok().map(|s| (f.clone(), s)))
+            .collect();
         build_model(
             repo_root,
             &files,

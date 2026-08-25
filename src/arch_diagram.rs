@@ -181,6 +181,7 @@ pub fn run_diagram(
 mod tests {
     use super::*;
     use crate::arch_model::{PackageNode, PruningSummary, SymbolNode};
+    use crate::test_support::run_kibitzer;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -201,24 +202,6 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, contents).unwrap();
         path
-    }
-
-    fn kibitzer_bin_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            })
-            .join("kibitzer")
-    }
-
-    fn run_kibitzer(args: &[&str]) -> std::process::Output {
-        std::process::Command::new(kibitzer_bin_path())
-            .args(args)
-            .output()
-            .expect("kibitzer binary runs (run `cargo build` first if this fails)")
     }
 
     fn empty_pruning() -> PruningSummary {
@@ -405,6 +388,40 @@ mod tests {
         assert!(contents.contains("```mermaid"));
         assert!(contents.contains(DISCLAIMER_MERMAID));
         assert!(contents.contains("Widget"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagram_cli_scope_filters_to_matching_package_only() {
+        // No go.mod: `import_graph::build_go` early-returns without one, so these files
+        // fall back to a plain repo-root-relative directory package key (same reasoning as
+        // `arch_export.rs`'s `run_export_scope_filters_exported_packages`).
+        let dir = tmp_dir("cli-scope-filter");
+        write_fixture(&dir, "web/ui/widget.go", "package ui\n\nfunc Widget() {}\n");
+        write_fixture(
+            &dir,
+            "server/api/handler.go",
+            "package api\n\nfunc Handler() {}\n",
+        );
+
+        let output = run_kibitzer(&[
+            "architecture",
+            "diagram",
+            "--path",
+            dir.to_str().unwrap(),
+            "--level",
+            "code",
+            "--scope",
+            "web/**",
+        ]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(stdout.contains("web/ui"), "got: {stdout}");
+        assert!(stdout.contains("Widget"), "got: {stdout}");
+        assert!(!stdout.contains("server/api"), "got: {stdout}");
+        assert!(!stdout.contains("Handler"), "got: {stdout}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

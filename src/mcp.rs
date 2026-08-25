@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,7 +9,9 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::arch_model::{ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model};
+use crate::arch_model::{
+    ArchModel, ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model,
+};
 use crate::check::{
     run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
@@ -396,6 +398,33 @@ impl KibitzerServer {
         }
     }
 
+    /// Resolves `path`'s nearest `.claude/inspect.json` repo root, or a `json_error`-ready
+    /// message otherwise. Shared by `list_architecture_symbols`/`get_architecture_node`,
+    /// which previously each inlined this same `find_config` dispatch.
+    fn resolve_repo_root(path: &Path) -> Result<PathBuf, String> {
+        match find_config(path) {
+            Ok(Some((_, root))) => Ok(root),
+            Ok(None) => Err("no .claude/inspect.json found above this path".to_string()),
+            Err(e) => Err(format!("error reading config: {e}")),
+        }
+    }
+
+    /// Loads the cached `ArchModel` for `repo_root` via `spawn_blocking` (the build is
+    /// synchronous/blocking — whole-repo walk, disk reads, tree-sitter parsing — so it must
+    /// not run inline on the async call stack). Shared by `list_architecture_symbols`/
+    /// `get_architecture_node`, which previously each inlined this same dispatch.
+    async fn load_model_off_stack(
+        &self,
+        repo_root: PathBuf,
+        include_private: bool,
+    ) -> Result<Arc<ArchModel>, String> {
+        let cache = Arc::clone(&self.model_cache);
+        tokio::task::spawn_blocking(move || load_cached_model(&cache, &repo_root, include_private))
+            .await
+            .map_err(|e| format!("architecture model build task failed: {e}"))?
+            .map_err(|e| format!("error building architecture model: {e}"))
+    }
+
     #[tool(
         description = "Query the repo's architecture model for a paginated, filtered slice of \
                         symbols (by package/kind/name) — returns JSON \
@@ -409,12 +438,9 @@ impl KibitzerServer {
     ) -> String {
         let req = req.0;
         let path = PathBuf::from(&req.path);
-        let repo_root = match find_config(&path) {
-            Ok(Some((_, root))) => root,
-            Ok(None) => {
-                return json_error("no .claude/inspect.json found above this path".to_string());
-            }
-            Err(e) => return json_error(format!("error reading config: {e}")),
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
         };
 
         let level = if req.level.eq_ignore_ascii_case("component") {
@@ -434,21 +460,12 @@ impl KibitzerServer {
             },
         };
 
-        // The model build (whole-repo walk + tree-sitter parse) is synchronous/blocking;
-        // run it off the async call stack so it doesn't block this Tokio worker thread.
-        let cache = Arc::clone(&self.model_cache);
-        let build_root = repo_root.clone();
-        let include_private = req.include_private;
-        let model = match tokio::task::spawn_blocking(move || {
-            load_cached_model(&cache, &build_root, include_private)
-        })
-        .await
+        let model = match self
+            .load_model_off_stack(repo_root, req.include_private)
+            .await
         {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => return json_error(format!("error building architecture model: {e}")),
-            Err(e) => {
-                return json_error(format!("architecture model build task failed: {e}"));
-            }
+            Ok(m) => m,
+            Err(e) => return json_error(e),
         };
 
         let scope: Vec<String> = req.scope.iter().cloned().collect();
@@ -521,12 +538,9 @@ impl KibitzerServer {
     async fn get_architecture_node(&self, req: Parameters<GetArchitectureNodeRequest>) -> String {
         let req = req.0;
         let path = PathBuf::from(&req.path);
-        let repo_root = match find_config(&path) {
-            Ok(Some((_, root))) => root,
-            Ok(None) => {
-                return json_error("no .claude/inspect.json found above this path".to_string());
-            }
-            Err(e) => return json_error(format!("error reading config: {e}")),
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
         };
 
         // Always resolved against the default (`include_private: false`) model: the
@@ -534,21 +548,9 @@ impl KibitzerServer {
         // `pruning.pruned_symbol_ids`, which is only populated on that model. This also
         // shares the same `ModelCacheKey` `list_architecture_symbols` uses by default, so
         // the two tools share one cache slot within a session.
-        //
-        // The model build (whole-repo walk + tree-sitter parse) is synchronous/blocking;
-        // run it off the async call stack so it doesn't block this Tokio worker thread.
-        let cache = Arc::clone(&self.model_cache);
-        let build_root = repo_root.clone();
-        let model = match tokio::task::spawn_blocking(move || {
-            load_cached_model(&cache, &build_root, false)
-        })
-        .await
-        {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => return json_error(format!("error building architecture model: {e}")),
-            Err(e) => {
-                return json_error(format!("architecture model build task failed: {e}"));
-            }
+        let model = match self.load_model_off_stack(repo_root, false).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
         };
 
         if let Some(pkg) = model.package(&req.node) {
@@ -923,6 +925,64 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert_eq!(json["total_matched"], 0, "got: {json}");
         assert_eq!(json["possibly_pruned"], true, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_kind_filter_returns_only_matching_kind() {
+        let dir = tmp_dir("list-kind-filter");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(ListArchitectureSymbolsRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                package: Some("fixture/shapes".to_string()),
+                kind: Some("method".to_string()),
+                level: default_level(),
+                include_private: false,
+                limit: default_limit(),
+                cursor: None,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        let symbols = json["symbols"].as_array().unwrap();
+        assert!(!symbols.is_empty(), "got: {json}");
+        for entry in symbols {
+            assert_eq!(entry["symbol"]["kind"], "method", "got: {json}");
+        }
+        // `shapes` has two `Close` methods and no other symbol kinds, so filtering to
+        // "method" must match exactly those two, not the types they're attached to.
+        assert_eq!(json["total_matched"], 2, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_level_component_returns_no_symbols() {
+        let dir = tmp_dir("list-level-component");
+        write_arch_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(ListArchitectureSymbolsRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                package: Some("fixture/widgets".to_string()),
+                kind: None,
+                level: "component".to_string(),
+                include_private: false,
+                limit: default_limit(),
+                cursor: None,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["total_matched"], 0, "got: {json}");
+        assert_eq!(json["symbols"].as_array().unwrap().len(), 0, "got: {json}");
     }
 
     #[test]

@@ -24,15 +24,10 @@
 //!   interface/class/type-alias/function) — there was no direct-child-without-a-field
 //!   case in practice, so `is_exported` just checks the immediate parent's kind.
 //!
-//! This function takes no `GrammarCache` and does no file I/O — the caller (Epic 1.3's
-//! `build_model`, or the LSP `document_symbol` handler) parses the tree and owns the file
-//! path; `SymbolNode::file` is left empty (`PathBuf::new()`) here for the caller to fill
+//! This function takes no `GrammarCache` and does no file I/O — the caller (`arch_model.rs`'s
+//! `build_model`, or `lsp.rs`'s `document_symbols_for_file`) parses the tree and owns the
+//! file path; `SymbolNode::file` is left empty (`PathBuf::new()`) here for the caller to fill
 //! in, since `extract_symbols_for_file`'s signature (Story 1.2.2) takes no file path.
-//!
-//! Epic 1.2 (this file) has no real caller yet — `build_model` (Epic 1.3) is the first
-//! one, hence the blanket `dead_code` allow below, matching `arch_model.rs`'s precedent.
-
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 
@@ -140,22 +135,6 @@ fn kotlin_is_exported(node: Node, _source: &str) -> bool {
 /// `rules.rs`). A plain class's first keyword child is `"class"` instead.
 fn kotlin_is_interface(node: Node) -> bool {
     find_child_by_kind(node, "interface").is_some()
-}
-
-/// Empty config for languages not covered yet. Returns no symbols rather than panicking,
-/// so a mixed-language repo containing files in a not-yet-supported language doesn't
-/// crash `build_model` (Epic 1.3). Unused now that Python/Java/Kotlin (Phase 5) are all
-/// wired in `lang_symbol_config`, but kept as a documented fallback shape rather than
-/// deleted, since `Language` may grow further later.
-#[allow(dead_code)]
-fn unimplemented_config() -> LangSymbolConfig {
-    LangSymbolConfig {
-        type_kinds: &[],
-        interface_kinds: &[],
-        function_kinds: &[],
-        name_finder: field_name,
-        is_exported: |_, _| false,
-    }
 }
 
 fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
@@ -534,6 +513,18 @@ mod tests {
         assert_eq!(symbols[0].kind, SymbolKind::Interface);
         assert_eq!(symbols[0].name, "Reader");
         assert!(symbols[0].exported);
+    }
+
+    #[test]
+    fn go_grouped_type_declaration_emits_a_symbol_per_type_spec() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype (\n\tA struct{}\n\tB interface{ M() }\n)\n",
+            "pkg",
+        );
+        assert_eq!(symbols.len(), 2, "got: {symbols:?}");
+        assert_eq!(find_by_name(&symbols, "A").kind, SymbolKind::Type);
+        assert_eq!(find_by_name(&symbols, "B").kind, SymbolKind::Interface);
     }
 
     #[test]

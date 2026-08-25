@@ -106,6 +106,7 @@ pub fn run_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_kibitzer;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -125,29 +126,6 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, contents).unwrap();
         path
-    }
-
-    /// The compiled `kibitzer` binary's path. Cargo only sets `CARGO_BIN_EXE_<name>` for
-    /// integration tests/benches (this crate has no `tests/` directory — everything is
-    /// inline `#[cfg(test)]`, per `validation.md`'s Test Stack section), so it's not
-    /// available here; `cargo test` still builds the plain `kibitzer` binary target as
-    /// part of the same build, so it's resolved by convention instead.
-    fn kibitzer_bin_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            })
-            .join("kibitzer")
-    }
-
-    fn run_kibitzer(args: &[&str]) -> std::process::Output {
-        std::process::Command::new(kibitzer_bin_path())
-            .args(args)
-            .output()
-            .expect("kibitzer binary runs (run `cargo build` first if this fails)")
     }
 
     #[test]

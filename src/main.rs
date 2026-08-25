@@ -26,6 +26,8 @@ mod primitive_obsession;
 mod rules;
 mod run;
 mod symbol_extract;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

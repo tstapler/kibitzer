@@ -372,15 +372,11 @@ impl Backend {
                     Err(anyhow::anyhow!("panicked: {message}"))
                 });
 
-            // The generation check and the `index_state` write must happen under the same
-            // lock hold — checking outside the lock (as this used to) leaves a window where
-            // an older rebuild can pass its check, get preempted before locking, let a
-            // newer rebuild finish and swap in its result, and then resume and
-            // unconditionally overwrite that newer result. Locking first closes that
-            // window: whichever rebuild's check-and-write runs last under the lock is, by
-            // definition, the one that observes the current (monotonically increasing)
-            // `build_generation` value, so a strictly older generation can never win against
-            // a strictly newer one, regardless of completion order.
+            // Check-and-write must happen under one lock hold: checking outside the lock
+            // left a window where an older rebuild could pass its check, get preempted,
+            // let a newer rebuild swap in, then resume and overwrite it. Under the lock,
+            // whichever check-and-write runs last always sees the current generation, so
+            // an older generation can never win regardless of completion order.
             let mut state = index_state.lock().expect("index_state mutex poisoned");
             if build_generation.load(Ordering::SeqCst) == generation {
                 *state = match result {
@@ -392,24 +388,12 @@ impl Backend {
         });
     }
 
-    /// Triggered by `did_save` for any in-scope file: if the index is `Ready`, spawns a new
-    /// background rebuild (never inline) so `workspace/symbol` eventually picks up the
-    /// save — matching the Pattern Decisions table's disk-snapshot tolerance applied to the
-    /// whole-repo index instead of one file. No-op while `Building`: the in-flight initial
-    /// build already reads whatever's on disk when it reaches each file, so a second
-    /// concurrent build triggered by a save that lands mid-walk buys nothing but wasted
-    /// work and a second race to swap into `index_state` (see Story 4.3.0). Also a no-op
-    /// while `Failed`, or if no workspace root is known.
-    ///
-    /// Also a no-op whenever a rebuild is already in flight (`rebuilding` is already
-    /// `true`), gated via `compare_exchange` rather than a bare `store` so a burst of rapid
-    /// `did_save`s (e.g. an editor's "save all") spawns at most one rebuild instead of one
-    /// per file. This doesn't lose a save's changes forever: `index_state` stays
-    /// `Ready(old_model)` for the whole in-flight rebuild, so every dropped trigger's save
-    /// is still on disk for the *next* rebuild to pick up — same disk-snapshot consistency
-    /// model `check_and_publish`'s diagnostics already rely on. Worst case, a save that
-    /// lands after the in-flight rebuild's walk already passed its file waits one more
-    /// `did_save` (from any file) to trigger the rebuild that picks it up.
+    /// Triggered by `did_save`: spawns a background rebuild if the index is `Ready` and no
+    /// rebuild is already in flight (`rebuilding`, gated via `compare_exchange` so a burst
+    /// of rapid saves spawns at most one rebuild). No-op while `Building`/`Failed`, or with
+    /// no known workspace root. A dropped trigger isn't lost: `index_state` stays
+    /// `Ready(old_model)` until the in-flight rebuild swaps in, and that rebuild reads
+    /// whatever's on disk, so a save landing mid-rebuild is picked up by the *next* one.
     fn trigger_rebuild_if_ready(&self) {
         let is_ready = matches!(
             &*self.index_state.lock().expect("index_state mutex poisoned"),
@@ -985,8 +969,15 @@ mod tests {
         ));
     }
 
+    /// `build_generation` is incremented synchronously in `spawn_indexed_build`, before
+    /// either closure below runs — so by the time B is spawned, A's captured generation is
+    /// already stale, regardless of completion order. This proves a stale-generation
+    /// completion is discarded (A never clobbers B), not that the lock-then-check ordering
+    /// specifically closes a race between two closures completing concurrently — that
+    /// narrower claim would need a hook forcing A's check to run *during* B's write, which
+    /// this test doesn't do.
     #[tokio::test]
-    async fn build_generation_gates_out_of_order_rebuild_completion() {
+    async fn stale_generation_completion_is_discarded_after_newer_build_completes() {
         let backend = test_backend();
         let repo_root = tmp_dir("out-of-order-rebuild");
         *backend.index_state.lock().unwrap() =
