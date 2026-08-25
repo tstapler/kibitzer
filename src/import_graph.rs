@@ -491,7 +491,13 @@ fn build_java(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .context("loading tree-sitter-java grammar")?;
 
-    let mut file_packages: Vec<(&PathBuf, String)> = Vec::new();
+    // Captures `(file, pkg, source, tree)` for every file so the second loop below can
+    // reuse the already-read source and already-parsed tree instead of re-reading and
+    // re-parsing each file a second time — the first pass still has to run to completion
+    // before the second (package-declaration-derived keying means `graph.nodes` isn't
+    // fully populated until every file's package is known), but there's no need to touch
+    // disk or tree-sitter twice per file to get there.
+    let mut file_packages: Vec<(&PathBuf, String, String, tree_sitter::Tree)> = Vec::new();
     for file in files {
         let source =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
@@ -504,18 +510,12 @@ fn build_java(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
         let pkg = java_package_name(tree.root_node(), &source).unwrap_or_default();
         graph.nodes.insert(pkg.clone());
         graph.file_packages.insert((*file).clone(), pkg.clone());
-        file_packages.push((file, pkg));
+        file_packages.push((file, pkg, source, tree));
     }
 
-    for (file, pkg) in &file_packages {
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let tree = parser
-            .parse(&source, None)
-            .with_context(|| format!("parsing {} with tree-sitter-java", file.display()))?;
-
+    for (file, pkg, source, tree) in &file_packages {
         let mut imports = Vec::new();
-        collect_java_imports(tree.root_node(), &source, &mut imports);
+        collect_java_imports(tree.root_node(), source, &mut imports);
 
         for (import_path, line) in imports {
             let Some(to_pkg) = package_of_import_path(&import_path) else {
@@ -566,7 +566,10 @@ fn build_kotlin(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
         .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
         .context("loading tree-sitter-kotlin-ng grammar")?;
 
-    let mut file_packages: Vec<(&PathBuf, String)> = Vec::new();
+    // Same shape as `build_java`: capture `(file, pkg, source, tree)` up front so the
+    // second loop reuses the already-read source and already-parsed tree instead of
+    // re-reading/re-parsing each file.
+    let mut file_packages: Vec<(&PathBuf, String, String, tree_sitter::Tree)> = Vec::new();
     for file in files {
         let source =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
@@ -577,18 +580,12 @@ fn build_kotlin(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
         let pkg = kotlin_package_name(tree.root_node(), &source).unwrap_or_default();
         graph.nodes.insert(pkg.clone());
         graph.file_packages.insert((*file).clone(), pkg.clone());
-        file_packages.push((file, pkg));
+        file_packages.push((file, pkg, source, tree));
     }
 
-    for (file, pkg) in &file_packages {
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let tree = parser
-            .parse(&source, None)
-            .with_context(|| format!("parsing {} with tree-sitter-kotlin-ng", file.display()))?;
-
+    for (file, pkg, source, tree) in &file_packages {
         let mut imports = Vec::new();
-        collect_kotlin_imports(tree.root_node(), &source, &mut imports);
+        collect_kotlin_imports(tree.root_node(), source, &mut imports);
 
         for (import_path, line) in imports {
             let Some(to_pkg) = package_of_import_path(&import_path) else {
