@@ -667,7 +667,16 @@ mod tests {
         for args in [
             vec!["init", "-q"],
             vec!["add", "-A"],
-            vec!["commit", "-q", "-m", "init"],
+            vec![
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
         ] {
             let status = Command::new("git")
                 .args(&args)

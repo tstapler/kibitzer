@@ -9,9 +9,12 @@ use std::path::PathBuf;
 
 /// The compiled `kibitzer` binary's path. Cargo only sets `CARGO_BIN_EXE_<name>` for
 /// integration tests/benches (this crate has no `tests/` directory — everything is inline
-/// `#[cfg(test)]`, per `validation.md`'s Test Stack section), so it's not available here;
-/// `cargo test` still builds the plain `kibitzer` binary target as part of the same build,
-/// so it's resolved by convention instead.
+/// `#[cfg(test)]`, per `validation.md`'s Test Stack section), so it's not available here.
+/// `cargo test` alone does NOT build this plain binary target (confirmed empirically — it
+/// only builds a separate test-harness binary under `target/debug/deps/`), so CI runs an
+/// explicit `cargo build` before `cargo test` (see `.github/workflows/ci.yml`). A local
+/// `cargo test` run needs the same: run `cargo build` first if these tests fail to find
+/// the binary.
 pub(crate) fn kibitzer_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
