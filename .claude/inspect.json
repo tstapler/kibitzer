@@ -1,0 +1,96 @@
+{
+  "checks": [
+    {
+      "name": "markdown-link-integrity",
+      "checker": "markdown-link-integrity",
+      "severity": "blocking",
+      "scope": ["**/*.md"],
+      "triggers": ["PostToolUse", "batch"],
+      "message": "broken markdown link/anchor"
+    },
+    {
+      "name": "primitive-obsession",
+      "checker": "primitive-obsession",
+      "severity": "advisory",
+      "scope": ["**/*.go"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "duplicate-code",
+      "checker": "duplicate-code",
+      "severity": "advisory",
+      "scope": ["**/*.go", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.py", "**/*.java", "**/*.kt"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "go-blank-imports",
+      "checker": "go-blank-imports",
+      "severity": "advisory",
+      "scope": ["**/*.go"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "go-ignored-error",
+      "checker": "go-ignored-error",
+      "severity": "advisory",
+      "scope": ["**/*.go"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "go-error-context",
+      "checker": "go-error-context",
+      "severity": "advisory",
+      "scope": ["**/*.go"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-go",
+      "checker": "syntax-rules",
+      "severity": "advisory",
+      "scope": ["**/*.go"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-typescript",
+      "checker": "syntax-rules-typescript",
+      "severity": "advisory",
+      "scope": ["**/*.ts"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-tsx",
+      "checker": "syntax-rules-tsx",
+      "severity": "advisory",
+      "scope": ["**/*.tsx"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-javascript",
+      "checker": "syntax-rules-javascript",
+      "severity": "advisory",
+      "scope": ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-python",
+      "checker": "syntax-rules-python",
+      "severity": "advisory",
+      "scope": ["**/*.py"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-java",
+      "checker": "syntax-rules-java",
+      "severity": "advisory",
+      "scope": ["**/*.java"],
+      "triggers": ["PostToolUse", "batch"]
+    },
+    {
+      "name": "syntax-rules-kotlin",
+      "checker": "syntax-rules-kotlin",
+      "severity": "advisory",
+      "scope": ["**/*.kt", "**/*.kts"],
+      "triggers": ["PostToolUse", "batch"]
+    }
+  ]
+}
