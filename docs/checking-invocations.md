@@ -37,10 +37,17 @@ Claude Code tags every `PostToolUse` hook execution with one of these
   real block — `blockingError.blockingError` is the literal stderr kibitzer
   printed (`[kibitzer] <check> (blocking): <message>`).
 
-Both carry a `command` field. Filter on `command == "kibitzer hook"`
-(or `blockingError.command` for the blocking type) — this is more reliable
-than filtering on the *content* of the message, since it doesn't depend on
-kibitzer's message format staying the same.
+Both carry a `command` field. Filter on it (or `blockingError.command` for
+the blocking type) — this is more reliable than filtering on the *content*
+of the message, since it doesn't depend on kibitzer's message format
+staying the same.
+
+The logged `command` is whatever string is in `settings.json`'s hook
+entry, not the literal string `"kibitzer hook"` — `kibitzer install`
+writes the resolved absolute binary path (`/home/tstapler/.cargo/bin/kibitzer
+hook`, or a Homebrew prefix, depending on how it was installed). An exact
+`command == "kibitzer hook"` match finds nothing on a real machine; match
+the suffix instead: `.attachment.command | test("kibitzer hook$")`.
 
 ## Recipe
 
@@ -52,9 +59,9 @@ grep -lI "kibitzer" ~/.claude/projects/*/*.jsonl
 # 2. For each candidate file, count REAL invocations by command, not by text match
 for f in ~/.claude/projects/*/*.jsonl; do
   success=$(jq -c 'select(.type=="attachment" and .attachment.type=="hook_success")
-    | select(.attachment.command=="kibitzer hook")' "$f" 2>/dev/null | wc -l)
+    | select(.attachment.command | test("kibitzer hook$"))' "$f" 2>/dev/null | wc -l)
   blocked=$(jq -c 'select(.type=="attachment" and .attachment.type=="hook_blocking_error")
-    | select(.attachment.blockingError.command=="kibitzer hook")' "$f" 2>/dev/null | wc -l)
+    | select(.attachment.blockingError.command | test("kibitzer hook$"))' "$f" 2>/dev/null | wc -l)
   if [ "$success" != "0" ] || [ "$blocked" != "0" ]; then
     echo "$f  success=$success blocked=$blocked"
   fi
@@ -62,12 +69,12 @@ done
 
 # 3. Read what a blocking run actually said
 jq -c 'select(.type=="attachment" and .attachment.type=="hook_blocking_error")
-  | select(.attachment.blockingError.command=="kibitzer hook")
+  | select(.attachment.blockingError.command | test("kibitzer hook$"))
   | {ts: .timestamp, tool: .attachment.toolUseID, err: .attachment.blockingError.blockingError}' "$f"
 
 # 4. Read what an advisory (non-blocking) run actually said
 jq -c 'select(.type=="attachment" and .attachment.type=="hook_success")
-  | select(.attachment.command=="kibitzer hook")
+  | select(.attachment.command | test("kibitzer hook$"))
   | {ts: .timestamp, exit: .attachment.exitCode, stdout: .attachment.stdout}' "$f"
 
 # 5. To see the actual edit that triggered a specific block, match its
@@ -93,3 +100,18 @@ grep -n "toolu_XXXX" "$f"
   reuse a number from an earlier read of the same file without rerunning
   the filter, since a partial filter (like blocking-only) silently drops
   a real category of hit.
+
+## Gotchas found doing this for real (2026-08-29)
+
+- An exact `command == "kibitzer hook"` filter matches nothing on a real
+  machine — `settings.json` stores the resolved absolute binary path
+  (`kibitzer install` writes it that way), not the bare `"kibitzer hook"`
+  string. Match the suffix instead (see above). A first pass with the
+  exact filter concluded kibitzer "never ran" in a session where it had
+  actually fired.
+- A hook invocation that finds zero applicable checks for the edited file
+  (e.g. editing `.claude/inspect.json` itself, which no configured check's
+  `scope` covers) prints nothing and exits 0 — Claude Code does not log a
+  transcript attachment for that silent no-op run at all. "No hit in the
+  transcript" for a given edit means either the hook didn't fire *or* it
+  ran and found nothing to check; it doesn't distinguish the two.
