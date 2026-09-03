@@ -68,14 +68,14 @@ pub const CATALOG: &[RuleMeta] = &[
 /// TS/JS/Go all use different node shapes for the "same" constructs (e.g. Go's chained
 /// `else if` nests a bare `if_statement` under `alternative`, JS/TS wrap it in an
 /// `else_clause` first).
-struct LangRuleConfig {
+pub(crate) struct LangRuleConfig {
     /// Checker name suffix distinguishing this language's registry entry — `lookup()`
     /// matches on exact name, so each language needs a distinct one (see
     /// `checker::lookup`'s first-match semantics).
-    name: &'static str,
-    file_globs: &'static [&'static str],
-    /// Declaration-like node kinds checked for the four rules below.
-    function_kinds: &'static [&'static str],
+    pub(crate) name: &'static str,
+    pub(crate) file_globs: &'static [&'static str],
+    /// Declaration-like node kinds checked for the rules below.
+    pub(crate) function_kinds: &'static [&'static str],
     /// The if-like node kind for this grammar — `"if_statement"` everywhere except
     /// Kotlin's `"if_expression"`.
     if_kind: &'static str,
@@ -98,7 +98,7 @@ struct LangRuleConfig {
     /// Locates a declaration's body node. Field-based (`child_by_field_name("body")`)
     /// for every grammar so far except Kotlin, whose `function_declaration`/
     /// `anonymous_function` expose no field names at all — only positional children.
-    body_finder: fn(Node) -> Option<Node>,
+    pub(crate) body_finder: fn(Node) -> Option<Node>,
     /// Locates a declaration's parameter-list node. Same field-vs-positional split as
     /// `body_finder`.
     params_finder: fn(Node) -> Option<Node>,
@@ -190,7 +190,10 @@ fn kotlin_params(decl: Node) -> Option<Node> {
         .find(|c| c.kind() == "function_value_parameters")
 }
 
-fn lang_config(lang: Language) -> LangRuleConfig {
+/// Shared with `comment_quality`'s over-commented check, which needs the same
+/// per-language function-kind/body lookup this file already maintains (Kotlin's
+/// positional-only body lookup in particular) rather than duplicating it.
+pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
     match lang {
         Language::Go => LangRuleConfig {
             name: "syntax-rules",

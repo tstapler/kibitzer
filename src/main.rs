@@ -6,6 +6,7 @@ mod backtest;
 mod cache;
 mod check;
 mod checker;
+mod comment_quality;
 mod config;
 mod daemon;
 mod declaration_checks;
