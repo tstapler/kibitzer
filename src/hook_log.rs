@@ -17,7 +17,7 @@ use crate::check::CheckResult;
 /// the log file; full content is already on disk at `file_path` if it's ever needed.
 const MAX_SNIPPET_LEN: usize = 4000;
 
-fn log_path() -> PathBuf {
+pub(crate) fn log_path() -> PathBuf {
     crate::cache::default_cache_path()
         .parent()
         .map(|p| p.join("hook-log.jsonl"))
