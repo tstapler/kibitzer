@@ -1438,6 +1438,35 @@ mod git_head_integration_tests {
     }
 
     #[test]
+    fn baseline_is_none_when_there_is_no_head_commit() {
+        let repo = TempRepo::new("no-head");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
+
+        let result = check_against_git_head(
+            &bad_marker_check(),
+            &repo.dir,
+            &repo.path("foo.txt"),
+            Some(&[(2, 2)]),
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn baseline_is_none_when_the_file_is_untracked_at_head() {
+        let repo = TempRepo::new("untracked-file");
+        repo.write_and_commit("committed.txt", "line1\n", "init");
+        repo.write_uncommitted("new.txt", "line1\nBAD\n");
+
+        let result = check_against_git_head(
+            &bad_marker_check(),
+            &repo.dir,
+            &repo.path("new.txt"),
+            Some(&[(2, 2)]),
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn run_check_downgrades_severity_when_violation_predates_edit() {
         let repo = TempRepo::new("run-check-downgrade");
         repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
