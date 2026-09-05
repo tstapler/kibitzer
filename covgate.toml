@@ -1,0 +1,9 @@
+# Diff coverage gate (see .github/workflows/ci.yml) — checks lines/regions
+# *changed* in a PR against cargo-llvm-cov's JSON report, not overall repo
+# coverage. Thresholds are set below the repo's current ~88-89% overall and
+# ~94-100% recent-diff coverage, leaving headroom for legitimately
+# hard-to-test glue code (CLI wiring, daemon IPC) without being toothless.
+# Ratchet these up as coverage improves; never down without a stated reason.
+[[gates]]
+fail-under-lines = 80
+fail-under-regions = 75
