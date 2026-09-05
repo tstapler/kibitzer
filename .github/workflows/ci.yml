@@ -13,15 +13,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # covgate diffs against origin/master to scope its coverage gate to
+          # this PR's changed lines; a shallow checkout wouldn't have that ref.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,covgate
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
         run: cargo build --workspace
-      - name: test
-        run: cargo test --workspace
+      - name: test with coverage
+        run: cargo llvm-cov --workspace --json --output-path coverage.json
+      - name: coverage gate (changed lines only)
+        run: covgate check coverage.json
