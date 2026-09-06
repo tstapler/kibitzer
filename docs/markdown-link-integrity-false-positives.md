@@ -77,3 +77,24 @@ including the caveat that this escalation only survives across edits when a
 `kibitzer daemon` is running (the recommended setup) — without one, grace state isn't
 persisted for diff-scoped per-edit hook calls, so a still-failing violation stays
 Advisory instead of escalating.
+
+### 2026-09-06 — personal-wiki (Logseq) — `[[wiki links]]` misread as unresolved reference-style links
+
+- **Repo**: `tstapler/personal-wiki` (session: knowledge:maintain run), file
+  `logseq/pages/GitHub Actions Pull Request Merge Ref Semantics.md` (and every other
+  edit made to `logseq/pages/*.md` / `logseq/journals/*.md` in this repo).
+- **What changed**: Added/edited Logseq Zettelkasten pages using the wiki's standard
+  `tags:: [[Page A]], [[Page B]]` and inline `[[Page]]` link syntax, per the
+  `logseq-wiki-syntax` skill.
+- **Why it's a false positive**: The wiki has no concept of Markdown reference-link
+  definitions (`[label]: url`) — cross-page links are Logseq double-bracket wiki-links
+  resolved by filename, not by an in-document reference table. Every single page in
+  this ~9,000-page wiki uses this syntax, so the check fires on essentially every edit
+  to the repo, for links that resolve correctly in Logseq (the target file exists) and
+  were never intended to be CommonMark reference links.
+- **Mechanism**: `markdown_link_integrity.rs` parses with `pulldown-cmark`, which reads
+  `[[Page Name]]` as a shortcut reference link `[Page Name]` (nested inside two literal
+  brackets) that requires a matching `[Page Name]: url` reference definition elsewhere
+  in the same file. Logseq wiki-links are cross-*file* by filename, not same-file
+  reference definitions, so the checker treats every wiki-link as "used but never
+  defined" regardless of whether the target page actually exists on disk.
