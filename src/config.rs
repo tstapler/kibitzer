@@ -550,6 +550,7 @@ pub fn default_checks() -> Vec<Check> {
                 "**/*.py",
                 "**/*.java",
                 "**/*.kt",
+                "**/*.rs",
             ],
         ),
         native_check("go-blank-imports", Severity::Advisory, &["**/*.go"]),
@@ -573,6 +574,7 @@ pub fn default_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.kt", "**/*.kts"],
         ),
+        native_check("syntax-rules-rust", Severity::Advisory, &["**/*.rs"]),
         native_check("comment-quality-go", Severity::Advisory, &["**/*.go"]),
         native_check(
             "comment-quality-typescript",
@@ -592,6 +594,7 @@ pub fn default_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.kt", "**/*.kts"],
         ),
+        native_check("comment-quality-rust", Severity::Advisory, &["**/*.rs"]),
     ]
 }
 

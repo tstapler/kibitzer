@@ -21,6 +21,7 @@ built on.
 | Python     | `comment-quality-python`         | `**/*.py`                                 |
 | Java       | `comment-quality-java`           | `**/*.java`                               |
 | Kotlin     | `comment-quality-kotlin`         | `**/*.kt`, `**/*.kts`                     |
+| Rust       | `comment-quality-rust`           | `**/*.rs`                                 |
 
 ## Findings
 

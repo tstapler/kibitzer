@@ -45,6 +45,7 @@ impl Checker for DuplicateCodeChecker {
             "**/*.py",
             "**/*.java",
             "**/*.kt",
+            "**/*.rs",
         ]
     }
 

@@ -29,6 +29,7 @@ rmcp = { version = "0.2", features = ["server", "transport-io"] }
 schemars = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
 tower-lsp = "0.20.0"
+tree-sitter-rust = "0.24"
 
 # The profile that 'dist' will build with
 [profile.dist]

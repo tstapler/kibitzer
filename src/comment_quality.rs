@@ -123,7 +123,7 @@ fn comment_kinds(lang: Language) -> &'static [&'static str] {
         | Language::TypeScript
         | Language::Tsx
         | Language::JavaScript => &["comment"],
-        Language::Java | Language::Kotlin => &["line_comment", "block_comment"],
+        Language::Java | Language::Kotlin | Language::Rust => &["line_comment", "block_comment"],
     }
 }
 
@@ -145,6 +145,7 @@ impl CommentQualityChecker {
             Language::Python => "comment-quality-python",
             Language::Java => "comment-quality-java",
             Language::Kotlin => "comment-quality-kotlin",
+            Language::Rust => "comment-quality-rust",
         }
     }
 }
@@ -365,9 +366,25 @@ fn check_proportionality(
     });
 }
 
+/// A single-line comment's `end_position()` sometimes lands at column 0 of the row
+/// *after* its own last line, rather than the end of its own line — verified for
+/// tree-sitter-rust's `line_comment`, whose reported span runs through its trailing
+/// newline (unlike every other grammar this checker covers, where a single-line
+/// comment's end position stays on its own row). Normalizing back to the comment's own
+/// last row keeps the row-adjacency math below (used to detect a contiguous leading
+/// comment block, and to count comment lines inside a body) grammar-independent.
+fn comment_end_row(node: Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row - 1
+    } else {
+        end.row
+    }
+}
+
 fn collect_comment_rows(node: Node, comment_kinds: &[&str], rows: &mut BTreeSet<usize>) {
     if comment_kinds.contains(&node.kind()) {
-        for row in node.start_position().row..=node.end_position().row {
+        for row in node.start_position().row..=comment_end_row(node) {
             rows.insert(row);
         }
         return;
@@ -388,10 +405,10 @@ fn leading_comment_rows(decl: Node, comment_kinds: &[&str]) -> BTreeSet<usize> {
         if !comment_kinds.contains(&sibling.kind()) {
             break;
         }
-        if sibling.end_position().row + 1 != next_start_row {
+        if comment_end_row(sibling) + 1 != next_start_row {
             break;
         }
-        for row in sibling.start_position().row..=sibling.end_position().row {
+        for row in sibling.start_position().row..=comment_end_row(sibling) {
             rows.insert(row);
         }
         next_start_row = sibling.start_position().row;
@@ -490,6 +507,62 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_flags_marketing_language() {
+        let src = "/// This seamlessly leverages a robust approach.\nfn f() {}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[verbose-comment]") && f.message.contains("leverage")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_flags_commented_out_code() {
+        let src = "fn f() {\n    // x = do_something(1, 2);\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_does_not_flag_ordinary_prose_comment() {
+        let src = "/// Parses the input and returns an error if it's malformed.\nfn parse() {}\n";
+        let findings = run(Language::Rust, src);
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_flags_over_commented_function() {
+        let src = "/// This function adds two numbers together.\n/// It takes a and b as parameters.\n/// It returns the sum of a and b.\n/// It never returns anything else.\n/// It has no side effects.\n/// There is nothing more to say about it.\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_checks_impl_methods_too() {
+        let src =
+            "struct S;\nimpl S {\n    /// This seamlessly does the thing.\n    fn m(&self) {}\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[verbose-comment]")),
             "findings: {findings:?}"
         );
     }

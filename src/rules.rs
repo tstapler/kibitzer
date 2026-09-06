@@ -154,6 +154,18 @@ fn kotlin_param_count(params: Node) -> usize {
         .count()
 }
 
+/// Rust's `parameters` children are `parameter` nodes (pattern + type fields) plus,
+/// for a method, a leading `self_parameter` node (`&self`/`&mut self`/`self`) —
+/// excluded from the count the same way Go's implicit receiver never appears in its
+/// parameter list at all.
+fn rust_param_count(params: Node) -> usize {
+    let mut cursor = params.walk();
+    params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "parameter")
+        .count()
+}
+
 /// Kotlin's `function_declaration`/`anonymous_function` expose no field names at all
 /// (verified via an explicit `field_name_for_child` dump, not just `to_sexp()`, since
 /// the latter's omission of field names was initially ambiguous) — the body is instead
@@ -311,6 +323,37 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: kotlin_param_count,
             body_finder: kotlin_body,
             params_finder: kotlin_params,
+        },
+        Language::Rust => LangRuleConfig {
+            name: "syntax-rules-rust",
+            file_globs: &["**/*.rs"],
+            // `function_item` covers free functions, inherent/trait `impl` methods, and
+            // default trait-method bodies alike (one node kind for all three, verified
+            // via `to_sexp()`). A trait method *declaration* with no body is the
+            // distinct `function_signature_item` kind, deliberately excluded —
+            // `body_finder` would return `None` for it anyway, same as Go interface
+            // methods never appearing in `function_kinds`. `closure_expression` is
+            // nesting-only (below), not function-like: its parameter list uses a
+            // different node kind (`closure_parameters`, not `parameters`) and isn't
+            // handled by `rust_param_count`.
+            function_kinds: &["function_item"],
+            // Rust's `if` is an expression with proper `condition`/`consequence`/
+            // `alternative` fields (Go-like, no positional fallback needed). A chained
+            // `else if` wraps in an intermediate `else_clause` before the nested
+            // `if_expression` (JS/TS-like).
+            if_kind: "if_expression",
+            nesting_kinds: &[
+                "for_expression",
+                "while_expression",
+                "loop_expression",
+                "match_expression",
+                "closure_expression",
+            ],
+            else_wrapper_kinds: &["else_clause"],
+            chain_kinds: &[],
+            param_counter: rust_param_count,
+            body_finder: field_body,
+            params_finder: field_params,
         },
     }
 }
@@ -1286,6 +1329,124 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    fn check_rust_source(src: &str) -> Result<Vec<Finding>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .context("loading tree-sitter-rust grammar")?;
+        let tree = parser
+            .parse(src, None)
+            .context("parsing Rust source with tree-sitter")?;
+
+        let cfg = lang_config(Language::Rust);
+        let mut findings = Vec::new();
+        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        Ok(findings)
+    }
+
+    #[test]
+    fn rust_allows_short_function() {
+        let findings = check_rust_source("fn f() {\n    println!(\"ok\");\n}\n").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn rust_flags_long_function() {
+        let mut src = String::from("fn f() {\n");
+        for _ in 0..45 {
+            src.push_str("    do_thing();\n");
+        }
+        src.push_str("}\n");
+        let findings = check_rust_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    #[test]
+    fn rust_flags_deep_nesting() {
+        let src = "fn f(x: i32) {\n    if x > 0 {\n        if x > 1 {\n            if x > 2 {\n                if x > 3 {\n                    do_thing();\n                }\n            }\n        }\n    }\n}\n";
+        let findings = check_rust_source(src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn rust_flat_else_if_chain_does_not_count_as_nesting() {
+        let src = "fn f(x: i32) {\n    if x == 1 {\n        a();\n    } else if x == 2 {\n        b();\n    } else if x == 3 {\n        c();\n    } else if x == 4 {\n        d();\n    } else {\n        e();\n    }\n}\n";
+        let findings = check_rust_source(src).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_flags_long_parameter_list() {
+        let findings =
+            check_rust_source("fn f(a: i32, b: i32, c: i32, d: i32, e: i32, g: i32) {}\n").unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]"))
+        );
+    }
+
+    #[test]
+    fn rust_self_parameter_does_not_count_toward_parameter_list() {
+        // `&self` is a `self_parameter` node, not a `parameter` — must not be counted,
+        // the same way Go's receiver is never part of its parameter list at all.
+        let findings = check_rust_source(
+            "struct S;\nimpl S {\n    fn m(&self, a: i32, b: i32, c: i32, d: i32) {}\n}\n",
+        )
+        .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_checks_impl_methods_too() {
+        let mut src = String::from("struct S;\nimpl S {\n    fn m(&self) {\n");
+        for _ in 0..45 {
+            src.push_str("        do_thing();\n");
+        }
+        src.push_str("    }\n}\n");
+        let findings = check_rust_source(&src).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[long-function]"))
+        );
+    }
+
+    #[test]
+    fn rust_closure_is_nesting_but_not_a_separate_function_kind() {
+        // A closure body deep enough to trip deep-nesting on its own counts toward the
+        // enclosing function's nesting depth (closure_expression is nesting-only, like
+        // Go's func_literal) but never produces its own long-function/long-parameter-list
+        // finding, since it isn't in `function_kinds`.
+        let src =
+            "fn f() {\n    let g = |a: i32, b: i32, c: i32, d: i32, e: i32, h: i32| a + b;\n}\n";
+        let findings = check_rust_source(src).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[long-parameter-list]")),
+            "findings: {findings:?}"
         );
     }
 }

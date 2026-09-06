@@ -19,6 +19,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | Python     | `syntax-rules-python`          | `**/*.py`                                 |
 | Java       | `syntax-rules-java`            | `**/*.java`                               |
 | Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
+| Rust       | `syntax-rules-rust`            | `**/*.rs`                                 |
 
 The three rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
@@ -97,6 +98,21 @@ each grammar's real `to_sexp()` output:
   modifier produces a **sibling** `parameter_modifiers` node rather than
   nesting inside the `parameter`, so the counter filters to
   `kind() == "parameter"` to avoid over-counting.
+- **Rust** (`tree-sitter-rust`): function-like — `function_item` only (covers
+  free functions, inherent/trait `impl` methods, and default trait-method
+  bodies alike — one node kind for all three). A trait method *declaration*
+  with no body is the distinct `function_signature_item` kind, excluded from
+  `function_kinds` (its `body_finder` lookup would return `None` anyway, same
+  as Go interface methods). `if_expression` has proper `condition`/
+  `consequence`/`alternative` fields (Go-like); a chained `else if` wraps in
+  an intermediate `else_clause` (JS/TS-like). Nesting —
+  `for_expression`/`while_expression`/`loop_expression`/`match_expression`/
+  `closure_expression` (a closure is nesting-only, like Go's `func_literal` —
+  its parameter list uses a different node kind, `closure_parameters`, not
+  `parameters`). `parameters`' children are `parameter` nodes plus, for a
+  method, a leading `self_parameter` (`&self`/`&mut self`/`self`) — excluded
+  from the count the same way Go's implicit receiver never appears in its
+  parameter list at all.
 
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.

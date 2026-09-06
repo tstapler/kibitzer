@@ -35,6 +35,7 @@ pub enum Language {
     Python,
     Java,
     Kotlin,
+    Rust,
 }
 
 impl Language {
@@ -47,6 +48,7 @@ impl Language {
             Language::Python => tree_sitter_python::LANGUAGE.into(),
             Language::Java => tree_sitter_java::LANGUAGE.into(),
             Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         }
     }
 }
@@ -94,6 +96,7 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(SyntaxRulesChecker::new(Language::Python)),
         Box::new(SyntaxRulesChecker::new(Language::Java)),
         Box::new(SyntaxRulesChecker::new(Language::Kotlin)),
+        Box::new(SyntaxRulesChecker::new(Language::Rust)),
         Box::new(CommentQualityChecker::new(Language::Go)),
         Box::new(CommentQualityChecker::new(Language::TypeScript)),
         Box::new(CommentQualityChecker::new(Language::Tsx)),
@@ -101,6 +104,7 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(CommentQualityChecker::new(Language::Python)),
         Box::new(CommentQualityChecker::new(Language::Java)),
         Box::new(CommentQualityChecker::new(Language::Kotlin)),
+        Box::new(CommentQualityChecker::new(Language::Rust)),
     ]
 }
 

@@ -137,6 +137,46 @@ fn kotlin_is_interface(node: Node) -> bool {
     find_child_by_kind(node, "interface").is_some()
 }
 
+/// Rust: exported iff a plain, unrestricted `pub` is present. `pub(crate)`/
+/// `pub(super)`/`pub(in path)` wrap a further named child inside `visibility_modifier`
+/// (verified via `to_sexp()`: `pub(crate) enum Color` produces `(visibility_modifier
+/// (crate))`, `pub(super) fn f` produces `(visibility_modifier (super))`, plain `pub fn`
+/// produces an empty `(visibility_modifier)`) — those restricted forms don't count as
+/// truly exported, the same restricted-visibility exclusion Kotlin's `internal` gets. No
+/// `visibility_modifier` child at all means private (Rust's default), same as Go's
+/// lowercase-first-letter default.
+fn rust_is_exported(node: Node, _source: &str) -> bool {
+    match find_child_by_kind(node, "visibility_modifier") {
+        Some(vis) => vis.named_child_count() == 0,
+        None => false,
+    }
+}
+
+/// Rust has no `interface`/`class` keyword marking a `trait_item` as special the way
+/// Kotlin's `class_declaration` needs disambiguating — `trait_item` is already its own
+/// distinct node kind (see `interface_kinds` below), so no analogous helper is needed.
+///
+/// Walks up to the enclosing `impl_item` (if any) and reads its `type` field — the Self
+/// type an impl block implements methods for (e.g. `S` in both `impl S` and `impl Trait
+/// for S`, verified via `to_sexp()`: both produce a `type` field, `impl_item` additionally
+/// carries a `trait` field only for the latter). Unlike every other language's
+/// method/parent lookup (which reads an ancestor's `name` field), this reads `type` —
+/// `impl_item` has no name of its own. `strip_generic_params` handles a generic Self type
+/// (`impl<T> Foo<T>` has `type: (generic_type type: (type_identifier) ...)`, whose full
+/// text is `Foo<T>`) the same way it handles a generic function name elsewhere.
+fn rust_impl_type_name(node: Node, source: &str) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "impl_item" {
+            return n
+                .child_by_field_name("type")
+                .map(|t| strip_generic_params(node_text(t, source)));
+        }
+        cur = n.parent();
+    }
+    None
+}
+
 fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
     match lang {
         Language::Go => LangSymbolConfig {
@@ -213,6 +253,20 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             function_kinds: &["function_declaration"],
             name_finder: field_name,
             is_exported: kotlin_is_exported,
+        },
+        Language::Rust => LangSymbolConfig {
+            type_kinds: &["struct_item", "enum_item", "union_item"],
+            interface_kinds: &["trait_item"],
+            // `function_item` covers free functions and impl/trait methods alike (one
+            // node kind — verified via `to_sexp()`); `classify_node`'s Rust branch below
+            // tells them apart by walking up for an enclosing `impl_item`, the same
+            // enclosing-ancestor pattern Python/Kotlin use for `class_definition`/
+            // `class_declaration`. A trait method *declaration* with no body
+            // (`function_signature_item`) is a distinct kind, deliberately excluded —
+            // it produces no symbol, matching Go interface methods never appearing here.
+            function_kinds: &["function_item"],
+            name_finder: field_name,
+            is_exported: rust_is_exported,
         },
     }
 }
@@ -385,6 +439,12 @@ fn classify_node(
             } else {
                 SymbolKind::Function
             }
+        } else if language == Language::Rust {
+            if rust_impl_type_name(node, source).is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
         } else if kind == "method_definition" {
             SymbolKind::Method
         } else {
@@ -405,6 +465,7 @@ fn classify_node(
             Language::Java => enclosing_kind_name(node, source, JAVA_TYPE_KINDS),
             Language::Kotlin => enclosing_kind_name(node, source, &["class_declaration"]),
             Language::Python => enclosing_kind_name(node, source, &["class_definition"]),
+            Language::Rust => rust_impl_type_name(node, source),
             _ => enclosing_kind_name(node, source, &["class_declaration"]),
         }
     } else {

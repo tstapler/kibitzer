@@ -75,6 +75,11 @@ pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
         build_python(repo_root, &python_files, &mut graph)?;
     }
 
+    let rust_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "rs")).collect();
+    if !rust_files.is_empty() {
+        build_rust(repo_root, &rust_files, &mut graph)?;
+    }
+
     Ok(graph)
 }
 
@@ -1009,6 +1014,336 @@ fn build_python(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -
             {
                 graph.edges.push(ImportEdge {
                     from: pkg.clone(),
+                    to,
+                    file: (*file).clone(),
+                    line,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------
+// Rust — bespoke resolver, deliberately not a `QualifiedImportLangConfig` variant.
+// Package identity is crate- and directory-derived, not from a parsed declaration —
+// Rust has no single "this file's package" node the way Go's `package_clause` or
+// Java's `package_declaration` are (a file's real *module* path comes from where
+// `mod` statements wire it into the crate tree, tracked project-wide, not from
+// anything local to the file itself). `rust_module_key` instead follows the
+// filesystem convention real Rust tooling defaults to (`foo/bar.rs` -> `bar` nested
+// under `foo`; `foo/mod.rs`/`foo.rs` -> `foo` itself) — covers every file actually
+// wired into its crate via a `mod` declaration matching its path, the dominant
+// real-world case, but not one moved via a `#[path = "..."]` attribute override
+// (accepted v1 limitation: no attempt to parse `#[path]`). Also file-granularity
+// only: an inline `mod foo { ... }` block's contents stay attributed to the
+// *enclosing file's* module key rather than a synthetic nested one, the same
+// granularity every other language here uses (a JS/TS/Java/Kotlin nested class
+// doesn't get its own node either).
+//
+// A repo can hold multiple crates (a Cargo workspace) sharing module names that
+// would otherwise collide (`crate::foo` in one crate is unrelated to `crate::foo`
+// in another) — `rust_module_key` scopes every node under the nearest ancestor
+// directory containing a `Cargo.toml` (found via the same bounded upward walk
+// `find_go_mod_upward` uses for `go.mod`), keyed by that crate directory's own
+// repo-relative path, so a name collision across crates can't produce a false edge.
+//
+// `use` resolution (`resolve_rust_use_path`) only resolves `crate::`/`self::`/
+// `super::`-prefixed paths — those are unambiguously same-crate. A bare leading
+// segment (`use foo::Bar;`, Rust 2018+ "uniform paths") is deliberately left
+// unresolved: disambiguating it from a genuine external-crate name needs a full
+// symbol table, not just this file's own AST (accepted v1 limitation, same spirit as
+// Go's stdlib-import skip and JS's bare-specifier skip). The graph-membership guard
+// below excludes it from producing an edge either way, so this only means a real
+// same-crate uniform-path import goes uncounted, never that a wrong edge appears.
+// ---------------------------------------------------------------------------------
+
+/// Bounded upward walk for the nearest ancestor `Cargo.toml`, identical in shape to
+/// `find_go_mod_upward` — stops at `repo_root` rather than walking to the filesystem
+/// root, since kibitzer has no business reading a `Cargo.toml` outside the repo it
+/// was invoked against. Returns the crate root directory (the `Cargo.toml`'s own
+/// directory), not the manifest path itself.
+fn find_cargo_toml_upward(start_dir: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let mut dir = start_dir;
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if dir == repo_root {
+            return None;
+        }
+        match dir.parent() {
+            Some(parent) if parent.starts_with(repo_root) => dir = parent,
+            _ => return None,
+        }
+    }
+}
+
+/// Reads a crate's declared package name straight out of its `Cargo.toml`'s
+/// `[package]` table — a simple line scan, not a full TOML parser, the same minimal
+/// treatment this file already gives `go.mod`'s `module` line. A guaranteed-unique
+/// key across an entire Cargo workspace (crate names must be unique for Cargo's own
+/// dependency resolution to work), and far friendlier in rendered output than a
+/// directory-relative path. Falls back to the crate directory's own name if no
+/// `[package]`/`name` key is found — e.g. a workspace root manifest with no
+/// `[package]` of its own, which `find_cargo_toml_upward` only returns for a file
+/// that isn't under any workspace member's own directory (an unusual layout, but
+/// still needs *some* stable key rather than an empty one).
+fn rust_crate_key(crate_dir: &Path) -> String {
+    let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap_or_default();
+    let mut in_package_table = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(table) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_package_table = table == "package";
+            continue;
+        }
+        if in_package_table
+            && let Some(rest) = line.strip_prefix("name")
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+            && let Some(name) = value
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+        {
+            return name.to_string();
+        }
+    }
+    crate_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A file's module key: the crate's package name alone for the crate root itself
+/// (`src/main.rs`/`src/lib.rs`), or with `::`-joined module segments appended for
+/// everything else. `None` when the file isn't inside a resolvable crate (no
+/// ancestor `Cargo.toml`) or isn't under that crate's `src/` directory (a
+/// non-standard layout — e.g. a build script or an example — deliberately out of
+/// scope, mirroring every other resolver's "skip the file entirely" convention for
+/// what it doesn't handle).
+fn rust_module_key(repo_root: &Path, file: &Path) -> Option<String> {
+    let file_dir = file.parent()?;
+    let crate_dir = find_cargo_toml_upward(file_dir, repo_root)?;
+    let src_dir = crate_dir.join("src");
+    let rel = file.strip_prefix(&src_dir).ok()?;
+
+    let crate_key = rust_crate_key(&crate_dir);
+
+    let mut segments: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+
+    // The file's own basename names a module only when it isn't one of the three
+    // "this directory's own module" filenames — `main.rs`/`lib.rs` (crate root) and
+    // `mod.rs` (the pre-2018 "directory as module" file) collapse into their
+    // containing directory's key instead of adding a segment of their own.
+    if let Some(last) = segments.pop() {
+        let stem = last.strip_suffix(".rs").unwrap_or(&last);
+        if !matches!(stem, "main" | "lib" | "mod") {
+            segments.push(stem.to_string());
+        }
+    }
+
+    if segments.is_empty() {
+        Some(crate_key)
+    } else {
+        Some(format!("{crate_key}::{}", segments.join("::")))
+    }
+}
+
+/// Recursively flattens a `use` path expression (`scoped_identifier`, or a leaf
+/// `identifier`/`crate`/`self`/`super`) into its dot-free segments, e.g.
+/// `crate::foo::Bar` -> `["crate", "foo", "Bar"]`. Verified via `to_sexp()`:
+/// `scoped_identifier` always carries `path`/`name` fields, recursing through nested
+/// `scoped_identifier`s until a leaf keyword (`crate`/`self`/`super`) or plain
+/// `identifier` ends the chain.
+fn flatten_rust_path(node: Node, src: &[u8]) -> Vec<String> {
+    match node.kind() {
+        "scoped_identifier" => {
+            let mut segments = node
+                .child_by_field_name("path")
+                .map(|p| flatten_rust_path(p, src))
+                .unwrap_or_default();
+            if let Some(name) = node.child_by_field_name("name")
+                && let Ok(text) = name.utf8_text(src)
+            {
+                segments.push(text.to_string());
+            }
+            segments
+        }
+        "crate" => vec!["crate".to_string()],
+        "self" => vec!["self".to_string()],
+        "super" => vec!["super".to_string()],
+        "identifier" | "type_identifier" => node
+            .utf8_text(src)
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Expands one `use_declaration`'s `argument` into every raw path it names, alongside
+/// the declaration's own line — a `scoped_use_list` (`use crate::foo::{Bar, Baz}`)
+/// expands to one entry per braced item, each inheriting the shared path prefix; a
+/// `use_wildcard` (`use std::io::*`) contributes the wildcarded module path itself,
+/// treating the glob as a dependency on that whole module; `use_as_clause`
+/// (`use super::qux as renamed`) resolves by its un-renamed `path` — the alias never
+/// affects what's actually depended on; a bare `self` *as a use-list item*
+/// (`use foo::{self, Bar}`, verified via `to_sexp()`) means "the prefix module
+/// itself", a different meaning from `self` at the head of a path chain (handled by
+/// `flatten_rust_path`/`resolve_rust_use_path` instead, where it means "current
+/// module") — disambiguated here by `prefix` being non-empty only inside a list.
+fn collect_rust_use_paths(
+    argument: Node,
+    src: &[u8],
+    prefix: &[String],
+    line: usize,
+    out: &mut Vec<(Vec<String>, usize)>,
+) {
+    match argument.kind() {
+        "self" if !prefix.is_empty() => {
+            out.push((prefix.to_vec(), line));
+        }
+        "scoped_identifier" | "crate" | "self" | "super" | "identifier" | "type_identifier" => {
+            let mut segments = prefix.to_vec();
+            segments.extend(flatten_rust_path(argument, src));
+            if !segments.is_empty() {
+                out.push((segments, line));
+            }
+        }
+        "scoped_use_list" => {
+            let path_prefix = argument
+                .child_by_field_name("path")
+                .map(|p| flatten_rust_path(p, src))
+                .unwrap_or_default();
+            if let Some(list) = argument.child_by_field_name("list") {
+                let mut cursor = list.walk();
+                for item in list.named_children(&mut cursor) {
+                    collect_rust_use_paths(item, src, &path_prefix, line, out);
+                }
+            }
+        }
+        "use_as_clause" => {
+            if let Some(path) = argument.child_by_field_name("path") {
+                collect_rust_use_paths(path, src, prefix, line, out);
+            }
+        }
+        "use_wildcard" => {
+            if let Some(inner) = argument.named_child(0) {
+                collect_rust_use_paths(inner, src, prefix, line, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_rust_imports(node: Node, src: &[u8], out: &mut Vec<(Vec<String>, usize)>) {
+    if node.kind() == "use_declaration"
+        && let Some(argument) = node.child_by_field_name("argument")
+    {
+        collect_rust_use_paths(argument, src, &[], node.start_position().row + 1, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_rust_imports(child, src, out);
+    }
+}
+
+/// Resolves one `use` path's raw segments (as `collect_rust_imports` found them)
+/// against `own_module` (the importing file's own module key, from
+/// `rust_module_key`) and `known` (every module key registered in this run).
+/// `crate`/`self`/`super` are the only leading segments substituted — anything else
+/// is left unresolved (see this section's module-level doc comment). Tries the full
+/// resolved path first, then with its last segment stripped (an imported *item*
+/// rather than the module itself, e.g. `use crate::foo::Bar` naming the type `Bar`
+/// inside module `crate::foo`) — the same two shapes real code produces at this
+/// syntactic position, tried in order rather than assumed unconditionally the way
+/// Java/Kotlin's `strip_last_segment` can, since a bare Rust `use` path genuinely can
+/// name either a module or an item.
+///
+/// Accepted v1 limitation: only a single leading `super` is popped — a chained
+/// `super::super::foo` (real, valid Rust for reaching a grandparent module) treats
+/// the second `super` as a literal path segment instead of popping again, so it
+/// resolves to nothing rather than the intended target. Not fixed speculatively;
+/// `super::super::` is rare enough in practice (most code reaches further ancestors
+/// via `crate::` instead) that this hasn't shown up as a real miss yet.
+fn resolve_rust_use_path(
+    raw: &[String],
+    own_module: &str,
+    known: &BTreeSet<String>,
+) -> Option<String> {
+    let (head, rest) = raw.split_first()?;
+    let mut own_segments: Vec<String> = own_module.split("::").map(String::from).collect();
+    let mut resolved: Vec<String> = match head.as_str() {
+        "crate" if !own_segments.is_empty() => vec![own_segments.remove(0)],
+        "self" => own_segments,
+        "super" => {
+            own_segments.pop();
+            own_segments
+        }
+        _ => return None,
+    };
+    resolved.extend(rest.iter().cloned());
+    if resolved.is_empty() {
+        return None;
+    }
+
+    let full = resolved.join("::");
+    if known.contains(&full) {
+        return Some(full);
+    }
+    if resolved.len() > 1 {
+        resolved.pop();
+        let without_last = resolved.join("::");
+        if known.contains(&without_last) {
+            return Some(without_last);
+        }
+    }
+    None
+}
+
+/// Rust's bespoke `build()` entry point. Same two-pass graph-membership-guard shape
+/// as `build_python`/`build_qualified_name_language`: pass 1 registers every file's
+/// own module key before pass 2 resolves any `use` path against the full set, so
+/// resolution never depends on file walk order.
+fn build_rust(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .context("loading tree-sitter-rust grammar")?;
+
+    let mut file_data: Vec<(&PathBuf, String, tree_sitter::Tree, String)> = Vec::new();
+
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let tree = parser
+            .parse(&source, None)
+            .with_context(|| format!("parsing {} with tree-sitter-rust", file.display()))?;
+
+        if let Some(module) = rust_module_key(repo_root, file) {
+            graph.nodes.insert(module.clone());
+            graph.file_packages.insert((*file).clone(), module.clone());
+            file_data.push((file, module, tree, source));
+        }
+    }
+
+    for (file, module, tree, source) in &file_data {
+        let mut imports = Vec::new();
+        collect_rust_imports(tree.root_node(), source.as_bytes(), &mut imports);
+
+        for (raw, line) in imports {
+            if let Some(to) = resolve_rust_use_path(&raw, module, &graph.nodes)
+                && &to != module
+            {
+                graph.edges.push(ImportEdge {
+                    from: module.clone(),
                     to,
                     file: (*file).clone(),
                     line,
@@ -1980,6 +2315,269 @@ mod tests {
 
         assert!(!graph.nodes.contains("django/db"));
         assert!(graph.edges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Rust ---
+
+    #[test]
+    fn rust_import_graph_finds_a_two_module_cycle_via_crate_paths() {
+        let dir = tmp_dir("rust-cycle");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        let a = write(
+            &dir,
+            "src/a.rs",
+            "use crate::b;\n\npub fn f() { b::g(); }\n",
+        );
+        let b = write(
+            &dir,
+            "src/b.rs",
+            "use crate::a;\n\npub fn g() { a::f(); }\n",
+        );
+        write(&dir, "src/lib.rs", "mod a;\nmod b;\n");
+
+        let graph = build(&dir, &[a, b]).unwrap();
+
+        assert!(graph.nodes.contains("app::a"));
+        assert!(graph.nodes.contains("app::b"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::a" && e.to == "app::b")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::b" && e.to == "app::a")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_nested_module_directory_resolves_to_a_qualified_key() {
+        let dir = tmp_dir("rust-nested");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        let node = write(&dir, "src/dom/node.rs", "pub struct Node;\n");
+
+        let graph = build(&dir, std::slice::from_ref(&node)).unwrap();
+
+        assert_eq!(
+            graph.file_packages.get(&node),
+            Some(&"app::dom::node".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_mod_rs_collapses_into_its_directory_key() {
+        let dir = tmp_dir("rust-mod-rs");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        let mod_file = write(&dir, "src/dom/mod.rs", "pub struct Node;\n");
+
+        let graph = build(&dir, std::slice::from_ref(&mod_file)).unwrap();
+
+        assert_eq!(
+            graph.file_packages.get(&mod_file),
+            Some(&"app::dom".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_super_resolves_to_a_sibling_module_via_the_importing_files_parent() {
+        let dir = tmp_dir("rust-super-sibling");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        // `dom::node` reaches its sibling `dom::element` via `super::element`: `super`
+        // pops one level (`dom::node` -> `dom`), then `element` is looked up there.
+        // (`self::element` would instead mean "a child of `dom::node` itself," which
+        // is a different module — not what this fixture is testing.)
+        let node = write(
+            &dir,
+            "src/dom/node.rs",
+            "use super::element;\n\npub fn f() { element::g(); }\n",
+        );
+        let element = write(&dir, "src/dom/element.rs", "pub fn g() {}\n");
+        write(&dir, "src/lib.rs", "mod dom;\n");
+
+        let graph = build(&dir, &[node, element]).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::dom::node" && e.to == "app::dom::element"),
+            "edges: {:?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn rust_super_resolves_to_the_crate_root_from_a_top_level_module() {
+        let dir = tmp_dir("rust-super-root");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        // A top-level module (`utils`, one level deep already) reaches the crate root
+        // itself via a single `super::`.
+        let utils = write(
+            &dir,
+            "src/utils.rs",
+            "use super::other;\n\npub fn f() { other::g(); }\n",
+        );
+        let other = write(&dir, "src/other.rs", "pub fn g() {}\n");
+        write(&dir, "src/lib.rs", "mod utils;\nmod other;\n");
+
+        let graph = build(&dir, &[utils, other]).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::utils" && e.to == "app::other"),
+            "edges: {:?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn rust_use_list_bare_self_item_resolves_to_the_prefix_module_itself() {
+        let dir = tmp_dir("rust-use-self");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        // `use crate::utils::{self, helper_fn};` — `self` here means "the `utils`
+        // module itself," a different meaning from `self::` at the head of a path
+        // (covered by the two `super` tests above via their non-conflicting cases).
+        let consumer = write(
+            &dir,
+            "src/consumer.rs",
+            "use crate::utils::{self, helper_fn};\n",
+        );
+        let utils = write(&dir, "src/utils.rs", "pub fn helper_fn() {}\n");
+        write(&dir, "src/lib.rs", "mod consumer;\nmod utils;\n");
+
+        let graph = build(&dir, &[consumer, utils]).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::consumer" && e.to == "app::utils"),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_scoped_use_list_and_wildcard_both_resolve() {
+        let dir = tmp_dir("rust-use-list");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        let consumer = write(
+            &dir,
+            "src/consumer.rs",
+            "use crate::{utils::helper, other};\nuse crate::wild::*;\n",
+        );
+        let utils = write(&dir, "src/utils.rs", "pub mod helper {}\n");
+        let other = write(&dir, "src/other.rs", "pub fn f() {}\n");
+        let wild = write(&dir, "src/wild.rs", "pub fn g() {}\n");
+        write(
+            &dir,
+            "src/lib.rs",
+            "mod consumer;\nmod utils;\nmod other;\nmod wild;\n",
+        );
+
+        let graph = build(&dir, &[consumer, utils, other, wild]).unwrap();
+
+        // `utils::helper` doesn't exist as its own file/module in this fixture, so it
+        // falls back to the parent `utils` module per `resolve_rust_use_path`'s
+        // module-vs-item fallback.
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::consumer" && e.to == "app::utils"),
+            "edges: {:?}",
+            graph.edges
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::consumer" && e.to == "app::other")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::consumer" && e.to == "app::wild")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_use_as_clause_resolves_by_its_unaliased_path() {
+        let dir = tmp_dir("rust-use-as");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        let consumer = write(&dir, "src/consumer.rs", "use crate::other as renamed;\n");
+        let other = write(&dir, "src/other.rs", "pub fn f() {}\n");
+        write(&dir, "src/lib.rs", "mod consumer;\nmod other;\n");
+
+        let graph = build(&dir, &[consumer, other]).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from == "app::consumer" && e.to == "app::other")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_external_crate_import_creates_no_edge() {
+        let dir = tmp_dir("rust-external");
+        write(&dir, "Cargo.toml", "[package]\nname = \"app\"\n");
+        let a = write(
+            &dir,
+            "src/lib.rs",
+            "use std::collections::HashMap;\nuse serde::Serialize;\n\npub fn f() -> HashMap<String, String> { HashMap::new() }\n",
+        );
+
+        let graph = build(&dir, &[a]).unwrap();
+
+        assert!(graph.edges.is_empty(), "edges: {:?}", graph.edges);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_multi_crate_workspace_does_not_collide_on_same_named_modules() {
+        let dir = tmp_dir("rust-workspace");
+        write(
+            &dir,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        );
+        write(&dir, "a/Cargo.toml", "[package]\nname = \"a\"\n");
+        write(&dir, "b/Cargo.toml", "[package]\nname = \"b\"\n");
+        let a_utils = write(&dir, "a/src/utils.rs", "pub fn f() {}\n");
+        let b_utils = write(&dir, "b/src/utils.rs", "pub fn g() {}\n");
+        let a_lib = write(&dir, "a/src/lib.rs", "mod utils;\n");
+        let b_lib = write(&dir, "b/src/lib.rs", "mod utils;\n");
+
+        let graph = build(&dir, &[a_utils, b_utils, a_lib, b_lib]).unwrap();
+
+        assert!(graph.nodes.contains("a::utils"));
+        assert!(graph.nodes.contains("b::utils"));
+        assert_ne!(
+            graph.nodes.iter().filter(|n| n.ends_with("utils")).count(),
+            1,
+            "both crates' utils modules must get distinct, crate-scoped keys"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
