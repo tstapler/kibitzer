@@ -15,12 +15,6 @@ const MAX_NESTING_DEPTH: usize = 4;
 /// A function/method parameter list naming more identifiers than this is flagged by
 /// `long-parameter-list`.
 const LONG_PARAM_LIST_COUNT: usize = 5;
-/// A leading doc comment shorter than this never trips `disproportionate-comment`,
-/// regardless of how it compares to the declaration below it — without this floor, a
-/// 2-line comment on a 1-line getter would fire on a technicality the rule isn't meant
-/// to catch (see CLAUDE.md's Proportionality section: "would a reviewer of this change
-/// have asked for this paragraph?" — nobody would, for a 2-line comment).
-const MIN_DISPROPORTIONATE_COMMENT_LINES: usize = 4;
 
 /// Metadata for one rule in the catalog. Thresholds above are fixed for now —
 /// per-rule configurability is a natural follow-up, not required for the initial
@@ -55,12 +49,6 @@ pub const CATALOG: &[RuleMeta] = &[
         description: "Function/method parameter list names more than 5 identifiers.",
         default_severity: Severity::Advisory,
     },
-    RuleMeta {
-        id: "disproportionate-comment",
-        category: "style",
-        description: "A function/method's leading doc comment is both at least 4 lines and longer than the declaration it documents.",
-        default_severity: Severity::Advisory,
-    },
 ];
 
 /// Per-language node-kind table the AST walk consults instead of hardcoded literals.
@@ -74,7 +62,7 @@ struct LangRuleConfig {
     /// `checker::lookup`'s first-match semantics).
     name: &'static str,
     file_globs: &'static [&'static str],
-    /// Declaration-like node kinds checked for the four rules below.
+    /// Declaration-like node kinds checked for the three rules below.
     function_kinds: &'static [&'static str],
     /// The if-like node kind for this grammar — `"if_statement"` everywhere except
     /// Kotlin's `"if_expression"`.
@@ -102,12 +90,6 @@ struct LangRuleConfig {
     /// Locates a declaration's parameter-list node. Same field-vs-positional split as
     /// `body_finder`.
     params_finder: fn(Node) -> Option<Node>,
-    /// This grammar's comment node kind(s) — a single `"comment"` kind covers both
-    /// line and block comment styles for Go/JS/TS/Python (verified via `to_sexp()`),
-    /// but Java/Kotlin split them into distinct `"line_comment"`/`"block_comment"`
-    /// kinds. Used by `disproportionate-comment` to find a declaration's leading doc
-    /// comment.
-    comment_kinds: &'static [&'static str],
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -209,7 +191,6 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: go_param_identifier_count,
             body_finder: field_body,
             params_finder: field_params,
-            comment_kinds: &["comment"],
         },
         Language::TypeScript => LangRuleConfig {
             name: "syntax-rules-typescript",
@@ -236,7 +217,6 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: js_ts_param_count,
             body_finder: field_body,
             params_finder: field_params,
-            comment_kinds: &["comment"],
         },
         Language::Tsx => LangRuleConfig {
             name: "syntax-rules-tsx",
@@ -274,7 +254,6 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: py_param_count,
             body_finder: field_body,
             params_finder: field_params,
-            comment_kinds: &["comment"],
         },
         Language::Java => LangRuleConfig {
             name: "syntax-rules-java",
@@ -297,7 +276,6 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: js_ts_param_count,
             body_finder: field_body,
             params_finder: field_params,
-            comment_kinds: &["line_comment", "block_comment"],
         },
         Language::Kotlin => LangRuleConfig {
             name: "syntax-rules-kotlin",
@@ -330,7 +308,6 @@ fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: kotlin_param_count,
             body_finder: kotlin_body,
             params_finder: kotlin_params,
-            comment_kinds: &["line_comment", "block_comment"],
         },
     }
 }
@@ -351,7 +328,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, disproportionate-comment (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -419,51 +396,6 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, findings: &mut Vec<Findin
             });
         }
     }
-
-    if let Some((comment_start, comment_end)) = leading_comment_span(decl, cfg) {
-        let comment_lines = comment_end - comment_start + 1;
-        let decl_lines = decl.end_position().row - decl.start_position().row + 1;
-        if comment_lines >= MIN_DISPROPORTIONATE_COMMENT_LINES && comment_lines > decl_lines {
-            findings.push(Finding {
-                line: comment_start + 1,
-                message: format!(
-                    "[disproportionate-comment] leading comment spans {comment_lines} lines but the declaration it documents only spans {decl_lines} — trim to the why a reader needs, not the investigation"
-                ),
-            });
-        }
-    }
-}
-
-/// The contiguous run of comment siblings directly preceding `decl`, if any — a
-/// declaration's doc comment, whether one block comment or several consecutive
-/// single-line comments (each its own sibling node per `to_sexp()`, verified for every
-/// grammar this rule covers). Returns 0-indexed `(start_row, end_row)` inclusive of the
-/// whole run. Deliberately only looks at `decl`'s own immediate previous sibling — never
-/// walks up to a parent — so a function expression assigned inline (e.g. a JS/TS
-/// `arrow_function` as a `const f = () => {...}` initializer) is silently skipped rather
-/// than risking misattributing some unrelated preceding statement's comment to it.
-fn leading_comment_span(decl: Node, cfg: &LangRuleConfig) -> Option<(usize, usize)> {
-    let mut current = decl.prev_sibling()?;
-    if !cfg.comment_kinds.contains(&current.kind()) {
-        return None;
-    }
-    // The comment block must butt directly up against `decl` — a blank line in between
-    // means it's not documenting `decl` at all (e.g. a file-level comment separated by
-    // a blank line from the first declaration below it).
-    if decl.start_position().row != current.end_position().row + 1 {
-        return None;
-    }
-
-    let end_row = current.end_position().row;
-    let mut start_row = current.start_position().row;
-    while let Some(prev) = current.prev_sibling() {
-        if !cfg.comment_kinds.contains(&prev.kind()) || prev.end_position().row + 1 != start_row {
-            break;
-        }
-        start_row = prev.start_position().row;
-        current = prev;
-    }
-    Some((start_row, end_row))
 }
 
 /// Depth of `node` itself (as passed in via `current_depth`), taking the max over all
@@ -781,61 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn flags_disproportionate_comment() {
-        let src =
-            "package main\n\n// line one\n// line two\n// line three\n// line four\nfunc f() {}\n";
-        let findings = check_source(src).unwrap();
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn allows_short_comment_below_the_line_floor() {
-        let src = "package main\n\n// one line\nfunc f() {}\n";
-        let findings = check_source(src).unwrap();
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn allows_long_comment_on_a_longer_function() {
-        let mut src = String::from(
-            "package main\n\n// line one\n// line two\n// line three\n// line four\nfunc f() {\n",
-        );
-        for _ in 0..6 {
-            src.push_str("\tprintln(\"line\")\n");
-        }
-        src.push_str("}\n");
-        let findings = check_source(&src).unwrap();
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn does_not_attribute_a_comment_separated_by_a_blank_line() {
-        let src = "package main\n\n// line one\n// line two\n// line three\n// line four\n\nfunc f() {}\n";
-        let findings = check_source(src).unwrap();
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
-        );
-    }
-
-    #[test]
     fn catalog_ids_are_unique_and_documented() {
         let ids: Vec<&str> = CATALOG.iter().map(|r| r.id).collect();
         let mut sorted = ids.clone();
@@ -994,26 +871,6 @@ mod tests {
                 .filter(|f| f.message.contains("[long-parameter-list]"))
                 .count(),
             2
-        );
-    }
-
-    #[test]
-    fn ts_flags_disproportionate_comment_on_a_method() {
-        let findings = check_ts_source(
-            "class C {\n\
-             \t// line one\n\
-             \t// line two\n\
-             \t// line three\n\
-             \t// line four\n\
-             \tmethod() { return 1; }\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
         );
     }
 
@@ -1213,18 +1070,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn py_flags_disproportionate_comment() {
-        let src = "# line one\n# line two\n# line three\n# line four\ndef f():\n    pass\n";
-        let findings = check_py_source(src).unwrap();
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
-        );
-    }
-
     fn check_java_source(src: &str) -> Result<Vec<Finding>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -1326,26 +1171,6 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[long-parameter-list]"))
-        );
-    }
-
-    #[test]
-    fn java_flags_disproportionate_comment() {
-        let findings = check_java_source(
-            "class C {\n\
-             \t// line one\n\
-             \t// line two\n\
-             \t// line three\n\
-             \t// line four\n\
-             \tvoid f() {}\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
         );
     }
 
@@ -1458,20 +1283,6 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[long-parameter-list]"))
-        );
-    }
-
-    #[test]
-    fn kotlin_flags_disproportionate_comment() {
-        let findings = check_kotlin_source(
-            "// line one\n// line two\n// line three\n// line four\nfun f() {}\n",
-        )
-        .unwrap();
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[disproportionate-comment]")),
-            "got: {findings:?}"
         );
     }
 }

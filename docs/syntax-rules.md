@@ -20,7 +20,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | Java       | `syntax-rules-java`            | `**/*.java`                               |
 | Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
 
-The rules and their thresholds are the same across languages
+The three rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
 kinds each language's `lang_config()` entry checks against differ:
 
@@ -29,7 +29,6 @@ kinds each language's `lang_config()` entry checks against differ:
 | `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this. |
 | `deep-nesting`         | complexity | advisory          | > 4 levels             | Function/method body nests control-flow constructs deeper than this. An `else if` chain is treated as one flat branch, not added nesting, in every language. |
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
-| `disproportionate-comment` | style  | advisory          | ≥ 4 lines and longer than the declaration | A function/method's leading doc comment (one block comment, or several consecutive single-line comments treated as one run) is both at least 4 lines and longer than the declaration it documents. Only looks at the declaration's immediate previous sibling — an inline function expression (e.g. a JS/TS `arrow_function` assigned to a `const`) is skipped rather than risk attributing some unrelated preceding statement's comment to it. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
 each grammar's real `to_sexp()` output:
@@ -98,12 +97,6 @@ each grammar's real `to_sexp()` output:
   modifier produces a **sibling** `parameter_modifiers` node rather than
   nesting inside the `parameter`, so the counter filters to
   `kind() == "parameter"` to avoid over-counting.
-
-Each language's comment node kind(s), used by `disproportionate-comment` to
-find a declaration's leading doc comment (verified via `to_sexp()`): a single
-`"comment"` kind covers both line and block styles for Go/TS/TSX/JavaScript/
-Python; Java and Kotlin split them into distinct `"line_comment"`/
-`"block_comment"` kinds.
 
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.
