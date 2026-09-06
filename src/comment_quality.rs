@@ -90,6 +90,30 @@ const BANNED_PHRASES: &[(&str, &str)] = &[
         "handles the case from issue",
         "this belongs in the commit message, not a comment referencing an issue",
     ),
+    // Bureaucratic wordy-filler phrases below, hand-picked from Vale's write-good
+    // `TooWordy.yml` style pack (https://vale.sh/, vale-styles/write-good) — only the
+    // unambiguous multi-word constructs that have no legitimate short form in a
+    // technical comment. Deliberately NOT importing that pack's full list (or its
+    // `Weasel.yml`): both are calibrated for narrative/bureaucratic prose and flag
+    // ordinary technical vocabulary ("eliminate", "employ", "currently", "correctly")
+    // that reads fine in a code comment — wholesale import would trade precision for
+    // coverage in the wrong direction for this checker.
+    (
+        "in order to",
+        "say \"to\" instead — \"in order to\" is always wordy filler",
+    ),
+    ("due to the fact that", "say \"because\" instead"),
+    ("because of the fact that", "say \"because\" instead"),
+    ("by virtue of the fact that", "say \"because\" instead"),
+    ("in spite of the fact that", "say \"although\" instead"),
+    ("in the event that", "say \"if\" instead"),
+    ("with regard to", "say \"about\" instead"),
+    ("with regards to", "say \"about\" instead"),
+    ("for the purpose of", "say \"to\" or \"for\" instead"),
+    (
+        "it is important to note that",
+        "cut the filler and state the fact directly",
+    ),
 ];
 
 fn comment_kinds(lang: Language) -> &'static [&'static str] {
@@ -222,12 +246,25 @@ fn strip_comment_markers(line: &str) -> &str {
     s.trim_end_matches("*/").trim()
 }
 
-/// Conservative code-shape heuristic: a semicolon/brace terminator, or a call/assignment
+/// Conservative code-shape heuristic: a brace terminator, a semicolon terminator
+/// alongside punctuation no ordinary English clause would carry, or a call/assignment
 /// expression with no spaces where a sentence would have them. Deliberately biased
 /// toward missing real commented-out code over flagging prose (see
 /// `docs/reporting-false-positives.md` for how to report a miss the other way).
+///
+/// A bare `ends_with(';')` check (SonarQube's S125 has the same documented gap) treats
+/// any semicolon-terminated clause as code, so a doc comment written as a semicolon-
+/// separated bullet list ("- validates input;") reads as "ends in `;`" and misfires —
+/// see docs/comment-quality-false-positives.md. Requiring an unambiguous code-only
+/// punctuation character alongside the trailing `;` (not `.`/`,`, both common in prose)
+/// fixes that specific case at the cost of no longer flagging a punctuation-free
+/// statement like a bare `return;` or `break;` — an acceptable trade given the stated
+/// bias above.
 fn looks_like_code(text: &str) -> bool {
-    if text.ends_with(';') || text.ends_with('{') || text == "}" || text.ends_with("});") {
+    if text.ends_with('{') || text == "}" || text.ends_with("});") {
+        return true;
+    }
+    if text.ends_with(';') && text.chars().any(|c| "(){}[]=<>+*/&|!".contains(c)) {
         return true;
     }
     is_call_expression(text) || is_assignment(text)
@@ -387,6 +424,19 @@ mod tests {
     }
 
     #[test]
+    fn flags_wordy_filler_phrase() {
+        let src = "package main\n\n// We check this in order to validate the input.\nfunc F() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[verbose-comment]")
+                    && f.message.contains("in order to")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
     fn flags_commented_out_code() {
         let src = "package main\n\nfunc F() {\n\t// x = doSomething(1, 2);\n}\n";
         let findings = run(Language::Go, src);
@@ -394,6 +444,22 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.message.contains("[commented-out-code]"))
+        );
+    }
+
+    /// Regression guard for docs/comment-quality-false-positives.md's first entry:
+    /// SonarQube's S125 has the same documented gap (a bare `ends_with(';')` treats any
+    /// semicolon-terminated clause as code), and a semicolon-separated bullet list is a
+    /// common real doc-comment style.
+    #[test]
+    fn does_not_flag_a_semicolon_terminated_bullet_list() {
+        let src = "package main\n\n// Normalize does three things:\n// - validates input;\n// - normalizes casing;\n// - returns the result;\nfunc Normalize(s string) string {\n\treturn s\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
         );
     }
 
