@@ -524,9 +524,10 @@ fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
 }
 
 /// The built-in catalog that runs everywhere by default, pylint-style — no
-/// `.claude/inspect.json` required. Mirrors this repo's own non-dogfood check list
-/// (`.claude/inspect.json`) exactly, since that list already curates severities/scopes
-/// sensible enough to dogfood on kibitzer's own codebase. A local `.claude/inspect.json`
+/// `.claude/inspect.json` required. Every native per-file checker that doesn't need
+/// repo-specific setup (an architecture model, a `command` a project must supply): this
+/// repo's own non-dogfood check list, plus the `comment-quality-<lang>` family
+/// (`src/comment_quality.rs`) added once it landed. A local `.claude/inspect.json`
 /// overlays these via `merge_checks`: `disabled` turns a default off by name, and a
 /// `checks` entry reusing a default's `name` replaces it outright. See
 /// docs/suppressing-checks.md.
@@ -569,6 +570,25 @@ pub fn default_checks() -> Vec<Check> {
         native_check("syntax-rules-java", Severity::Advisory, &["**/*.java"]),
         native_check(
             "syntax-rules-kotlin",
+            Severity::Advisory,
+            &["**/*.kt", "**/*.kts"],
+        ),
+        native_check("comment-quality-go", Severity::Advisory, &["**/*.go"]),
+        native_check(
+            "comment-quality-typescript",
+            Severity::Advisory,
+            &["**/*.ts"],
+        ),
+        native_check("comment-quality-tsx", Severity::Advisory, &["**/*.tsx"]),
+        native_check(
+            "comment-quality-javascript",
+            Severity::Advisory,
+            &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        ),
+        native_check("comment-quality-python", Severity::Advisory, &["**/*.py"]),
+        native_check("comment-quality-java", Severity::Advisory, &["**/*.java"]),
+        native_check(
+            "comment-quality-kotlin",
             Severity::Advisory,
             &["**/*.kt", "**/*.kts"],
         ),

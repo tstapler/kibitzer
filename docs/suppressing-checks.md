@@ -2,9 +2,10 @@
 
 kibitzer runs a built-in default catalog everywhere — pylint-style, no
 `.claude/inspect.json` required (`config::default_checks()` in `src/config.rs`;
-the full list is in `docs/syntax-rules.md` plus `markdown-link-integrity`,
-`primitive-obsession`, `duplicate-code`, `go-blank-imports`,
-`go-ignored-error`, `go-error-context`). A local `.claude/inspect.json`
+the full list is in `docs/syntax-rules.md` and `docs/comment-quality.md`, plus
+`markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
+`go-blank-imports`, `go-ignored-error`, `go-error-context`). A local
+`.claude/inspect.json`
 overlays that catalog rather than replacing it — see
 `config::find_effective_config`. There is no inline/per-line suppression
 comment (`// kibitzer:disable ...`, `# noqa`, etc.) — see
