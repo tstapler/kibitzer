@@ -41,12 +41,42 @@ const BANNED_PHRASES: &[(&str, &str)] = &[
         "enterprise-grade",
         "state the fact instead of reaching for marketing language",
     ),
+    // The next two roots' inflected forms are listed as separate entries rather than
+    // matched by a stem, per `contains_whole_phrase`'s word-boundary check below — a
+    // real backtest finding: whole-word matching (needed so a short attribution
+    // phrase doesn't fire inside an unrelated longer word) would otherwise also
+    // reject a common third-person present-tense phrasing as "root plus more
+    // letters," losing a legitimate hit.
     (
         "leverage",
         "say what actually happens instead of a vaguer synonym",
     ),
     (
+        "leverages",
+        "say what actually happens instead of a vaguer synonym",
+    ),
+    (
+        "leveraging",
+        "say what actually happens instead of a vaguer synonym",
+    ),
+    (
+        "leveraged",
+        "say what actually happens instead of a vaguer synonym",
+    ),
+    (
         "utilize",
+        "say what actually happens instead of a vaguer synonym",
+    ),
+    (
+        "utilizes",
+        "say what actually happens instead of a vaguer synonym",
+    ),
+    (
+        "utilizing",
+        "say what actually happens instead of a vaguer synonym",
+    ),
+    (
+        "utilized",
         "say what actually happens instead of a vaguer synonym",
     ),
     (
@@ -177,14 +207,25 @@ impl Checker for CommentQualityChecker {
 
         let mut comments = Vec::new();
         collect_comments(tree.root_node(), kinds, &mut comments);
+        // Threaded across every comment node in document order (not reset per-node) so
+        // a fenced code example spanning several consecutive single-line nodes — Rust's
+        // `///` lines are each their own node, verified via `to_sexp()` — is tracked as
+        // one fence, not re-opened/closed per line. See `check_commented_out_code`.
+        let mut in_fence = false;
         for comment in &comments {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
             check_verbose_phrases(*comment, text, &mut findings);
-            check_commented_out_code(*comment, text, &mut findings);
+            in_fence = check_commented_out_code(*comment, text, in_fence, &mut findings);
         }
 
         let cfg = rules::lang_config(self.lang);
-        walk_declarations_for_proportionality(tree.root_node(), &cfg, kinds, &mut findings);
+        walk_declarations_for_proportionality(
+            tree.root_node(),
+            &cfg,
+            kinds,
+            ctx.source.as_bytes(),
+            &mut findings,
+        );
 
         Ok(findings)
     }
@@ -201,10 +242,36 @@ fn collect_comments<'a>(node: Node<'a>, kinds: &[&str], out: &mut Vec<Node<'a>>)
     }
 }
 
+/// Whether `haystack` contains `needle` as a whole word/phrase, not merely as a
+/// substring — a real backtest finding (docs/comment-quality-false-positives.md): the
+/// short banned phrase `"this pr"` matched inside ordinary words like "this
+/// **pr**events"/"this **pr**operly"/"this **pr**ocess" with a plain `.contains()`.
+/// Only the two outer boundaries are checked (not `needle`'s internal spaces), so a
+/// multi-word phrase still matches as a unit.
+fn contains_whole_phrase(haystack: &str, needle: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(rel_pos) = haystack.get(search_start..).and_then(|s| s.find(needle)) {
+        let pos = search_start + rel_pos;
+        let before_ok = haystack[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = haystack[pos + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = pos + 1;
+    }
+    false
+}
+
 fn check_verbose_phrases(comment: Node, text: &str, findings: &mut Vec<Finding>) {
     let lower = text.to_lowercase();
     for (phrase, reason) in BANNED_PHRASES {
-        if lower.contains(phrase) {
+        if contains_whole_phrase(&lower, phrase) {
             findings.push(Finding {
                 line: comment.start_position().row + 1,
                 message: format!("[verbose-comment] contains \"{phrase}\" — {reason}"),
@@ -213,11 +280,28 @@ fn check_verbose_phrases(comment: Node, text: &str, findings: &mut Vec<Finding>)
     }
 }
 
-fn check_commented_out_code(comment: Node, text: &str, findings: &mut Vec<Finding>) {
+/// Scans one comment node's lines for dead code, skipping anything inside a fenced
+/// (```` ``` ````) code example — a real backtest finding: Rust doc comments routinely
+/// embed real, intentional usage examples this way, which `looks_like_code` is
+/// (correctly, for its actual purpose) built to recognize as code-shaped. `in_fence`
+/// carries the fence state in from the previous comment node and returns the state
+/// after this one, so a fence spanning several consecutive single-line nodes (Rust's
+/// `///` lines are each their own node) is tracked as one fence, not reset per node.
+fn check_commented_out_code(
+    comment: Node,
+    text: &str,
+    in_fence: bool,
+    findings: &mut Vec<Finding>,
+) -> bool {
     let start_row = comment.start_position().row;
+    let mut in_fence = in_fence;
     for (offset, raw_line) in text.lines().enumerate() {
         let stripped = strip_comment_markers(raw_line);
-        if stripped.is_empty() {
+        if stripped.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || stripped.is_empty() {
             continue;
         }
         if looks_like_code(stripped) {
@@ -227,6 +311,7 @@ fn check_commented_out_code(comment: Node, text: &str, findings: &mut Vec<Findin
             });
         }
     }
+    in_fence
 }
 
 /// Strips the leading comment-marker noise (`//`, `///`, `//!`, `#`, `/*`, `*/`, a
@@ -258,14 +343,19 @@ fn strip_comment_markers(line: &str) -> &str {
 /// separated bullet list ("- validates input;") reads as "ends in `;`" and misfires —
 /// see docs/comment-quality-false-positives.md. Requiring an unambiguous code-only
 /// punctuation character alongside the trailing `;` (not `.`/`,`, both common in prose)
-/// fixes that specific case at the cost of no longer flagging a punctuation-free
-/// statement like a bare `return;` or `break;` — an acceptable trade given the stated
-/// bias above.
+/// narrows that, but a real-world backtest (see docs/comment-quality-false-positives.md)
+/// found `(`/`)` and `<`/`>` are *not* unambiguous either: an Apache license header
+/// ("Licensed under ... (the \"License\");") and a spec-quoting blockquote ("> ... the
+/// command;") both carry those characters in ordinary prose. Only `{}[]=+*/&|!` survive
+/// as the punctuation set — narrower still, at the further cost of no longer flagging a
+/// punctuation-free statement like a bare `return;`/`break;`, or a real call expression
+/// mentioned only via this branch (already independently caught by
+/// `is_call_expression`'s stricter shape check below, so nothing is actually lost there).
 fn looks_like_code(text: &str) -> bool {
     if text.ends_with('{') || text == "}" || text.ends_with("});") {
         return true;
     }
-    if text.ends_with(';') && text.chars().any(|c| "(){}[]=<>+*/&|!".contains(c)) {
+    if text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c)) {
         return true;
     }
     is_call_expression(text) || is_assignment(text)
@@ -313,20 +403,28 @@ fn is_assignment(text: &str) -> bool {
             .chars()
             .all(|c| c.is_alphanumeric() || "_.[]$".contains(c))
         && !rhs.is_empty()
+        // A real single-statement assignment's RHS doesn't itself contain another bare
+        // `=` — a second one signals a narrative computation explanation instead (a
+        // real backtest finding: "FQDN=15 + 1(dot) + 55 = 71 chars" and
+        // "OOMScoreAdj = 1000 - (...) = 869" both have a valid-looking `lhs`, but their
+        // `rhs` re-derives a value through a second `=`, which no single Go/Rust/etc.
+        // assignment statement does).
+        && !rhs.contains('=')
 }
 
 fn walk_declarations_for_proportionality(
     node: Node,
     cfg: &rules::LangRuleConfig,
     comment_kinds: &[&str],
+    src: &[u8],
     findings: &mut Vec<Finding>,
 ) {
     if cfg.function_kinds.contains(&node.kind()) {
-        check_proportionality(node, cfg, comment_kinds, findings);
+        check_proportionality(node, cfg, comment_kinds, src, findings);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_declarations_for_proportionality(child, cfg, comment_kinds, findings);
+        walk_declarations_for_proportionality(child, cfg, comment_kinds, src, findings);
     }
 }
 
@@ -334,6 +432,7 @@ fn check_proportionality(
     decl: Node,
     cfg: &rules::LangRuleConfig,
     comment_kinds: &[&str],
+    src: &[u8],
     findings: &mut Vec<Finding>,
 ) {
     let Some(body) = (cfg.body_finder)(decl) else {
@@ -345,7 +444,8 @@ fn check_proportionality(
     collect_comment_rows(body, comment_kinds, &mut comment_rows);
     let body_comment_lines = comment_rows.len();
 
-    let leading_rows = leading_comment_rows(decl, comment_kinds);
+    let leading_nodes = leading_comment_nodes(decl, comment_kinds, src);
+    let leading_rows = leading_comment_rows(&leading_nodes);
     let leading_start_line = leading_rows.iter().next().map(|row| row + 1);
 
     let total_comment_lines = body_comment_lines + leading_rows.len();
@@ -357,6 +457,9 @@ fn check_proportionality(
     if (total_comment_lines as f64) < COMMENT_TO_CODE_RATIO * (body_code_lines as f64) {
         return;
     }
+    if has_safety_section(&leading_nodes, src) {
+        return;
+    }
 
     findings.push(Finding {
         line: leading_start_line.unwrap_or(decl.start_position().row + 1),
@@ -364,6 +467,20 @@ fn check_proportionality(
             "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
         ),
     });
+}
+
+/// `# Safety` is Rust's standard doc-comment heading for justifying an `unsafe fn`'s
+/// invariants — a real backtest finding: this idiom naturally produces a short
+/// function with a long justification, which the ratio otherwise reads as
+/// restatement when it's the opposite (the comment carries information the
+/// signature alone can't). Checked as a plain lowercase substring, not Rust-gated,
+/// since no other language's real doc comments coincidentally contain this exact
+/// heading.
+fn has_safety_section(leading_nodes: &[Node], src: &[u8]) -> bool {
+    leading_nodes.iter().any(|node| {
+        node.utf8_text(src)
+            .is_ok_and(|t| t.to_lowercase().contains("# safety"))
+    })
 }
 
 /// A single-line comment's `end_position()` sometimes lands at column 0 of the row
@@ -396,9 +513,13 @@ fn collect_comment_rows(node: Node, comment_kinds: &[&str], rows: &mut BTreeSet<
 }
 
 /// Comment nodes immediately preceding `decl` with no blank-line gap, walked backward
-/// while each one stays contiguous with the one after it.
-fn leading_comment_rows(decl: Node, comment_kinds: &[&str]) -> BTreeSet<usize> {
-    let mut rows = BTreeSet::new();
+/// while each one stays contiguous with the one after it — stopping (without including
+/// the code-like one) at a block whose own text looks like commented-out code rather
+/// than documentation. A real backtest finding: a run of leftover commented-out
+/// function stubs immediately before a real, unrelated function was getting folded
+/// into that function's "leading doc comment," inflating its comment-to-code ratio.
+fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8]) -> Vec<Node<'a>> {
+    let mut nodes = Vec::new();
     let mut next_start_row = decl.start_position().row;
     let mut cursor = decl;
     while let Some(sibling) = cursor.prev_sibling() {
@@ -408,11 +529,28 @@ fn leading_comment_rows(decl: Node, comment_kinds: &[&str]) -> BTreeSet<usize> {
         if comment_end_row(sibling) + 1 != next_start_row {
             break;
         }
-        for row in sibling.start_position().row..=comment_end_row(sibling) {
-            rows.insert(row);
+        let Ok(text) = sibling.utf8_text(src) else {
+            break;
+        };
+        if text
+            .lines()
+            .any(|line| looks_like_code(strip_comment_markers(line)))
+        {
+            break;
         }
+        nodes.push(sibling);
         next_start_row = sibling.start_position().row;
         cursor = sibling;
+    }
+    nodes
+}
+
+fn leading_comment_rows(leading_nodes: &[Node]) -> BTreeSet<usize> {
+    let mut rows = BTreeSet::new();
+    for node in leading_nodes {
+        for row in node.start_position().row..=comment_end_row(*node) {
+            rows.insert(row);
+        }
     }
     rows
 }
@@ -563,6 +701,103 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.message.contains("[verbose-comment]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    // --- Regression tests from the 2026-09-06 Kubernetes/Cassandra/Servo backtest ---
+
+    #[test]
+    fn short_banned_phrase_does_not_match_inside_an_unrelated_longer_word() {
+        let src = "// This prevents the race and properly handles the process.\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("\"this pr\"")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn short_banned_phrase_still_matches_as_its_own_word() {
+        let src = "// For purpose of this PR, report only the failure count.\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings.iter().any(|f| f.message.contains("\"this pr\"")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn license_header_style_comment_is_not_flagged_as_commented_out_code() {
+        let src = "// Licensed under the Apache License, Version 2.0 (the \"License\");\npackage main\n\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn spec_quoting_blockquote_ending_in_semicolon_is_not_flagged_as_commented_out_code() {
+        let src = "// > or if the command is the fontSize command;\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn narrative_arithmetic_comment_is_not_flagged_as_commented_out_code() {
+        let src = "// FQDN=15 + 1(dot) + 55 = 71 chars\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_doc_comment_code_example_is_not_flagged_as_commented_out_code() {
+        let src = "/// Example:\n///\n/// ```\n/// let x = f(1, 2);\n/// ```\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn adjacent_commented_out_stub_is_not_folded_into_the_next_functions_ratio() {
+        // The two `//`-commented function stubs immediately above `Real` look like
+        // dead code, not `Real`'s own leading doc comment — they must not inflate
+        // `Real`'s comment-to-code ratio (a real backtest finding against Servo).
+        let src = "// fn Dead1() { return 1; }\n// fn Dead2() { return 2; }\nfunc Real() int {\n\treturn 3\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_safety_doc_section_is_exempt_from_over_commented() {
+        let src = "/// Derefs a raw pointer.\n///\n/// # Safety\n///\n/// The caller must ensure the pointer is non-null, properly aligned, and\n/// points to a live, initialized value of type `T` for the duration of the\n/// borrow — violating any of these is immediate undefined behavior.\npub unsafe fn deref<T>(p: *const T) -> &'static T {\n    &*p\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
             "findings: {findings:?}"
         );
     }

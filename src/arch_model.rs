@@ -137,6 +137,7 @@ pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
         Some("py") => Some(Language::Python),
         Some("java") => Some(Language::Java),
         Some("kt") | Some("kts") => Some(Language::Kotlin),
+        Some("rs") => Some(Language::Rust),
         _ => None,
     }
 }
@@ -465,6 +466,16 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Regression guard: `language_for_path` is a separate extension->Language table
+    /// from `checker.rs`'s registry, verified independently by a real-world backtest
+    /// against Servo — a `.rs` file silently fell through to `None` (counted as
+    /// "unsupported," never reaching `symbol_extract.rs`'s Rust support) until this
+    /// arm was added.
+    #[test]
+    fn language_for_path_recognizes_rust() {
+        assert_eq!(language_for_path(Path::new("foo.rs")), Some(Language::Rust));
+    }
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
