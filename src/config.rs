@@ -372,6 +372,11 @@ pub struct Config {
     pub checks: Vec<Check>,
     #[serde(default)]
     pub architecture: ArchitectureConfig,
+    /// Names of built-in default checks (`default_checks()`) to turn off for this repo.
+    /// Has no effect on a check that isn't one of the defaults — just don't add it to
+    /// `checks` in the first place. See docs/suppressing-checks.md.
+    #[serde(default)]
+    pub disabled: Vec<String>,
 }
 
 fn validate(config: &Config, config_path: &Path) -> Result<()> {
@@ -458,17 +463,24 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Walk upward from `start` looking for `.claude/inspect.json`, returning the parsed
-/// config and the directory it was found in (the repo root, by convention).
-pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
-    let mut dir = if start.is_dir() {
+fn start_dir(start: &Path) -> PathBuf {
+    if start.is_dir() {
         start.to_path_buf()
     } else {
         start
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
-    };
+    }
+}
+
+/// Walk upward from `start` looking for `.claude/inspect.json`, returning the parsed
+/// config and the directory it was found in (the repo root, by convention). Returns
+/// `None` when no such file exists anywhere above `start` — this is the raw lookup;
+/// most callers that actually run checks want `find_effective_config` instead, which
+/// never returns "nothing to do" (see its doc comment for why).
+pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
+    let mut dir = start_dir(start);
 
     loop {
         let candidate = dir.join(CONFIG_DIR).join(CONFIG_FILENAME);
@@ -492,6 +504,125 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
             Some(parent) => dir = parent.to_path_buf(),
             None => return Ok(None),
         }
+    }
+}
+
+/// One `checker`-based `Check` running on `PostToolUse`+`batch`, the shape every entry
+/// in `default_checks()` shares.
+fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
+    Check {
+        name: name.to_string(),
+        command: None,
+        checker: Some(name.to_string()),
+        architecture_checker: None,
+        severity,
+        scope: scope.iter().map(|s| s.to_string()).collect(),
+        triggers: vec!["PostToolUse".to_string(), "batch".to_string()],
+        message: None,
+        output_format: None,
+    }
+}
+
+/// The built-in catalog that runs everywhere by default, pylint-style — no
+/// `.claude/inspect.json` required. Mirrors this repo's own non-dogfood check list
+/// (`.claude/inspect.json`) exactly, since that list already curates severities/scopes
+/// sensible enough to dogfood on kibitzer's own codebase. A local `.claude/inspect.json`
+/// overlays these via `merge_checks`: `disabled` turns a default off by name, and a
+/// `checks` entry reusing a default's `name` replaces it outright. See
+/// docs/suppressing-checks.md.
+pub fn default_checks() -> Vec<Check> {
+    vec![
+        Check {
+            message: Some("broken markdown link/anchor".to_string()),
+            ..native_check("markdown-link-integrity", Severity::Blocking, &["**/*.md"])
+        },
+        native_check("primitive-obsession", Severity::Advisory, &["**/*.go"]),
+        native_check(
+            "duplicate-code",
+            Severity::Advisory,
+            &[
+                "**/*.go",
+                "**/*.ts",
+                "**/*.tsx",
+                "**/*.js",
+                "**/*.jsx",
+                "**/*.py",
+                "**/*.java",
+                "**/*.kt",
+            ],
+        ),
+        native_check("go-blank-imports", Severity::Advisory, &["**/*.go"]),
+        native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
+        native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
+        Check {
+            checker: Some("syntax-rules".to_string()),
+            ..native_check("syntax-rules-go", Severity::Advisory, &["**/*.go"])
+        },
+        native_check("syntax-rules-typescript", Severity::Advisory, &["**/*.ts"]),
+        native_check("syntax-rules-tsx", Severity::Advisory, &["**/*.tsx"]),
+        native_check(
+            "syntax-rules-javascript",
+            Severity::Advisory,
+            &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        ),
+        native_check("syntax-rules-python", Severity::Advisory, &["**/*.py"]),
+        native_check("syntax-rules-java", Severity::Advisory, &["**/*.java"]),
+        native_check(
+            "syntax-rules-kotlin",
+            Severity::Advisory,
+            &["**/*.kt", "**/*.kts"],
+        ),
+    ]
+}
+
+/// Overlays `local`'s `checks`/`disabled` onto `defaults`: a default named in
+/// `local.disabled` is dropped; a `local.checks` entry whose `name` matches a surviving
+/// default replaces it in place, and any other `local.checks` entry is appended.
+fn merge_checks(defaults: Vec<Check>, local: &Config) -> Vec<Check> {
+    let mut merged: Vec<Check> = defaults
+        .into_iter()
+        .filter(|c| !local.disabled.contains(&c.name))
+        .collect();
+    for check in &local.checks {
+        match merged.iter_mut().find(|c| c.name == check.name) {
+            Some(slot) => *slot = check.clone(),
+            None => merged.push(check.clone()),
+        }
+    }
+    merged
+}
+
+/// Like `find_config`, but never returns "nothing to do": when no `.claude/inspect.json`
+/// exists above `start`, this returns the built-in `default_checks()` catalog (pylint-
+/// style — checks run out of the box) rather than an empty check list, with `start`'s
+/// own directory standing in for the repo root. When a local config *does* exist, its
+/// `checks`/`disabled` overlay the defaults (see `merge_checks`) and its `architecture`
+/// section passes through unchanged — architecture components/dependency rules are
+/// inherently repo-specific and have no sensible default.
+///
+/// Callers that specifically need to know whether a real config file exists (e.g. to
+/// report "no architecture model configured") should use `find_config` directly instead.
+pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
+    match find_config(start)? {
+        Some((local, root)) => {
+            let checks = merge_checks(default_checks(), &local);
+            Ok((
+                Config {
+                    checks,
+                    architecture: local.architecture,
+                    disabled: Vec::new(),
+                },
+                root,
+            ))
+        }
+        None => Ok((
+            Config {
+                checks: default_checks(),
+                architecture: ArchitectureConfig::default(),
+                disabled: Vec::new(),
+            },
+            start_dir(start),
+        )),
     }
 }
 
@@ -822,5 +953,104 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("undefined component 'zzzzzzzzzz'"));
         assert!(!msg.contains("did you mean"));
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-config-test-{}-{name}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_checks_ids_are_unique() {
+        let defaults = default_checks();
+        let names: Vec<&str> = defaults.iter().map(|c| c.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names.len(), sorted.len());
+    }
+
+    #[test]
+    fn find_effective_config_falls_back_to_defaults_with_no_inspect_json() {
+        let dir = tmp_dir("no-config");
+        let (config, root) = find_effective_config(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+        assert_eq!(config.checks.len(), default_checks().len());
+        assert!(
+            config
+                .checks
+                .iter()
+                .any(|c| c.name == "markdown-link-integrity")
+        );
+    }
+
+    #[test]
+    fn find_effective_config_disable_removes_a_default_by_name() {
+        let dir = tmp_dir("disable");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{"disabled": ["primitive-obsession"]}"#,
+        )
+        .unwrap();
+
+        let (config, _) = find_effective_config(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            !config
+                .checks
+                .iter()
+                .any(|c| c.name == "primitive-obsession")
+        );
+        assert_eq!(config.checks.len(), default_checks().len() - 1);
+    }
+
+    #[test]
+    fn find_effective_config_overrides_a_default_by_reusing_its_name() {
+        let dir = tmp_dir("override");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{"checks": [{"name": "markdown-link-integrity", "checker": "markdown-link-integrity", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+
+        let (config, _) = find_effective_config(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let overridden = config
+            .checks
+            .iter()
+            .find(|c| c.name == "markdown-link-integrity")
+            .expect("default still present");
+        assert_eq!(overridden.severity, Severity::Advisory);
+        // Overriding by name replaces the entry in place rather than duplicating it.
+        assert_eq!(config.checks.len(), default_checks().len());
+    }
+
+    #[test]
+    fn find_effective_config_adds_a_check_not_in_the_defaults() {
+        let dir = tmp_dir("add");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{"checks": [{"name": "custom", "command": "true {file}", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+
+        let (config, _) = find_effective_config(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(config.checks.iter().any(|c| c.name == "custom"));
+        assert_eq!(config.checks.len(), default_checks().len() + 1);
     }
 }

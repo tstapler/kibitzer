@@ -10,7 +10,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use crate::arch_model::{self, ArchModel, ModelCache, PackageNode, SymbolNode};
 use crate::check::{CheckResult, run_checks_for_trigger};
 use crate::checker::GrammarCache;
-use crate::config::{Severity, find_config};
+use crate::config::{Severity, find_effective_config};
 use crate::symbol_extract::extract_symbols_for_file;
 
 /// Trigger name checks opt into via `.claude/inspect.json`'s `triggers` field to run under
@@ -80,9 +80,7 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
 /// Run every in-scope check against `path` (as it currently exists on disk — see the
 /// module-level caveat about `did_change`) and translate the results into diagnostics.
 fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
-    let Some((config, repo_root)) = find_config(path)? else {
-        return Ok(Vec::new());
-    };
+    let (config, repo_root) = find_effective_config(path)?;
     let results = run_checks_for_trigger(&config.checks, LSP_TRIGGER, &repo_root, path, None)?;
     Ok(results
         .iter()

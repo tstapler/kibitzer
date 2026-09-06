@@ -16,7 +16,7 @@ use crate::arch_model::{
 use crate::check::{
     run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
-use crate::config::{Check, Severity, find_config};
+use crate::config::{Check, Severity, find_config, find_effective_config};
 use crate::glob::matches_scope;
 
 #[derive(Debug, Clone)]
@@ -266,12 +266,13 @@ impl KibitzerServer {
     }
 
     #[tool(
-        description = "List the checks configured in the nearest .claude/inspect.json above the given path."
+        description = "List the checks that actually run above the given path: the built-in default \
+                        catalog, overlaid with the nearest .claude/inspect.json if one exists."
     )]
     async fn list_checks(&self, req: Parameters<ListChecksRequest>) -> String {
         let path = PathBuf::from(&req.0.path);
-        match find_config(&path) {
-            Ok(Some((config, root))) => {
+        match find_effective_config(&path) {
+            Ok((config, root)) => {
                 let names: Vec<String> = config
                     .checks
                     .iter()
@@ -283,7 +284,6 @@ impl KibitzerServer {
                     names.join("\n")
                 )
             }
-            Ok(None) => "no .claude/inspect.json found above this path".to_string(),
             Err(e) => format!("error reading config: {e}"),
         }
     }
@@ -298,9 +298,8 @@ impl KibitzerServer {
         req: Parameters<ArchitectureAssessmentRequest>,
     ) -> String {
         let path = PathBuf::from(&req.0.path);
-        let (config, repo_root) = match find_config(&path) {
-            Ok(Some(c)) => c,
-            Ok(None) => return "no .claude/inspect.json found above this path".to_string(),
+        let (config, repo_root) = match find_effective_config(&path) {
+            Ok(c) => c,
             Err(e) => return format!("error reading config: {e}"),
         };
 
@@ -474,12 +473,10 @@ impl KibitzerServer {
     )]
     async fn run_checks(&self, req: Parameters<RunChecksRequest>) -> String {
         let file_path = PathBuf::from(&req.0.file_path);
-        let config = match find_config(&file_path) {
-            Ok(Some(c)) => c,
-            Ok(None) => return "no .claude/inspect.json found above this file".to_string(),
+        let (config, repo_root) = match find_effective_config(&file_path) {
+            Ok(c) => c,
             Err(e) => return format!("error reading config: {e}"),
         };
-        let (config, repo_root) = config;
         match run_checks_for_trigger(&config.checks, &req.0.trigger, &repo_root, &file_path, None) {
             Ok(results) => {
                 let failures: Vec<String> = results

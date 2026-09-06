@@ -172,6 +172,10 @@ pub fn run_hook() -> Result<ExitCode> {
                 result.describe()
             );
         }
+        eprintln!(
+            "[kibitzer] to disable a check or exclude a file, see \
+             https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md"
+        );
         return Ok(ExitCode::from(2));
     }
 
@@ -183,8 +187,10 @@ pub fn run_hook() -> Result<ExitCode> {
     context.push_str(
         "\n\nIf any of the above looks like a false positive (fired on content the edit \
          didn't actually introduce, or on a pattern the check misidentifies), see \
-         docs/reporting-false-positives.md for how to file it — don't just note it in \
-         passing.",
+         https://github.com/tstapler/kibitzer/blob/master/docs/reporting-false-positives.md \
+         for how to file it — don't just note it in passing. To turn a check off (repo-wide) \
+         or exclude a specific file, see \
+         https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md.",
     );
 
     let payload = json!({

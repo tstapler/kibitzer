@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::{Cache, default_cache_path};
 use crate::check::{CheckResult, run_checks_for_trigger};
-use crate::config::{CONFIG_DIR, CONFIG_FILENAME, find_config};
+use crate::config::{CONFIG_DIR, CONFIG_FILENAME, find_effective_config};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -145,9 +145,7 @@ fn handle_run_checks(
     cache: &Arc<Mutex<Cache>>,
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
-    let Some((config, repo_root)) = find_config(cwd)? else {
-        return Ok(Vec::new());
-    };
+    let (config, repo_root) = find_effective_config(cwd)?;
     let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
 
     // Cached entries aren't keyed by changed_lines — only bypass the cache lookup when a
@@ -238,9 +236,7 @@ pub fn run_checks_smart(
     if let Some(results) = try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines) {
         return Ok(results);
     }
-    let Some((config, repo_root)) = find_config(cwd)? else {
-        return Ok(Vec::new());
-    };
+    let (config, repo_root) = find_effective_config(cwd)?;
     let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
     let mut results = run_checks_for_trigger(
         &config.checks,

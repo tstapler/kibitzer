@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
-use crate::config::{Check, Severity, find_config};
+use crate::config::{Check, Severity, find_effective_config};
 
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
@@ -107,13 +107,7 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
 /// returns whether any check hit a genuine blocking failure, plus every rendered report
 /// line in print order (see `report_lines`).
 fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
-    let Some((config, repo_root)) = find_config(dir)? else {
-        eprintln!(
-            "[kibitzer] no .claude/inspect.json found above {}",
-            dir.display()
-        );
-        return Ok((false, Vec::new()));
-    };
+    let (config, repo_root) = find_effective_config(dir)?;
 
     let arch_config = config.architecture.clone();
     let (file_checks, repo_checks): (Vec<Check>, Vec<Check>) =

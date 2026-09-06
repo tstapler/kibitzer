@@ -33,14 +33,22 @@ fn glob_to_regex(pattern: &str) -> Regex {
     Regex::new(&out).expect("glob_to_regex always produces a valid pattern")
 }
 
-/// Returns true if `rel_path` (relative to the repo root, `/`-separated) matches any
-/// of the given glob patterns. An empty `scopes` list matches everything.
+/// Returns true if `rel_path` (relative to the repo root, `/`-separated) is in scope:
+/// it matches at least one positive pattern (or there are none, gitignore-style — an
+/// empty/all-negative `scopes` list starts from "everything") and none of the `!`-
+/// prefixed negative patterns. Negative patterns are the supported way to suppress a
+/// check for one file/directory while leaving the rest of its scope active — see
+/// docs/suppressing-checks.md.
 pub fn matches_scope(rel_path: &str, scopes: &[String]) -> bool {
-    if scopes.is_empty() {
-        return true;
+    let mut positives = scopes.iter().filter(|p| !p.starts_with('!')).peekable();
+    let included =
+        positives.peek().is_none() || positives.any(|pat| glob_to_regex(pat).is_match(rel_path));
+    if !included {
+        return false;
     }
-    scopes
+    !scopes
         .iter()
+        .filter_map(|p| p.strip_prefix('!'))
         .any(|pat| glob_to_regex(pat).is_match(rel_path))
 }
 
@@ -72,5 +80,26 @@ mod tests {
     #[test]
     fn empty_scope_matches_all() {
         assert!(matches_scope("anything/at/all.rs", &[]));
+    }
+
+    #[test]
+    fn negative_pattern_excludes_a_single_file_from_a_wider_positive_scope() {
+        let scope = &["**/*.go".to_string(), "!vendor/generated.go".to_string()];
+        assert!(matches_scope("pkg/foo.go", scope));
+        assert!(!matches_scope("vendor/generated.go", scope));
+    }
+
+    #[test]
+    fn negative_pattern_excludes_a_whole_directory() {
+        let scope = &["**/*.go".to_string(), "!vendor/**".to_string()];
+        assert!(!matches_scope("vendor/pkg/foo.go", scope));
+        assert!(matches_scope("pkg/foo.go", scope));
+    }
+
+    #[test]
+    fn scope_with_only_negative_patterns_matches_everything_except_them() {
+        let scope = &["!vendor/**".to_string()];
+        assert!(matches_scope("pkg/foo.go", scope));
+        assert!(!matches_scope("vendor/foo.go", scope));
     }
 }
