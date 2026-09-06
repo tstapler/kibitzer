@@ -6,6 +6,7 @@ mod backtest;
 mod cache;
 mod check;
 mod checker;
+mod comment_quality;
 mod config;
 mod daemon;
 mod declaration_checks;
@@ -27,6 +28,7 @@ mod mermaid;
 mod primitive_obsession;
 mod rules;
 mod run;
+mod status;
 mod symbol_extract;
 #[cfg(test)]
 mod test_support;
@@ -70,6 +72,9 @@ enum Command {
         #[command(subcommand)]
         check: CheckCommand,
     },
+    /// Summarize the PostToolUse hook log: firing counts, per-check pass/fail/blocked
+    /// stats, and per-repo activity.
+    Status,
     /// Install kibitzer's PostToolUse hook into a Claude Code settings.json, merging
     /// with whatever hooks are already configured there.
     Install {
@@ -296,6 +301,7 @@ fn main() -> Result<ExitCode> {
                 }
             }
         },
+        Command::Status => status::run_status(),
         Command::Install { global, dry_run } => install::run_install(global, dry_run),
         Command::Architecture { action } => match action {
             ArchitectureAction::Export {

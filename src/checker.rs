@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
+use crate::comment_quality::CommentQualityChecker;
 use crate::duplicate_code::DuplicateCodeChecker;
 use crate::go_blank_imports::BlankImportsChecker;
 use crate::go_error_context::ErrorContextChecker;
@@ -93,6 +94,13 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(SyntaxRulesChecker::new(Language::Python)),
         Box::new(SyntaxRulesChecker::new(Language::Java)),
         Box::new(SyntaxRulesChecker::new(Language::Kotlin)),
+        Box::new(CommentQualityChecker::new(Language::Go)),
+        Box::new(CommentQualityChecker::new(Language::TypeScript)),
+        Box::new(CommentQualityChecker::new(Language::Tsx)),
+        Box::new(CommentQualityChecker::new(Language::JavaScript)),
+        Box::new(CommentQualityChecker::new(Language::Python)),
+        Box::new(CommentQualityChecker::new(Language::Java)),
+        Box::new(CommentQualityChecker::new(Language::Kotlin)),
     ]
 }
 
