@@ -1,3 +1,6 @@
+mod arch_diagram;
+mod arch_export;
+mod arch_model;
 mod architecture_checks;
 mod backtest;
 mod cache;
@@ -14,7 +17,9 @@ mod go_blank_imports;
 mod go_error_context;
 mod go_ignored_error;
 mod hook;
+mod hook_log;
 mod import_graph;
+mod install;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;
@@ -22,6 +27,9 @@ mod mermaid;
 mod primitive_obsession;
 mod rules;
 mod run;
+mod symbol_extract;
+#[cfg(test)]
+mod test_support;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -61,6 +69,65 @@ enum Command {
     Check {
         #[command(subcommand)]
         check: CheckCommand,
+    },
+    /// Install kibitzer's PostToolUse hook into a Claude Code settings.json, merging
+    /// with whatever hooks are already configured there.
+    Install {
+        /// Install into ~/.claude/settings.json (all projects) instead of
+        /// <cwd>/.claude/settings.json (this project only).
+        #[arg(long)]
+        global: bool,
+        /// Print what would be written instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Query the shared architecture model (packages, symbols, import edges) — export it
+    /// as JSON, or render it as a diagram.
+    Architecture {
+        #[command(subcommand)]
+        action: ArchitectureAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArchitectureAction {
+    /// Build the repo's architecture model (packages, symbols, import edges) and write it
+    /// as pretty-printed JSON.
+    Export {
+        /// Any path inside the repo to export (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Glob (relative to the repo root, `**` supported) restricting which packages are
+        /// exported. Defaults to the whole repo.
+        #[arg(long)]
+        scope: Option<String>,
+        /// File to write the ArchModel JSON to.
+        #[arg(long)]
+        out: PathBuf,
+        /// Print the JSON that would be written instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Include unexported (private) symbols. Default: excluded.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Render a Component/Code-level diagram in Mermaid notation *inspired by* C4 — not a
+    /// standards-conformant C4 Context/Container diagram.
+    Diagram {
+        /// Any path inside the repo to diagram (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Glob (relative to the repo root, `**` supported) restricting which packages are
+        /// diagrammed. Defaults to the whole repo.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Diagram granularity: package-to-package boxes, or symbols nested inside their
+        /// package's box.
+        #[arg(long, value_enum, default_value_t = arch_diagram::DiagramLevel::Component)]
+        level: arch_diagram::DiagramLevel,
+        /// File to write the combined text-tree + Mermaid output to. Defaults to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -214,7 +281,11 @@ fn main() -> Result<ExitCode> {
                         finding.file_path.display(),
                         finding.line,
                         finding.checker,
-                        if finding.pre_existing { " (pre-existing)" } else { "" },
+                        if finding.pre_existing {
+                            " (pre-existing)"
+                        } else {
+                            ""
+                        },
                         finding.message
                     );
                 }
@@ -224,6 +295,22 @@ fn main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
             }
+        },
+        Command::Install { global, dry_run } => install::run_install(global, dry_run),
+        Command::Architecture { action } => match action {
+            ArchitectureAction::Export {
+                path,
+                scope,
+                out,
+                dry_run,
+                include_private,
+            } => arch_export::run_export(path, scope, out, dry_run, include_private),
+            ArchitectureAction::Diagram {
+                path,
+                scope,
+                level,
+                out,
+            } => arch_diagram::run_diagram(path, scope, level, out),
         },
     }
 }

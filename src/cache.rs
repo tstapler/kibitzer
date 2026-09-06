@@ -10,15 +10,16 @@ use crate::check::CheckResult;
 use crate::config::Severity;
 
 /// A cheap fingerprint of a file's on-disk state, used to invalidate cache entries
-/// without hashing file contents.
+/// without hashing file contents. `pub(crate)` so `arch_model.rs`'s `ModelCache` can
+/// reuse this fingerprinting instead of reimplementing mtime/len stamping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct Stamp {
+pub(crate) struct Stamp {
     mtime_secs: u64,
     mtime_nanos: u32,
     len: u64,
 }
 
-fn stamp(path: &Path) -> Option<Stamp> {
+pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let dur = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
@@ -153,4 +154,107 @@ pub fn default_cache_path() -> PathBuf {
         .join(".cache")
         .join("kibitzer")
         .join("cache.json")
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+    use crate::check::CheckResult;
+    use std::path::PathBuf;
+
+    fn file() -> PathBuf {
+        PathBuf::from("src/foo.rs")
+    }
+
+    fn result(severity: Severity, passed: bool) -> CheckResult {
+        CheckResult {
+            check_name: "no-bad-marker".to_string(),
+            severity,
+            passed,
+            output: String::new(),
+            message: None,
+            command: String::new(),
+            findings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn first_blocking_failure_is_downgraded_to_advisory_with_a_note() {
+        let mut cache = Cache::default();
+        let mut results = vec![result(Severity::Blocking, false)];
+
+        cache.apply_grace(&mut results, &file(), "Edit");
+
+        assert_eq!(results[0].severity, Severity::Advisory);
+        assert!(results[0].output.contains("will block if still failing"));
+    }
+
+    #[test]
+    fn second_consecutive_failure_escalates_back_to_blocking() {
+        let mut cache = Cache::default();
+
+        let mut first = vec![result(Severity::Blocking, false)];
+        cache.apply_grace(&mut first, &file(), "Edit");
+        assert_eq!(first[0].severity, Severity::Advisory);
+
+        let mut second = vec![result(Severity::Blocking, false)];
+        cache.apply_grace(&mut second, &file(), "Edit");
+        assert_eq!(second[0].severity, Severity::Blocking);
+    }
+
+    #[test]
+    fn a_pass_clears_grace_so_a_later_failure_gets_a_fresh_grace_period() {
+        let mut cache = Cache::default();
+
+        let mut failing = vec![result(Severity::Blocking, false)];
+        cache.apply_grace(&mut failing, &file(), "Edit");
+        assert_eq!(failing[0].severity, Severity::Advisory);
+
+        let mut passing = vec![result(Severity::Blocking, true)];
+        cache.apply_grace(&mut passing, &file(), "Edit");
+
+        let mut failing_again = vec![result(Severity::Blocking, false)];
+        cache.apply_grace(&mut failing_again, &file(), "Edit");
+        assert_eq!(failing_again[0].severity, Severity::Advisory);
+    }
+
+    #[test]
+    fn batch_trigger_always_enforces_immediately_no_grace() {
+        let mut cache = Cache::default();
+        let mut results = vec![result(Severity::Blocking, false)];
+
+        cache.apply_grace(&mut results, &file(), "batch");
+
+        assert_eq!(results[0].severity, Severity::Blocking);
+    }
+
+    #[test]
+    fn advisory_results_pass_through_untouched() {
+        let mut cache = Cache::default();
+        let mut results = vec![result(Severity::Advisory, false)];
+
+        cache.apply_grace(&mut results, &file(), "Edit");
+
+        assert_eq!(results[0].severity, Severity::Advisory);
+        assert!(results[0].output.is_empty());
+    }
+
+    #[test]
+    fn grace_state_is_scoped_per_check_name_not_just_per_file() {
+        let mut cache = Cache::default();
+        let mut first_check = vec![CheckResult {
+            check_name: "check-a".to_string(),
+            ..result(Severity::Blocking, false)
+        }];
+        cache.apply_grace(&mut first_check, &file(), "Edit");
+        assert_eq!(first_check[0].severity, Severity::Advisory);
+
+        // A different check failing on the same file gets its own fresh grace period.
+        let mut second_check = vec![CheckResult {
+            check_name: "check-b".to_string(),
+            ..result(Severity::Blocking, false)
+        }];
+        cache.apply_grace(&mut second_check, &file(), "Edit");
+        assert_eq!(second_check[0].severity, Severity::Advisory);
+    }
 }

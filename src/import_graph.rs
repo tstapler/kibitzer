@@ -1,14 +1,15 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 /// A directed edge from one package/module directory to another, plus the specific
 /// import statement (file + line) that produced it — kept so findings derived from the
 /// graph can still point at a concrete location, per the `{file}:{line}: {message}`
 /// convention every other checker follows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportEdge {
     pub from: String,
     pub to: String,
@@ -22,6 +23,13 @@ pub struct ImportEdge {
 pub struct ImportGraph {
     pub nodes: BTreeSet<String>,
     pub edges: Vec<ImportEdge>,
+    /// Every file this graph extracted imports for, mapped to the package/node key it
+    /// was grouped under — the single source of truth for a file's package key, per
+    /// language (Go: module-qualified import path; JS/TS: repo-relative directory).
+    /// `arch_model::build_model` consults this so its own package grouping always
+    /// matches this graph's node keys instead of re-deriving (and potentially
+    /// mismatching) them.
+    pub file_packages: BTreeMap<PathBuf, String>,
 }
 
 impl ImportGraph {
@@ -192,6 +200,7 @@ fn build_qualified_name_language(
             &mut identity_cache,
         ) {
             graph.nodes.insert(pkg.clone());
+            graph.file_packages.insert((*file).clone(), pkg.clone());
             file_packages.push((file, pkg, tree, source));
         }
     }
@@ -410,7 +419,9 @@ fn build_js(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
         .collect();
 
     for file in files {
-        graph.nodes.insert(dir_key(&js_module_dir(file)));
+        let key = dir_key(&js_module_dir(file));
+        graph.nodes.insert(key.clone());
+        graph.file_packages.insert((*file).clone(), key);
     }
 
     for file in files {
@@ -972,6 +983,7 @@ fn build_python(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -
 
         if let Some(pkg) = python_package_of(repo_root, file) {
             graph.nodes.insert(pkg.clone());
+            graph.file_packages.insert((*file).clone(), pkg.clone());
             if let Some(dir) = file.parent().and_then(|d| d.canonicalize().ok()) {
                 known_dirs.insert(dir, pkg.clone());
             }
@@ -1164,6 +1176,35 @@ mod tests {
         let graph = build(&dir, &[a]).unwrap();
 
         assert!(graph.edges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_packages_maps_go_files_to_module_qualified_keys() {
+        let dir = tmp_dir("go-file-packages");
+        write(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let a = write(&dir, "domain/a.go", "package domain\n\nfunc A() {}\n");
+
+        let graph = build(&dir, std::slice::from_ref(&a)).unwrap();
+
+        assert_eq!(
+            graph.file_packages.get(&a),
+            Some(&"example.com/app/domain".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_packages_maps_ts_files_to_directory_keys() {
+        let dir = tmp_dir("ts-file-packages");
+        let a = write(&dir, "web/index.ts", "export function f() {}\n");
+
+        let graph = build(&dir, std::slice::from_ref(&a)).unwrap();
+
+        let expected = dir_key(&dir.join("web"));
+        assert_eq!(graph.file_packages.get(&a), Some(&expected));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

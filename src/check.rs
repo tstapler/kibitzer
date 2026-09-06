@@ -1169,6 +1169,16 @@ const SKIP_DIRS: &[&str] = &[
     "dist",
     "build",
     ".next",
+    // Python virtualenv/bytecode-cache dirs (Epic 5.1).
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    // Java/Kotlin Gradle/Maven build dirs (Epic 5.2/5.3) — Kotlin/Gradle projects share
+    // these same dirs with Java, so no Kotlin-specific additions are needed.
+    ".gradle",
+    ".mvn",
+    "out",
 ];
 
 fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -1514,6 +1524,35 @@ mod git_head_integration_tests {
             Some(&[(7, 7)]),
         );
         assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn baseline_is_none_when_there_is_no_head_commit() {
+        let repo = TempRepo::new("no-head");
+        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
+
+        let result = check_against_git_head(
+            &bad_marker_check(),
+            &repo.dir,
+            &repo.path("foo.txt"),
+            Some(&[(2, 2)]),
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn baseline_is_none_when_the_file_is_untracked_at_head() {
+        let repo = TempRepo::new("untracked-file");
+        repo.write_and_commit("committed.txt", "line1\n", "init");
+        repo.write_uncommitted("new.txt", "line1\nBAD\n");
+
+        let result = check_against_git_head(
+            &bad_marker_check(),
+            &repo.dir,
+            &repo.path("new.txt"),
+            Some(&[(2, 2)]),
+        );
+        assert_eq!(result, None);
     }
 
     #[test]

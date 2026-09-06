@@ -213,29 +213,29 @@ pub fn run_backtest(
         let key = transcript.to_string_lossy().into_owned();
         let current_stamp = stamp(transcript);
 
-        if let Some(current_stamp) = current_stamp {
-            if let Some(entry) = cache.entries.get(&key) {
-                if entry.stamp == current_stamp && entry.checkers_key == checkers_key {
-                    stats.snapshots_checked += entry.snapshots_checked;
-                    stats.edits_unreconstructable += entry.edits_unreconstructable;
-                    findings.extend(
-                        entry
-                            .findings
-                            .iter()
-                            .filter(|f| !(only_new && f.pre_existing))
-                            .map(|f| BacktestFinding {
-                                transcript: transcript.clone(),
-                                file_path: f.file_path.clone(),
-                                seq: f.seq,
-                                checker: f.checker.clone(),
-                                line: f.line,
-                                message: f.message.clone(),
-                                pre_existing: f.pre_existing,
-                            }),
-                    );
-                    continue;
-                }
-            }
+        if let Some(current_stamp) = current_stamp
+            && let Some(entry) = cache.entries.get(&key)
+            && entry.stamp == current_stamp
+            && entry.checkers_key == checkers_key
+        {
+            stats.snapshots_checked += entry.snapshots_checked;
+            stats.edits_unreconstructable += entry.edits_unreconstructable;
+            findings.extend(
+                entry
+                    .findings
+                    .iter()
+                    .filter(|f| !(only_new && f.pre_existing))
+                    .map(|f| BacktestFinding {
+                        transcript: transcript.clone(),
+                        file_path: f.file_path.clone(),
+                        seq: f.seq,
+                        checker: f.checker.clone(),
+                        line: f.line,
+                        message: f.message.clone(),
+                        pre_existing: f.pre_existing,
+                    }),
+            );
+            continue;
         }
 
         let (snapshots, unreconstructable) = reconstruct_snapshots(transcript)

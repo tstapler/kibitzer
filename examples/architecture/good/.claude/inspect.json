@@ -1,0 +1,10 @@
+{
+  "architecture": {
+    "layers": ["handlers", "domain", "infra"]
+  },
+  "checks": [
+    { "name": "import-cycles", "architecture_checker": "import-cycles", "severity": "advisory" },
+    { "name": "layering", "architecture_checker": "layering", "severity": "advisory" },
+    { "name": "coupling", "architecture_checker": "coupling", "severity": "advisory" }
+  ]
+}
