@@ -339,3 +339,37 @@ Advisory instead of escalating.
   in the same file. Logseq wiki-links are cross-*file* by filename, not same-file
   reference definitions, so the checker treats every wiki-link as "used but never
   defined" regardless of whether the target page actually exists on disk.
+
+### 2026-09-06 — stapler-squad — GFM task-list checkboxes (`- [x]`/`- [ ]`) misread as unresolved reference-style links
+
+- **Repo**: `tstapler/stapler-squad`, file: a scratch `/tmp/pr-ship-*.md` state-tracking
+  file (not committed to the repo — a working-memory file for a `/github:pr-ship`-style
+  orchestration loop), created via `Write`.
+- **What changed**: Wrote a standard GitHub-Flavored-Markdown task list to track gate
+  status, e.g.:
+  ```markdown
+  - [x] Gate 1a: Local compile
+  - [x] Gate 1b: Local tests (changed packages only)
+  - [ ] Gate 2:  Code review clean
+  ```
+- **Why it's a false positive**: `- [x]`/`- [ ]` at the start of a list item is
+  standard GFM task-list checkbox syntax, not a Markdown reference-style link. Every
+  unchecked/checked box in the list fired `"[x] used but never defined"` /
+  `"[ ] used but never defined"`.
+- **Mechanism**: confirmed by reading `src/markdown_link_integrity.rs` directly.
+  `check_source` builds its parser with `Options::empty()` (line 84,
+  `Parser::new_with_broken_link_callback(body, Options::empty(), Some(callback))`) —
+  `pulldown_cmark::Options` never sets `ENABLE_TASKLISTS`, so `[x]`/`[ ]` at the start
+  of a list item is not recognized as a GFM task-list checkbox at all; it's parsed per
+  plain CommonMark bracket rules, where `[x]`/`[ ]` looks exactly like a shortcut
+  reference-link label. Compounding this, the checker's own
+  `new_with_broken_link_callback` (lines 82-84) is deliberately set up to force *any*
+  undefined bracket-label sequence to still emit a `Link`/`Tag::Link` event — the
+  callback `|_broken| Some((CowStr::Borrowed(""), CowStr::Borrowed("")))` exists (per
+  the function's own doc comment two lines above) specifically so dangling references
+  aren't silently rendered as plain text and skipped. That combination means every task
+  checkbox becomes a `LinkType::ReferenceUnknown` event with no matching
+  `ref_defs` entry, so `is_reference_style` (line 136) is true and the file:162
+  `format!("[{id}] used but never defined")` finding fires for every single checkbox in
+  the list — task lists in general trigger this, not something specific to this one
+  scratch file.
