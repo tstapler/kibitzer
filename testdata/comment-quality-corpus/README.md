@@ -9,7 +9,7 @@ evaluate against.
 
 ## Provenance
 
-330 comments pulled from three real open-source repos, each an isolated
+390 comments pulled from three real open-source repos, each an isolated
 excerpt (one comment + its enclosing function/method's identifier context —
 not the surrounding file), attributed via each entry's `repo`/`path` fields.
 This is the same practice most linters use to build test/eval fixtures from
@@ -36,6 +36,18 @@ from the same three repos' current directory structure (verified via
 `gh api search/code` when a guessed path 404'd, e.g. Cassandra's `Memtable`
 class moved to `db/memtable/AbstractMemtable.java` and Servo's `element.rs`/
 `document.rs` moved under `dom/element/` and `dom/document/` since round 4/5).
+The round-7 rows (`round: 7`) were confirmed the same way: each new file
+(Cassandra's `Future.java`/`MessagingService.java`/`Row.java`/`Schema.java`,
+kubelet's `reason_cache.go`/`active_deadline.go`/`kubelet_getters.go`/
+`server/server.go`/`cm/qos_container_manager_linux.go`/
+`lifecycle/predicate.go`/`eviction/helpers.go`, and Servo's
+`net/resource_thread.rs`/`net/filemanager_thread.rs`/`net/cookie_storage.rs`/
+`script/messaging.rs`/`net/http_cache.rs`) was existence-checked at its exact
+path via `gh api repos/<org>/<repo>/contents/<path>`, with two ambiguous cases
+(`kubelet/server.go` and `kubelet/qos_container_manager_linux.go`, which don't
+exist at the bare `pkg/kubelet/` path) resolved by locating the real
+subpackage (`pkg/kubelet/server/server.go`, `pkg/kubelet/cm/
+qos_container_manager_linux.go`) the same way.
 
 ## Format
 
@@ -50,7 +62,7 @@ JSON Lines, one object per example, sorted by `id`. Fields:
 | `comment` | Raw comment text, verbatim from source. |
 | `signature` | The function/method identifier context for the comment. |
 | `label` | `how` / `why` / `ambiguous`, from blind hand-labeling (see below). Copied verbatim from the source research data — never re-derived. |
-| `round` | Which research round produced the label: `3`, `4`, `5`, or `6`. |
+| `round` | Which research round produced the label: `3`, `4`, `5`, `6`, or `7`. |
 | `_round3_embedding_similarity` | Present only on some round-3 rows: a leftover score from an abandoned embedding experiment. Historical only, not authoritative — do not use for anything beyond curiosity about that experiment. |
 
 Example row:
@@ -61,15 +73,15 @@ Example row:
 
 ## Current size and label balance
 
-330 examples total (60 from round 3, 150 from round 4, 60 from round 5, 60
-from round 6), 110 per language.
+390 examples total (60 from round 3, 150 from round 4, 60 from round 5, 60
+from round 6, 60 from round 7), 130 per language.
 
 | | how | why | ambiguous | total |
 |---|---|---|---|---|
-| go | 61 | 49 | 0 | 110 |
-| java | 46 | 62 | 2 | 110 |
-| rust | 36 | 72 | 2 | 110 |
-| **all** | **143** | **183** | **4** | **330** |
+| go | 70 | 60 | 0 | 130 |
+| java | 55 | 73 | 2 | 130 |
+| rust | 48 | 80 | 2 | 130 |
+| **all** | **173** | **213** | **4** | **390** |
 
 The round-5 fresh-60 batch (`round: 5`, 20 per language, gathered from files
 not previously sampled in the same three repos) was deliberately curated for
@@ -80,7 +92,19 @@ came out 11 `how` / 9 `why` for go, 10 `how` / 9 `why` / 1 `ambiguous` for
 java, and 9 `how` / 11 `why` for rust — close to balanced for all three
 languages, including rust, without deliberately excluding bare-URL rust
 comments (round 6 happened to sample few of them; see the caveat below,
-which still describes the corpus as a whole).
+which still describes the corpus as a whole). The round-7 fresh-60 batch
+(`round: 7`, 20 per language, again from previously-unsampled files) came out
+9 `how` / 11 `why` for go, 9 `how` / 11 `why` for java, and 12 `how` / 8 `why`
+for rust; round 7 deliberately over-sampled Java methods with `{@link}`/
+`{@see}` Javadoc cross-references (6 of the 20 Java rows), including both
+internal same-package targets and Guava's genuinely-external
+`com.google.common.util.concurrent.Futures#addCallback`, to test a
+same-round classifier fix targeting exactly that internal-vs-external
+distinction. Result (not checked into this repo, see the round-7 research
+scratchpad): the fix correctly flipped one new internal-`{@link}` false
+positive to a true negative, but also flipped two previously-correct `why`
+predictions to false negatives in the same six-row subset — a net accuracy
+regression, consistent with the same fix's effect on the canonical 330.
 
 ### Caveat: the rust ("servo") `why` subset is skewed toward spec-URL citations
 
@@ -111,10 +135,11 @@ those candidates into a sample file, and each sample was then hand-labeled
 classifier — to keep it valid as a test set. Reuse that same scan-then-curate
 approach to pull more candidates from these or additional repos, and keep the
 blind-labeling discipline: label first, run the classifier second, never the
-other way round. Rounds 5 and 6 followed this same discipline; their
+other way round. Rounds 5, 6, and 7 followed this same discipline; their
 scratchpads (`build_fresh60.py`, `gen_corpus_fields.py`, `fresh60_labels.py`,
-`discourse_classifier_v3.py`/`v4.py`, plus round 6's `eval_step1.py`/
-`eval_step2.py`/`append_corpus.py`) are not checked into this repo either.
+`discourse_classifier_v3.py`/`v4.py`/`v5.py`, plus `eval_step1.py`/
+`eval_step2.py`/`append_corpus.py` per round) are not checked into this repo
+either.
 
 ## Known limitations
 
