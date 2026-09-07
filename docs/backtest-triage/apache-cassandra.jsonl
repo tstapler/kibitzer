@@ -1,0 +1,1 @@
+{"file": "src/java/org/apache/cassandra/config/DatabaseDescriptor.java", "line": 6101, "note": "setDumpHeapOnUncaughtException(boolean enabled): sets a field then branches on the same flag to validate/rollback (if (enabled && !pathExists) ...).", "rule": "flag-argument", "verdict": "true_positive"}

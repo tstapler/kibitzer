@@ -1,0 +1,2 @@
+{"file": "cmd/kubeadm/app/phases/upgrade/postupgrade.go", "line": 99, "note": "Textbook case: WriteKubeletConfigFiles branches on dryRun twice (if/else, then two guarded print blocks).", "rule": "flag-argument", "verdict": "true_positive"}
+{"file": "cmd/kubeadm/app/phases/upgrade/postupgrade.go", "line": 162, "note": "RemoveKubeletArgsFromFile: if dryRun { print-only; return } else { real backup+edit }.", "rule": "flag-argument", "verdict": "true_positive"}

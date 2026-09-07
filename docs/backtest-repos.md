@@ -41,3 +41,7 @@ kibitzer run ~/code/github.com/BurntSushi/ripgrep
 
 Filter to one rule's findings by grepping the `[rule-id]` prefix in the message, e.g.
 `grep '\[flag-argument\]'`.
+
+To triage findings as true/false positive and track that across repeated runs
+instead of re-reading the same output each time, use
+`scripts/backtest-triage.py` — see `docs/backtest-triage/README.md`.

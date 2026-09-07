@@ -1,0 +1,1 @@
+{"file": "src/vs/workbench/contrib/chat/browser/widget/chatListRenderer.ts", "line": 1822, "note": "shouldShowWorkingProgress: moreContentAvailable is an operand deep in a compound && condition (line ~1894), not the whole if - confirms the operand-of-condition scope works as intended.", "rule": "flag-argument", "verdict": "true_positive"}
