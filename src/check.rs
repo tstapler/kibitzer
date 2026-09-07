@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
+use crate::plugin::Registry;
 
 /// Beyond this many lines, `describe()` truncates the command's raw output and points
 /// the agent at `command` to see the rest, instead of dumping everything inline —
@@ -154,14 +155,25 @@ mod describe_tests {
 
 /// Run a single check against `file_path` (already confirmed in-scope by the caller).
 /// `changed_lines`, when present, scopes the result to findings that fall within those
-/// 1-indexed inclusive line ranges — see [`scope_output_to_changed_lines`].
+/// 1-indexed inclusive line ranges — see [`scope_output_to_changed_lines`]. `registry`
+/// should be loaded once per batch/request by the caller (see [`run_checks_for_trigger`])
+/// rather than reloaded here — `registry.json` is read on every plugin-missing check
+/// otherwise, even for a repo with zero plugins installed.
 pub fn run_check(
     check: &Check,
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
+    registry: &Registry,
 ) -> anyhow::Result<CheckResult> {
-    run_check_with_timeout(check, repo_root, file_path, changed_lines, COMMAND_TIMEOUT)
+    run_check_with_timeout(
+        check,
+        repo_root,
+        file_path,
+        changed_lines,
+        COMMAND_TIMEOUT,
+        registry,
+    )
 }
 
 /// Parameterized-timeout counterpart to [`run_check`] — the real entry point calls this
@@ -173,6 +185,7 @@ fn run_check_with_timeout(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     timeout: Duration,
+    registry: &Registry,
 ) -> anyhow::Result<CheckResult> {
     if let Some(checker_name) = &check.checker {
         return run_native_check(check, checker_name, repo_root, file_path, changed_lines);
@@ -184,7 +197,7 @@ fn run_check_with_timeout(
     // exist — that would otherwise surface as generic shell "command not found" noise
     // indistinguishable from a real check failure. Severity is forced to `Advisory`
     // regardless of `check.severity` so a missing install never blocks an edit.
-    if let Some(binary_path) = crate::plugin::missing_binary_for(&check.name) {
+    if let Some(binary_path) = registry.missing_binary_for(&check.name) {
         return Ok(CheckResult {
             check_name: check.name.clone(),
             severity: Severity::Advisory,
@@ -312,7 +325,7 @@ enum CommandOutcome {
 /// is shelled out to the recorded pid to unblock the background thread's `wait_with_output()`
 /// so it doesn't leak, then `TimedOut` is returned immediately without waiting on it further.
 ///
-/// Two known v1 limitations, accepted for this pass (Tech Debt Disposition, `src/check.rs`
+/// Four known v1 limitations, accepted for this pass (Tech Debt Disposition, `src/check.rs`
 /// row):
 /// - If the child writes more than the OS pipe buffer (~64KB on Linux) before exiting, it
 ///   can block on `write()` before the timeout is ever noticed. Acceptable today because
@@ -321,6 +334,19 @@ enum CommandOutcome {
 ///   compound/piped command (e.g. `foo | bar`) can leave orphaned grandchild processes
 ///   running after the timeout fires. Fully closing this would need process-group/session
 ///   based killing (`setsid` + `killpg`), out of scope here.
+/// - A distinct issue from the one above: if a descendant the killed `sh` leaves behind
+///   still holds the piped stdout/stderr fds open, the background thread's
+///   `wait_with_output()` (which reads both pipes to EOF) never returns — this function
+///   itself still returns promptly (it doesn't join that thread), but the thread leaks
+///   for the rest of the process's lifetime, one per such hang. Acceptable for now in a
+///   short-lived CLI invocation; a long-running daemon/MCP-server process should watch
+///   for this if check hangs become common.
+/// - `kill -KILL <pid>` targets a bare pid with no liveness check first, so on a system
+///   under enough process churn the pid could theoretically have already been reused by
+///   an unrelated process between the child exiting on its own and the kill call landing
+///   — signaling the wrong process. Low likelihood in practice and no cheap fix exists on
+///   stable `std::process` (no atomic "kill iff still my child" primitive); accepted as a
+///   documented risk rather than worked around.
 fn run_command_with_timeout(
     cmd_str: &str,
     repo_root: &Path,
@@ -1262,12 +1288,20 @@ fn map_ranges_through_hunks(ranges: &[(usize, usize)], hunks: &[DiffHunk]) -> Ve
 
 /// Run every check in `checks` that applies to `trigger` and whose scope matches
 /// `file_path` (given relative to `repo_root`).
+///
+/// `registry` is threaded straight through to [`run_check`] rather than reloaded here —
+/// callers that process multiple files in one batch/request (`run_batch_collect` in
+/// `run.rs`) should load it exactly once for the whole batch and pass the same
+/// `&Registry` into every call, instead of reloading and reparsing `registry.json` from
+/// disk once per call (or, if reloaded again inside the per-`check` loop, once per
+/// (file, check) pair).
 pub fn run_checks_for_trigger(
     checks: &[Check],
     trigger: &str,
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
+    registry: &Registry,
 ) -> anyhow::Result<Vec<CheckResult>> {
     let rel_path = relativize(repo_root, file_path);
     let mut results = Vec::new();
@@ -1278,7 +1312,13 @@ pub fn run_checks_for_trigger(
         if !matches_scope(&rel_path, &check.scope) {
             continue;
         }
-        results.push(run_check(check, repo_root, file_path, changed_lines)?);
+        results.push(run_check(
+            check,
+            repo_root,
+            file_path,
+            changed_lines,
+            registry,
+        )?);
     }
     Ok(results)
 }
@@ -1446,6 +1486,7 @@ mod sarif_run_check_tests {
             Path::new("."),
             Path::new("src/lib.rs"),
             Some(&[(1, 5)]),
+            &Registry::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1460,7 +1501,14 @@ mod sarif_run_check_tests {
             command: Some("echo 'not sarif at all'".to_string()),
             ..sarif_check("{}")
         };
-        let result = run_check(&check, Path::new("."), Path::new("src/lib.rs"), None).unwrap();
+        let result = run_check(
+            &check,
+            Path::new("."),
+            Path::new("src/lib.rs"),
+            None,
+            &Registry::default(),
+        )
+        .unwrap();
         assert_eq!(result.output.trim(), "not sarif at all");
     }
 }
@@ -1498,6 +1546,7 @@ mod timeout_tests {
             Path::new("irrelevant.txt"),
             None,
             Duration::from_millis(200),
+            &Registry::default(),
         )
         .unwrap();
 
@@ -1528,6 +1577,7 @@ mod timeout_tests {
             Path::new("irrelevant.txt"),
             None,
             Duration::from_millis(200),
+            &Registry::default(),
         )
         .unwrap();
 
@@ -1543,46 +1593,14 @@ mod timeout_tests {
 mod plugin_missing_tests {
     use super::*;
     use crate::config::{OutputFormat, Severity};
+    use crate::plugin::test_support::with_xdg_data_home;
     use crate::plugin::{InstalledPlugin, PluginName, Registry};
     use std::time::Instant;
 
-    /// Mirrors `plugin.rs`'s own `with_xdg_data_home` test helper, serialized against it
-    /// (and `config.rs`'s copy) via the shared `plugin::XDG_DATA_HOME_LOCK` so parallel
-    /// `#[test]` threads across modules never race the same env var.
-    fn with_xdg_data_home<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-check-plugin-missing-test-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var("XDG_DATA_HOME").ok();
-        // SAFETY: `plugin::XDG_DATA_HOME_LOCK` serializes every test across modules that
-        // touches this env var.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &dir);
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-
-        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
-
     #[test]
     fn run_check_returns_plugin_missing_result_with_advisory_severity_when_binary_absent() {
-        with_xdg_data_home(|| {
-            let missing_binary =
-                std::env::temp_dir().join("kibitzer-check-plugin-missing-test-nonexistent-binary");
+        with_xdg_data_home("check-plugin-missing", |dir| {
+            let missing_binary = dir.join("kibitzer-check-plugin-missing-test-nonexistent-binary");
             let plugin = InstalledPlugin {
                 name: PluginName::parse("kibitzer-stub-plugin").unwrap(),
                 version: "0.1.0".to_string(),
@@ -1617,9 +1635,16 @@ mod plugin_missing_tests {
                 output_format: None,
             };
 
+            let registry = Registry::load(&crate::plugin::default_registry_path());
             let started = Instant::now();
-            let result =
-                run_check(&check, Path::new("."), Path::new("irrelevant.txt"), None).unwrap();
+            let result = run_check(
+                &check,
+                Path::new("."),
+                Path::new("irrelevant.txt"),
+                None,
+                &registry,
+            )
+            .unwrap();
 
             assert!(
                 started.elapsed() < Duration::from_secs(1),
@@ -1890,6 +1915,7 @@ mod git_head_integration_tests {
             &repo.dir,
             &repo.path("foo.txt"),
             Some(&[(2, 2)]),
+            &Registry::default(),
         )
         .unwrap();
         assert!(!result.passed);
@@ -1986,7 +2012,14 @@ mod git_head_integration_tests {
         repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
         repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
 
-        let result = run_check(&repo_wide_bad_marker_check(), &repo.dir, &repo.dir, None).unwrap();
+        let result = run_check(
+            &repo_wide_bad_marker_check(),
+            &repo.dir,
+            &repo.dir,
+            None,
+            &Registry::default(),
+        )
+        .unwrap();
         assert!(!result.passed);
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
@@ -2205,8 +2238,14 @@ mod native_check_tests {
         let dir = tmp_dir("missing-file");
         let file = dir.join("does-not-exist.go");
 
-        let result = run_check(&primitive_obsession_check(), &dir, &file, None)
-            .expect("a missing file must not abort the whole check run");
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+        )
+        .expect("a missing file must not abort the whole check run");
         assert!(!result.passed);
         assert!(result.output.contains("does-not-exist.go"));
 
@@ -2219,7 +2258,14 @@ mod native_check_tests {
         let file = dir.join("notes.md");
         std::fs::write(&file, "func f(a, b string) {}\n").unwrap();
 
-        let result = run_check(&primitive_obsession_check(), &dir, &file, None).unwrap();
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+        )
+        .unwrap();
         assert!(result.passed);
         assert_eq!(result.output, "");
 
@@ -2256,14 +2302,29 @@ mod native_check_tests {
 
         // Line 4 (outside/pre-existing) is excluded; line 5 (inside) is the
         // only changed line, matching this file's `{file}:{line}:` findings.
-        let result = run_check(&blank_imports_check(), &dir, &file, Some(&[(5, 5)])).unwrap();
+        let registry = Registry::default();
+        let result = run_check(
+            &blank_imports_check(),
+            &dir,
+            &file,
+            Some(&[(5, 5)]),
+            &registry,
+        )
+        .unwrap();
         assert!(!result.passed);
         assert!(result.output.contains("unjustified/inside"));
         assert!(!result.output.contains("unjustified/outside"));
 
         // Scoping to a range with no findings at all reports a pass, proving the
         // filtering — not just the checker itself — determines the outcome.
-        let clean = run_check(&blank_imports_check(), &dir, &file, Some(&[(1, 1)])).unwrap();
+        let clean = run_check(
+            &blank_imports_check(),
+            &dir,
+            &file,
+            Some(&[(1, 1)]),
+            &registry,
+        )
+        .unwrap();
         assert!(clean.passed);
 
         let _ = std::fs::remove_dir_all(&dir);

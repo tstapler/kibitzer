@@ -1009,7 +1009,11 @@ mod tests {
         // `XDG_DATA_HOME`-mutating test (this module and `plugin.rs`) via the shared
         // `plugin::XDG_DATA_HOME_LOCK` so a concurrently-running plugin-registration test
         // can never sneak an extra synthesized check into this count.
-        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+        // `.unwrap_or_else(|e| e.into_inner())`, not `.unwrap()`: an unrelated test
+        // panicking while holding this lock must not poison it for every other test.
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("no-config");
         let (config, root) = find_effective_config(&dir).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -1027,7 +1031,9 @@ mod tests {
     #[test]
     fn find_effective_config_disable_removes_a_default_by_name() {
         // See the lock comment on `find_effective_config_falls_back_to_defaults_with_no_inspect_json`.
-        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("disable");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
@@ -1051,7 +1057,9 @@ mod tests {
     #[test]
     fn find_effective_config_overrides_a_default_by_reusing_its_name() {
         // See the lock comment on `find_effective_config_falls_back_to_defaults_with_no_inspect_json`.
-        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("override");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
@@ -1073,32 +1081,7 @@ mod tests {
         assert_eq!(config.checks.len(), default_checks().len());
     }
 
-    /// Points `default_registry_path()` at a private, unique temp directory for the
-    /// duration of `f`, serialized against `plugin.rs`'s own `XDG_DATA_HOME`-mutating
-    /// tests via the shared `plugin::XDG_DATA_HOME_LOCK` (see that module's doc comment)
-    /// so parallel `#[test]` threads in either module never race the same env var.
-    fn with_xdg_data_home<R>(f: impl FnOnce(&Path) -> R) -> R {
-        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
-        let dir = tmp_dir("plugin-xdg-data-home");
-        let previous = std::env::var("XDG_DATA_HOME").ok();
-        // SAFETY: `plugin::XDG_DATA_HOME_LOCK` serializes every test (in this module or
-        // `plugin.rs`) that touches this env var.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &dir);
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
-
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-
-        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
+    use crate::plugin::test_support::with_xdg_data_home;
 
     fn sample_installed_plugin_for_effective_config_test() -> crate::plugin::InstalledPlugin {
         crate::plugin::InstalledPlugin {
@@ -1116,7 +1099,7 @@ mod tests {
 
     #[test]
     fn find_effective_config_includes_registered_plugin_check_alongside_defaults() {
-        with_xdg_data_home(|_xdg_dir| {
+        with_xdg_data_home("config-effective-with-plugin", |_xdg_dir| {
             crate::plugin::Registry::save(
                 &crate::plugin::default_registry_path(),
                 &crate::plugin::Registry {
@@ -1148,7 +1131,7 @@ mod tests {
 
     #[test]
     fn find_effective_config_matches_default_checks_exactly_when_no_plugins_registered() {
-        with_xdg_data_home(|_xdg_dir| {
+        with_xdg_data_home("config-effective-no-plugins", |_xdg_dir| {
             // No registry.json written — `default_registry_path()` points at an empty
             // temp directory, so `Registry::load` returns its `Default` (no plugins).
             let dir = tmp_dir("plugin-effective-config-no-plugins");
@@ -1165,7 +1148,9 @@ mod tests {
     #[test]
     fn find_effective_config_adds_a_check_not_in_the_defaults() {
         // See the lock comment on `find_effective_config_falls_back_to_defaults_with_no_inspect_json`.
-        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("add");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(

@@ -14,7 +14,7 @@ use crate::arch_model::{
     ArchModel, ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model,
 };
 use crate::check::{
-    run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
+    CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_config, find_effective_config};
 use crate::glob::matches_scope;
@@ -273,6 +273,9 @@ impl KibitzerServer {
         let path = PathBuf::from(&req.0.path);
         match find_effective_config(&path) {
             Ok((config, root)) => {
+                // Loaded once for the whole listing rather than once per check.
+                let registry =
+                    crate::plugin::Registry::load(&crate::plugin::default_registry_path());
                 let names: Vec<String> = config
                     .checks
                     .iter()
@@ -280,7 +283,7 @@ impl KibitzerServer {
                         // Task 4.3.1d: flag a plugin-backed check whose binary is missing
                         // right in the listing, instead of only discovering it via a
                         // failed `run_checks` call.
-                        let plugin_tag = if crate::plugin::missing_binary_for(&c.name).is_some() {
+                        let plugin_tag = if registry.missing_binary_for(&c.name).is_some() {
                             ", plugin=not-installed"
                         } else {
                             ""
@@ -410,8 +413,12 @@ impl KibitzerServer {
                 message: None,
                 output_format: None,
             };
+            // `synthetic.checker` is always `Some` here, so `run_check` takes the native-
+            // checker path and never consults the registry — an empty one avoids an
+            // unused `registry.json` load on every (file, checker) pair in this loop.
+            let no_plugins = crate::plugin::Registry::default();
             for file in &files {
-                let result = match run_check(&synthetic, &repo_root, file, None) {
+                let result = match run_check(&synthetic, &repo_root, file, None, &no_plugins) {
                     Ok(r) => r,
                     Err(e) => {
                         lines.push(format!(
@@ -486,12 +493,28 @@ impl KibitzerServer {
     )]
     async fn run_checks(&self, req: Parameters<RunChecksRequest>) -> String {
         let file_path = PathBuf::from(&req.0.file_path);
-        let (config, repo_root) = match find_effective_config(&file_path) {
-            Ok(c) => c,
-            Err(e) => return format!("error reading config: {e}"),
-        };
-        match run_checks_for_trigger(&config.checks, &req.0.trigger, &repo_root, &file_path, None) {
-            Ok(results) => {
+        let trigger = req.0.trigger;
+        // Command-based checks can each block for up to `COMMAND_TIMEOUT` — run the
+        // whole synchronous dispatch on a blocking-pool thread (the same pattern
+        // `load_model_off_stack` uses for the whole-repo model build below) instead of
+        // inline on this `async fn`'s stack, where it would tie up a tokio worker thread
+        // with no `.await` point for the entire duration.
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CheckResult>> {
+            let (config, repo_root) = find_effective_config(&file_path)?;
+            let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
+            run_checks_for_trigger(
+                &config.checks,
+                &trigger,
+                &repo_root,
+                &file_path,
+                None,
+                &registry,
+            )
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(results)) => {
                 let failures: Vec<String> = results
                     .iter()
                     .filter(|r| !r.passed)
@@ -512,7 +535,8 @@ impl KibitzerServer {
                     failures.join("\n")
                 }
             }
-            Err(e) => format!("error running checks: {e}"),
+            Ok(Err(e)) => format!("error running checks: {e}"),
+            Err(e) => format!("run_checks task failed: {e}"),
         }
     }
 
@@ -1688,7 +1712,12 @@ mod tests {
 
         impl RegisteredMissingPlugin {
             fn new() -> Self {
-                let lock = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+                // `.unwrap_or_else(|e| e.into_inner())`, not `.unwrap()`: an unrelated
+                // test panicking while holding this lock (in this module or another)
+                // must not poison it for every other test in the process.
+                let lock = crate::plugin::XDG_DATA_HOME_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let xdg_dir = tmp_dir("plugin-missing-xdg");
                 let previous_xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
                 // SAFETY: the held `lock` serializes every test across modules that

@@ -14,12 +14,14 @@ use ureq::ResponseExt;
 
 use crate::config::{self, Check, OutputFormat, Severity};
 
-/// A validated plugin identifier. Constructed only via [`PluginName::parse`], which
+/// A validated plugin identifier. Constructed only via [`PluginName::parse`] — including
+/// on deserialization, via `#[serde(try_from = "String")]` below, so a `registry.json`
+/// (or any other wire source) can never construct one bypassing the allowlist — which
 /// allowlists `^[A-Za-z0-9_-]{1,64}$` — closing the door on `/`, `\`, `..`, and any
 /// future problem character at once, so an unvalidated name can never reach a
 /// filesystem join (`default_plugin_dir().join(name)`, `fs::remove_dir_all`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 pub struct PluginName(String);
 
 impl PluginName {
@@ -32,6 +34,20 @@ impl PluginName {
             anyhow::bail!("invalid plugin name: {s:?}");
         }
         Ok(Self(s.to_string()))
+    }
+}
+
+impl TryFrom<String> for PluginName {
+    type Error = anyhow::Error;
+
+    /// Backs `#[serde(try_from = "String")]` above — every deserialization of a
+    /// `PluginName` (a hand-written `#[derive(Deserialize)]` would instead build the
+    /// tuple field directly from the wire string, skipping `parse`'s validation
+    /// entirely) routes through here, so a `registry.json` with a name like
+    /// `"../../etc"` fails to deserialize instead of silently reopening the
+    /// path-traversal invariant `parse` exists to close.
+    fn try_from(s: String) -> Result<Self> {
+        Self::parse(&s)
     }
 }
 
@@ -109,6 +125,25 @@ impl Registry {
         fs::write(path, serde_json::to_string_pretty(registry)?)?;
         Ok(())
     }
+
+    /// Backs Task 4.3.1b's `run_check` preflight and `mcp.rs`'s `list_checks` tag:
+    /// `Some(path)` iff `check_name` names a plugin in `self` whose binary no longer
+    /// exists on disk (e.g. removed out-of-band, or the whole plugin directory deleted);
+    /// `None` both when `check_name` isn't a registered plugin at all (a hand-authored
+    /// check is unaffected) and when it is registered and its binary is present.
+    ///
+    /// Every caller (`run_check`/`run_checks_for_trigger` and their callers in
+    /// `run.rs`/`daemon.rs`/`lsp.rs`/`mcp.rs`) loads the `Registry` once per batch/
+    /// request and calls this directly, rather than each check reloading and
+    /// reparsing `registry.json` from disk — wasted work even when zero plugins are
+    /// installed, and multiplicative across a batch of files.
+    pub fn missing_binary_for(&self, check_name: &str) -> Option<PathBuf> {
+        self.plugins
+            .iter()
+            .find(|p| p.name.as_ref() == check_name)
+            .filter(|p| !p.binary_path.exists())
+            .map(|p| p.binary_path.clone())
+    }
 }
 
 /// `$XDG_DATA_HOME/kibitzer/plugins`, falling back to `$HOME/.local/share/kibitzer/plugins`
@@ -152,20 +187,6 @@ pub fn registered_plugin_checks() -> Vec<Check> {
             output_format: Some(p.output_format),
         })
         .collect()
-}
-
-/// Backs Task 4.3.1b's `run_check` preflight and `mcp.rs`'s `list_checks` tag: `Some(path)`
-/// iff `check_name` names a registered plugin whose binary no longer exists on disk
-/// (e.g. removed out-of-band, or the whole plugin directory deleted); `None` both when
-/// `check_name` isn't a registered plugin at all (a hand-authored check is unaffected) and
-/// when it is registered and its binary is present.
-pub fn missing_binary_for(check_name: &str) -> Option<PathBuf> {
-    Registry::load(&default_registry_path())
-        .plugins
-        .into_iter()
-        .find(|p| p.name.as_ref() == check_name)
-        .filter(|p| !p.binary_path.exists())
-        .map(|p| p.binary_path)
 }
 
 /// Splits a plain `MAJOR.MINOR.PATCH` version string into a comparable tuple. Never
@@ -222,11 +243,93 @@ fn reject_disallowed_host(host: &str) -> Result<()> {
     }
 }
 
+/// Hops manually followed by [`fetch_source_bytes`] before giving up — generous enough
+/// for any legitimate GitHub release-asset redirect chain (typically one hop,
+/// `github.com`/`api.github.com` -> an `*.githubusercontent.com` object store) while
+/// still bounding a redirect loop.
+const MAX_REDIRECT_HOPS: u8 = 5;
+
+/// Resolves a `Location` header value against the URI it was returned for. Handles an
+/// absolute URI (the common case for GitHub's redirects) directly; a `//host/path`
+/// network-path reference or a `/path` absolute-path reference against `base`'s
+/// scheme/authority; and a bare relative reference against `base`'s path directory.
+fn resolve_redirect_uri(base: &ureq::http::Uri, location: &str) -> Result<ureq::http::Uri> {
+    if let Ok(parsed) = location.parse::<ureq::http::Uri>()
+        && parsed.scheme().is_some()
+    {
+        return Ok(parsed);
+    }
+
+    let scheme = base.scheme_str().unwrap_or("https");
+    let resolved = if let Some(rest) = location.strip_prefix("//") {
+        format!("{scheme}://{rest}")
+    } else {
+        let authority = base
+            .authority()
+            .map(|a| a.as_str())
+            .ok_or_else(|| anyhow::anyhow!("redirect base URI {base} has no authority"))?;
+        let path = if location.starts_with('/') {
+            location.to_string()
+        } else {
+            let base_path = base.path();
+            let dir = &base_path[..base_path.rfind('/').map(|i| i + 1).unwrap_or(0)];
+            format!("{dir}{location}")
+        };
+        format!("{scheme}://{authority}{path}")
+    };
+    resolved
+        .parse()
+        .with_context(|| format!("resolving redirect target {location:?} against {base}"))
+}
+
+/// One hop's outcome inside [`fetch_source_bytes`]'s manual redirect loop.
+enum RedirectHop {
+    Body(Vec<u8>),
+    Redirect(ureq::http::Uri),
+}
+
+/// Performs exactly one request against `current` and returns either the (allowlist-
+/// checked) response body or the next (allowlist-checked) hop to follow — the allowlist
+/// check on a redirect target happens here, before [`fetch_source_bytes`]'s loop ever
+/// issues the next request to it.
+fn fetch_one_hop(agent: &ureq::Agent, current: &ureq::http::Uri) -> Result<RedirectHop> {
+    let mut response = agent
+        .get(current)
+        .call()
+        .with_context(|| format!("fetching {current}"))?;
+
+    if !response.status().is_redirection() {
+        reject_disallowed_host(response.get_uri().host().unwrap_or(""))?;
+        let bytes = response
+            .body_mut()
+            .read_to_vec()
+            .with_context(|| format!("reading response body from {current}"))?;
+        return Ok(RedirectHop::Body(bytes));
+    }
+
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("redirect from {current} had no Location header"))?
+        .to_string();
+    let next = resolve_redirect_uri(current, &location)?;
+    reject_disallowed_host(next.host().unwrap_or(""))?;
+    Ok(RedirectHop::Redirect(next))
+}
+
 /// Fetches `source` as raw bytes: an `https://` URL is checked against
-/// [`is_allowed_host`] both before the request and again against the response's final,
-/// post-redirect URI (ADR-002's redirect-target requirement) before its body is trusted;
+/// [`is_allowed_host`] before every request in the chain — including each redirect
+/// hop's target, not just the final response — before its body is ever trusted;
 /// `http://` is rejected outright (HTTPS-only); anything else is treated as a local
 /// filesystem path and read directly, with no network access at all.
+///
+/// Automatic redirects are disabled (`max_redirects(0)`) and followed by hand, up to
+/// [`MAX_REDIRECT_HOPS`] times, so the allowlist gates the actual outbound request to
+/// each hop — not just the response ureq would otherwise have already fetched. ureq's
+/// default agent follows up to 10 redirects on its own before any of this code runs,
+/// which would let the real network request reach a disallowed/internal host during the
+/// chain even though the old post-redirect-only check rejected the final response.
 fn fetch_source_bytes(source: &str) -> Result<Vec<u8>> {
     if source.starts_with("http://") {
         anyhow::bail!("refusing to fetch over plain HTTP (HTTPS only): {source}");
@@ -236,20 +339,24 @@ fn fetch_source_bytes(source: &str) -> Result<Vec<u8>> {
             .with_context(|| format!("failed to read plugin manifest from {source:?}"));
     }
 
-    let uri: ureq::http::Uri = source
+    let mut current: ureq::http::Uri = source
         .parse()
         .with_context(|| format!("parsing URL {source:?}"))?;
-    reject_disallowed_host(uri.host().unwrap_or(""))?;
+    reject_disallowed_host(current.host().unwrap_or(""))?;
 
-    let mut response = ureq::get(source)
-        .call()
-        .with_context(|| format!("fetching {source}"))?;
-    reject_disallowed_host(response.get_uri().host().unwrap_or(""))?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .build()
+        .into();
 
-    response
-        .body_mut()
-        .read_to_vec()
-        .with_context(|| format!("reading response body from {source}"))
+    for _ in 0..=MAX_REDIRECT_HOPS {
+        match fetch_one_hop(&agent, &current)? {
+            RedirectHop::Body(bytes) => return Ok(bytes),
+            RedirectHop::Redirect(next) => current = next,
+        }
+    }
+
+    anyhow::bail!("too many redirects (> {MAX_REDIRECT_HOPS}) fetching {source}")
 }
 
 /// Fetches and parses a [`PluginManifest`] from `source` — an `https://` URL (subject to
@@ -397,9 +504,10 @@ fn verify_and_place(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&temp_path)?.permissions();
-        perms.set_mode(perms.mode() | 0o111);
-        fs::set_permissions(&temp_path, perms)?;
+        // Explicit mode, not `perms.mode() | 0o111` — OR-ing onto whatever the umask
+        // produced can leave the binary group/world-writable under a permissive umask
+        // (e.g. 0o002), which `| 0o111` would never clear.
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))?;
     }
     fs::rename(&temp_path, &binary_path)
         .with_context(|| format!("renaming into place at {}", binary_path.display()))?;
@@ -598,8 +706,72 @@ pub fn remove_plugin(name: &PluginName, force: bool) -> Result<ExitCode> {
 #[cfg(test)]
 pub(crate) static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The `XDG_DATA_HOME`-mutating test helper, previously reimplemented independently (with
+/// a real mutex-poisoning bug in at least one copy) in `plugin.rs`, `config.rs`, and
+/// `check.rs`'s own `#[cfg(test)]` modules — now the one shared copy all three import.
+/// `mcp.rs`'s async plugin-missing tests hold their own RAII guard instead (their setup
+/// needs to outlive multiple `.await` points across a test body, which this
+/// synchronous-closure shape can't express) but acquire the same `XDG_DATA_HOME_LOCK`
+/// with the same poison-recovery fix applied directly at that call site.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::XDG_DATA_HOME_LOCK;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "kibitzer-xdg-data-home-test-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Points `default_plugin_dir()`/`default_registry_path()` at a private, unique temp
+    /// directory named after `name` for the duration of `f`, serialized against every
+    /// other test (in any module, via `super::with_xdg_data_home`'s callers or this one)
+    /// that touches `XDG_DATA_HOME` via `XDG_DATA_HOME_LOCK`. Restores the previous env
+    /// var value and removes the temp directory even if `f` panics.
+    ///
+    /// Two poisoning-safety details, both required together:
+    /// - `XDG_DATA_HOME_LOCK.lock()` recovers from a poisoned mutex instead of
+    ///   propagating it (`unwrap_or_else(|e| e.into_inner())`, not `.unwrap()`) — a
+    ///   single test panic while holding this lock must not cascade into every OTHER
+    ///   test in the process that acquires it afterward.
+    /// - The lock `guard` is dropped BEFORE `resume_unwind` re-raises a caught panic.
+    ///   The previous, buggy shape kept `_guard` alive across `resume_unwind`, which
+    ///   starts a fresh unwind through this frame — unwinding past a still-held
+    ///   `MutexGuard` poisons the mutex (root cause of the bug this consolidation
+    ///   fixes; the `unwrap_or_else` above is defense in depth, not a substitute).
+    pub(crate) fn with_xdg_data_home<R>(name: &str, f: impl FnOnce(&Path) -> R) -> R {
+        let guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var("XDG_DATA_HOME").ok();
+        // SAFETY: `guard` serializes every test in the process that touches this var.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+
+        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::with_xdg_data_home;
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -632,7 +804,9 @@ mod tests {
 
     #[test]
     fn default_plugin_dir_respects_xdg_data_home_override() {
-        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap();
+        // `.unwrap_or_else(|e| e.into_inner())`, not `.unwrap()`: an unrelated test
+        // panicking while holding this lock must not poison it for every other test.
+        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("XDG_DATA_HOME").ok();
         // SAFETY: `XDG_DATA_HOME_LOCK` serializes every test in this module that
         // touches this env var, so no other thread observes it mid-mutation.
@@ -664,6 +838,27 @@ mod tests {
     fn plugin_name_parse_accepts_valid_identifier() {
         let name = PluginName::parse("kibitzer-stub-plugin").unwrap();
         assert_eq!(name.as_ref(), "kibitzer-stub-plugin");
+    }
+
+    /// The regression this guards: `#[serde(transparent)]` on a tuple-struct `PluginName`
+    /// deserializes straight from the wire string, bypassing `PluginName::parse`
+    /// entirely — so a `registry.json` (or any other JSON source) naming
+    /// `"../../etc"` would deserialize successfully despite `parse` rejecting it.
+    /// `#[serde(try_from = "String")]` must route every deserialization through `parse`.
+    #[test]
+    fn plugin_name_deserialize_rejects_path_traversal_like_parse_does() {
+        let err = serde_json::from_str::<PluginName>(r#""../../etc""#).unwrap_err();
+        assert!(err.to_string().contains("invalid plugin name"));
+    }
+
+    /// Same regression, exercised the way it actually manifests: a `registry.json`-shaped
+    /// document (an `InstalledPlugin` list) with one entry's `name` an invalid string —
+    /// `Registry::load`'s `serde_json::from_str` must fail on it, not silently construct
+    /// an unvalidated `PluginName`.
+    #[test]
+    fn registry_deserialize_rejects_invalid_plugin_name_in_installed_plugin() {
+        let json = r#"{"plugins":[{"name":"../../etc","version":"0.1.0","min_kibitzer_version":"0.1.0","sha256":"deadbeef","binary_path":"/tmp/x","severity":"advisory","scope":[],"triggers":[],"output_format":"sarif"}]}"#;
+        assert!(serde_json::from_str::<Registry>(json).is_err());
     }
 
     #[test]
@@ -731,34 +926,6 @@ mod tests {
         }
     }
 
-    /// Points `default_plugin_dir()`/`default_registry_path()` at a private, unique temp
-    /// directory for the duration of `f`, serialized against every other test in this
-    /// module that touches `XDG_DATA_HOME` via `XDG_DATA_HOME_LOCK`. Cleans up the temp
-    /// directory and restores the previous env var value afterward, even if `f` panics.
-    fn with_xdg_data_home<R>(name: &str, f: impl FnOnce(&Path) -> R) -> R {
-        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap();
-        let dir = unique_temp_path(name);
-        fs::create_dir_all(&dir).unwrap();
-        let previous = std::env::var("XDG_DATA_HOME").ok();
-        // SAFETY: see `default_plugin_dir_respects_xdg_data_home_override` above —
-        // `XDG_DATA_HOME_LOCK` serializes every test in this module touching this var.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &dir);
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
-
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
-        let _ = fs::remove_dir_all(&dir);
-
-        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
-
     fn sample_manifest_json(name: &str, version: &str, min_kibitzer_version: &str) -> String {
         format!(
             r#"{{"name":"{name}","version":"{version}","min_kibitzer_version":"{min_kibitzer_version}","severity":"advisory","scope":["**/*"],"triggers":["batch"],"output_format":"sarif","targets":{{}}}}"#
@@ -785,6 +952,47 @@ mod tests {
     fn fetch_manifest_rejects_disallowed_https_host_before_request() {
         let err = fetch_manifest("https://evil.example.com/manifest.json").unwrap_err();
         assert!(err.to_string().contains("not an allowed host"));
+    }
+
+    #[test]
+    fn fetch_manifest_rejects_plain_http_url_before_any_request() {
+        let err = fetch_manifest("http://github.com/manifest.json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing to fetch over plain HTTP")
+        );
+    }
+
+    #[test]
+    fn is_allowed_host_accepts_the_documented_positive_cases() {
+        assert!(is_allowed_host("github.com"));
+        assert!(is_allowed_host("api.github.com"));
+        assert!(is_allowed_host("objects.githubusercontent.com"));
+    }
+
+    /// Pure-logic coverage for the redirect-target resolution `fetch_source_bytes`'s
+    /// manual redirect loop relies on (no network access, no mock server needed) — the
+    /// three `Location` header shapes a real server can send.
+    #[test]
+    fn resolve_redirect_uri_handles_absolute_root_relative_and_path_relative_locations() {
+        let base: ureq::http::Uri = "https://github.com/foo/bar/releases/download/v1/x.tar.gz"
+            .parse()
+            .unwrap();
+
+        let absolute =
+            resolve_redirect_uri(&base, "https://objects.githubusercontent.com/blob123").unwrap();
+        assert_eq!(absolute.host(), Some("objects.githubusercontent.com"));
+
+        let root_relative = resolve_redirect_uri(&base, "/other/path").unwrap();
+        assert_eq!(root_relative.host(), Some("github.com"));
+        assert_eq!(root_relative.path(), "/other/path");
+
+        let path_relative = resolve_redirect_uri(&base, "sibling.tar.gz").unwrap();
+        assert_eq!(path_relative.host(), Some("github.com"));
+        assert_eq!(
+            path_relative.path(),
+            "/foo/bar/releases/download/v1/sibling.tar.gz"
+        );
     }
 
     #[test]
@@ -934,49 +1142,42 @@ mod tests {
         });
     }
 
+    // `Registry::missing_binary_for` is a pure in-memory lookup (no `registry.json`
+    // load) — these exercise it directly instead of round-tripping through disk/
+    // `XDG_DATA_HOME`, which the free-function version this replaced required.
     #[test]
     fn missing_binary_for_returns_path_when_plugin_binary_absent() {
-        with_xdg_data_home("missing-binary-present", |dir| {
-            let mut plugin = sample_installed_plugin("kibitzer-stub-plugin", "0.1.0");
-            plugin.binary_path = dir.join("this-binary-does-not-exist");
-            Registry::save(
-                &default_registry_path(),
-                &Registry {
-                    plugins: vec![plugin.clone()],
-                },
-            )
-            .unwrap();
+        let dir = unique_temp_path("missing-binary-present");
+        let mut plugin = sample_installed_plugin("kibitzer-stub-plugin", "0.1.0");
+        plugin.binary_path = dir.join("this-binary-does-not-exist");
+        let registry = Registry {
+            plugins: vec![plugin.clone()],
+        };
 
-            let result = missing_binary_for("kibitzer-stub-plugin");
+        let result = registry.missing_binary_for("kibitzer-stub-plugin");
 
-            assert_eq!(result, Some(plugin.binary_path));
-        });
+        assert_eq!(result, Some(plugin.binary_path));
     }
 
     #[test]
     fn missing_binary_for_returns_none_for_non_plugin_check_name() {
-        with_xdg_data_home("missing-binary-none", |_dir| {
-            assert_eq!(missing_binary_for("not-a-registered-plugin"), None);
-        });
+        let registry = Registry::default();
+        assert_eq!(registry.missing_binary_for("not-a-registered-plugin"), None);
     }
 
     #[test]
     fn missing_binary_for_returns_none_when_plugin_binary_present() {
-        with_xdg_data_home("missing-binary-present-ok", |dir| {
-            let binary_path = dir.join("kibitzer-stub-plugin-binary");
-            fs::write(&binary_path, b"binary").unwrap();
-            let mut plugin = sample_installed_plugin("kibitzer-stub-plugin", "0.1.0");
-            plugin.binary_path = binary_path;
-            Registry::save(
-                &default_registry_path(),
-                &Registry {
-                    plugins: vec![plugin],
-                },
-            )
-            .unwrap();
+        let binary_path = unique_temp_path("missing-binary-present-ok-binary");
+        fs::write(&binary_path, b"binary").unwrap();
+        let mut plugin = sample_installed_plugin("kibitzer-stub-plugin", "0.1.0");
+        plugin.binary_path = binary_path.clone();
+        let registry = Registry {
+            plugins: vec![plugin],
+        };
 
-            assert_eq!(missing_binary_for("kibitzer-stub-plugin"), None);
-        });
+        assert_eq!(registry.missing_binary_for("kibitzer-stub-plugin"), None);
+
+        let _ = fs::remove_file(&binary_path);
     }
 
     #[test]
