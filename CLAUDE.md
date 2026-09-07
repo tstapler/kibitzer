@@ -15,6 +15,8 @@ this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 Go-specific `go-blank-imports`/`go-ignored-error`/`go-error-context`. A local
 `.claude/inspect.json` overlays the defaults rather than replacing them —
 see `docs/suppressing-checks.md` for how a repo disables or scopes one.
+A separately installed checker (`kibitzer plugin install|list|remove|status`)
+is chained in alongside these defaults the same way — see `docs/plugins.md`.
 
 ## Cutting a release
 

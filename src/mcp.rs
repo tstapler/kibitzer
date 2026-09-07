@@ -276,7 +276,20 @@ impl KibitzerServer {
                 let names: Vec<String> = config
                     .checks
                     .iter()
-                    .map(|c| format!("{} ({:?}, scope={:?})", c.name, c.severity, c.scope))
+                    .map(|c| {
+                        // Task 4.3.1d: flag a plugin-backed check whose binary is missing
+                        // right in the listing, instead of only discovering it via a
+                        // failed `run_checks` call.
+                        let plugin_tag = if crate::plugin::missing_binary_for(&c.name).is_some() {
+                            ", plugin=not-installed"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "{} ({:?}, scope={:?}{plugin_tag})",
+                            c.name, c.severity, c.scope
+                        )
+                    })
                     .collect();
                 format!(
                     "config root: {}\nchecks:\n{}",
@@ -482,7 +495,16 @@ impl KibitzerServer {
                 let failures: Vec<String> = results
                     .iter()
                     .filter(|r| !r.passed)
-                    .map(|r| format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe()))
+                    .map(|r| {
+                        // Task 4.3.1c: a plugin-backed check whose binary is missing
+                        // renders `[skipped]`, not `[Advisory]`/`[Blocking]` — an agent
+                        // shouldn't read "not installed" as "ran and found a defect."
+                        if r.plugin_missing {
+                            format!("[skipped] {}: {}", r.check_name, r.describe())
+                        } else {
+                            format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe())
+                        }
+                    })
                     .collect();
                 if failures.is_empty() {
                     "all checks passed".to_string()
@@ -1641,5 +1663,125 @@ mod tests {
             "got: {instructions}"
         );
         assert!(instructions.contains("JSON"), "got: {instructions}");
+    }
+
+    /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
+    /// plugin-backed check whose binary is missing, instead of raw shell noise a real
+    /// command failure would look like.
+    mod plugin_missing_rendering_tests {
+        use super::*;
+        use crate::config::OutputFormat;
+        use crate::plugin::{InstalledPlugin, PluginName, Registry};
+
+        const PLUGIN_NAME: &str = "kibitzer-stub-plugin";
+
+        /// Points `default_registry_path()` at a private temp dir, with `PLUGIN_NAME`
+        /// registered but its binary absent, for as long as this guard is alive —
+        /// serialized (via the held lock) against every other module
+        /// (`plugin.rs`/`config.rs`/`check.rs`) that mutates `XDG_DATA_HOME`, and restored
+        /// on drop even if the test panics.
+        struct RegisteredMissingPlugin {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            xdg_dir: PathBuf,
+            previous_xdg_data_home: Option<String>,
+        }
+
+        impl RegisteredMissingPlugin {
+            fn new() -> Self {
+                let lock = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+                let xdg_dir = tmp_dir("plugin-missing-xdg");
+                let previous_xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+                // SAFETY: the held `lock` serializes every test across modules that
+                // touches this env var.
+                unsafe {
+                    std::env::set_var("XDG_DATA_HOME", &xdg_dir);
+                }
+
+                let plugin = InstalledPlugin {
+                    name: PluginName::parse(PLUGIN_NAME).unwrap(),
+                    version: "0.1.0".to_string(),
+                    min_kibitzer_version: "0.1.0".to_string(),
+                    sha256: "deadbeef".to_string(),
+                    binary_path: xdg_dir.join("this-binary-does-not-exist"),
+                    severity: Severity::Blocking,
+                    scope: vec!["**/*".to_string()],
+                    triggers: vec!["batch".to_string()],
+                    output_format: OutputFormat::Sarif,
+                };
+                Registry::save(
+                    &crate::plugin::default_registry_path(),
+                    &Registry {
+                        plugins: vec![plugin],
+                    },
+                )
+                .unwrap();
+
+                Self {
+                    _lock: lock,
+                    xdg_dir,
+                    previous_xdg_data_home,
+                }
+            }
+        }
+
+        impl Drop for RegisteredMissingPlugin {
+            fn drop(&mut self) {
+                // SAFETY: still holding `_lock`.
+                unsafe {
+                    match &self.previous_xdg_data_home {
+                        Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                        None => std::env::remove_var("XDG_DATA_HOME"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.xdg_dir);
+            }
+        }
+
+        #[tokio::test]
+        async fn list_checks_appends_plugin_not_installed_tag_when_binary_missing() {
+            let _plugin = RegisteredMissingPlugin::new();
+            let dir = tmp_dir("list-checks-plugin-missing");
+
+            let output = KibitzerServer::new()
+                .list_checks(Parameters(ListChecksRequest {
+                    path: dir.display().to_string(),
+                }))
+                .await;
+
+            std::fs::remove_dir_all(&dir).ok();
+
+            let plugin_line = output
+                .lines()
+                .find(|line| line.contains(PLUGIN_NAME))
+                .unwrap_or_else(|| panic!("no line for {PLUGIN_NAME} in output:\n{output}"));
+            assert!(
+                plugin_line.contains("plugin=not-installed"),
+                "got: {plugin_line}"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_checks_renders_skipped_prefix_for_plugin_missing_result() {
+            let _plugin = RegisteredMissingPlugin::new();
+            let dir = tmp_dir("run-checks-plugin-missing");
+            let file_path = dir.join("some-file.stub-only-extension");
+            std::fs::write(&file_path, "irrelevant content").unwrap();
+
+            let output = KibitzerServer::new()
+                .run_checks(Parameters(RunChecksRequest {
+                    file_path: file_path.display().to_string(),
+                    trigger: "batch".to_string(),
+                }))
+                .await;
+
+            std::fs::remove_dir_all(&dir).ok();
+
+            assert!(
+                output.contains(&format!("[skipped] {PLUGIN_NAME}")),
+                "got: {output}"
+            );
+            assert!(!output.contains("[Blocking]"), "got: {output}");
+            assert!(!output.contains("[Advisory]"), "got: {output}");
+        }
     }
 }

@@ -37,6 +37,18 @@ struct CacheEntry {
     /// definition edit (command/scope/severity) must invalidate cached results even
     /// if the target file itself didn't change.
     config_stamp: Stamp,
+    /// Fingerprint of `plugin::default_registry_path()` at the time `results` was
+    /// produced — a `plugin install`/`remove` rewrites `registry.json`, and without this
+    /// a long-running daemon would keep serving pre-install cached results for a file
+    /// forever (pre-mortem.md Failure #2). `None` both when no plugins are installed and
+    /// when the registry file doesn't exist for any other reason — `stamp()` is already
+    /// `None`-safe for a missing file, so two entries both taken with no `registry.json`
+    /// present compare equal (a hit), matching pre-plugin-system cache behavior exactly.
+    /// `#[serde(default)]` so a `cache.json` written before this field existed still
+    /// deserializes instead of `Cache::load` discarding the whole cache on first run
+    /// after upgrade.
+    #[serde(default)]
+    registry_stamp: Option<Stamp>,
     trigger: String,
     results: Vec<CheckResult>,
 }
@@ -73,14 +85,17 @@ impl Cache {
         &self,
         file_path: &Path,
         config_path: &Path,
+        registry_path: &Path,
         trigger: &str,
     ) -> Option<Vec<CheckResult>> {
         let file_stamp = stamp(file_path)?;
         let config_stamp = stamp(config_path)?;
+        let registry_stamp = stamp(registry_path);
         let entry = self.entries.get(&key(file_path))?;
         if entry.trigger == trigger
             && entry.file_stamp == file_stamp
             && entry.config_stamp == config_stamp
+            && entry.registry_stamp == registry_stamp
         {
             Some(entry.results.clone())
         } else {
@@ -92,17 +107,20 @@ impl Cache {
         &mut self,
         file_path: &Path,
         config_path: &Path,
+        registry_path: &Path,
         trigger: &str,
         results: Vec<CheckResult>,
     ) {
         let (Some(file_stamp), Some(config_stamp)) = (stamp(file_path), stamp(config_path)) else {
             return;
         };
+        let registry_stamp = stamp(registry_path);
         self.entries.insert(
             key(file_path),
             CacheEntry {
                 file_stamp,
                 config_stamp,
+                registry_stamp,
                 trigger: trigger.to_string(),
                 results,
             },
@@ -156,6 +174,102 @@ pub fn default_cache_path() -> PathBuf {
         .join("cache.json")
 }
 
+/// Task 4.1.2c: proves `registry_stamp` (Story 4.1.2) invalidates on a `plugin install`/
+/// `remove` (a `registry.json` write) without disturbing the pre-existing
+/// `config_stamp`-only hit/miss behavior for repos with no plugins installed.
+#[cfg(test)]
+mod registry_invalidation_tests {
+    use super::*;
+    use crate::check::CheckResult;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "kibitzer-cache-registry-test-{}-{name}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn sample_result() -> CheckResult {
+        CheckResult {
+            check_name: "sample-check".to_string(),
+            severity: Severity::Advisory,
+            passed: true,
+            output: String::new(),
+            message: None,
+            command: String::new(),
+            findings: Vec::new(),
+            plugin_missing: false,
+        }
+    }
+
+    #[test]
+    fn installing_a_plugin_after_put_invalidates_the_cached_entry() {
+        let file_path = tmp_path("file.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let config_path = tmp_path("inspect.json");
+        fs::write(&config_path, "{}").unwrap();
+        let registry_path = tmp_path("registry.json"); // does not exist yet
+
+        let mut cache = Cache::default();
+        cache.put(
+            &file_path,
+            &config_path,
+            &registry_path,
+            "batch",
+            vec![sample_result()],
+        );
+        assert!(
+            cache
+                .get(&file_path, &config_path, &registry_path, "batch")
+                .is_some(),
+            "sanity: should hit before registry.json exists"
+        );
+
+        // Simulates `kibitzer plugin install` rewriting registry.json.
+        fs::write(&registry_path, r#"{"plugins":[]}"#).unwrap();
+
+        let result = cache.get(&file_path, &config_path, &registry_path, "batch");
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_file(&registry_path);
+        assert!(
+            result.is_none(),
+            "a newly-created registry.json must invalidate the cached entry"
+        );
+    }
+
+    #[test]
+    fn unchanged_registry_still_hits_no_regression_for_no_plugin_repos() {
+        let file_path = tmp_path("file2.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let config_path = tmp_path("inspect2.json");
+        fs::write(&config_path, "{}").unwrap();
+        let registry_path = tmp_path("registry2.json"); // never written — matches
+        // "no plugins installed" for the whole test.
+
+        let mut cache = Cache::default();
+        cache.put(
+            &file_path,
+            &config_path,
+            &registry_path,
+            "batch",
+            vec![sample_result()],
+        );
+
+        let result = cache.get(&file_path, &config_path, &registry_path, "batch");
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_file(&config_path);
+        assert!(
+            result.is_some(),
+            "registry_stamp being None on both sides must never itself cause a miss"
+        );
+    }
+}
+
 #[cfg(test)]
 mod grace_tests {
     use super::*;
@@ -175,6 +289,7 @@ mod grace_tests {
             message: None,
             command: String::new(),
             findings: Vec::new(),
+            plugin_missing: false,
         }
     }
 

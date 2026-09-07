@@ -1,6 +1,9 @@
-# Opt out of the parent stapler-scripts workspace so this package can be built independently.
-# Remove this when kibitzer is added to the workspace members list.
+# Opts out of the parent stapler-scripts workspace (one directory up) while making this repo
+# its own real multi-member workspace: "." is the kibitzer package itself, and
+# crates/kibitzer-stub-plugin is a sibling package published as a second cargo-dist App
+# (ADR-001, project_plans/checker-plugin-system/decisions/ADR-001-real-cargo-workspace-with-stub-plugin-package.md).
 [workspace]
+members = [".", "crates/kibitzer-stub-plugin"]
 
 [package]
 name = "kibitzer"
@@ -30,6 +33,21 @@ schemars = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
 tower-lsp = "0.20.0"
 tree-sitter-rust = "0.24"
+sha2 = "0.11"
+ureq = "3"
+
+# NOTE: this does NOT expose CARGO_BIN_EXE_kibitzer-stub-plugin to tests/*.rs — that
+# requires an "artifact dependency" (`artifact = "bin"`), which needs `-Z bindeps` and is
+# nightly-only as of cargo 1.98 (confirmed: `artifact = …` requires -Z bindeps` manifest
+# error on stable). A plain path dependency only links the sibling's *library* crate.
+# Kept anyway so `cargo metadata`/IDEs record the intentional relationship; the crate has
+# an otherwise-unused `lib.rs` solely so this entry parses (a lib-less package can't be a
+# dependency at all — "ignoring invalid dependency ... missing a lib target").
+# tests/plugin_contract.rs instead locates the sibling binaries at runtime, relative to
+# CARGO_BIN_EXE_kibitzer's own directory, relying on `cargo test`/`cargo llvm-cov`'s
+# workspace-wide default (no `default-members` override below) to have already built them.
+[dev-dependencies]
+kibitzer-stub-plugin = { path = "crates/kibitzer-stub-plugin" }
 
 # The profile that 'dist' will build with
 [profile.dist]

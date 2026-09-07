@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,13 @@ use crate::glob::matches_scope;
 /// buries the actionable part of the message and burns the agent's context on a single
 /// failed check.
 const MAX_SUMMARY_LINES: usize = 20;
+
+/// Wall-clock ceiling on a single `run_check` command dispatch (see
+/// [`run_command_with_timeout`]). Plugin binaries are the class of `command` check most
+/// likely to genuinely hang (a first-run model load, a downloaded runtime waiting on
+/// something that never arrives), so this applies to every shell-out check, not just
+/// plugin-backed ones.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
@@ -42,6 +51,14 @@ pub struct CheckResult {
     /// silently discarding the whole cache on the first run after upgrade.
     #[serde(default)]
     pub findings: Vec<crate::architecture_checks::ArchFinding>,
+    /// `true` iff this result is `run_check`'s early-return for a plugin-backed check
+    /// whose binary is missing from disk (Task 4.3.1b) — distinct from a check that ran
+    /// and failed, so `mcp.rs`/`hook.rs` can render `[skipped]` instead of
+    /// `[Advisory]`/`[Blocking]` and an agent doesn't misdiagnose a missing install as a
+    /// code defect. `#[serde(default)]` for the same cache-compatibility reason as
+    /// `command`/`findings` above.
+    #[serde(default)]
+    pub plugin_missing: bool,
 }
 
 impl CheckResult {
@@ -87,6 +104,7 @@ mod describe_tests {
             message: message.map(String::from),
             command: "some-check-command".to_string(),
             findings: Vec::new(),
+            plugin_missing: false,
         }
     }
 
@@ -143,8 +161,45 @@ pub fn run_check(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> anyhow::Result<CheckResult> {
+    run_check_with_timeout(check, repo_root, file_path, changed_lines, COMMAND_TIMEOUT)
+}
+
+/// Parameterized-timeout counterpart to [`run_check`] — the real entry point calls this
+/// with [`COMMAND_TIMEOUT`]; tests call it directly with a short duration so the timeout
+/// path can be exercised without an actual 30-second wait.
+fn run_check_with_timeout(
+    check: &Check,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    timeout: Duration,
+) -> anyhow::Result<CheckResult> {
     if let Some(checker_name) = &check.checker {
         return run_native_check(check, checker_name, repo_root, file_path, changed_lines);
+    }
+
+    // Task 4.3.1b: a plugin-backed check (always `command`-based, never `checker`) whose
+    // binary has gone missing (removed out-of-band, or the whole plugin uninstalled)
+    // short-circuits here, before a `sh -c` is ever spawned against a path that doesn't
+    // exist — that would otherwise surface as generic shell "command not found" noise
+    // indistinguishable from a real check failure. Severity is forced to `Advisory`
+    // regardless of `check.severity` so a missing install never blocks an edit.
+    if let Some(binary_path) = crate::plugin::missing_binary_for(&check.name) {
+        return Ok(CheckResult {
+            check_name: check.name.clone(),
+            severity: Severity::Advisory,
+            passed: false,
+            output: String::new(),
+            message: Some(format!(
+                "plugin '{}' is not installed (expected binary at {}) — run `kibitzer plugin install {}`",
+                check.name,
+                binary_path.display(),
+                check.name
+            )),
+            command: String::new(),
+            findings: Vec::new(),
+            plugin_missing: true,
+        });
     }
 
     let command = check
@@ -153,11 +208,28 @@ pub fn run_check(
         .expect("config-load validation guarantees command is set when checker is not");
 
     let cmd_str = substitute_command(command, file_path, changed_lines);
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&cmd_str)
-        .current_dir(repo_root)
-        .output()?;
+    let output = match run_command_with_timeout(&cmd_str, repo_root, timeout)? {
+        CommandOutcome::Completed(output) => output,
+        CommandOutcome::TimedOut => {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: false,
+                output: format!("command timed out after {timeout:?} and was killed: {cmd_str}"),
+                message: Some(format!(
+                    "{}check timed out after {timeout:?} and was killed",
+                    check
+                        .message
+                        .as_ref()
+                        .map(|m| format!("{m} — "))
+                        .unwrap_or_default()
+                )),
+                command: cmd_str,
+                findings: Vec::new(),
+                plugin_missing: false,
+            });
+        }
+    };
 
     let passed_raw = output.status.success();
 
@@ -218,7 +290,71 @@ pub fn run_check(
         message,
         command: cmd_str,
         findings: Vec::new(),
+        plugin_missing: false,
     })
+}
+
+/// Outcome of [`run_command_with_timeout`]: either the child exited (successfully or not —
+/// that's `Output.status`'s job to say) within the deadline, or it didn't and was killed.
+enum CommandOutcome {
+    Completed(std::process::Output),
+    TimedOut,
+}
+
+/// Runs `sh -c <cmd_str>` in `repo_root`, killing it and reporting [`CommandOutcome::TimedOut`]
+/// if it hasn't exited within `timeout`, instead of blocking `run_check` forever.
+///
+/// The child is spawned with piped stdout/stderr and its `wait_with_output()` — which does
+/// its own correct concurrent draining of both pipes — runs on a background thread that
+/// reports back over a channel; the caller does a bounded `recv_timeout` on that channel
+/// rather than polling or hand-rolling pipe reads (hand-rolled reads risk a deadlock if a
+/// pipe buffer fills while the reader is blocked on the other one). On timeout, `kill -KILL`
+/// is shelled out to the recorded pid to unblock the background thread's `wait_with_output()`
+/// so it doesn't leak, then `TimedOut` is returned immediately without waiting on it further.
+///
+/// Two known v1 limitations, accepted for this pass (Tech Debt Disposition, `src/check.rs`
+/// row):
+/// - If the child writes more than the OS pipe buffer (~64KB on Linux) before exiting, it
+///   can block on `write()` before the timeout is ever noticed. Acceptable today because
+///   every check in `default_checks()` produces small, single-file lint output.
+/// - `kill -KILL <pid>` only signals the direct child (`sh`), not its descendants, so a
+///   compound/piped command (e.g. `foo | bar`) can leave orphaned grandchild processes
+///   running after the timeout fires. Fully closing this would need process-group/session
+///   based killing (`setsid` + `killpg`), out of scope here.
+fn run_command_with_timeout(
+    cmd_str: &str,
+    repo_root: &Path,
+    timeout: Duration,
+) -> anyhow::Result<CommandOutcome> {
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd_str)
+        .current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Ok(CommandOutcome::Completed(result?)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Unix-only, matching daemon.rs's existing Unix-only assumption
+            // (std::os::unix::net::UnixListener) — this codebase doesn't target Windows.
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .status();
+            Ok(CommandOutcome::TimedOut)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("command dispatch thread disconnected without reporting a result")
+        }
+    }
 }
 
 /// In-process counterpart to the shell-out path above for `config::Check::checker`-based
@@ -250,6 +386,7 @@ fn run_native_check(
                 message: None,
                 command: cmd_str,
                 findings: Vec::new(),
+                plugin_missing: false,
             });
         }
     }
@@ -269,6 +406,7 @@ fn run_native_check(
                 message: check.message.clone(),
                 command: cmd_str,
                 findings: Vec::new(),
+                plugin_missing: false,
             });
         }
     };
@@ -306,6 +444,7 @@ fn run_native_check(
         message,
         command: cmd_str,
         findings: Vec::new(),
+        plugin_missing: false,
     })
 }
 
@@ -852,6 +991,7 @@ pub fn run_architecture_check(
                 message: check.message.clone(),
                 command: cmd_str,
                 findings: Vec::new(),
+                plugin_missing: false,
             });
         }
     };
@@ -869,6 +1009,7 @@ pub fn run_architecture_check(
                         message: check.message.clone(),
                         command: cmd_str,
                         findings: Vec::new(),
+                        plugin_missing: false,
                     });
                 }
             };
@@ -887,6 +1028,7 @@ pub fn run_architecture_check(
                         message: check.message.clone(),
                         command: cmd_str,
                         findings: Vec::new(),
+                        plugin_missing: false,
                     });
                 }
             };
@@ -928,6 +1070,7 @@ pub fn run_architecture_check(
         message,
         command: cmd_str,
         findings,
+        plugin_missing: false,
     })
 }
 
@@ -1319,6 +1462,187 @@ mod sarif_run_check_tests {
         };
         let result = run_check(&check, Path::new("."), Path::new("src/lib.rs"), None).unwrap();
         assert_eq!(result.output.trim(), "not sarif at all");
+    }
+}
+
+/// Epic 4.2 (Tech Debt item a): a hung `command` check must be killed and reported as a
+/// timeout instead of blocking `run_check` forever, while a normal fast-exiting command is
+/// completely unaffected. Exercises [`run_check_with_timeout`] directly with a short
+/// duration so the hang test doesn't actually wait out a real-world timeout.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use crate::config::Severity;
+    use std::time::Instant;
+
+    fn command_check(command: &str) -> Check {
+        Check {
+            name: "hangy".to_string(),
+            command: Some(command.to_string()),
+            checker: None,
+            architecture_checker: None,
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("command check".to_string()),
+            output_format: None,
+        }
+    }
+
+    #[test]
+    fn run_check_reports_timeout_and_kills_process_when_command_hangs() {
+        let started = Instant::now();
+        let result = run_check_with_timeout(
+            &command_check("sleep 60"),
+            Path::new("."),
+            Path::new("irrelevant.txt"),
+            None,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "run_check_with_timeout should return in well under 1s, took {:?}",
+            started.elapsed()
+        );
+        assert!(!result.passed);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out")
+                || result.output.contains("timed out"),
+            "expected 'timed out' in message or output, got message={:?} output={:?}",
+            result.message,
+            result.output
+        );
+    }
+
+    #[test]
+    fn run_check_behaves_unchanged_when_command_exits_quickly() {
+        let result = run_check_with_timeout(
+            &command_check("true"),
+            Path::new("."),
+            Path::new("irrelevant.txt"),
+            None,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert!(result.passed);
+        assert!(!result.output.to_lowercase().contains("timed out"));
+    }
+}
+
+/// Task 4.3.1b: a plugin-backed check whose registered binary is missing from disk must
+/// short-circuit with `plugin_missing: true` and a forced `Advisory` severity — regardless
+/// of the check's own configured severity — without ever spawning the command.
+#[cfg(test)]
+mod plugin_missing_tests {
+    use super::*;
+    use crate::config::{OutputFormat, Severity};
+    use crate::plugin::{InstalledPlugin, PluginName, Registry};
+    use std::time::Instant;
+
+    /// Mirrors `plugin.rs`'s own `with_xdg_data_home` test helper, serialized against it
+    /// (and `config.rs`'s copy) via the shared `plugin::XDG_DATA_HOME_LOCK` so parallel
+    /// `#[test]` threads across modules never race the same env var.
+    fn with_xdg_data_home<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK.lock().unwrap();
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-check-plugin-missing-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var("XDG_DATA_HOME").ok();
+        // SAFETY: `plugin::XDG_DATA_HOME_LOCK` serializes every test across modules that
+        // touches this env var.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    #[test]
+    fn run_check_returns_plugin_missing_result_with_advisory_severity_when_binary_absent() {
+        with_xdg_data_home(|| {
+            let missing_binary =
+                std::env::temp_dir().join("kibitzer-check-plugin-missing-test-nonexistent-binary");
+            let plugin = InstalledPlugin {
+                name: PluginName::parse("kibitzer-stub-plugin").unwrap(),
+                version: "0.1.0".to_string(),
+                min_kibitzer_version: "0.1.0".to_string(),
+                sha256: "deadbeef".to_string(),
+                binary_path: missing_binary,
+                severity: Severity::Advisory,
+                scope: vec!["**/*".to_string()],
+                triggers: vec!["batch".to_string()],
+                output_format: OutputFormat::Sarif,
+            };
+            Registry::save(
+                &crate::plugin::default_registry_path(),
+                &Registry {
+                    plugins: vec![plugin],
+                },
+            )
+            .unwrap();
+
+            // Configured `Blocking`, even though a real plugin manifest would normally
+            // set its own severity — proves the forced-Advisory downgrade happens
+            // regardless of what the `Check` itself is configured with.
+            let check = Check {
+                name: "kibitzer-stub-plugin".to_string(),
+                command: Some("echo should-never-run {file}".to_string()),
+                checker: None,
+                architecture_checker: None,
+                severity: Severity::Blocking,
+                scope: vec![],
+                triggers: vec![],
+                message: None,
+                output_format: None,
+            };
+
+            let started = Instant::now();
+            let result =
+                run_check(&check, Path::new("."), Path::new("irrelevant.txt"), None).unwrap();
+
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "should return near-instantly without spawning a process"
+            );
+            assert!(result.plugin_missing);
+            assert!(!result.passed);
+            assert_eq!(result.severity, Severity::Advisory);
+            assert!(result.output.is_empty(), "no subprocess should have run");
+            assert!(
+                result.command.is_empty(),
+                "short-circuit result carries no substituted command"
+            );
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("is not installed"),
+                "message: {:?}",
+                result.message
+            );
+        });
     }
 }
 

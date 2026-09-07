@@ -152,7 +152,12 @@ fn handle_run_checks(
     // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
     if changed_lines.is_none()
         && let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.get(file_path, &config_path, trigger)
+        && let Some(cached) = guard.get(
+            file_path,
+            &config_path,
+            &crate::plugin::default_registry_path(),
+            trigger,
+        )
     {
         return Ok(cached);
     }
@@ -171,7 +176,13 @@ fn handle_run_checks(
         // to the cache would let a later unscoped (e.g. batch) request read back a partial
         // result as if it were a full-file one.
         if changed_lines.is_none() {
-            guard.put(file_path, &config_path, trigger, results.clone());
+            guard.put(
+                file_path,
+                &config_path,
+                &crate::plugin::default_registry_path(),
+                trigger,
+                results.clone(),
+            );
             let _ = guard.save(cache_path);
         }
     }
@@ -252,7 +263,13 @@ pub fn run_checks_smart(
     // See handle_run_checks: don't let a diff-scoped partial result overwrite the
     // full-file cache entry.
     if changed_lines.is_none() {
-        cache.put(file_path, &config_path, trigger, results.clone());
+        cache.put(
+            file_path,
+            &config_path,
+            &crate::plugin::default_registry_path(),
+            trigger,
+            results.clone(),
+        );
         let _ = cache.save(&cache_path);
     }
 

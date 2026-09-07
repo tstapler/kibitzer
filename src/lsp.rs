@@ -575,6 +575,7 @@ mod tests {
             message: None,
             command: "true".to_string(),
             findings: Vec::new(),
+            plugin_missing: false,
         }
     }
 
