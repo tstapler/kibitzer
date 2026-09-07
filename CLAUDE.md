@@ -17,6 +17,9 @@ Go-specific `go-blank-imports`/`go-ignored-error`/`go-error-context`. A local
 see `docs/suppressing-checks.md` for how a repo disables or scopes one.
 A separately installed checker (`kibitzer plugin install|list|remove|status`)
 is chained in alongside these defaults the same way — see `docs/plugins.md`.
+`testdata/comment-quality-corpus/` holds a hand-labeled how/why/ambiguous
+comment corpus for training/testing/tuning a future comment-quality
+classifier — see its README for provenance and known limitations.
 
 ## Cutting a release
 
