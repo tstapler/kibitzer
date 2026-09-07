@@ -56,6 +56,12 @@ pub const CATALOG: &[RuleMeta] = &[
         description: "Boolean parameter is branched on directly (if/ternary) in the function body — Fowler's Remove Flag Argument.",
         default_severity: Severity::Advisory,
     },
+    RuleMeta {
+        id: "unreachable-code",
+        category: "dead-code",
+        description: "A statement follows an unconditional return/break/continue/panic in the same block — Fowler's Remove Dead Code.",
+        default_severity: Severity::Advisory,
+    },
 ];
 
 /// Per-language node-kind table the AST walk consults instead of hardcoded literals.
@@ -108,6 +114,33 @@ pub(crate) struct LangRuleConfig {
     /// deliberately not special-cased here — the `if`-branching case is this check's
     /// primary target).
     ternary_kind: Option<&'static str>,
+    /// Node kind for a `{ ... }`-style block whose (possibly indirect, see
+    /// `statement_container`) children are an ordered statement sequence, for
+    /// `unreachable-code`.
+    block_kind: &'static str,
+    /// Given a `block_kind` node, returns the node whose *named* children are that
+    /// ordered statement sequence — identity for every grammar except Go, whose
+    /// grammar nests the sequence one level deeper (`block > statement_list`).
+    statement_container: fn(Node) -> Node,
+    /// Given one raw child of `statement_container`'s result, returns the node to
+    /// compare against `terminal_kinds` — identity for every grammar except Rust, whose
+    /// grammar wraps a bare `return`/`break`/`continue` expression in an
+    /// `expression_statement` (verified via `to_sexp()`; every other grammar here
+    /// exposes `return_statement`/`break_statement`/`continue_statement` as a direct,
+    /// unwrapped statement kind).
+    unwrap_statement: fn(Node) -> Node,
+    /// Node kinds that unconditionally end control flow when found (after
+    /// `unwrap_statement`) as a statement in a `block_kind`. Empty of `break`/
+    /// `continue` for Kotlin: tree-sitter-kotlin-ng 1.1.0 has no dedicated node kind for
+    /// bare `break`/`continue` (verified — absent from its `node-types.json`; a bare
+    /// `break` parses as a plain `identifier`, indistinguishable from a variable
+    /// reference), so only `return_expression` is listed for it.
+    terminal_kinds: &'static [&'static str],
+    /// Returns true if the raw statement (before `unwrap_statement`) is a call/macro
+    /// invocation this language treats as always-diverging — Go's `panic(...)`, Rust's
+    /// `panic!`/`unreachable!`/`todo!`/`unimplemented!`. `no_panic_detector` for every
+    /// other grammar, which has no such built-in.
+    panic_detector: fn(Node, &[u8]) -> bool,
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -375,6 +408,79 @@ fn kotlin_params(decl: Node) -> Option<Node> {
         .find(|c| c.kind() == "function_value_parameters")
 }
 
+/// `statement_container`/`unwrap_statement` default for every grammar but Go/Rust.
+fn identity_stmt(n: Node) -> Node {
+    n
+}
+
+/// Go nests a block's actual statement sequence one level deeper than the `block`
+/// node itself (`block > statement_list`) — an empty block has no `statement_list`
+/// child at all, so this falls back to the (childless) block itself rather than
+/// panicking.
+fn go_statement_container(block: Node) -> Node {
+    let mut cursor = block.walk();
+    block
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "statement_list")
+        .unwrap_or(block)
+}
+
+/// Go has no dedicated "diverging call" node kind — `panic(...)` is an ordinary
+/// `call_expression`, so this matches on the called identifier's text.
+fn go_panic_detector(stmt: Node, src: &[u8]) -> bool {
+    if stmt.kind() != "expression_statement" {
+        return false;
+    }
+    let Some(call) = stmt.named_child(0) else {
+        return false;
+    };
+    if call.kind() != "call_expression" {
+        return false;
+    }
+    let Some(func) = call.child_by_field_name("function") else {
+        return false;
+    };
+    func.kind() == "identifier" && func.utf8_text(src) == Ok("panic")
+}
+
+/// No language besides Go/Rust has a built-in the `unreachable-code` rule treats as
+/// always-diverging.
+fn no_panic_detector(_stmt: Node, _src: &[u8]) -> bool {
+    false
+}
+
+/// Rust's `return`/`break`/`continue` are expressions, so a bare one used as a
+/// statement is wrapped in an `expression_statement` (verified via `to_sexp()`) —
+/// unlike every other grammar here, which gives them their own direct statement kind.
+fn rust_unwrap_statement(stmt: Node) -> Node {
+    if stmt.kind() == "expression_statement" {
+        stmt.named_child(0).unwrap_or(stmt)
+    } else {
+        stmt
+    }
+}
+
+/// Matches Rust's diverging macros (`panic!`, `unreachable!`, `todo!`, `unimplemented!`)
+/// invoked as a bare statement.
+fn rust_panic_detector(stmt: Node, src: &[u8]) -> bool {
+    if stmt.kind() != "expression_statement" {
+        return false;
+    }
+    let Some(invocation) = stmt.named_child(0) else {
+        return false;
+    };
+    if invocation.kind() != "macro_invocation" {
+        return false;
+    }
+    let Some(name) = invocation.child_by_field_name("macro") else {
+        return false;
+    };
+    matches!(
+        name.utf8_text(src),
+        Ok("panic") | Ok("unreachable") | Ok("todo") | Ok("unimplemented")
+    )
+}
+
 /// Shared with `comment_quality`'s over-commented check, which needs the same
 /// per-language function-kind/body lookup this file already maintains (Kotlin's
 /// positional-only body lookup in particular) rather than duplicating it.
@@ -399,6 +505,11 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             params_finder: field_params,
             bool_param_finder: go_bool_params,
             ternary_kind: None,
+            block_kind: "block",
+            statement_container: go_statement_container,
+            unwrap_statement: identity_stmt,
+            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+            panic_detector: go_panic_detector,
         },
         Language::TypeScript => LangRuleConfig {
             name: "syntax-rules-typescript",
@@ -427,6 +538,11 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             params_finder: field_params,
             bool_param_finder: ts_js_bool_params,
             ternary_kind: Some("ternary_expression"),
+            block_kind: "statement_block",
+            statement_container: identity_stmt,
+            unwrap_statement: identity_stmt,
+            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+            panic_detector: no_panic_detector,
         },
         Language::Tsx => LangRuleConfig {
             name: "syntax-rules-tsx",
@@ -466,6 +582,11 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             params_finder: field_params,
             bool_param_finder: py_bool_params,
             ternary_kind: None,
+            block_kind: "block",
+            statement_container: identity_stmt,
+            unwrap_statement: identity_stmt,
+            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+            panic_detector: no_panic_detector,
         },
         Language::Java => LangRuleConfig {
             name: "syntax-rules-java",
@@ -490,6 +611,11 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             params_finder: field_params,
             bool_param_finder: java_bool_params,
             ternary_kind: Some("ternary_expression"),
+            block_kind: "block",
+            statement_container: identity_stmt,
+            unwrap_statement: identity_stmt,
+            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+            panic_detector: no_panic_detector,
         },
         Language::Kotlin => LangRuleConfig {
             name: "syntax-rules-kotlin",
@@ -524,6 +650,12 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             params_finder: kotlin_params,
             bool_param_finder: kotlin_bool_params,
             ternary_kind: None,
+            block_kind: "block",
+            statement_container: identity_stmt,
+            unwrap_statement: identity_stmt,
+            // `break`/`continue` omitted — see `terminal_kinds`'s doc comment.
+            terminal_kinds: &["return_expression"],
+            panic_detector: no_panic_detector,
         },
         Language::Rust => LangRuleConfig {
             name: "syntax-rules-rust",
@@ -557,6 +689,15 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             params_finder: field_params,
             bool_param_finder: rust_bool_params,
             ternary_kind: None,
+            block_kind: "block",
+            statement_container: identity_stmt,
+            unwrap_statement: rust_unwrap_statement,
+            terminal_kinds: &[
+                "return_expression",
+                "break_expression",
+                "continue_expression",
+            ],
+            panic_detector: rust_panic_detector,
         },
     }
 }
@@ -577,7 +718,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -594,7 +735,9 @@ impl Checker for SyntaxRulesChecker {
             .context("syntax-rules checker requires a parsed tree")?;
         let cfg = lang_config(self.lang);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, ctx.source.as_bytes(), &mut findings);
+        let src = ctx.source.as_bytes();
+        walk_declarations(tree.root_node(), &cfg, src, &mut findings);
+        walk_blocks(tree.root_node(), &cfg, src, &mut findings);
         Ok(findings)
     }
 }
@@ -606,6 +749,69 @@ fn walk_declarations(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mu
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_declarations(child, cfg, src, findings);
+    }
+}
+
+/// Recurses over the whole tree (not just function bodies — a `unreachable-code` block
+/// can be any `{ ... }`, including one nested inside another already-dead block) looking
+/// for `block_kind` nodes to hand to `check_block_for_unreachable`.
+fn walk_blocks(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
+    if node.kind() == cfg.block_kind {
+        check_block_for_unreachable(node, cfg, src, findings);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_blocks(child, cfg, src, findings);
+    }
+}
+
+/// Flags at most one statement per block: the first one found after an unconditional
+/// `return`/`break`/`continue`/panic-call. Everything past that point is dead by
+/// construction, so a second finding for the same block would be noise, not signal.
+/// Doesn't descend into `switch`/`match`/`when` case bodies — those aren't `block_kind`
+/// nodes in any of the seven grammars here, so this scope is a property of the walk, not
+/// a separate carve-out.
+fn check_block_for_unreachable(
+    block: Node,
+    cfg: &LangRuleConfig,
+    src: &[u8],
+    findings: &mut Vec<Finding>,
+) {
+    let container = (cfg.statement_container)(block);
+    let mut terminal: Option<(&'static str, usize)> = None;
+    let mut cursor = container.walk();
+    for stmt in container.named_children(&mut cursor) {
+        if stmt.kind().contains("comment") {
+            continue;
+        }
+        if let Some((label, term_line)) = terminal {
+            findings.push(Finding {
+                line: stmt.start_position().row + 1,
+                message: format!(
+                    "[unreachable-code] statement is unreachable — an unconditional `{label}` on line {term_line} ends this block first"
+                ),
+            });
+            break;
+        }
+        let effective = (cfg.unwrap_statement)(stmt);
+        if cfg.terminal_kinds.contains(&effective.kind()) {
+            terminal = Some((
+                terminal_label(effective.kind()),
+                stmt.start_position().row + 1,
+            ));
+        } else if (cfg.panic_detector)(stmt, src) {
+            terminal = Some(("panic", stmt.start_position().row + 1));
+        }
+    }
+}
+
+fn terminal_label(kind: &str) -> &'static str {
+    if kind.starts_with("return") {
+        "return"
+    } else if kind.starts_with("break") {
+        "break"
+    } else {
+        "continue"
     }
 }
 
@@ -800,6 +1006,215 @@ mod tests {
         let mut findings = Vec::new();
         walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
+    }
+
+    /// `check_unreachable` companions below need `walk_blocks`, not `walk_declarations` —
+    /// takes the grammar as a parameter since `unreachable-code` is exercised across all
+    /// seven languages, unlike `check_source` above (Go-only).
+    fn check_unreachable(
+        lang: Language,
+        ts_lang: tree_sitter::Language,
+        src: &str,
+    ) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let cfg = lang_config(lang);
+        let mut findings = Vec::new();
+        walk_blocks(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
+        findings
+    }
+
+    #[test]
+    fn go_unreachable_after_return() {
+        let findings = check_unreachable(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\tif true {\n\t\treturn\n\t\tfmt.Println(1)\n\t}\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("[unreachable-code]"));
+        assert!(findings[0].message.contains("return"));
+    }
+
+    #[test]
+    fn go_unreachable_after_panic() {
+        let findings = check_unreachable(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\tpanic(\"x\")\n\tfmt.Println(1)\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("panic"));
+    }
+
+    #[test]
+    fn go_allows_reachable_code() {
+        let findings = check_unreachable(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\tif true {\n\t\tfmt.Println(1)\n\t}\n\tfmt.Println(2)\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn go_only_flags_first_statement_in_dead_region() {
+        let findings = check_unreachable(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\treturn\n\tfmt.Println(1)\n\tfmt.Println(2)\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn typescript_unreachable_after_break() {
+        let findings = check_unreachable(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  while (true) {\n    break;\n    let x = 1;\n  }\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("break"));
+    }
+
+    #[test]
+    fn python_unreachable_after_continue() {
+        let findings = check_unreachable(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    while True:\n        continue\n        x = 1\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("continue"));
+    }
+
+    #[test]
+    fn java_unreachable_after_return() {
+        let findings = check_unreachable(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  if (true) {\n    return;\n    System.out.println(1);\n  }\n} }\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn kotlin_unreachable_after_return() {
+        let findings = check_unreachable(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  if (true) {\n    return\n    println(1)\n  }\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn kotlin_bare_break_is_not_flagged() {
+        // tree-sitter-kotlin-ng 1.1.0 has no dedicated node kind for a bare `break` (it
+        // parses as a plain `identifier`) — documenting the resulting false-negative
+        // rather than silently relying on it, per `terminal_kinds`'s doc comment.
+        let findings = check_unreachable(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  while (true) {\n    break\n    println(1)\n  }\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn rust_unreachable_after_return_expression() {
+        let findings = check_unreachable(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n  if true {\n    return;\n    println!(\"1\");\n  }\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("return"));
+    }
+
+    #[test]
+    fn rust_unreachable_after_panic_macro() {
+        let findings = check_unreachable(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n  panic!(\"x\");\n  println!(\"1\");\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("panic"));
+    }
+
+    #[test]
+    fn rust_allows_reachable_code() {
+        let findings = check_unreachable(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n  if true {\n    println!(\"1\");\n  }\n  println!(\"2\");\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    /// The next-best thing to compile-time verification for the plain `&'static str`
+    /// node-kind literals scattered through `lang_config`: tree-sitter core has no
+    /// macro/codegen path that would let the compiler itself reject a typo'd kind name
+    /// (that would require generating constants from each grammar crate's
+    /// `node-types.json`, which none of them currently ship), but `Language::
+    /// id_for_node_kind` returns 0 for any string that isn't a real *named* node kind for
+    /// that grammar — so this test fails immediately, at the same "before it ships"
+    /// point a compile error would, if any literal here or added later drifts from the
+    /// real grammar.
+    #[test]
+    fn node_kind_literals_are_valid_for_their_grammar() {
+        fn assert_valid(ts_lang: tree_sitter::Language, cfg: &LangRuleConfig) {
+            let mut kinds: Vec<&str> = vec![cfg.if_kind, cfg.block_kind];
+            kinds.extend(cfg.function_kinds);
+            kinds.extend(cfg.nesting_kinds);
+            kinds.extend(cfg.else_wrapper_kinds);
+            kinds.extend(cfg.chain_kinds);
+            kinds.extend(cfg.terminal_kinds);
+            if let Some(t) = cfg.ternary_kind {
+                kinds.push(t);
+            }
+            for kind in kinds {
+                assert_ne!(
+                    ts_lang.id_for_node_kind(kind, true),
+                    0,
+                    "`{kind}` is not a valid named node kind for the `{}` grammar",
+                    cfg.name
+                );
+            }
+        }
+
+        assert_valid(tree_sitter_go::LANGUAGE.into(), &lang_config(Language::Go));
+        assert_valid(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &lang_config(Language::TypeScript),
+        );
+        assert_valid(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            &lang_config(Language::Tsx),
+        );
+        assert_valid(
+            tree_sitter_javascript::LANGUAGE.into(),
+            &lang_config(Language::JavaScript),
+        );
+        assert_valid(
+            tree_sitter_python::LANGUAGE.into(),
+            &lang_config(Language::Python),
+        );
+        assert_valid(
+            tree_sitter_java::LANGUAGE.into(),
+            &lang_config(Language::Java),
+        );
+        assert_valid(
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            &lang_config(Language::Kotlin),
+        );
+        assert_valid(
+            tree_sitter_rust::LANGUAGE.into(),
+            &lang_config(Language::Rust),
+        );
     }
 
     #[test]
