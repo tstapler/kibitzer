@@ -26,6 +26,13 @@ pub struct Finding {
 /// A tree-sitter grammar a [`Checker`] can request via [`Checker::language`]. Kept
 /// deliberately open-ended (not just `Go`) so future checkers for other languages plug
 /// into the same [`GrammarCache`] without a trait-signature change.
+///
+/// Adding a variant? `Language::extensions` below won't compile until you add its arm
+/// (an exhaustive match on `Language`, enforced by the compiler) — but you also need to
+/// add the variant to `Language::ALL`, which the compiler can't check for you (Rust has
+/// no built-in enum reflection). Forgetting `ALL` silently drops the new language out of
+/// `from_extension`/`for_path`, the same class of miss `checker::tests::
+/// from_extension_recognizes_every_language_variant` exists to catch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Go,
@@ -39,6 +46,19 @@ pub enum Language {
 }
 
 impl Language {
+    /// Every variant — see this enum's own doc comment for why this list exists and
+    /// what forgetting to update it costs.
+    const ALL: &'static [Language] = &[
+        Language::Go,
+        Language::TypeScript,
+        Language::Tsx,
+        Language::JavaScript,
+        Language::Python,
+        Language::Java,
+        Language::Kotlin,
+        Language::Rust,
+    ];
+
     fn ts_language(self) -> tree_sitter::Language {
         match self {
             Language::Go => tree_sitter_go::LANGUAGE.into(),
@@ -50,6 +70,48 @@ impl Language {
             Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         }
+    }
+
+    /// The file extensions (no leading `.`) this language's checkers/parsers apply to
+    /// — the single source of truth `from_extension` derives from, instead of every
+    /// per-language file-extension dispatch in this codebase hand-rolling its own copy
+    /// of this match. Exhaustively matched (no wildcard arm), so the compiler refuses
+    /// to build once a new `Language` variant exists until this function says what
+    /// extensions it covers.
+    ///
+    /// This function (and `from_extension`/`for_path` below) exist because five
+    /// independent copies of this exact match had accumulated
+    /// (`arch_model.rs::language_for_path`, `arch_export.rs::has_supported_extension`,
+    /// and per-language file-filtering in `import_graph.rs::build`/
+    /// `declarations.rs::build`) — a real backtest against Servo (2026-09-06) found
+    /// that `arch_model.rs`'s copy had silently missed `Rust` when Rust support was
+    /// added, so every `.rs` file was skipped for architecture-export/LSP-symbol
+    /// purposes with no error, only an easy-to-miss stat. `arch_export.rs`'s copy had
+    /// the identical gap, independently. Nothing forced any of them to stay in sync.
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Language::Go => &["go"],
+            Language::TypeScript => &["ts"],
+            Language::Tsx => &["tsx"],
+            Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
+            Language::Python => &["py"],
+            Language::Java => &["java"],
+            Language::Kotlin => &["kt", "kts"],
+            Language::Rust => &["rs"],
+        }
+    }
+
+    /// Maps a file extension (no leading `.`) to the `Language` that parses it.
+    pub(crate) fn from_extension(ext: &str) -> Option<Language> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|lang| lang.extensions().contains(&ext))
+    }
+
+    /// Convenience wrapper over [`Language::from_extension`] for a whole `Path`.
+    pub(crate) fn for_path(path: &Path) -> Option<Language> {
+        Self::from_extension(path.extension()?.to_str()?)
     }
 }
 
@@ -195,6 +257,53 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::path::PathBuf;
+
+    /// Regression guard for the class of bug this file's `Language::ALL`/`extensions`/
+    /// `from_extension` consolidation was written to close: a real backtest found
+    /// `arch_model.rs::language_for_path` (and, independently,
+    /// `arch_export.rs::has_supported_extension`) had silently missed `Rust` when it
+    /// was added as a `Language` variant. This test would have caught that miss
+    /// directly, and catches the same class for any future variant.
+    ///
+    /// The non-empty check on its own line, not folded into the loop below, is
+    /// load-bearing: an *empty* `extensions()` slice (exactly what the original bug
+    /// looked like once fixed the wrong way — clearing the list instead of restoring
+    /// it) makes the round-trip loop iterate zero times and report nothing wrong.
+    /// Confirmed by deliberately reintroducing that exact regression and re-running
+    /// this test — the round-trip loop alone passed silently; this line is what
+    /// caught it.
+    #[test]
+    fn from_extension_recognizes_every_language_variant() {
+        for lang in Language::ALL {
+            assert!(
+                !lang.extensions().is_empty(),
+                "{lang:?} claims no extensions at all"
+            );
+            for ext in lang.extensions() {
+                assert_eq!(
+                    Language::from_extension(ext),
+                    Some(*lang),
+                    "extension {ext:?} (declared by {lang:?}::extensions) did not round-trip \
+                     back through from_extension"
+                );
+            }
+        }
+    }
+
+    /// No two languages should claim the same extension — if they did, whichever
+    /// appears first in `Language::ALL` would silently shadow the other in
+    /// `from_extension`.
+    #[test]
+    fn no_two_languages_claim_the_same_extension() {
+        let mut seen = std::collections::HashMap::new();
+        for lang in Language::ALL {
+            for ext in lang.extensions() {
+                if let Some(prev) = seen.insert(*ext, *lang) {
+                    panic!("extension {ext:?} claimed by both {prev:?} and {lang:?}");
+                }
+            }
+        }
+    }
 
     struct StubChecker {
         name: String,

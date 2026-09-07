@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
+use crate::checker::Language;
 use crate::config::{Component, component_of};
 
 /// The shape of one enumerated declaration. `Enum` has no producer yet in Go/JS/TS
@@ -85,43 +86,51 @@ pub fn build(
 ) -> Result<DeclarationGraph> {
     let mut graph = DeclarationGraph::default();
 
-    let go_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "go")).collect();
+    let go_files: Vec<&PathBuf> = files_for(files, Language::Go);
     if !go_files.is_empty() {
         build_go_declarations(repo_root, &go_files, components, &mut graph)?;
     }
 
     let js_files: Vec<&PathBuf> = files
         .iter()
-        .filter(|f| crate::import_graph::is_js_like(f))
+        .filter(|f| crate::import_graph::is_js_like(Language::for_path(f)))
         .collect();
     if !js_files.is_empty() {
         build_js_ts_declarations(repo_root, &js_files, components, &mut graph)?;
     }
 
-    let java_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "java")).collect();
+    let java_files: Vec<&PathBuf> = files_for(files, Language::Java);
     if !java_files.is_empty() {
         build_java_declarations(repo_root, &java_files, components, &mut graph)?;
     }
 
-    let kotlin_files: Vec<&PathBuf> = files.iter().filter(|f| is_kotlin_like(f)).collect();
+    let kotlin_files: Vec<&PathBuf> = files_for(files, Language::Kotlin);
     if !kotlin_files.is_empty() {
         build_kotlin_declarations(repo_root, &kotlin_files, components, &mut graph)?;
     }
 
-    let python_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "py")).collect();
+    let python_files: Vec<&PathBuf> = files_for(files, Language::Python);
     if !python_files.is_empty() {
         build_python_declarations(repo_root, &python_files, components, &mut graph)?;
     }
 
+    // No Rust arm yet: this graph doesn't extract Rust declarations at all (a separate,
+    // not-yet-built feature — see `symbol_extract.rs` for the equivalent Rust support
+    // that *does* exist, for architecture-export/LSP purposes rather than
+    // content/naming-rule checking). Left out deliberately rather than silently, unlike
+    // the bug `Language::extensions`'s doc comment describes: this function is still
+    // `#[allow(dead_code)]`/test-only, so there's no live path for this gap to bite
+    // through yet.
     Ok(graph)
 }
 
-fn has_ext(path: &Path, ext: &str) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some(ext)
-}
-
-fn is_kotlin_like(path: &Path) -> bool {
-    has_ext(path, "kt") || has_ext(path, "kts")
+/// Every file in `files` whose extension `Language::for_path` maps to `lang` — see
+/// `import_graph.rs`'s identically-named, identically-purposed helper.
+fn files_for(files: &[PathBuf], lang: Language) -> Vec<&PathBuf> {
+    files
+        .iter()
+        .filter(|f| Language::for_path(f) == Some(lang))
+        .collect()
 }
 
 /// Resolves `file`'s repo-relative path to a component name via the same

@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+use crate::checker::Language;
+
 /// A directed edge from one package/module directory to another, plus the specific
 /// import statement (file + line) that produced it — kept so findings derived from the
 /// graph can still point at a concrete location, per the `{file}:{line}: {message}`
@@ -47,35 +49,35 @@ impl ImportGraph {
 pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
     let mut graph = ImportGraph::default();
 
-    let go_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "go")).collect();
+    let go_files: Vec<&PathBuf> = files_for(files, Language::Go);
     if !go_files.is_empty() {
         build_qualified_name_language(repo_root, &go_files, &mut graph, &go_lang_config())?;
     }
 
-    let js_files: Vec<&PathBuf> = files.iter().filter(|f| is_js_like(f)).collect();
+    let js_files: Vec<&PathBuf> = files
+        .iter()
+        .filter(|f| is_js_like(Language::for_path(f)))
+        .collect();
     if !js_files.is_empty() {
         build_js(&js_files, &mut graph)?;
     }
 
-    let java_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "java")).collect();
+    let java_files: Vec<&PathBuf> = files_for(files, Language::Java);
     if !java_files.is_empty() {
         build_qualified_name_language(repo_root, &java_files, &mut graph, &java_lang_config())?;
     }
 
-    let kotlin_files: Vec<&PathBuf> = files
-        .iter()
-        .filter(|f| has_ext(f, "kt") || has_ext(f, "kts"))
-        .collect();
+    let kotlin_files: Vec<&PathBuf> = files_for(files, Language::Kotlin);
     if !kotlin_files.is_empty() {
         build_qualified_name_language(repo_root, &kotlin_files, &mut graph, &kotlin_lang_config())?;
     }
 
-    let python_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "py")).collect();
+    let python_files: Vec<&PathBuf> = files_for(files, Language::Python);
     if !python_files.is_empty() {
         build_python(repo_root, &python_files, &mut graph)?;
     }
 
-    let rust_files: Vec<&PathBuf> = files.iter().filter(|f| has_ext(f, "rs")).collect();
+    let rust_files: Vec<&PathBuf> = files_for(files, Language::Rust);
     if !rust_files.is_empty() {
         build_rust(repo_root, &rust_files, &mut graph)?;
     }
@@ -83,14 +85,24 @@ pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
     Ok(graph)
 }
 
-fn has_ext(path: &Path, ext: &str) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some(ext)
+/// Every file in `files` whose extension `Language::for_path` maps to `lang` — the
+/// per-language file-filtering every builder below needs, all going through the one
+/// extension table instead of each maintaining its own `has_ext` check (see
+/// `Language::extensions`'s doc comment for why that used to be risky).
+fn files_for(files: &[PathBuf], lang: Language) -> Vec<&PathBuf> {
+    files
+        .iter()
+        .filter(|f| Language::for_path(f) == Some(lang))
+        .collect()
 }
 
-pub(crate) fn is_js_like(path: &Path) -> bool {
+/// TypeScript/TSX/JavaScript are one `build_js` call, unlike every other language here
+/// (each its own `Language` variant, but not its own import-graph builder — they share
+/// directory-based, not qualified-name-based, resolution).
+pub(crate) fn is_js_like(lang: Option<Language>) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs")
+        lang,
+        Some(Language::TypeScript | Language::Tsx | Language::JavaScript)
     )
 }
 

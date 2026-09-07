@@ -8,28 +8,17 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 use crate::arch_model::{ModelLevel, PruneConfig, build_model, collect_repo_files};
+use crate::checker::Language;
 use crate::config::find_config;
 
-/// File extensions `build_model` (via `symbol_extract.rs`'s `LangSymbolConfig` table)
-/// recognizes. Duplicated here (not imported) from `arch_model.rs`'s private
-/// `language_for_path` — this phase is scoped to leave `arch_model.rs` untouched — so this
-/// command can cheaply detect the "no supported languages" case up front, before doing any
-/// parsing.
+/// Whether `build_model` (via `symbol_extract.rs`'s `LangSymbolConfig` table)
+/// recognizes this file's extension — `Language::for_path` is the single source of
+/// truth (see its doc comment: a hand-rolled copy of this exact check once existed
+/// here independently and silently missed `Rust`, the same miss `arch_model.rs`'s own
+/// former copy made). Lets this command cheaply detect the "no supported languages"
+/// case up front, before doing any parsing.
 fn has_supported_extension(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("go")
-            | Some("ts")
-            | Some("tsx")
-            | Some("js")
-            | Some("jsx")
-            | Some("mjs")
-            | Some("cjs")
-            | Some("py")
-            | Some("java")
-            | Some("kt")
-            | Some("kts")
-    )
+    Language::for_path(path).is_some()
 }
 
 /// Runs `kibitzer architecture export`. Always exits `ExitCode::SUCCESS` on a successful

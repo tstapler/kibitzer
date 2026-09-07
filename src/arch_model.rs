@@ -123,23 +123,13 @@ pub fn looks_generated(source: &str) -> bool {
     })
 }
 
-/// Maps a file extension to the `Language` `build_model` should parse it with. Mirrors
-/// `import_graph.rs`'s `has_ext`/`is_js_like` extension dispatch (duplicated here rather
-/// than reused, since those helpers are private to that module and this feature's plan
-/// scopes `import_graph.rs` to read-only). Files with no recognized extension return
-/// `None` and are counted as `unsupported_language_files`, not silently dropped.
+/// Maps a file extension to the `Language` `build_model` should parse it with —
+/// `Language::for_path` is the single source of truth (see its doc comment for why: a
+/// hand-rolled copy of this exact match here once silently missed `Rust`). Files with
+/// no recognized extension return `None` and are counted as `unsupported_language_files`,
+/// not silently dropped.
 pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("go") => Some(Language::Go),
-        Some("ts") => Some(Language::TypeScript),
-        Some("tsx") => Some(Language::Tsx),
-        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Some(Language::JavaScript),
-        Some("py") => Some(Language::Python),
-        Some("java") => Some(Language::Java),
-        Some("kt") | Some("kts") => Some(Language::Kotlin),
-        Some("rs") => Some(Language::Rust),
-        _ => None,
-    }
+    Language::for_path(path)
 }
 
 /// The package/directory key a file groups under. `ImportGraph` is the single source of
