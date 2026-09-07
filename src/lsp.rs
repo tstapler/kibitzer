@@ -81,7 +81,15 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
 /// module-level caveat about `did_change`) and translate the results into diagnostics.
 fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
     let (config, repo_root) = find_effective_config(path)?;
-    let results = run_checks_for_trigger(&config.checks, LSP_TRIGGER, &repo_root, path, None)?;
+    let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
+    let results = run_checks_for_trigger(
+        &config.checks,
+        LSP_TRIGGER,
+        &repo_root,
+        path,
+        None,
+        &registry,
+    )?;
     Ok(results
         .iter()
         .flat_map(|r| diagnostics_from_result(r, path))
@@ -575,6 +583,7 @@ mod tests {
             message: None,
             command: "true".to_string(),
             findings: Vec::new(),
+            plugin_missing: false,
         }
     }
 

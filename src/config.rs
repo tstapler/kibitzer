@@ -626,9 +626,13 @@ fn merge_checks(defaults: Vec<Check>, local: &Config) -> Vec<Check> {
 /// Callers that specifically need to know whether a real config file exists (e.g. to
 /// report "no architecture model configured") should use `find_config` directly instead.
 pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
+    let defaults: Vec<Check> = default_checks()
+        .into_iter()
+        .chain(crate::plugin::registered_plugin_checks())
+        .collect();
     match find_config(start)? {
         Some((local, root)) => {
-            let checks = merge_checks(default_checks(), &local);
+            let checks = merge_checks(defaults, &local);
             Ok((
                 Config {
                     checks,
@@ -640,7 +644,7 @@ pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
         }
         None => Ok((
             Config {
-                checks: default_checks(),
+                checks: defaults,
                 architecture: ArchitectureConfig::default(),
                 disabled: Vec::new(),
             },
@@ -1001,6 +1005,15 @@ mod tests {
 
     #[test]
     fn find_effective_config_falls_back_to_defaults_with_no_inspect_json() {
+        // Asserts an exact count against `default_checks()` — serialized against every
+        // `XDG_DATA_HOME`-mutating test (this module and `plugin.rs`) via the shared
+        // `plugin::XDG_DATA_HOME_LOCK` so a concurrently-running plugin-registration test
+        // can never sneak an extra synthesized check into this count.
+        // `.unwrap_or_else(|e| e.into_inner())`, not `.unwrap()`: an unrelated test
+        // panicking while holding this lock must not poison it for every other test.
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("no-config");
         let (config, root) = find_effective_config(&dir).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -1017,6 +1030,10 @@ mod tests {
 
     #[test]
     fn find_effective_config_disable_removes_a_default_by_name() {
+        // See the lock comment on `find_effective_config_falls_back_to_defaults_with_no_inspect_json`.
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("disable");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
@@ -1039,6 +1056,10 @@ mod tests {
 
     #[test]
     fn find_effective_config_overrides_a_default_by_reusing_its_name() {
+        // See the lock comment on `find_effective_config_falls_back_to_defaults_with_no_inspect_json`.
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("override");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
@@ -1060,8 +1081,76 @@ mod tests {
         assert_eq!(config.checks.len(), default_checks().len());
     }
 
+    use crate::plugin::test_support::with_xdg_data_home;
+
+    fn sample_installed_plugin_for_effective_config_test() -> crate::plugin::InstalledPlugin {
+        crate::plugin::InstalledPlugin {
+            name: crate::plugin::PluginName::parse("kibitzer-stub-plugin").unwrap(),
+            version: "0.1.0".to_string(),
+            min_kibitzer_version: "0.1.0".to_string(),
+            sha256: "deadbeef".to_string(),
+            binary_path: PathBuf::from("/tmp/fixtures/kibitzer-stub-plugin"),
+            severity: Severity::Advisory,
+            scope: vec!["**/*".to_string()],
+            triggers: vec!["batch".to_string()],
+            output_format: OutputFormat::Sarif,
+        }
+    }
+
+    #[test]
+    fn find_effective_config_includes_registered_plugin_check_alongside_defaults() {
+        with_xdg_data_home("config-effective-with-plugin", |_xdg_dir| {
+            crate::plugin::Registry::save(
+                &crate::plugin::default_registry_path(),
+                &crate::plugin::Registry {
+                    plugins: vec![sample_installed_plugin_for_effective_config_test()],
+                },
+            )
+            .unwrap();
+
+            let dir = tmp_dir("plugin-effective-config-with-plugin");
+            let (config, _root) = find_effective_config(&dir).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+
+            assert!(
+                config
+                    .checks
+                    .iter()
+                    .any(|c| c.name == "kibitzer-stub-plugin")
+            );
+            for default in default_checks() {
+                assert!(
+                    config.checks.iter().any(|c| c.name == default.name),
+                    "missing default check {}",
+                    default.name
+                );
+            }
+            assert_eq!(config.checks.len(), default_checks().len() + 1);
+        });
+    }
+
+    #[test]
+    fn find_effective_config_matches_default_checks_exactly_when_no_plugins_registered() {
+        with_xdg_data_home("config-effective-no-plugins", |_xdg_dir| {
+            // No registry.json written — `default_registry_path()` points at an empty
+            // temp directory, so `Registry::load` returns its `Default` (no plugins).
+            let dir = tmp_dir("plugin-effective-config-no-plugins");
+            let (config, _root) = find_effective_config(&dir).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+
+            let names: Vec<&str> = config.checks.iter().map(|c| c.name.as_str()).collect();
+            let defaults = default_checks();
+            let default_names: Vec<&str> = defaults.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, default_names);
+        });
+    }
+
     #[test]
     fn find_effective_config_adds_a_check_not_in_the_defaults() {
+        // See the lock comment on `find_effective_config_falls_back_to_defaults_with_no_inspect_json`.
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("add");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(

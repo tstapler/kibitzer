@@ -152,17 +152,26 @@ fn handle_run_checks(
     // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
     if changed_lines.is_none()
         && let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.get(file_path, &config_path, trigger)
+        && let Some(cached) = guard.get(
+            file_path,
+            &config_path,
+            &crate::plugin::default_registry_path(),
+            trigger,
+        )
     {
         return Ok(cached);
     }
 
+    // Loaded once for this request's whole check loop, not once per check — see
+    // `run_checks_for_trigger`'s doc comment.
+    let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
         &repo_root,
         file_path,
         changed_lines,
+        &registry,
     )?;
 
     if let Ok(mut guard) = cache.lock() {
@@ -171,7 +180,13 @@ fn handle_run_checks(
         // to the cache would let a later unscoped (e.g. batch) request read back a partial
         // result as if it were a full-file one.
         if changed_lines.is_none() {
-            guard.put(file_path, &config_path, trigger, results.clone());
+            guard.put(
+                file_path,
+                &config_path,
+                &crate::plugin::default_registry_path(),
+                trigger,
+                results.clone(),
+            );
             let _ = guard.save(cache_path);
         }
     }
@@ -238,12 +253,14 @@ pub fn run_checks_smart(
     }
     let (config, repo_root) = find_effective_config(cwd)?;
     let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
+    let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
         &repo_root,
         file_path,
         changed_lines,
+        &registry,
     )?;
 
     let cache_path = default_cache_path();
@@ -252,7 +269,13 @@ pub fn run_checks_smart(
     // See handle_run_checks: don't let a diff-scoped partial result overwrite the
     // full-file cache entry.
     if changed_lines.is_none() {
-        cache.put(file_path, &config_path, trigger, results.clone());
+        cache.put(
+            file_path,
+            &config_path,
+            &crate::plugin::default_registry_path(),
+            trigger,
+            results.clone(),
+        );
         let _ = cache.save(&cache_path);
     }
 

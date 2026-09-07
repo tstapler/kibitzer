@@ -1,0 +1,24 @@
+[package]
+name = "kibitzer-stub-plugin"
+version = "0.1.13"
+edition = "2024"
+description = "Throwaway kibitzer plugin binary that proves the plugin install/register/run path end-to-end"
+repository = "https://github.com/tstapler/kibitzer"
+license = "MIT"
+
+[[bin]]
+name = "kibitzer-stub-plugin"
+path = "src/main.rs"
+
+[[bin]]
+name = "kibitzer-stub-plugin-second"
+path = "src/bin/second.rs"
+
+[dependencies]
+serde_json = "1"
+
+# Package-local override: replaces (not merges with) dist-workspace.toml's workspace-wide
+# installers = ["shell", "homebrew"], so this throwaway crate never gets a permanent public
+# Homebrew formula (ADR-001 Update, adversarial-review.md BLOCKER resolution).
+[package.metadata.dist]
+installers = ["shell"]

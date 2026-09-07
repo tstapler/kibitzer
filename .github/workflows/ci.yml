@@ -31,6 +31,14 @@ jobs:
       - name: build
         run: cargo build --workspace
       - name: test with coverage
-        run: cargo llvm-cov --workspace --json --output-path coverage.json
+        # cargo llvm-cov builds everything itself in a separate, instrumented target dir
+        # (target/llvm-cov-target) and, for a workspace member with no tests of its own
+        # (kibitzer-stub-plugin), only ever produces test-harness stand-ins for its [[bin]]
+        # targets there — never a normal-mode build tests/plugin_contract.rs could run and
+        # get real output from. Point it at this step's own plain `cargo build --workspace`
+        # above instead (see tests/plugin_contract.rs's sibling_workspace_binary).
+        run: |
+          KIBITZER_SIBLING_BIN_DIR="$(pwd)/target/debug" \
+            cargo llvm-cov --workspace --json --output-path coverage.json
       - name: coverage gate (changed lines only)
         run: covgate check coverage.json

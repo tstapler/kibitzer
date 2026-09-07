@@ -25,6 +25,7 @@ mod lsp;
 mod markdown_link_integrity;
 mod mcp;
 mod mermaid;
+mod plugin;
 mod primitive_obsession;
 mod rules;
 mod run;
@@ -91,6 +92,44 @@ enum Command {
     Architecture {
         #[command(subcommand)]
         action: ArchitectureAction,
+    },
+    /// Install, list, remove, or check the status of optional external checker plugins
+    /// (see `src/plugin.rs`).
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// Fetch, verify, and register a plugin from an HTTPS source or a local manifest path.
+    Install {
+        #[arg(value_parser = plugin::PluginName::parse)]
+        name: plugin::PluginName,
+        #[arg(long)]
+        source: String,
+        /// Re-run the fetch/verify/place/register pipeline even if this exact version is
+        /// already installed.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List every installed plugin.
+    List,
+    /// Delete a plugin's binary and registry entry.
+    Remove {
+        #[arg(value_parser = plugin::PluginName::parse)]
+        name: plugin::PluginName,
+        /// Proceed even if a local `.claude/inspect.json` check still references this
+        /// plugin by name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Report whether an installed plugin's binary is present and its checksum/version
+    /// are still valid. With no `<name>`, reports on every installed plugin.
+    Status {
+        #[arg(value_parser = plugin::PluginName::parse)]
+        name: Option<plugin::PluginName>,
     },
 }
 
@@ -318,7 +357,82 @@ fn main() -> Result<ExitCode> {
                 out,
             } => arch_diagram::run_diagram(path, scope, level, out),
         },
+        Command::Plugin { action } => match action {
+            PluginAction::Install {
+                name,
+                source,
+                force,
+            } => plugin::install_plugin(&name, &source, force),
+            PluginAction::List => {
+                let plugins = plugin::list_plugins()?;
+                print_plugin_list(&plugins);
+                Ok(ExitCode::SUCCESS)
+            }
+            PluginAction::Remove { name, force } => plugin::remove_plugin(&name, force),
+            PluginAction::Status { name } => match name {
+                Some(name) => {
+                    let report = plugin::plugin_status(&name)?;
+                    println!("{}", format_plugin_status_line(&report));
+                    Ok(ExitCode::SUCCESS)
+                }
+                None => {
+                    let plugins = plugin::list_plugins()?;
+                    if plugins.is_empty() {
+                        println!("[kibitzer] no plugins installed");
+                    } else {
+                        for installed in &plugins {
+                            let report = plugin::plugin_status(&installed.name)?;
+                            println!("{}", format_plugin_status_line(&report));
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            },
+        },
     }
+}
+
+/// `kibitzer plugin list`'s rendering (Task 3.3.1a): one line per plugin, or the exact
+/// literal `[kibitzer] no plugins installed` when the registry is empty (Story 3.1.1's AC).
+fn print_plugin_list(plugins: &[plugin::InstalledPlugin]) {
+    if plugins.is_empty() {
+        println!("[kibitzer] no plugins installed");
+        return;
+    }
+    for installed in plugins {
+        println!(
+            "{} v{} — {}",
+            installed.name,
+            installed.version,
+            installed.binary_path.display()
+        );
+    }
+}
+
+/// `kibitzer plugin status`'s per-plugin rendering (Task 3.3.1b): `ok` when the binary is
+/// present, its hash matches, and it's version-compatible; otherwise the specific failing
+/// dimension(s), always containing the literal substring `binary missing` when the file is
+/// gone.
+fn format_plugin_status_line(report: &plugin::PluginStatusReport) -> String {
+    let name = &report.installed.name;
+    let version = &report.installed.version;
+    if !report.binary_present {
+        return format!(
+            "{name} v{version}: binary missing (expected at {})",
+            report.installed.binary_path.display()
+        );
+    }
+    if report.hash_matches && report.version_compatible {
+        return format!("{name} v{version}: ok");
+    }
+    let mut issues = Vec::new();
+    if !report.hash_matches {
+        issues.push("hash mismatch");
+    }
+    if !report.version_compatible {
+        issues.push("incompatible with the currently running kibitzer version");
+    }
+    format!("{name} v{version}: {}", issues.join(", "))
 }
 
 /// `kibitzer check architecture <name> <dir>` (Story 1.2.2): runs one whole-repo
