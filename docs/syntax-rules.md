@@ -21,7 +21,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
 | Rust       | `syntax-rules-rust`            | `**/*.rs`                                 |
 
-The three rules and their thresholds are the same across languages
+The rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
 kinds each language's `lang_config()` entry checks against differ:
 
@@ -30,6 +30,7 @@ kinds each language's `lang_config()` entry checks against differ:
 | `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this. |
 | `deep-nesting`         | complexity | advisory          | > 4 levels             | Function/method body nests control-flow constructs deeper than this. An `else if` chain is treated as one flat branch, not added nesting, in every language. |
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
+| `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
 each grammar's real `to_sexp()` output:
@@ -113,6 +114,24 @@ each grammar's real `to_sexp()` output:
   method, a leading `self_parameter` (`&self`/`&mut self`/`self`) — excluded
   from the count the same way Go's implicit receiver never appears in its
   parameter list at all.
+
+`flag-argument`'s boolean-type detection per language, verified against real
+`to_sexp()` output (`bool_param_finder` in `src/rules.rs`): Go's plain `bool`
+`type_identifier`; TS's `predefined_type` `boolean` inside a parameter's
+`type_annotation` (plain JS parameters carry no `type` field at all, so the
+check is a no-op there — it never guesses a boolean from a name or usage);
+Python's `type` field on a `typed_parameter`/`typed_default_parameter` whose
+text is exactly `bool` (an unannotated parameter is skipped, same reasoning
+as JS); Java's primitive `boolean_type` or boxed `Boolean` `type_identifier`;
+Kotlin's `user_type` wrapping an `identifier` reading `Boolean` (Kotlin has
+no primitive-type keywords); Rust's by-value `primitive_type` reading `bool`
+(a `&bool` reference parameter is deliberately not unwrapped). Destructured/
+tuple/pattern parameters are skipped everywhere — only a plain named
+parameter is a candidate. The condition side of the check reuses each
+language's `if_kind` (so `else if`/`elif` conditions count too) plus, where
+the grammar exposes a ternary with a `condition` field, that node kind too
+(`ternary_expression` for TS/JS/Java; Python's `conditional_expression` and
+Kotlin/Go/Rust, which have no ternary, are `None`).
 
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.

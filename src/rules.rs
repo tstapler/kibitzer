@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -49,6 +50,12 @@ pub const CATALOG: &[RuleMeta] = &[
         description: "Function/method parameter list names more than 5 identifiers.",
         default_severity: Severity::Advisory,
     },
+    RuleMeta {
+        id: "flag-argument",
+        category: "design",
+        description: "Boolean parameter is branched on directly (if/ternary) in the function body — Fowler's Remove Flag Argument.",
+        default_severity: Severity::Advisory,
+    },
 ];
 
 /// Per-language node-kind table the AST walk consults instead of hardcoded literals.
@@ -90,6 +97,17 @@ pub(crate) struct LangRuleConfig {
     /// Locates a declaration's parameter-list node. Same field-vs-positional split as
     /// `body_finder`.
     pub(crate) params_finder: fn(Node) -> Option<Node>,
+    /// Names of this language's boolean-typed parameters in a parameter-list node, for
+    /// `flag-argument`. Returns only parameters whose type is unambiguously a plain
+    /// boolean (skipping untyped/destructured/pattern parameters) to keep the check
+    /// low-false-positive, per its issue's scope note.
+    bool_param_finder: fn(Node, &[u8]) -> Vec<String>,
+    /// The ternary-expression node kind that, like `if_kind`, exposes a `condition`
+    /// field — `None` where the grammar has no ternary (Go, Kotlin, Rust) or where its
+    /// ternary is positional rather than field-based (Python's `conditional_expression`,
+    /// deliberately not special-cased here — the `if`-branching case is this check's
+    /// primary target).
+    ternary_kind: Option<&'static str>,
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -166,6 +184,179 @@ fn rust_param_count(params: Node) -> usize {
         .count()
 }
 
+/// Go's `parameter_declaration` names its type once even when it groups several names
+/// (`func f(a, b bool)` is one node with two `name` fields) — each grouped name is
+/// still its own flag-argument candidate, so all of them are returned. Verified
+/// against real `to_sexp()` output: a bool param's type is `type_identifier` with text
+/// `"bool"` (not `qualified_type` or any wrapper).
+fn go_bool_params(params: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for decl in params.children(&mut cursor) {
+        if decl.kind() != "parameter_declaration" {
+            continue;
+        }
+        let Some(ty) = decl.child_by_field_name("type") else {
+            continue;
+        };
+        if ty.kind() != "type_identifier" || ty.utf8_text(src) != Ok("bool") {
+            continue;
+        }
+        let mut names = decl.walk();
+        for name in decl.children_by_field_name("name", &mut names) {
+            if let Ok(text) = name.utf8_text(src) {
+                out.push(text.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// TS wraps each parameter in `required_parameter`/`optional_parameter` with `pattern`/
+/// `type` fields (the `type` field is a `type_annotation` wrapping the real type node,
+/// e.g. `predefined_type` for `boolean`); JS's bare pattern nodes carry neither field,
+/// so `child_by_field_name("type")` naturally returns `None` there and the parameter is
+/// skipped — correct, since JS has no static types to check. Destructured/rest patterns
+/// (`pattern` isn't a plain `identifier`) are skipped too: not a nameable flag argument.
+fn ts_js_bool_params(params: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        let name_node = param.child_by_field_name("pattern").unwrap_or(param);
+        if name_node.kind() != "identifier" {
+            continue;
+        }
+        let Some(annotation) = param.child_by_field_name("type") else {
+            continue;
+        };
+        let mut acursor = annotation.walk();
+        let is_bool = annotation
+            .named_children(&mut acursor)
+            .any(|t| t.kind() == "predefined_type" && t.utf8_text(src) == Ok("boolean"));
+        if is_bool && let Ok(text) = name_node.utf8_text(src) {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
+/// Python's `typed_parameter`/`typed_default_parameter` wrap the annotation in a `type`
+/// field whose span is exactly the annotation text (`"bool"`, not `": bool"`) — verified
+/// against real `to_sexp()` output. The parameter's name is its only other `identifier`
+/// child (a default value, if any, is a different node kind, e.g. `true`/a literal).
+fn py_bool_params(params: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        if param.kind() != "typed_parameter" && param.kind() != "typed_default_parameter" {
+            continue;
+        }
+        let Some(ty) = param.child_by_field_name("type") else {
+            continue;
+        };
+        if ty.utf8_text(src) != Ok("bool") {
+            continue;
+        }
+        let ty_id = ty.id();
+        let mut names = param.walk();
+        if let Some(name) = param
+            .named_children(&mut names)
+            .find(|c| c.id() != ty_id && c.kind() == "identifier")
+            && let Ok(text) = name.utf8_text(src)
+        {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
+/// Java's `formal_parameter` has `type`/`name` fields; a primitive bool is the distinct
+/// `boolean_type` node kind, while the boxed `Boolean` is a plain `type_identifier` —
+/// both count, since either can be branched on the same way. Verified against real
+/// `to_sexp()` output for the primitive case.
+fn java_bool_params(params: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        if param.kind() != "formal_parameter" {
+            continue;
+        }
+        let Some(ty) = param.child_by_field_name("type") else {
+            continue;
+        };
+        let is_bool = ty.kind() == "boolean_type"
+            || (ty.kind() == "type_identifier" && ty.utf8_text(src) == Ok("Boolean"));
+        if is_bool
+            && let Some(name) = param.child_by_field_name("name")
+            && let Ok(text) = name.utf8_text(src)
+        {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
+/// Kotlin's `parameter` node exposes no field names (same positional shape as
+/// `kotlin_body`/`kotlin_params`): its identifier child is the name, and — since Kotlin
+/// has no primitive-type keywords — a plain `Boolean` type is a `user_type` node
+/// wrapping an `identifier` with that exact text. Verified against real `to_sexp()`
+/// output.
+fn kotlin_bool_params(params: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for param in params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "parameter")
+    {
+        let mut pcursor = param.walk();
+        let children: Vec<Node> = param.named_children(&mut pcursor).collect();
+        let Some(name_node) = children.iter().find(|c| c.kind() == "identifier") else {
+            continue;
+        };
+        let is_bool = children.iter().any(|c| {
+            c.kind() == "user_type"
+                && c.named_child(0)
+                    .is_some_and(|inner| inner.utf8_text(src) == Ok("Boolean"))
+        });
+        if is_bool && let Ok(text) = name_node.utf8_text(src) {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
+/// Rust's `parameter` has `pattern`/`type` fields; a plain-by-value `bool` is the
+/// distinct `primitive_type` node kind with text `"bool"` (a reference like `&bool` is
+/// wrapped in `reference_type` instead and deliberately not unwrapped here — a
+/// reference-to-bool parameter is rare enough, and different enough in call-site shape,
+/// that it's left for a future pass rather than guessed at now). Destructured patterns
+/// (tuple/struct) are skipped: not a nameable flag argument.
+fn rust_bool_params(params: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for param in params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "parameter")
+    {
+        let Some(pattern) = param.child_by_field_name("pattern") else {
+            continue;
+        };
+        if pattern.kind() != "identifier" {
+            continue;
+        }
+        let Some(ty) = param.child_by_field_name("type") else {
+            continue;
+        };
+        if ty.kind() != "primitive_type" || ty.utf8_text(src) != Ok("bool") {
+            continue;
+        }
+        if let Ok(text) = pattern.utf8_text(src) {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
 /// Kotlin's `function_declaration`/`anonymous_function` expose no field names at all
 /// (verified via an explicit `field_name_for_child` dump, not just `to_sexp()`, since
 /// the latter's omission of field names was initially ambiguous) — the body is instead
@@ -206,6 +397,8 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: go_param_identifier_count,
             body_finder: field_body,
             params_finder: field_params,
+            bool_param_finder: go_bool_params,
+            ternary_kind: None,
         },
         Language::TypeScript => LangRuleConfig {
             name: "syntax-rules-typescript",
@@ -232,6 +425,8 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: js_ts_param_count,
             body_finder: field_body,
             params_finder: field_params,
+            bool_param_finder: ts_js_bool_params,
+            ternary_kind: Some("ternary_expression"),
         },
         Language::Tsx => LangRuleConfig {
             name: "syntax-rules-tsx",
@@ -269,6 +464,8 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: py_param_count,
             body_finder: field_body,
             params_finder: field_params,
+            bool_param_finder: py_bool_params,
+            ternary_kind: None,
         },
         Language::Java => LangRuleConfig {
             name: "syntax-rules-java",
@@ -291,6 +488,8 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: js_ts_param_count,
             body_finder: field_body,
             params_finder: field_params,
+            bool_param_finder: java_bool_params,
+            ternary_kind: Some("ternary_expression"),
         },
         Language::Kotlin => LangRuleConfig {
             name: "syntax-rules-kotlin",
@@ -323,6 +522,8 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: kotlin_param_count,
             body_finder: kotlin_body,
             params_finder: kotlin_params,
+            bool_param_finder: kotlin_bool_params,
+            ternary_kind: None,
         },
         Language::Rust => LangRuleConfig {
             name: "syntax-rules-rust",
@@ -354,6 +555,8 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             param_counter: rust_param_count,
             body_finder: field_body,
             params_finder: field_params,
+            bool_param_finder: rust_bool_params,
+            ternary_kind: None,
         },
     }
 }
@@ -374,7 +577,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -391,22 +594,22 @@ impl Checker for SyntaxRulesChecker {
             .context("syntax-rules checker requires a parsed tree")?;
         let cfg = lang_config(self.lang);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, ctx.source.as_bytes(), &mut findings);
         Ok(findings)
     }
 }
 
-fn walk_declarations(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<Finding>) {
+fn walk_declarations(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
     if cfg.function_kinds.contains(&node.kind()) {
-        check_declaration(node, cfg, findings);
+        check_declaration(node, cfg, src, findings);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_declarations(child, cfg, findings);
+        walk_declarations(child, cfg, src, findings);
     }
 }
 
-fn check_declaration(decl: Node, cfg: &LangRuleConfig, findings: &mut Vec<Finding>) {
+fn check_declaration(decl: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
     let line = decl.start_position().row + 1;
 
     if let Some(body) = (cfg.body_finder)(decl) {
@@ -441,6 +644,60 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, findings: &mut Vec<Findin
                 ),
             });
         }
+
+        let bool_params = (cfg.bool_param_finder)(params, src);
+        if let Some(body) = (cfg.body_finder)(decl)
+            && !bool_params.is_empty()
+        {
+            let mut branched_on = HashSet::new();
+            collect_condition_identifiers(body, cfg, src, &mut branched_on);
+            for name in bool_params {
+                if branched_on.contains(&name) {
+                    findings.push(Finding {
+                        line,
+                        message: format!(
+                            "[flag-argument] boolean parameter `{name}` is branched on directly in the body — Fowler's Remove Flag Argument: split into two named functions or replace with a small enum"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Collects every identifier referenced in the `condition` of an `if`/ternary anywhere
+/// under `node` — not just a direct match, since the condition may be a compound
+/// expression (`!flag`, `flag && x`) and the issue's scope explicitly covers "the
+/// condition (or an operand of the condition)". Doesn't restrict to the passed-in
+/// parameter's own function scope (a nested closure/lambda could shadow the name) —
+/// deliberately: this check is a mechanical, low-false-positive heuristic, not a
+/// scope-resolving analysis, and a shadowed name would just be one more legitimate hit.
+fn collect_condition_identifiers(
+    node: Node,
+    cfg: &LangRuleConfig,
+    src: &[u8],
+    out: &mut HashSet<String>,
+) {
+    if (node.kind() == cfg.if_kind || cfg.ternary_kind == Some(node.kind()))
+        && let Some(condition) = node.child_by_field_name("condition")
+    {
+        collect_identifiers(condition, src, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_condition_identifiers(child, cfg, src, out);
+    }
+}
+
+fn collect_identifiers(node: Node, src: &[u8], out: &mut HashSet<String>) {
+    if node.kind() == "identifier"
+        && let Ok(text) = node.utf8_text(src)
+    {
+        out.insert(text.to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers(child, src, out);
     }
 }
 
@@ -541,7 +798,7 @@ mod tests {
 
         let cfg = lang_config(Language::Go);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
     }
 
@@ -768,6 +1025,55 @@ mod tests {
         assert!(CATALOG.iter().all(|r| !r.description.is_empty()));
     }
 
+    #[test]
+    fn flags_bool_param_branched_on_directly() {
+        let findings = check_source(
+            "package main\nfunc f(verbose bool) {\n\tif verbose {\n\t\tprintln(\"v\")\n\t}\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`verbose`"))
+        );
+    }
+
+    #[test]
+    fn grouped_bool_param_names_are_each_checked() {
+        let findings =
+            check_source("package main\nfunc f(a, ok bool) {\n\tif ok {\n\t\tprintln(a)\n\t}\n}\n")
+                .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`ok`"))
+        );
+    }
+
+    #[test]
+    fn does_not_flag_bool_param_never_branched_on() {
+        let findings =
+            check_source("package main\nfunc f(verbose bool) {\n\tprintln(verbose)\n}\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
+    #[test]
+    fn does_not_flag_non_bool_param_branched_on() {
+        let findings = check_source(
+            "package main\nfunc f(count int) {\n\tif count > 0 {\n\t\tprintln(count)\n\t}\n}\n",
+        )
+        .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
     fn check_ts_source(src: &str) -> Result<Vec<Finding>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -779,8 +1085,44 @@ mod tests {
 
         let cfg = lang_config(Language::TypeScript);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
+    }
+
+    #[test]
+    fn ts_flags_bool_param_branched_on_directly() {
+        let findings = check_ts_source(
+            "function f(verbose: boolean) {\n  if (verbose) {\n    console.log(\"v\");\n  }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`verbose`"))
+        );
+    }
+
+    #[test]
+    fn ts_flags_bool_param_branched_on_via_ternary() {
+        let findings =
+            check_ts_source("function f(verbose: boolean) {\n  return verbose ? 1 : 2;\n}\n")
+                .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
+    #[test]
+    fn ts_does_not_flag_bool_param_only_forwarded() {
+        let findings =
+            check_ts_source("function f(verbose: boolean) {\n  g(verbose);\n}\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
     }
 
     fn check_js_source(src: &str) -> Result<Vec<Finding>> {
@@ -794,7 +1136,7 @@ mod tests {
 
         let cfg = lang_config(Language::JavaScript);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
     }
 
@@ -967,6 +1309,21 @@ mod tests {
     }
 
     #[test]
+    fn js_untyped_param_is_never_flagged_as_flag_argument() {
+        // JS has no static types to check, so `verbose` can't be identified as boolean —
+        // this documents that gap rather than guessing from the name.
+        let findings = check_js_source(
+            "function f(verbose) {\n  if (verbose) {\n    console.log(\"v\");\n  }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
+    #[test]
     fn checker_names_are_distinct_per_language() {
         let names: Vec<&str> = [
             Language::Go,
@@ -997,7 +1354,7 @@ mod tests {
 
         let cfg = lang_config(Language::Python);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
     }
 
@@ -1116,6 +1473,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn py_flags_bool_param_branched_on_directly() {
+        let findings =
+            check_py_source("def f(verbose: bool):\n    if verbose:\n        print(\"v\")\n")
+                .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`verbose`"))
+        );
+    }
+
+    #[test]
+    fn py_does_not_flag_untyped_bool_looking_param() {
+        // No type annotation means the param's runtime type can't be verified — must
+        // not be guessed from usage alone.
+        let findings =
+            check_py_source("def f(verbose):\n    if verbose:\n        print(\"v\")\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
     fn check_java_source(src: &str) -> Result<Vec<Finding>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -1127,7 +1509,7 @@ mod tests {
 
         let cfg = lang_config(Language::Java);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
     }
 
@@ -1220,6 +1602,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn java_flags_bool_param_branched_on_directly() {
+        let findings = check_java_source(
+            "class C {\n    void f(boolean verbose) {\n        if (verbose) {\n            g();\n        }\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`verbose`"))
+        );
+    }
+
+    #[test]
+    fn java_flags_bool_param_branched_on_via_ternary() {
+        let findings = check_java_source(
+            "class C {\n    int f(boolean verbose) {\n        return verbose ? 1 : 2;\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
+    #[test]
+    fn java_does_not_flag_non_bool_param() {
+        let findings = check_java_source(
+            "class C {\n    void f(String name) {\n        if (name != null) {\n            g();\n        }\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
     fn check_kotlin_source(src: &str) -> Result<Vec<Finding>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -1231,7 +1652,7 @@ mod tests {
 
         let cfg = lang_config(Language::Kotlin);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
     }
 
@@ -1332,6 +1753,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kotlin_flags_bool_param_branched_on_directly() {
+        let findings = check_kotlin_source(
+            "fun f(verbose: Boolean) {\n    if (verbose) {\n        g()\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`verbose`"))
+        );
+    }
+
+    #[test]
+    fn kotlin_does_not_flag_non_bool_param() {
+        let findings = check_kotlin_source(
+            "fun f(name: String) {\n    if (name != \"\") {\n        g()\n    }\n}\n",
+        )
+        .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
     fn check_rust_source(src: &str) -> Result<Vec<Finding>> {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -1343,7 +1790,7 @@ mod tests {
 
         let cfg = lang_config(Language::Rust);
         let mut findings = Vec::new();
-        walk_declarations(tree.root_node(), &cfg, &mut findings);
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
         Ok(findings)
     }
 
@@ -1447,6 +1894,28 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[long-parameter-list]")),
             "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_flags_bool_param_branched_on_directly() {
+        let findings =
+            check_rust_source("fn f(verbose: bool) {\n    if verbose {\n        g();\n    }\n}\n")
+                .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]") && f.message.contains("`verbose`"))
+        );
+    }
+
+    #[test]
+    fn rust_does_not_flag_bool_param_only_forwarded() {
+        let findings = check_rust_source("fn f(verbose: bool) {\n    g(verbose);\n}\n").unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]"))
         );
     }
 }
