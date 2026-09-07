@@ -134,5 +134,17 @@ first.
   a block past the first repeat — since a lot of two-copy repetition is
   benign, defensible fixture/boilerplate, the checker now only flags once a
   block occurs 3+ times, reporting all occurrence lines in one finding.
+  `duplicate-code` only ever compares a file against itself, though — #28
+  (confirmed transcript occurrence: a fix landed at one call site while the
+  same precondition, duplicated at two other call sites in different files,
+  went unnoticed) called for a cross-file counterpart. Implemented as
+  `kibitzer check duplicates <dir>` (`find_cross_file_duplicates` in
+  `src/duplicate_code.rs`) — a dedicated batch/CLI subcommand rather than a
+  new `Checker`/`ArchitectureChecker` registration, since it needs neither a
+  single-file `PostToolUse` hook nor a `.claude/inspect.json` architecture
+  model, just a directory to scan. v1 scope is Go-only, matching
+  `primitive_obsession.rs`'s precedent; the diff-aware "does this edit
+  duplicate something elsewhere in the repo" mode the issue also proposes is
+  still open.
 
 None of these have a confirmed transcript occurrence backing them yet.
