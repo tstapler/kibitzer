@@ -187,6 +187,12 @@ enum CheckCommand {
     /// List natively implemented checkers available to reference from
     /// `.claude/inspect.json`'s `checker` field.
     List,
+    /// Cross-file (repo-wide) duplicate-code detection — see #28. `duplicate-code`
+    /// (the `Checker` registered under that name) only compares a file against
+    /// itself; this pools the same line-window hashing across every `.go` file under
+    /// `dir` instead, catching the same logic copy-pasted across call sites. v1 scope
+    /// is Go-only, matching `primitive_obsession.rs`'s precedent.
+    Duplicates { dir: PathBuf },
     /// Backtests a checker (or "all") against file edits reconstructed from Claude
     /// Code session transcripts, to validate it against real historical edits before
     /// shipping it. See docs/backtesting.md.
@@ -291,6 +297,7 @@ fn main() -> Result<ExitCode> {
                 }
             }
             CheckCommand::Architecture { name, dir } => run_architecture_cli(&name, &dir),
+            CheckCommand::Duplicates { dir } => run_duplicates_cli(&dir),
             CheckCommand::Backtest {
                 name,
                 transcripts_dir,
@@ -488,6 +495,52 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
+/// v1 scope is Go-only (see `CheckCommand::Duplicates`'s doc comment) — filters
+/// `walk_and_collect_files`' output to `.go` before reading, rather than reusing
+/// `duplicate_code::DuplicateCodeChecker::file_globs()`'s full multi-language list,
+/// which is single-file `duplicate-code`'s scope, not this command's.
+fn run_duplicates_cli(dir: &Path) -> Result<ExitCode> {
+    let all_files =
+        check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
+    let mut files = Vec::new();
+    for path in all_files {
+        if path.extension().and_then(|e| e.to_str()) != Some("go") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        files.push((path, source));
+    }
+
+    let duplicates = duplicate_code::find_cross_file_duplicates(&files);
+    if duplicates.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for dup in &duplicates {
+        let locations: Vec<String> = dup
+            .occurrences
+            .iter()
+            .map(|o| format!("{}:{}", o.file.display(), o.line))
+            .collect();
+        let file_count = dup
+            .occurrences
+            .iter()
+            .map(|o| &o.file)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let first = &dup.occurrences[0];
+        println!(
+            "{}:{}: block repeated {} times across {file_count} files (locations: {}) — consider extracting a shared function",
+            first.file.display(),
+            first.line,
+            dup.occurrences.len(),
+            locations.join(", ")
+        );
+    }
+    Ok(ExitCode::from(1))
+}
+
 #[cfg(test)]
 mod architecture_cli_tests {
     use super::*;
@@ -586,5 +639,50 @@ mod architecture_cli_tests {
 
         let exit = run_architecture_cli("naming-rules", &repo.dir).unwrap();
         assert_eq!(exit, ExitCode::from(1));
+    }
+
+    #[test]
+    fn cli_duplicates_flags_block_repeated_across_go_files() {
+        let repo = TempRepo::new("cross-file-dup");
+        let block = "func doWork(id string) error {\n\
+                      \tconn := openConnection(id)\n\
+                      \tdefer conn.Close()\n\
+                      \tresult := conn.Fetch(id)\n\
+                      \tlog.Printf(\"fetched %v\", result)\n\
+                      \treturn conn.Validate(result)\n";
+        repo.write("pkg1/a.go", &format!("package pkg1\n\n{block}"));
+        repo.write("pkg2/b.go", &format!("package pkg2\n\n{block}"));
+        repo.write("pkg3/c.go", &format!("package pkg3\n\n{block}"));
+
+        let exit = run_duplicates_cli(&repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
+    }
+
+    #[test]
+    fn cli_duplicates_ignores_non_go_files() {
+        let repo = TempRepo::new("cross-file-dup-non-go");
+        let block = "function doWork(id) {\n  const conn = openConnection(id);\n  const result = conn.fetch(id);\n  console.log(result);\n  conn.close();\n  return conn.validate(result);\n}\n";
+        repo.write("a.ts", block);
+        repo.write("b.ts", block);
+        repo.write("c.ts", block);
+
+        let exit = run_duplicates_cli(&repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn cli_duplicates_passes_on_clean_directory() {
+        let repo = TempRepo::new("cross-file-dup-clean");
+        repo.write(
+            "a.go",
+            "package main\n\nfunc a() {\n\tfmt.Println(\"a\")\n}\n",
+        );
+        repo.write(
+            "b.go",
+            "package main\n\nfunc b() {\n\tfmt.Println(\"b\")\n}\n",
+        );
+
+        let exit = run_duplicates_cli(&repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
     }
 }
