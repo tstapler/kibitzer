@@ -18,6 +18,17 @@ const COMMENT_TO_CODE_RATIO: f64 = 2.0;
 /// ...and only once the comment block clears this many lines — keeps a short doc
 /// comment over a trivial function from firing.
 const MIN_COMMENT_LINES_FOR_RATIO: usize = 4;
+/// `COMMENT_TO_CODE_RATIO` grows by this much per parameter beyond
+/// `PARAM_COUNT_RATIO_BASELINE` — a function with several parameters (especially
+/// primitive/boolean ones `primitive-obsession`/`long-parameter-list` already flag)
+/// legitimately needs more explanation regardless of body length, since the type
+/// system carries none of their semantics. Unlike the punctuation/word-boundary fixes
+/// nearby, this specific increment has no real-world example directly requiring it —
+/// see docs/comment-quality-false-positives.md for what backtest evidence does and
+/// doesn't support here; treat it as a starting hypothesis like `COMMENT_TO_CODE_RATIO`
+/// itself, not a derived constant.
+const PARAM_COUNT_RATIO_BONUS: f64 = 0.25;
+const PARAM_COUNT_RATIO_BASELINE: usize = 2;
 
 /// Marketing filler, hedge words, and invented-rationale phrases that add nothing a
 /// reader couldn't already see, plus the task/fix/caller-referencing anti-pattern
@@ -454,7 +465,24 @@ fn check_proportionality(
     if total_comment_lines < MIN_COMMENT_LINES_FOR_RATIO || body_code_lines == 0 {
         return;
     }
-    if (total_comment_lines as f64) < COMMENT_TO_CODE_RATIO * (body_code_lines as f64) {
+    if is_delegating_single_statement_body(body, src) {
+        // A real backtest (docs/comment-quality-false-positives.md) found every
+        // sampled false positive had exactly this shape: a body that's one
+        // statement delegating to something else (a call, a method chain, a
+        // struct/object construction) — Go's `return &LimitedWriter{w, n}`, Java's
+        // `return CompactionManager.instance.performSSTableRewrite(...)`, Rust's
+        // `self.node.first_child_ref().map(Into::into)`. The comment in every case
+        // documented behavior that lives in the callee/constructed type, or an
+        // invariant the signature can't express — never a restatement of the one
+        // line actually visible here, no matter how long the comment ran.
+        return;
+    }
+    let param_count = (cfg.params_finder)(decl)
+        .map(|params| (cfg.param_counter)(params))
+        .unwrap_or(0);
+    let effective_ratio = COMMENT_TO_CODE_RATIO
+        + PARAM_COUNT_RATIO_BONUS * param_count.saturating_sub(PARAM_COUNT_RATIO_BASELINE) as f64;
+    if (total_comment_lines as f64) < effective_ratio * (body_code_lines as f64) {
         return;
     }
     if has_safety_section(&leading_nodes, src) {
@@ -467,6 +495,66 @@ fn check_proportionality(
             "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
         ),
     });
+}
+
+/// Whether `body` (already known non-empty by the caller) contains exactly one
+/// statement, and that statement delegates elsewhere (a call, a method chain, or a
+/// struct/object construction) rather than being a self-contained computation over
+/// the function's own parameters (`a + b`, `x > 0`). AST-based (named-child count),
+/// not line-count-based — a line-count check would only catch a body crammed onto one
+/// source line (Go's `func F() { return G() }` style) and miss the far more common
+/// "brace on its own line" formatting, which is exactly the shape most of the real
+/// false positives this exists to fix are written in.
+fn is_delegating_single_statement_body(body: Node, src: &[u8]) -> bool {
+    let container = statement_container(body);
+    if container.named_child_count() != 1 {
+        return false;
+    }
+    let Some(stmt) = container.named_child(0) else {
+        return false;
+    };
+    let Ok(text) = stmt.utf8_text(src) else {
+        return false;
+    };
+    is_delegating_text(text)
+}
+
+/// Descends through pure single-child "statement container" wrapper nodes to the
+/// level that actually holds the function's statement(s) as named children — two
+/// grammars here wrap differently, both verified via `to_sexp()`: Go's `block` always
+/// wraps a `statement_list` one level down (verified for both a one- and a
+/// two-statement body: `(block (statement_list (expression_statement ...)
+/// (expression_statement ...)))`), and Kotlin's `function_body` (unlike every other
+/// grammar here) wraps a `block` one level down rather than being the statement
+/// container itself (see `rules.rs::kotlin_body`'s doc comment for the same
+/// positional-vs-field-based grammar quirk this mirrors). Every other grammar's body
+/// node already holds its statement(s) as direct named children, so this is a no-op
+/// for them.
+fn statement_container(mut node: Node) -> Node {
+    loop {
+        if node.named_child_count() != 1 {
+            return node;
+        }
+        let Some(child) = node.named_child(0) else {
+            return node;
+        };
+        if matches!(child.kind(), "statement_list" | "block") {
+            node = child;
+        } else {
+            return node;
+        }
+    }
+}
+
+/// A call (`foo(...)`, `a.b.c(...)`, a chained `a.b().c()`) or a struct/object
+/// construction (`Type{...}`, `&Type{...}`) both indicate delegation to something
+/// whose own behavior isn't visible in the text given — as opposed to a
+/// self-contained computation over the function's own parameters.
+fn is_delegating_text(text: &str) -> bool {
+    let text = text.trim();
+    let text = text.strip_prefix("return ").unwrap_or(text).trim();
+    let text = text.strip_prefix('&').unwrap_or(text);
+    text.contains('(') || (text.contains('{') && text.trim_end_matches(';').ends_with('}'))
 }
 
 /// `# Safety` is Rust's standard doc-comment heading for justifying an `unsafe fn`'s
@@ -796,6 +884,108 @@ mod tests {
         let findings = run(Language::Rust, src);
         assert!(
             !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    // --- Regression tests for the two 2026-09-06 backtest-informed enforcements:
+    // delegating-single-statement-body exemption, and parameter-count-scaled ratio ---
+
+    #[test]
+    fn delegating_body_with_struct_construction_is_exempt_from_over_commented() {
+        // Mirrors kubernetes/kubernetes's pkg/kubelet/util/ioutils/ioutils.go
+        // LimitWriter almost verbatim.
+        let src = "// LimitWriter is a copy of the standard library ioutils.LimitReader,\n// applied to the writer interface.\n// LimitWriter returns a Writer that writes to w\n// but stops with EOF after n bytes.\n// The underlying implementation is a *LimitedWriter.\nfunc LimitWriter(w Writer, n int64) Writer { return &LimitedWriter{w, n} }\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn delegating_body_with_qualified_multi_arg_call_is_exempt_from_over_commented() {
+        // Mirrors apache/cassandra's ColumnFamilyStore.sstablesRewrite: several
+        // opaque boolean/numeric parameters, a thorough per-parameter explanation,
+        // over a body that's one delegating call — spread across multiple lines
+        // (unlike the crammed-one-line test above) to prove the exemption is
+        // AST-based (named-child count), not line-count-based.
+        let src = "// Rewrite rewrites all SSTables according to specified parameters.\n//\n// skipIfCurrentVersion, if true, rewrites only SSTables older than current.\n// skipIfNewerThanTimestamp excludes SSTables created after this timestamp.\n// skipIfCompressionMatches, if true, rewrites only SSTables whose compression differs.\nfunc Rewrite(skipIfCurrentVersion bool, skipIfNewerThanTimestamp int64, skipIfCompressionMatches bool, jobs int) error {\n\treturn other.PerformRewrite(skipIfCurrentVersion, skipIfNewerThanTimestamp, skipIfCompressionMatches, jobs)\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn rust_delegating_method_chain_is_exempt_from_over_commented() {
+        // Mirrors servo/servo's ServoLayoutNode::dangerous_first_child: a method
+        // chain (not a bare call or brace construction) as the sole statement.
+        let src = "/// Get the first child of this node.\n///\n/// This node should never be exposed directly to the layout interface, as\n/// that may allow mutating a node that is being laid out on another thread.\npub(super) unsafe fn dangerous_first_child(&self) -> Option<Self> {\n    self.node.first_child_ref().map(Into::into)\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn multi_statement_body_is_not_exempt_even_when_the_last_statement_delegates() {
+        // Mirrors apache/cassandra's ColumnFamilyStore.addSSTable: a precondition
+        // check PLUS a delegating call is two statements, not one — the
+        // single-statement gate must not treat this as "just a delegation" the way
+        // it correctly does for a bare one-statement body.
+        // Body is 4 lines (open-brace-with-signature, two statements, close brace),
+        // so 8 comment lines are needed to clear the flat 2x ratio (8 >= 2.0*4).
+        let src = "// Add validates and adds the given item to the store.\n// This should be called after ensuring the item's checksum matches, since\n// items with mismatched checksums silently corrupt the on-disk index and\n// there is no way to detect this after the fact — the corruption surfaces\n// only much later, in an unrelated request against unrelated data, by\n// which point the original cause is impossible to trace back.\n// This line and the next exist only to reach the required comment count.\n// Final padding line.\nfunc Add(item Item) {\n\tvalidate(item)\n\tstore.Add(item)\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn higher_parameter_count_raises_the_over_commented_threshold() {
+        // 6 parameters, a single non-delegating statement (plain arithmetic — no
+        // call/construction shape, so the delegating-body exemption correctly
+        // doesn't apply here). At the flat 2x ratio this would fire, since 7
+        // comment lines over a 3-line body clears a 2x threshold of 6. Scaled for
+        // 6 params (2 plus a 0.25 bonus per param over the baseline of 2, giving
+        // 3x here) it must not, since 7 no longer clears a 3x threshold of 9.
+        // Body is 3 lines (open-brace-with-signature, one return, close brace); 7
+        // comment lines clear the flat 2x threshold of 6 but not the scaled 3x
+        // threshold of 9.
+        let src = "// f validates a, b, c, d, e, and g against their expected ranges before use,\n// since callers frequently pass swapped or stale values here and the\n// resulting corruption is silent until much later in an unrelated request.\n// This line and the next two exist only to reach the required comment count.\n// Padding line two.\n// Padding line three.\n// Padding line four.\nfunc f(a, b, c, d, e, g int) int {\n\treturn a + b + c + d + e + g\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn low_parameter_count_does_not_get_a_ratio_bonus() {
+        // Same shape as the test above but with only 2 parameters (at the
+        // baseline, so no bonus applies) and the same comment/body line counts —
+        // this must still fire at the plain 2.0x ratio.
+        let src = "// f validates a and b against their expected ranges before use,\n// since callers frequently pass swapped or stale values here and the\n// resulting corruption is silent until much later in an unrelated request.\n// This line and the next two exist only to reach the required comment count.\n// Padding line two.\n// Padding line three.\n// Padding line four.\nfunc f(a, b int) int {\n\treturn a + b + a + b + a + b\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
                 .iter()
                 .any(|f| f.message.contains("[over-commented]")),
             "findings: {findings:?}"

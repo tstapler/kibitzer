@@ -79,28 +79,43 @@ in the same session:
   read as restatement when it's the opposite. **Fixed** by exempting a leading comment
   block containing a `# Safety` heading from the ratio check entirely.
 
-## Open
-
-### `[over-commented]`'s ratio appears too aggressive on thin, well-documented wrapper methods
+### 2026-09-06 — `[over-commented]` too aggressive on thin, well-documented wrapper methods
 
 Both the Kubernetes and Cassandra backtest samples independently converged on the same
 pattern: a public function/method with a short, delegating body but a thorough
 doc comment explaining real contract details the signature doesn't expose (parameter
-semantics, caveats, when/why to call it) gets flagged as "restating the code," when
-the comment is actually carrying information the one-line body can't. Examples:
-`ColumnFamilyStore.java`'s `sstablesRewrite`/`addSSTable`
-(apache/cassandra, `src/java/org/apache/cassandra/db`), and — most starkly — the
-Kubernetes sample's `[over-commented]` hits had **zero clear true positives found at
-n=16** (`pkg/kubelet/util/ioutils/ioutils.go`, `pkg/kubelet/certificate/transport.go`,
-`pkg/kubelet/cm/cpumanager/cpu_assignment.go`, `pkg/kubelet/kubelet_node_status.go`,
-`pkg/kubelet/cadvisor/cadvisor_linux.go` — every one a well-documented public function
-over a short/delegating body).
+semantics, caveats, when/why to call it) got flagged as "restating the code," when
+the comment was actually carrying information the one-line body can't. Examples read
+directly from source (not just the summary counts): `ioutils.go`'s `LimitWriter`
+(`return &LimitedWriter{w, n}`, kubernetes/kubernetes), `ColumnFamilyStore.java`'s
+`sstablesRewrite` (`return CompactionManager.instance.performSSTableRewrite(...)`,
+apache/cassandra), and `servo_layout_node.rs`'s `dangerous_first_child`
+(`self.node.first_child_ref().map(Into::into)`, servo/servo) — every one a body that's
+a single statement delegating to something else, whose real behavior lives in the
+callee/constructed type or an invariant the signature can't express, not in the one
+line visible here. The Kubernetes sample's `[over-commented]` hits had zero clear true
+positives at n=16.
 
-This is a threshold/design question, not a mechanical bug — the ratio (`2.0x`, 4-line
-floor) was already flagged as unvalidated when it shipped (see this file's intro), and
-this backtest is the first real data point, pointing toward "too aggressive." Not
-changed in this pass; needs a decision on how much to loosen it (or whether to add a
-"public API with a short/delegating body" exemption instead of a blanket threshold
-change) before the next tuning pass.
+**Fixed** two ways, both evidence-driven from the examples above:
+- **Delegating-single-statement-body exemption** (`is_delegating_single_statement_body`):
+  a body that's exactly one statement (AST-based — named-child count, after unwrapping
+  Go's `block`/`statement_list` and Kotlin's `function_body`/`block` wrapper nesting,
+  not line-count-based, since a line-count check would only catch a body crammed onto
+  one source line and miss the far more common "brace on its own line" style every
+  real example above is written in) that itself looks like a delegation (a call, a
+  method chain, or a struct/object construction) is exempt from the ratio entirely,
+  regardless of comment length. A real precondition-plus-delegation body (Cassandra's
+  `addSSTable` — see the "stale comment" entry above) is *not* exempt: it's two
+  statements, not one, and correctly keeps failing the gate.
+- **Parameter-count-scaled ratio**: `COMMENT_TO_CODE_RATIO` grows by
+  `PARAM_COUNT_RATIO_BONUS` (0.25, itself unvalidated the same way the base ratio is —
+  no backtest example isolated this specific increment) per parameter beyond
+  `PARAM_COUNT_RATIO_BASELINE` (2), for a multi-statement body with several
+  parameters whose semantics the type system can't carry.
+
+Both regression-guarded in `comment_quality.rs`'s test module, built directly from the
+real examples above rather than only synthetic cases. A genuinely-restating synthetic
+case (`Add(a, b) { return a + b }` — a self-contained computation, correctly *not* a
+delegation) still fires unchanged.
 
 ## Log

@@ -82,14 +82,14 @@ pub(crate) struct LangRuleConfig {
     /// chains via a nested `if_expression` directly (already covered by `if_kind`).
     chain_kinds: &'static [&'static str],
     /// Counts the parameters in the node `params_finder` returns.
-    param_counter: fn(Node) -> usize,
+    pub(crate) param_counter: fn(Node) -> usize,
     /// Locates a declaration's body node. Field-based (`child_by_field_name("body")`)
     /// for every grammar so far except Kotlin, whose `function_declaration`/
     /// `anonymous_function` expose no field names at all — only positional children.
     pub(crate) body_finder: fn(Node) -> Option<Node>,
     /// Locates a declaration's parameter-list node. Same field-vs-positional split as
     /// `body_finder`.
-    params_finder: fn(Node) -> Option<Node>,
+    pub(crate) params_finder: fn(Node) -> Option<Node>,
 }
 
 fn field_body(decl: Node) -> Option<Node> {
