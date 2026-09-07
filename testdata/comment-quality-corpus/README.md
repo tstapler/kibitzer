@@ -9,7 +9,7 @@ evaluate against.
 
 ## Provenance
 
-210 comments pulled from three real open-source repos, each an isolated
+270 comments pulled from three real open-source repos, each an isolated
 excerpt (one comment + its enclosing function/method's identifier context —
 not the surrounding file), attributed via each entry's `repo`/`path` fields.
 This is the same practice most linters use to build test/eval fixtures from
@@ -24,7 +24,12 @@ real-world code.
 Every entry's `path` was confirmed by matching a distinctive line from the
 downloaded source against the upstream repo via `gh api search/code` (or, for
 the round-4 `servo2_*` files, against the exact paths used to fetch them in
-`research/fetch_rs.py`) — not guessed from the local filename alone.
+`research/fetch_rs.py`) — not guessed from the local filename alone. The
+round-5 rows (`round: 5`) were confirmed the same way in spirit but via a
+different mechanism: each file was fetched directly at the path returned by
+`gh api repos/<org>/<repo>/contents/<dir>` (the GitHub Contents API listing
+for that directory on the repo's default branch), so the path is the one the
+API itself reports exists — not a guess later verified by search.
 
 ## Format
 
@@ -39,7 +44,7 @@ JSON Lines, one object per example, sorted by `id`. Fields:
 | `comment` | Raw comment text, verbatim from source. |
 | `signature` | The function/method identifier context for the comment. |
 | `label` | `how` / `why` / `ambiguous`, from blind hand-labeling (see below). Copied verbatim from the source research data — never re-derived. |
-| `round` | Which research round produced the label: `3` or `4`. |
+| `round` | Which research round produced the label: `3`, `4`, or `5`. |
 | `_round3_embedding_similarity` | Present only on some round-3 rows: a leftover score from an abandoned embedding experiment. Historical only, not authoritative — do not use for anything beyond curiosity about that experiment. |
 
 Example row:
@@ -50,18 +55,24 @@ Example row:
 
 ## Current size and label balance
 
-210 examples total (60 from round 3, 150 from round 4), 70 per language.
+270 examples total (60 from round 3, 150 from round 4, 60 from round 5), 90 per
+language.
 
 | | how | why | ambiguous | total |
 |---|---|---|---|---|
-| go | 44 | 26 | 0 | 70 |
-| java | 30 | 39 | 1 | 70 |
-| rust | 18 | 52 | 0 | 70 |
-| **all** | **92** | **117** | **1** | **210** |
+| go | 50 | 40 | 0 | 90 |
+| java | 36 | 53 | 1 | 90 |
+| rust | 27 | 61 | 2 | 90 |
+| **all** | **113** | **154** | **3** | **270** |
+
+The round-5 fresh-60 batch (`round: 5`, 20 per language, gathered from files
+not previously sampled in the same three repos) was deliberately curated for
+more balance than rounds 3-4's rust sample: 9 `why` / 9 `how` / 2 `ambiguous`,
+versus the heavily `why`-skewed round 3/4 rust rows.
 
 ### Caveat: the rust ("servo") `why` subset is skewed toward spec-URL citations
 
-34 of the 52 rust `why` labels (about two-thirds) are comments that are
+41 of the 61 rust `why` labels (about two-thirds) are comments that are
 *nothing but* a bare spec-URL citation, e.g.:
 
 ```
@@ -88,7 +99,9 @@ those candidates into a sample file, and each sample was then hand-labeled
 classifier — to keep it valid as a test set. Reuse that same scan-then-curate
 approach to pull more candidates from these or additional repos, and keep the
 blind-labeling discipline: label first, run the classifier second, never the
-other way round.
+other way round. Round 5 followed this same discipline; its scratchpad
+(`build_fresh60.py`, `gen_corpus_fields.py`, `fresh60_labels.py`,
+`discourse_classifier_v3.py`) is not checked into this repo either.
 
 ## Known limitations
 
