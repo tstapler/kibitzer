@@ -35,24 +35,46 @@ const CURRENT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 /// (confirmed against cargo 1.98: a plain path `[dev-dependencies]` entry — what
 /// `Cargo.toml` has — links only the sibling's *library* crate, and `artifact = "bin"`
 /// itself fails to parse without `-Z bindeps`). So this resolves the binary at runtime
-/// instead, next to `kibitzer`'s own binary (same target dir, same profile) — relying on
-/// `cargo test`/`cargo llvm-cov`'s workspace-wide default build (no `default-members`
-/// override in `Cargo.toml`, and CI's `cargo llvm-cov --workspace`) to have already built
-/// every workspace member's binaries before any test runs.
+/// instead.
+///
+/// Under a plain `cargo build --workspace`/`cargo test --workspace`, Cargo places the
+/// sibling's binary directly at `<profile>/<name>`, next to `kibitzer`'s own — checked
+/// first, and what local dev relies on. But `cargo llvm-cov --workspace` (confirmed by
+/// reproducing CI's exact failure locally) never produces that plain copy for a package
+/// with no tests of its own: `kibitzer-stub-plugin`'s `[[bin]]` targets only ever get
+/// compiled as *test-harness* binaries (each printing "running 0 tests" instead of
+/// running `fn main`) under `cargo test`/`cargo llvm-cov`, with no normal-mode build
+/// anywhere to fall back to — there is no on-disk artifact this function could locate
+/// that would actually work. So the fallback is `KIBITZER_SIBLING_BIN_DIR`, an env var
+/// CI's coverage step sets to a directory from a plain, separate `cargo build --workspace`
+/// (see `.github/workflows/ci.yml`) — a real normal-mode build, entirely decoupled from
+/// however the test binary itself got built.
 fn sibling_workspace_binary(name: &str) -> PathBuf {
     let kibitzer_bin = PathBuf::from(env!("CARGO_BIN_EXE_kibitzer"));
-    let path = kibitzer_bin
+    let profile_dir = kibitzer_bin
         .parent()
-        .expect("CARGO_BIN_EXE_kibitzer has a parent dir")
-        .join(name);
-    assert!(
-        path.exists(),
-        "{} not found at {} — run `cargo build --workspace` first \
-         (a lone `cargo test -p kibitzer` won't build workspace siblings)",
-        name,
-        path.display()
-    );
-    path
+        .expect("CARGO_BIN_EXE_kibitzer has a parent dir");
+
+    let plain_path = profile_dir.join(name);
+    if plain_path.exists() {
+        return plain_path;
+    }
+
+    if let Ok(dir) = std::env::var("KIBITZER_SIBLING_BIN_DIR") {
+        let path = PathBuf::from(dir).join(name);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    panic!(
+        "{name} not found at {} and $KIBITZER_SIBLING_BIN_DIR is unset or doesn't have it \
+         either — run `cargo build --workspace` first (a lone `cargo test -p kibitzer` \
+         won't build workspace siblings), or set KIBITZER_SIBLING_BIN_DIR to that build's \
+         target/<profile> directory (needed under `cargo llvm-cov`, which never produces \
+         a normal-mode build of a tests-free sibling package — see this function's doc)",
+        plain_path.display(),
+    )
 }
 
 struct TempRepo {
