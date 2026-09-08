@@ -195,11 +195,11 @@ fn run_check_with_timeout(
         // A whole-repo architecture check (`CheckKind::WholeRepoNative`) only ever runs
         // against a real import graph via `run_architecture_check` — `run.rs::run_batch`
         // partitions `Check`s by `is_per_file()` before dispatching either checker for
-        // exactly this reason. A per-file caller (`run_checks_for_trigger`, used by the
-        // `run_checks` MCP tool, hooks, and the LSP) has no import graph to run one
-        // against, so treat it as trivially passing here rather than falling through to
-        // the `command`-only branch below, which would panic on `check.command` being
-        // unset (an architecture check has neither `command` nor `checker`).
+        // exactly this reason. A per-file caller of `run_checks_for_trigger` has no
+        // import graph to run one against, so treat it as trivially passing here rather
+        // than falling through to the `command`-only branch below, which would panic on
+        // `check.command` being unset (an architecture check has neither `command` nor
+        // `checker`).
         return Ok(CheckResult {
             check_name: check.name.clone(),
             severity: check.severity,
@@ -2349,8 +2349,7 @@ mod native_check_tests {
 
     // A `WholeRepoNative` (`architecture_checker`-set) `Check` has neither `checker`
     // nor `command`, so it must be short-circuited before the `command`-only branch's
-    // `.expect()` — reached by any per-file trigger caller (`run_checks_for_trigger`,
-    // used by the `run_checks` MCP tool, hooks, and the LSP) that doesn't pre-filter by
+    // `.expect()` — reached whenever a per-file trigger dispatch doesn't pre-filter by
     // `is_per_file()` the way `run.rs::run_batch` does.
     #[test]
     fn whole_repo_native_check_dispatched_per_file_passes_trivially_instead_of_panicking() {
