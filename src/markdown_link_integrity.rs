@@ -156,7 +156,11 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
                     // cross-reference — matching the prior doc_report.py-based
                     // checker, which never flagged these. It still counts as a "use"
                     // above so a definition backing only an image isn't flagged unused.
-                    if is_dangling && !is_image && !normalized.starts_with('^') {
+                    if is_dangling
+                        && !is_image
+                        && !normalized.starts_with('^')
+                        && !is_wiki_link_bracket(body, &range)
+                    {
                         findings.push(Finding {
                             line: line_for_offset(&line_starts, range.start),
                             message: format!("[{id}] used but never defined"),
@@ -259,6 +263,18 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     findings.sort_by_key(|f| f.line);
     findings.dedup();
     Ok(findings)
+}
+
+/// CommonMark treats nested brackets as balanced text, so a Logseq-style wiki-link
+/// `[[Page Name]]` parses as literal `[` + a shortcut reference link `[Page Name]` +
+/// literal `]` — never as a single token. That inner shortcut is always dangling (no
+/// `[Page Name]: url` definition exists), which would otherwise read as a broken
+/// markdown reference. Detecting the surrounding literal brackets in the source text
+/// is what tells the two apart.
+fn is_wiki_link_bracket(body: &str, range: &std::ops::Range<usize>) -> bool {
+    range.start > 0
+        && body.as_bytes().get(range.start - 1) == Some(&b'[')
+        && body.as_bytes().get(range.end) == Some(&b']')
 }
 
 /// CommonMark reference-label matching is case-insensitive and collapses internal
@@ -579,6 +595,12 @@ mod tests {
         let body = "This has an [unclosed bracket and no matching close.\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ignores_logseq_style_wiki_links() {
+        let body = "See [[Some Page]] for details.\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
     }
 
     #[test]
