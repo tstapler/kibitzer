@@ -24,9 +24,12 @@ pub fn run_install(global: bool, dry_run: bool) -> Result<ExitCode> {
     let mut settings = read_settings(&path)?;
     let command = hook_command()?;
 
-    if !merge_hook(&mut settings, &command)? {
+    let added_post_tool_use = merge_hook(&mut settings, &command)?;
+    let added_stop = merge_stop_hook(&mut settings, &command)?;
+
+    if !added_post_tool_use && !added_stop {
         println!(
-            "[kibitzer] already installed: a PostToolUse hook already runs `kibitzer hook` in {}",
+            "[kibitzer] already installed: PostToolUse and Stop hooks already run `kibitzer hook` in {}",
             path.display()
         );
         return Ok(ExitCode::SUCCESS);
@@ -43,10 +46,19 @@ pub fn run_install(global: bool, dry_run: bool) -> Result<ExitCode> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(&path, rendered).with_context(|| format!("writing {}", path.display()))?;
-    println!(
-        "[kibitzer] installed PostToolUse hook (matcher \"{MATCHER}\", command `{command}`) into {}",
-        path.display()
-    );
+    if added_post_tool_use {
+        println!(
+            "[kibitzer] installed PostToolUse hook (matcher \"{MATCHER}\", command `{command}`) into {}",
+            path.display()
+        );
+    }
+    if added_stop {
+        println!(
+            "[kibitzer] installed Stop hook (command `{command}`) into {} — re-checks every \
+             file touched this task, unscoped",
+            path.display()
+        );
+    }
     println!(
         "[kibitzer] a Claude Code session already watching that settings file picks this up \
          automatically; otherwise open /hooks once to reload, or restart."
@@ -150,6 +162,50 @@ fn merge_hook(settings: &mut Value, command: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Merges a `Stop` hook running `command` into `settings`. Unlike `PostToolUse`,
+/// `Stop` has no tool name to match on, so entries here omit `matcher` — but each
+/// array item is still a `{"hooks": [...]}` wrapper object, *not* a bare command
+/// object; a doc fetch initially suggested the latter, but real, independently
+/// working config on this machine (this same global settings.json's own
+/// `UserPromptSubmit` entry, and the `ponytail` plugin's `hooks.json`) confirms the
+/// wrapper shape is what Claude Code actually expects for a no-matcher event.
+/// Returns `Ok(false)` if a `Stop` hook already invokes `kibitzer hook`, matching
+/// `merge_hook`'s idempotency contract.
+fn merge_stop_hook(settings: &mut Value, command: &str) -> Result<bool> {
+    let root = settings
+        .as_object_mut()
+        .context("settings.json root must be a JSON object")?;
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("`hooks` must be a JSON object")?;
+    let stop = hooks
+        .entry("Stop")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("`hooks.Stop` must be a JSON array")?;
+
+    let already_installed = stop.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.contains("kibitzer hook"))
+                })
+            })
+    });
+    if already_installed {
+        return Ok(false);
+    }
+
+    stop.push(json!({"hooks": [{"type": "command", "command": command}]}));
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +296,70 @@ mod tests {
     fn rejects_a_non_object_root() {
         let mut settings = json!([1, 2, 3]);
         assert!(merge_hook(&mut settings, "/bin/kibitzer hook").is_err());
+    }
+
+    #[test]
+    fn merge_stop_hook_merges_into_empty_settings_with_no_matcher() {
+        let mut settings = json!({});
+        assert!(merge_stop_hook(&mut settings, "/bin/kibitzer hook").unwrap());
+        assert_eq!(
+            settings,
+            json!({
+                "hooks": {
+                    "Stop": [{"hooks": [{"type": "command", "command": "/bin/kibitzer hook"}]}]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn merge_stop_hook_preserves_unrelated_existing_settings() {
+        let mut settings = json!({
+            "model": "sonnet",
+            "hooks": {
+                "PostToolUse": [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "/bin/kibitzer hook"}]}]
+            }
+        });
+        assert!(merge_stop_hook(&mut settings, "/bin/kibitzer hook").unwrap());
+        assert_eq!(settings["model"], "sonnet");
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "/bin/kibitzer hook"
+        );
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/bin/kibitzer hook"
+        );
+    }
+
+    #[test]
+    fn merge_stop_hook_is_idempotent() {
+        let mut settings = json!({});
+        assert!(merge_stop_hook(&mut settings, "/bin/kibitzer hook").unwrap());
+        assert!(
+            !merge_stop_hook(&mut settings, "/bin/kibitzer hook").unwrap(),
+            "second install should be a no-op"
+        );
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_stop_hook_appends_alongside_an_existing_unrelated_stop_hook() {
+        let mut settings = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "some-other-stop-hook"}]}]
+            }
+        });
+        assert!(merge_stop_hook(&mut settings, "/bin/kibitzer hook").unwrap());
+        let entries = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["hooks"][0]["command"], "some-other-stop-hook");
+        assert_eq!(entries[1]["hooks"][0]["command"], "/bin/kibitzer hook");
+    }
+
+    #[test]
+    fn merge_stop_hook_rejects_a_non_object_root() {
+        let mut settings = json!([1, 2, 3]);
+        assert!(merge_stop_hook(&mut settings, "/bin/kibitzer hook").is_err());
     }
 }
