@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ pub fn registry() -> Vec<Box<dyn ArchitectureChecker>> {
         Box::new(LayeringChecker),
         Box::new(CouplingChecker),
         Box::new(ComponentDependencyChecker),
+        Box::new(PackageSizeChecker),
     ]
 }
 
@@ -192,6 +193,58 @@ impl ArchitectureChecker for CouplingChecker {
             }
         }));
         findings
+    }
+}
+
+/// Aggregate Go line count per package beyond which `package-size` suggests splitting it
+/// into sub-packages — set at roughly 4x [`crate::file_size`]'s single-file threshold,
+/// since a package this large is usually several oversized files, not just one.
+const MAX_PACKAGE_LINES: usize = 2000;
+
+pub struct PackageSizeChecker;
+
+impl ArchitectureChecker for PackageSizeChecker {
+    fn name(&self) -> &str {
+        "package-size"
+    }
+
+    /// Sums each Go package's line count across its files (from `graph.file_packages`,
+    /// filtered to `.go` — this check is Go-specific, unlike the other architecture
+    /// checkers here) and flags any package whose total exceeds [`MAX_PACKAGE_LINES`].
+    /// Unlike those other checkers, this one reads file contents directly: `ImportGraph`
+    /// deliberately doesn't carry line counts (kept lean, per its own doc comment), so
+    /// there's no other source for this data. Generated files (per
+    /// [`crate::file_size::is_generated`]) are excluded from the sum for the same
+    /// reason `go-file-size` skips them outright — machine output isn't a candidate for
+    /// a human to split.
+    fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+        let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+        for (file, pkg) in &graph.file_packages {
+            if file.extension().and_then(|e| e.to_str()) != Some("go") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            if crate::file_size::is_generated(&source) {
+                continue;
+            }
+            *totals.entry(pkg.as_str()).or_default() += source.lines().count();
+        }
+
+        totals
+            .into_iter()
+            .filter(|(_, lines)| *lines > MAX_PACKAGE_LINES)
+            .map(|(pkg, lines)| ArchFinding {
+                file: None,
+                line: None,
+                message: format!(
+                    "[package-size] {pkg} totals {lines} lines across its files (over \
+                     {MAX_PACKAGE_LINES}) — consider splitting it into sub-packages"
+                ),
+                severity_override: None,
+            })
+            .collect()
     }
 }
 
@@ -990,6 +1043,127 @@ mod tests {
         assert_eq!(
             zero_match_advisory(&declared, |_| false, |s| s.to_string(), "things"),
             None
+        );
+    }
+
+    #[test]
+    fn lookup_finds_package_size_checker() {
+        assert!(lookup("package-size").is_some());
+    }
+
+    /// Unique per-test scratch dir: `PackageSizeChecker` reads real files off disk, so
+    /// (unlike this module's other checkers, which only ever construct an `ImportGraph`
+    /// by hand) its tests need actual files to point `graph.file_packages` at.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "kibitzer-package-size-test-{}-{name}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, rel_path: &str, lines: usize) -> PathBuf {
+            let file = self.path.join(rel_path);
+            std::fs::write(&file, "x\n".repeat(lines)).unwrap();
+            file
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn package_size_flags_a_package_over_the_threshold() {
+        let dir = TempDir::new("over");
+        let file = dir.write("a.go", MAX_PACKAGE_LINES + 1);
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file, "pkg".to_string());
+
+        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default());
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("pkg"));
+        assert!(findings[0].message.contains("consider splitting"));
+    }
+
+    #[test]
+    fn package_size_sums_multiple_files_in_the_same_package() {
+        let dir = TempDir::new("sum");
+        let file_a = dir.write("a.go", MAX_PACKAGE_LINES / 2 + 1);
+        let file_b = dir.write("b.go", MAX_PACKAGE_LINES / 2 + 1);
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file_a, "pkg".to_string());
+        graph.file_packages.insert(file_b, "pkg".to_string());
+
+        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default());
+
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn package_size_ignores_non_go_files() {
+        let dir = TempDir::new("non-go");
+        let file = dir.write("a.ts", MAX_PACKAGE_LINES + 1);
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file, "pkg".to_string());
+
+        assert!(
+            PackageSizeChecker
+                .check(&graph, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn package_size_excludes_generated_files_from_the_sum() {
+        let dir = TempDir::new("generated");
+        let mut content = "// Code generated by protoc-gen-go. DO NOT EDIT.\n".to_string();
+        content.push_str(&"x\n".repeat(MAX_PACKAGE_LINES + 1));
+        let file = dir.path.join("a.go");
+        std::fs::write(&file, &content).unwrap();
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file, "pkg".to_string());
+
+        assert!(
+            PackageSizeChecker
+                .check(&graph, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn package_size_below_threshold_has_no_findings() {
+        let dir = TempDir::new("under");
+        let file = dir.write("a.go", MAX_PACKAGE_LINES);
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file, "pkg".to_string());
+
+        assert!(
+            PackageSizeChecker
+                .check(&graph, &ArchitectureConfig::default())
+                .is_empty()
         );
     }
 }

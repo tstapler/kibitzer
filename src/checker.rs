@@ -7,6 +7,7 @@ use tree_sitter::Tree;
 
 use crate::comment_quality::CommentQualityChecker;
 use crate::duplicate_code::DuplicateCodeChecker;
+use crate::file_size::FileSizeChecker;
 use crate::go_blank_imports::BlankImportsChecker;
 use crate::go_error_context::ErrorContextChecker;
 use crate::go_ignored_error::IgnoredErrorChecker;
@@ -151,6 +152,14 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(BlankImportsChecker),
         Box::new(IgnoredErrorChecker),
         Box::new(ErrorContextChecker),
+        Box::new(FileSizeChecker::new(Language::Go)),
+        Box::new(FileSizeChecker::new(Language::TypeScript)),
+        Box::new(FileSizeChecker::new(Language::Tsx)),
+        Box::new(FileSizeChecker::new(Language::JavaScript)),
+        Box::new(FileSizeChecker::new(Language::Python)),
+        Box::new(FileSizeChecker::new(Language::Java)),
+        Box::new(FileSizeChecker::new(Language::Kotlin)),
+        Box::new(FileSizeChecker::new(Language::Rust)),
         Box::new(SyntaxRulesChecker::new(Language::Go)),
         Box::new(SyntaxRulesChecker::new(Language::TypeScript)),
         Box::new(SyntaxRulesChecker::new(Language::Tsx)),
@@ -417,5 +426,27 @@ mod tests {
     fn registry_contains_duplicate_code_by_name() {
         let checker = lookup("duplicate-code").expect("registered");
         assert_eq!(checker.name(), "duplicate-code");
+    }
+
+    #[test]
+    fn registry_contains_go_file_size_by_name() {
+        let checker = lookup("go-file-size").expect("registered");
+        assert_eq!(checker.name(), "go-file-size");
+    }
+
+    #[test]
+    fn registry_contains_a_file_size_checker_per_language() {
+        for name in [
+            "go-file-size",
+            "typescript-file-size",
+            "tsx-file-size",
+            "javascript-file-size",
+            "python-file-size",
+            "java-file-size",
+            "kotlin-file-size",
+            "rust-file-size",
+        ] {
+            assert!(lookup(name).is_some(), "{name} should be registered");
+        }
     }
 }

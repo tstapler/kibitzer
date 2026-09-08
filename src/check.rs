@@ -191,6 +191,27 @@ fn run_check_with_timeout(
         return run_native_check(check, checker_name, repo_root, file_path, changed_lines);
     }
 
+    if check.architecture_checker.is_some() {
+        // A whole-repo architecture check (`CheckKind::WholeRepoNative`) only ever runs
+        // against a real import graph via `run_architecture_check` — `run.rs::run_batch`
+        // partitions `Check`s by `is_per_file()` before dispatching either checker for
+        // exactly this reason. A per-file caller (`run_checks_for_trigger`, used by the
+        // `run_checks` MCP tool, hooks, and the LSP) has no import graph to run one
+        // against, so treat it as trivially passing here rather than falling through to
+        // the `command`-only branch below, which would panic on `check.command` being
+        // unset (an architecture check has neither `command` nor `checker`).
+        return Ok(CheckResult {
+            check_name: check.name.clone(),
+            severity: check.severity,
+            passed: true,
+            output: String::new(),
+            message: None,
+            command: String::new(),
+            findings: Vec::new(),
+            plugin_missing: false,
+        });
+    }
+
     // Task 4.3.1b: a plugin-backed check (always `command`-based, never `checker`) whose
     // binary has gone missing (removed out-of-band, or the whole plugin uninstalled)
     // short-circuits here, before a `sh -c` is ever spawned against a path that doesn't
@@ -493,10 +514,25 @@ fn run_checker_against_source(
     Ok((combined, passed))
 }
 
+/// Native per-file checks skip any file at or above this size rather than parsing it.
+/// Now that [`crate::config::default_checks`] turns every native checker on for every
+/// repo with no `.claude/inspect.json` of its own, this is what keeps that on-by-default
+/// behavior cheap: vendored bundles, generated code, and minified assets can be
+/// megabytes, and every native checker pays a full read plus (for most of them) a
+/// tree-sitter parse. `PostToolUse` runs this path on every single edit, so a file this
+/// large — which a "long file"/"long function" checker has nothing useful to say about
+/// anyway — is worth skipping outright rather than paying that cost every time.
+const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+
 fn run_checker_against_file(
     checker_name: &str,
     file_path: &Path,
 ) -> anyhow::Result<(String, bool)> {
+    if let Ok(metadata) = std::fs::metadata(file_path)
+        && metadata.len() > MAX_NATIVE_CHECK_BYTES
+    {
+        return Ok((String::new(), true));
+    }
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("reading {}", file_path.display()))?;
     run_checker_against_source(checker_name, file_path, &source)
@@ -2284,6 +2320,61 @@ mod native_check_tests {
             message: Some("blank import".to_string()),
             output_format: None,
         }
+    }
+
+    #[test]
+    fn oversized_file_is_skipped_rather_than_parsed() {
+        let dir = tmp_dir("oversized");
+        let file = dir.join("huge.go");
+        let mut content = String::from("package main\n\nimport (\n\t_ \"unjustified/pkg\"\n)\n");
+        content.push_str(&"// padding\n".repeat(300_000)); // ~3.3MB, over MAX_NATIVE_CHECK_BYTES
+        std::fs::write(&file, &content).unwrap();
+
+        let result = run_check(
+            &blank_imports_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+        )
+        .unwrap();
+        assert!(
+            result.passed,
+            "oversized file should be skipped rather than flagged"
+        );
+        assert!(result.output.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A `WholeRepoNative` (`architecture_checker`-set) `Check` has neither `checker`
+    // nor `command`, so it must be short-circuited before the `command`-only branch's
+    // `.expect()` — reached by any per-file trigger caller (`run_checks_for_trigger`,
+    // used by the `run_checks` MCP tool, hooks, and the LSP) that doesn't pre-filter by
+    // `is_per_file()` the way `run.rs::run_batch` does.
+    #[test]
+    fn whole_repo_native_check_dispatched_per_file_passes_trivially_instead_of_panicking() {
+        let dir = tmp_dir("whole-repo-native-per-file");
+        let file = dir.join("some-file.go");
+        std::fs::write(&file, "package main\n").unwrap();
+
+        let check = Check {
+            name: "package-size".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("package-size".to_string()),
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: None,
+            output_format: None,
+        };
+
+        let result = run_check(&check, &dir, &file, None, &Registry::default()).unwrap();
+        assert!(result.passed);
+        assert!(result.output.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Proves criterion 6 concretely for a new native checker (not just

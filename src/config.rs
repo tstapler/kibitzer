@@ -507,8 +507,12 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     }
 }
 
-/// One `checker`-based `Check` running on `PostToolUse`+`batch`, the shape every entry
-/// in `default_checks()` shares.
+/// One `checker`-based `Check` running on `PostToolUse`+`batch`+[`crate::task_stop::TRIGGER`],
+/// the shape every per-file entry in `default_checks()` shares. The `Stop`-trigger opt-in
+/// closes a gap `PostToolUse`'s diff-scoping leaves open: a per-edit check only sees the
+/// lines one specific edit touched, so a finding whose location doesn't overlap that edit
+/// (e.g. a file-size threshold crossed by an earlier edit in the same file/task) can be
+/// silently dropped. Re-running unscoped once per task via `Stop` closes that gap.
 fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
     Check {
         name: name.to_string(),
@@ -517,7 +521,29 @@ fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
         architecture_checker: None,
         severity,
         scope: scope.iter().map(|s| s.to_string()).collect(),
-        triggers: vec!["PostToolUse".to_string(), "batch".to_string()],
+        triggers: vec![
+            "PostToolUse".to_string(),
+            "batch".to_string(),
+            crate::task_stop::TRIGGER.to_string(),
+        ],
+        message: None,
+        output_format: None,
+    }
+}
+
+/// One `architecture_checker`-based `Check` running batch-only, for a whole-repo default
+/// that needs no project-specific setup — `architecture_checker` checks can't run under
+/// any other trigger (see `validate` below), so they're inherently cheap regardless of
+/// edit frequency.
+fn whole_repo_check(name: &str, architecture_checker: &str) -> Check {
+    Check {
+        name: name.to_string(),
+        command: None,
+        checker: None,
+        architecture_checker: Some(architecture_checker.to_string()),
+        severity: Severity::Advisory,
+        scope: vec![],
+        triggers: vec!["batch".to_string()],
         message: None,
         output_format: None,
     }
@@ -556,6 +582,23 @@ pub fn default_checks() -> Vec<Check> {
         native_check("go-blank-imports", Severity::Advisory, &["**/*.go"]),
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
+        native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
+        whole_repo_check("go-package-size", "package-size"),
+        native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
+        native_check("tsx-file-size", Severity::Advisory, &["**/*.tsx"]),
+        native_check(
+            "javascript-file-size",
+            Severity::Advisory,
+            &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        ),
+        native_check("python-file-size", Severity::Advisory, &["**/*.py"]),
+        native_check("java-file-size", Severity::Advisory, &["**/*.java"]),
+        native_check(
+            "kotlin-file-size",
+            Severity::Advisory,
+            &["**/*.kt", "**/*.kts"],
+        ),
+        native_check("rust-file-size", Severity::Advisory, &["**/*.rs"]),
         Check {
             checker: Some("syntax-rules".to_string()),
             ..native_check("syntax-rules-go", Severity::Advisory, &["**/*.go"])

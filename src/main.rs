@@ -13,6 +13,7 @@ mod declaration_checks;
 mod declarations;
 mod dedup;
 mod duplicate_code;
+mod file_size;
 mod glob;
 mod go_blank_imports;
 mod go_error_context;
@@ -31,6 +32,7 @@ mod rules;
 mod run;
 mod status;
 mod symbol_extract;
+mod task_stop;
 #[cfg(test)]
 mod test_support;
 
