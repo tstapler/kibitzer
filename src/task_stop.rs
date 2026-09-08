@@ -62,7 +62,9 @@ impl StopOffsets {
 
 fn default_offsets_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("kibitzer").join("stop-offsets.json");
+        return PathBuf::from(dir)
+            .join("kibitzer")
+            .join("stop-offsets.json");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
@@ -118,7 +120,10 @@ fn touched_files(lines: &[String]) -> BTreeSet<PathBuf> {
             if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                 continue;
             }
-            let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if !matches!(name, "Edit" | "Write" | "MultiEdit") {
                 continue;
             }
@@ -160,7 +165,12 @@ fn run_stop_hook_with_offsets_path(
 
     let mut offsets = StopOffsets::load(offsets_path);
     let key = transcript_path.to_string_lossy().into_owned();
-    let from_offset = offsets.entries.get(&key).copied().unwrap_or(0).min(metadata.len());
+    let from_offset = offsets
+        .entries
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
+        .min(metadata.len());
 
     let Some((lines, new_offset)) = new_lines_since(transcript_path, from_offset) else {
         return Ok(ExitCode::SUCCESS);
@@ -235,7 +245,10 @@ mod tests {
     fn tmp_path(name: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kibitzer-task-stop-test-{}-{name}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "kibitzer-task-stop-test-{}-{name}-{n}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -296,13 +309,19 @@ mod tests {
 
     #[test]
     fn touched_files_dedupes_the_same_file_edited_twice() {
-        let lines = vec![tool_use_line("Edit", "/repo/a.go"), tool_use_line("Edit", "/repo/a.go")];
+        let lines = vec![
+            tool_use_line("Edit", "/repo/a.go"),
+            tool_use_line("Edit", "/repo/a.go"),
+        ];
         assert_eq!(touched_files(&lines).len(), 1);
     }
 
     #[test]
     fn touched_files_ignores_unparseable_lines() {
-        let lines = vec!["not json at all".to_string(), tool_use_line("Edit", "/repo/a.go")];
+        let lines = vec![
+            "not json at all".to_string(),
+            tool_use_line("Edit", "/repo/a.go"),
+        ];
         assert_eq!(touched_files(&lines).len(), 1);
     }
 
