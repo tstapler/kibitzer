@@ -224,6 +224,12 @@ fn ignores_logseq_style_wiki_links() {
 }
 
 #[test]
+fn ignores_piped_wiki_links() {
+    let body = "See [[Industrial Waste|the waste feature]] for details.\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
 fn ignores_github_task_list_markers() {
     let body = "- [ ] todo item\n- [x] done item\n";
     assert!(check_source(&path(), body).unwrap().is_empty());

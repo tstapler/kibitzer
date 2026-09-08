@@ -84,11 +84,16 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     // link syntax instead — `[x]` parses as a dangling shortcut-reference link (`[ ]`,
     // being whitespace-only, isn't a valid CommonMark link label and stays literal text,
     // so only the checked-box form was actually affected).
-    let parser =
-        Parser::new_with_broken_link_callback(body, Options::ENABLE_TASKLISTS, Some(callback));
+    // ENABLE_WIKILINKS: without it, an Obsidian/Logseq wikilink (`[[Page]]`, or piped
+    // `[[Page|Text]]`) parses as literal `[` + a nested dangling shortcut-reference link
+    // + literal `]`, misreported the same way task-list checkboxes were. With this
+    // option, `[[...]]` is its own `LinkType::WikiLink` event — never reference-style —
+    // so it never reaches that matching logic at all.
+    let opts = Options::ENABLE_TASKLISTS | Options::ENABLE_WIKILINKS;
+    let parser = Parser::new_with_broken_link_callback(body, opts, Some(callback));
 
     let ref_defs = build_ref_defs(&parser, &line_starts);
-    let parsed = collect_parsed_links(parser, body, &line_starts);
+    let parsed = collect_parsed_links(parser, &line_starts);
     let local_anchors = heading_slugs(&parsed.headings);
 
     let mut findings = parsed.findings;
@@ -142,7 +147,6 @@ struct ParsedLinks {
 /// doesn't stack on top of this event-dispatch loop's).
 fn collect_parsed_links<'a, F: BrokenLinkCallback<'a>>(
     parser: Parser<'a, F>,
-    body: &str,
     line_starts: &[usize],
 ) -> ParsedLinks {
     let mut parsed = ParsedLinks {
@@ -167,7 +171,7 @@ fn collect_parsed_links<'a, F: BrokenLinkCallback<'a>>(
                 }
             }
             Event::Start(tag @ Tag::Link { .. }) | Event::Start(tag @ Tag::Image { .. }) => {
-                record_link_or_image(&mut parsed, body, line_starts, tag, range);
+                record_link_or_image(&mut parsed, line_starts, tag, range);
             }
             _ => {}
         }
@@ -222,7 +226,6 @@ fn reference_style_flags(link_type: LinkType) -> (bool, bool) {
 /// records an inline anchor link's target slug for [`dead_anchor_findings`] to check.
 fn record_link_or_image(
     parsed: &mut ParsedLinks,
-    body: &str,
     line_starts: &[usize],
     tag: Tag,
     range: std::ops::Range<usize>,
@@ -237,11 +240,7 @@ fn record_link_or_image(
         // unrelated failure mode from a broken doc cross-reference — matching the prior
         // doc_report.py-based checker, which never flagged these. It still counts as a
         // "use" above so a definition backing only an image isn't flagged unused.
-        if is_dangling
-            && !is_image
-            && !normalized.starts_with('^')
-            && !is_wiki_link_bracket(body, &range)
-        {
+        if is_dangling && !is_image && !normalized.starts_with('^') {
             parsed.findings.push(Finding {
                 line: line_for_offset(line_starts, range.start),
                 message: format!("[{id}] used but never defined"),
@@ -258,18 +257,6 @@ fn record_link_or_image(
             .anchor_links
             .push((line_for_offset(line_starts, range.start), slug.to_string()));
     }
-}
-
-/// CommonMark treats nested brackets as balanced text, so a Logseq-style wiki-link
-/// `[[Page Name]]` parses as literal `[` + a shortcut reference link `[Page Name]` +
-/// literal `]` — never as a single token. That inner shortcut is always dangling (no
-/// `[Page Name]: url` definition exists), which would otherwise read as a broken
-/// markdown reference. Detecting the surrounding literal brackets in the source text
-/// is what tells the two apart.
-fn is_wiki_link_bracket(body: &str, range: &std::ops::Range<usize>) -> bool {
-    range.start > 0
-        && body.as_bytes().get(range.start - 1) == Some(&b'[')
-        && body.as_bytes().get(range.end) == Some(&b']')
 }
 
 /// A `[ref_id]: target` definition whose label matches no reference-style link/image
