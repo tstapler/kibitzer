@@ -81,7 +81,13 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     // pass over events can detect both uses and dangling uses.
     let callback =
         |_broken: pulldown_cmark::BrokenLink| Some((CowStr::Borrowed(""), CowStr::Borrowed("")));
-    let parser = Parser::new_with_broken_link_callback(body, Options::empty(), Some(callback));
+    // ENABLE_TASKLISTS: without it, a GFM task-list marker at the start of a list item
+    // (`- [x] done`) isn't recognized as a `TaskListMarker` and falls back to generic
+    // link syntax instead — `[x]` parses as a dangling shortcut-reference link (`[ ]`,
+    // being whitespace-only, isn't a valid CommonMark link label and stays literal text,
+    // so only the checked-box form was actually affected).
+    let parser =
+        Parser::new_with_broken_link_callback(body, Options::ENABLE_TASKLISTS, Some(callback));
 
     let ref_defs: HashMap<String, (String, usize)> = parser
         .reference_definitions()
@@ -600,6 +606,12 @@ mod tests {
     #[test]
     fn ignores_logseq_style_wiki_links() {
         let body = "See [[Some Page]] for details.\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ignores_github_task_list_markers() {
+        let body = "- [ ] todo item\n- [x] done item\n";
         assert!(check_source(&path(), body).unwrap().is_empty());
     }
 
