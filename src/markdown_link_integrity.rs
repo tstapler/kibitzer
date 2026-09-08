@@ -79,9 +79,18 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     // Force the parser to still emit Link/Image events for dangling references (as
     // *Unknown link types) instead of silently rendering them as plain text, so a single
     // pass over events can detect both uses and dangling uses.
+    //
+    // ENABLE_WIKILINKS and ENABLE_TASKLISTS are on so `[[Page]]`/`[[Page|Text]]`
+    // (Obsidian/Logseq wikilinks) and `- [x]`/`- [ ]` (GFM task-list checkboxes) parse
+    // as their own dedicated event types (`LinkType::WikiLink`, `Event::TaskListMarker`)
+    // instead of falling through to plain CommonMark bracket rules, where both would
+    // otherwise look like an undefined shortcut reference-link label and get
+    // misreported as "used but never defined" — see
+    // docs/markdown-link-integrity-false-positives.md's 2026-09-06 entries.
     let callback =
         |_broken: pulldown_cmark::BrokenLink| Some((CowStr::Borrowed(""), CowStr::Borrowed("")));
-    let parser = Parser::new_with_broken_link_callback(body, Options::empty(), Some(callback));
+    let opts = Options::ENABLE_WIKILINKS | Options::ENABLE_TASKLISTS;
+    let parser = Parser::new_with_broken_link_callback(body, opts, Some(callback));
 
     let ref_defs: HashMap<String, (String, usize)> = parser
         .reference_definitions()
@@ -579,6 +588,29 @@ mod tests {
         let body = "This has an [unclosed bracket and no matching close.\n";
         let findings = check_source(&path(), body).unwrap();
         assert!(findings.is_empty());
+    }
+
+    // Regression for docs/markdown-link-integrity-false-positives.md's 2026-09-06
+    // "personal-wiki (Logseq)" entry: `[[Page Name]]` is a wikilink, not a nested
+    // shortcut reference-link needing a same-file `[Page Name]: url` definition.
+    #[test]
+    fn wikilinks_are_not_flagged_as_undefined_references() {
+        let body = "tags:: [[Games]], [[Hobbies]]\n\nSee [[Industrial Waste]] and [[Waste Processing Plant]].\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    #[test]
+    fn piped_wikilink_is_not_flagged_as_undefined_reference() {
+        let body = "See [[Industrial Waste|the waste feature]] for details.\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
+    }
+
+    // Regression for docs/markdown-link-integrity-false-positives.md's 2026-09-06
+    // "stapler-squad" entry: GFM task-list checkboxes aren't reference-link labels.
+    #[test]
+    fn task_list_checkboxes_are_not_flagged_as_undefined_references() {
+        let body = "- [x] Gate 1a: Local compile\n- [ ] Gate 2: Code review clean\n";
+        assert!(check_source(&path(), body).unwrap().is_empty());
     }
 
     #[test]
