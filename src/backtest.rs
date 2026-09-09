@@ -179,6 +179,68 @@ pub fn default_cache_path() -> PathBuf {
         .join("backtest-cache.json")
 }
 
+/// Serializes every `run_backtest` call in this process against the others — needed
+/// because `DuplicateIndexIsolation` mutates a process-wide env var, and `cargo test`
+/// runs many `#[test]`s (several of which call `run_backtest`) concurrently in one
+/// process. A real `kibitzer check backtest` invocation is a one-shot CLI process with
+/// nothing else to serialize against, so this only ever matters under test.
+static DUPLICATE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// For the lifetime of one `run_backtest` call, redirects `duplicate-code-cross-file`'s
+/// persistent per-repo index to a scratch directory instead of the real one at
+/// `~/.cache/kibitzer/duplicate-index/`. That checker treats whatever `source` it's
+/// given as a file's current truth and indexes it accordingly — fine for the live hook
+/// (always the real on-disk content) and for `kibitzer check native` (reads the file
+/// itself), but a backtest replays *reconstructed* historical snapshots that don't
+/// necessarily match what's on disk now, so writing them into the real index would
+/// corrupt what a later, real `PostToolUse` edit reads back.
+struct DuplicateIndexIsolation {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+    dir: PathBuf,
+}
+
+impl DuplicateIndexIsolation {
+    fn new() -> Self {
+        // A single test panicking while holding this lock must not poison it for
+        // every other test that acquires it afterward — same reasoning as
+        // `plugin::test_support::with_xdg_data_home`.
+        let lock = DUPLICATE_INDEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const ENV: &str = "KIBITZER_DUPLICATE_INDEX_DIR";
+        let previous = std::env::var(ENV).ok();
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-backtest-duplicate-index-{}",
+            std::process::id()
+        ));
+        // SAFETY: `lock` serializes every `run_backtest` call in this process that
+        // touches this var.
+        unsafe {
+            std::env::set_var(ENV, &dir);
+        }
+        Self {
+            _lock: lock,
+            previous,
+            dir,
+        }
+    }
+}
+
+impl Drop for DuplicateIndexIsolation {
+    fn drop(&mut self) {
+        const ENV: &str = "KIBITZER_DUPLICATE_INDEX_DIR";
+        // SAFETY: see `DuplicateIndexIsolation::new`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(ENV, value),
+                None => std::env::remove_var(ENV),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Runs `checker_names` (every registered checker if empty) against every file
 /// mutation reconstructed from `transcripts`. `only_new` drops findings that also
 /// fired against the pre-edit content — i.e. keeps only findings the edit itself
@@ -190,6 +252,12 @@ pub fn run_backtest(
     only_new: bool,
     cache: &mut BacktestCache,
 ) -> Result<BacktestReport> {
+    // Kept alive for the whole run: reconstructed snapshots aren't necessarily a
+    // file's real current content, so replaying them through a stateful checker (e.g.
+    // `duplicate-code-cross-file`) must never touch that checker's real persistent
+    // index — see `DuplicateIndexIsolation`'s doc comment.
+    let _index_isolation = DuplicateIndexIsolation::new();
+
     let checkers: Vec<Box<dyn crate::checker::Checker>> = if checker_names.is_empty() {
         crate::checker::registry()
     } else {
@@ -803,5 +871,71 @@ mod tests {
         .unwrap();
         assert_eq!(report.findings.len(), 0);
         assert_eq!(report.stats.snapshots_checked, 0);
+    }
+
+    fn write_transcript_of_three_files_sharing_a_block() -> TempTranscript {
+        let block = "func doWork(id string) error {\n\
+                      \tconn := openConnection(id)\n\
+                      \tdefer conn.Close()\n\
+                      \tresult := conn.Fetch(id)\n\
+                      \tlog.Printf(\"fetched %v\", result)\n\
+                      \treturn conn.Validate(result)\n\
+                      }\n";
+        let lines: Vec<Value> = ["pkg1/a.go", "pkg2/b.go", "pkg3/c.go"]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let pkg = path.split('/').next().unwrap();
+                tool_use(
+                    &format!("t{i}"),
+                    "Write",
+                    serde_json::json!({"file_path": format!("/repo/{path}"), "content": format!("package {pkg}\n\n{block}")}),
+                )
+            })
+            .collect();
+        write_transcript(&lines)
+    }
+
+    /// The scratch dir `DuplicateIndexIsolation::new` derives for this process — asserted
+    /// against directly since it's cleaned up on drop and so can't be observed any other way.
+    fn duplicate_index_scratch_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kibitzer-backtest-duplicate-index-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn backtest_isolates_the_duplicate_cross_file_index_and_still_finds_duplicates() {
+        assert!(
+            std::env::var("KIBITZER_DUPLICATE_INDEX_DIR").is_err(),
+            "sanity: no other test should be holding this var"
+        );
+
+        let file = write_transcript_of_three_files_sharing_a_block();
+        let report = run_backtest(
+            &[file.path().to_path_buf()],
+            &["duplicate-code-cross-file".to_string()],
+            false,
+            &mut BacktestCache::default(),
+        )
+        .unwrap();
+
+        assert!(
+            std::env::var("KIBITZER_DUPLICATE_INDEX_DIR").is_err(),
+            "isolation env var must be restored once the run finishes"
+        );
+        assert!(
+            !duplicate_index_scratch_dir().exists(),
+            "scratch index dir must be cleaned up on drop"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.checker == "duplicate-code-cross-file"),
+            "expected a cross-file duplicate finding, got: {:#?}",
+            report.findings
+        );
     }
 }

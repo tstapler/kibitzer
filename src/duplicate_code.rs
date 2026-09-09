@@ -7,15 +7,18 @@ use crate::checker::{CheckContext, Checker, Finding, Language};
 
 /// Minimum number of consecutive lines a duplicated block must span before flagging —
 /// short repeats (a closing brace, a single `return nil`) are normal, not copy-paste.
-const MIN_BLOCK_LINES: usize = 6;
+/// `pub(crate)`: shared with `duplicate_cross_file_checker`'s incremental index, which
+/// applies the exact same windowing bar to a single edited file at a time.
+pub(crate) const MIN_BLOCK_LINES: usize = 6;
 /// Minimum combined trimmed-line length a block must have, filtering out blocks that
 /// are mostly blank or single-token lines shared by coincidence rather than by copying.
 const MIN_BLOCK_CHARS: usize = 60;
 /// Minimum number of times a block must occur before flagging. A backtest against a
 /// real transcript corpus showed two occurrences alone produces mostly benign,
 /// individually-defensible repetition (e.g. a handful of near-identical test-fixture
-/// calls); three or more is a much stronger copy-paste signal.
-const MIN_OCCURRENCES: usize = 3;
+/// calls); three or more is a much stronger copy-paste signal. `pub(crate)`: see
+/// `MIN_BLOCK_LINES`.
+pub(crate) const MIN_OCCURRENCES: usize = 3;
 
 /// Flags blocks of code duplicated elsewhere in the same file — a lightweight,
 /// language-agnostic clone detector (line-window hashing, no AST) in the spirit of
@@ -162,8 +165,8 @@ fn index_cross_file_windows(normalized: &[Vec<String>]) -> HashMap<&[String], Ve
 
 /// Returns the `MIN_BLOCK_LINES`-line window at `start`, or `None` if it spans a blank
 /// line or falls short of `MIN_BLOCK_CHARS` — the same "not meaningful duplication"
-/// filter `find_duplicate_blocks` applies.
-fn qualifying_window(lines: &[String], start: usize) -> Option<&[String]> {
+/// filter `find_duplicate_blocks` applies. `pub(crate)`: see `MIN_BLOCK_LINES`.
+pub(crate) fn qualifying_window(lines: &[String], start: usize) -> Option<&[String]> {
     let window = &lines[start..start + MIN_BLOCK_LINES];
     if window.iter().any(|l| l.is_empty()) {
         return None;

@@ -11,8 +11,9 @@ architecture model, a `command` a project must supply) goes in
 `default_checks()` as part of landing it, not as a follow-up someone has to
 remember. `comment-quality-<lang>` (`docs/comment-quality.md`) is wired in
 this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
-`markdown-link-integrity`, `primitive-obsession`, `duplicate-code`, and the
-Go-specific `go-blank-imports`/`go-ignored-error`/`go-error-context`. A local
+`markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
+`duplicate-code-cross-file`, and the Go-specific
+`go-blank-imports`/`go-ignored-error`/`go-error-context`. A local
 `.claude/inspect.json` overlays the defaults rather than replacing them —
 see `docs/suppressing-checks.md` for how a repo disables or scopes one.
 A separately installed checker (`kibitzer plugin install|list|remove|status`)

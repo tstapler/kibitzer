@@ -7,6 +7,7 @@ use tree_sitter::Tree;
 
 use crate::comment_quality::CommentQualityChecker;
 use crate::duplicate_code::DuplicateCodeChecker;
+use crate::duplicate_cross_file_checker::CrossFileDuplicateChecker;
 use crate::file_size::FileSizeChecker;
 use crate::go_blank_imports::BlankImportsChecker;
 use crate::go_error_context::ErrorContextChecker;
@@ -149,6 +150,7 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(PrimitiveObsessionChecker),
         Box::new(MarkdownLinkIntegrityChecker),
         Box::new(DuplicateCodeChecker),
+        Box::new(CrossFileDuplicateChecker),
         Box::new(BlankImportsChecker),
         Box::new(IgnoredErrorChecker),
         Box::new(ErrorContextChecker),

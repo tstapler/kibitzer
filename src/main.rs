@@ -13,6 +13,7 @@ mod declaration_checks;
 mod declarations;
 mod dedup;
 mod duplicate_code;
+mod duplicate_cross_file_checker;
 mod file_size;
 mod glob;
 mod go_blank_imports;
@@ -191,9 +192,9 @@ enum CheckCommand {
     List,
     /// Cross-file (repo-wide) duplicate-code detection — see #28. `duplicate-code`
     /// (the `Checker` registered under that name) only compares a file against
-    /// itself; this pools the same line-window hashing across every `.go` file under
-    /// `dir` instead, catching the same logic copy-pasted across call sites. v1 scope
-    /// is Go-only, matching `primitive_obsession.rs`'s precedent.
+    /// itself; this pools the same line-window hashing across every file under `dir`
+    /// matching `DuplicateCodeChecker::file_globs()` instead, catching the same logic
+    /// copy-pasted across call sites in any of those languages.
     Duplicates { dir: PathBuf },
     /// Backtests a checker (or "all") against file edits reconstructed from Claude
     /// Code session transcripts, to validate it against real historical edits before
@@ -497,29 +498,50 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
-/// v1 scope is Go-only (see `CheckCommand::Duplicates`'s doc comment) — filters
-/// `walk_and_collect_files`' output to `.go` before reading, rather than reusing
-/// `duplicate_code::DuplicateCodeChecker::file_globs()`'s full multi-language list,
-/// which is single-file `duplicate-code`'s scope, not this command's.
+/// Covers every language `duplicate-code` (single-file) covers — see
+/// `duplicate_code::DuplicateCodeChecker::file_globs()` — so a block copy-pasted
+/// across files is caught regardless of language.
 fn run_duplicates_cli(dir: &Path) -> Result<ExitCode> {
+    let files = collect_files_for_duplicate_scan(dir)?;
+    let duplicates = duplicate_code::find_cross_file_duplicates(&files);
+    if duplicates.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    print_cross_file_duplicates(&duplicates);
+    Ok(ExitCode::from(1))
+}
+
+/// Walks `dir` and reads every file whose extension matches
+/// `DuplicateCodeChecker::file_globs()`, skipping anything else (build output,
+/// non-source config, etc).
+fn collect_files_for_duplicate_scan(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
+    use checker::Checker as _;
+
+    let extensions: std::collections::HashSet<&str> = duplicate_code::DuplicateCodeChecker
+        .file_globs()
+        .iter()
+        .filter_map(|glob| glob.rsplit('.').next())
+        .collect();
+
     let all_files =
         check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
     let mut files = Vec::new();
     for path in all_files {
-        if path.extension().and_then(|e| e.to_str()) != Some("go") {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !extensions.contains(ext) {
             continue;
         }
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         files.push((path, source));
     }
+    Ok(files)
+}
 
-    let duplicates = duplicate_code::find_cross_file_duplicates(&files);
-    if duplicates.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    for dup in &duplicates {
+fn print_cross_file_duplicates(duplicates: &[duplicate_code::CrossFileDuplicate]) {
+    for dup in duplicates {
         let locations: Vec<String> = dup
             .occurrences
             .iter()
@@ -540,7 +562,6 @@ fn run_duplicates_cli(dir: &Path) -> Result<ExitCode> {
             locations.join(", ")
         );
     }
-    Ok(ExitCode::from(1))
 }
 
 #[cfg(test)]
@@ -661,12 +682,24 @@ mod architecture_cli_tests {
     }
 
     #[test]
-    fn cli_duplicates_ignores_non_go_files() {
-        let repo = TempRepo::new("cross-file-dup-non-go");
+    fn cli_duplicates_flags_block_repeated_across_ts_files() {
+        let repo = TempRepo::new("cross-file-dup-ts");
         let block = "function doWork(id) {\n  const conn = openConnection(id);\n  const result = conn.fetch(id);\n  console.log(result);\n  conn.close();\n  return conn.validate(result);\n}\n";
         repo.write("a.ts", block);
         repo.write("b.ts", block);
         repo.write("c.ts", block);
+
+        let exit = run_duplicates_cli(&repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
+    }
+
+    #[test]
+    fn cli_duplicates_ignores_files_outside_duplicate_code_globs() {
+        let repo = TempRepo::new("cross-file-dup-unsupported-ext");
+        let block = "some duplicated prose line one\nsome duplicated prose line two\nsome duplicated prose line three\nsome duplicated prose line four\nsome duplicated prose line five\nsome duplicated prose line six\n";
+        repo.write("a.md", block);
+        repo.write("b.md", block);
+        repo.write("c.md", block);
 
         let exit = run_duplicates_cli(&repo.dir).unwrap();
         assert_eq!(exit, ExitCode::SUCCESS);
