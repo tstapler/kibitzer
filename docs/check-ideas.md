@@ -142,9 +142,13 @@ first.
   `src/duplicate_code.rs`) — a dedicated batch/CLI subcommand rather than a
   new `Checker`/`ArchitectureChecker` registration, since it needs neither a
   single-file `PostToolUse` hook nor a `.claude/inspect.json` architecture
-  model, just a directory to scan. v1 scope is Go-only, matching
-  `primitive_obsession.rs`'s precedent; the diff-aware "does this edit
-  duplicate something elsewhere in the repo" mode the issue also proposes is
-  still open.
+  model, just a directory to scan. Expanded from its initial Go-only v1 scope
+  to every language `duplicate-code` covers, and the diff-aware "does this
+  edit duplicate something elsewhere in the repo" mode the issue also
+  proposes is now implemented too, as the `duplicate-code-cross-file` default
+  check (`CrossFileDuplicateChecker` in `src/duplicate_cross_file_checker.rs`):
+  a persistent per-repo index (keyed off the nearest `.git` ancestor) of every
+  file's duplicate-candidate line windows, updated incrementally as each file
+  is edited rather than rescanning the whole repo per `PostToolUse` event.
 
 None of these have a confirmed transcript occurrence backing them yet.

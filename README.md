@@ -43,7 +43,7 @@ kibitzer check native go-ignored-error <file>      # flag `result, _ := f()` dis
 kibitzer check native go-error-context <file>      # flag bare error passthroughs (advisory)
 kibitzer check native syntax-rules <file>          # run the native syntactic rule catalog (see docs/syntax-rules.md)
 kibitzer check native markdown-link-integrity <file> # flag broken markdown reference links/anchors
-kibitzer check duplicates <dir>      # cross-file duplicate-code detection, repo-wide (Go v1)
+kibitzer check duplicates <dir>      # cross-file duplicate-code detection, repo-wide (batch)
 kibitzer check list                  # list all natively implemented checkers
 ```
 
