@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_window,
+    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_windows,
 };
 
 /// Diff-aware counterpart to `kibitzer check duplicates` (`duplicate_code::find_cross_file_duplicates`)
@@ -86,23 +86,56 @@ fn duplicate_index_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("kibitzer-duplicate-index"))
 }
 
-/// One index file per repo, named from the repo root's own path so it's human-
-/// inspectable rather than an opaque hash.
+/// One index file per repo. Named from a hash of the *canonicalized* repo root, not the
+/// raw path text: a naive `/`-to-`_` substitution collides ordinary, non-adversarial
+/// paths onto the same filename (e.g. `/home/t/my_project` and `/home/t/my/project`
+/// both sanitize to `_home_t_my_project`), which would silently mix two unrelated
+/// repos' indexes. Canonicalizing first also means a symlinked path and its resolved
+/// target share one index instead of silently fragmenting into two. The hash need not
+/// be cryptographic — inputs are this machine's own repo paths, not adversarial — so
+/// `DefaultHasher` (deterministic across runs, unlike `HashMap`'s randomized default)
+/// is enough. A truncated, sanitized basename is kept as a prefix purely so the
+/// directory listing stays human-inspectable; only the hash suffix is load-bearing.
 fn index_path_for_repo(repo_root: &Path) -> PathBuf {
-    let sanitized: String = repo_root
-        .to_string_lossy()
+    let canonical = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let readable: String = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
         .chars()
-        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(40)
         .collect();
-    duplicate_index_dir().join(format!("{sanitized}.json"))
+
+    let name = if readable.is_empty() {
+        format!("{hash:016x}.json")
+    } else {
+        format!("{readable}-{hash:016x}.json")
+    };
+    duplicate_index_dir().join(name)
 }
 
 /// Persistent, whole-repo reverse index from a duplicate-candidate window's exact
 /// (normalized) text to every `(file, 0-indexed start line)` it currently occurs at.
 /// `files` tracks which window keys each file currently contributes, so re-indexing a
-/// file can cheaply drop its stale entries before inserting the fresh ones. Loaded and
-/// saved as JSON, best-effort like `cache::Cache` — a lost update under concurrent
-/// invocations just means a duplicate is caught one edit later, not a correctness bug.
+/// file can cheaply drop its stale entries before inserting the fresh ones. `save`
+/// writes via temp-file-then-rename so a crash or a second, concurrent writer can never
+/// leave a torn/corrupt file for `load` to stumble over — the remaining risk under true
+/// concurrent invocations (e.g. two daemon connection threads editing the same repo at
+/// once, see `src/daemon.rs`'s per-connection `Arc<Mutex<Cache>>` for the pattern this
+/// index does *not* yet share) is a clean lost update, not corruption: whichever `save`
+/// runs last wins outright, and the dropped update's duplicate is simply caught the next
+/// time either file is re-indexed. Folding this into daemon-shared, lock-protected state
+/// the way `Cache` already is would close that gap; tracked as a follow-up rather than
+/// done here.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DuplicateIndex {
     windows: HashMap<String, Vec<(String, usize)>>,
@@ -117,11 +150,18 @@ impl DuplicateIndex {
             .unwrap_or_default()
     }
 
+    /// Writes via a uniquely-named temp file plus an atomic rename onto `path`, so a
+    /// reader's `load` always sees either the previous complete index or the new one —
+    /// never a partial write from a crash or an interleaved concurrent `save`.
     fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string(self)?)?;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.tmp.{}.{n}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_string(self)?)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -167,6 +207,17 @@ impl DuplicateIndex {
     /// single finding each, the same `covered_until` trick `find_duplicate_blocks`
     /// uses — tracked in `file_key`'s own line space since that's the only file this
     /// finding is reported against.
+    ///
+    /// Known limitation, deliberately not fixed here: nothing prunes a deleted or
+    /// renamed file's entries from the index — the `PostToolUse` hook has no
+    /// delete/rename signal, only Edit/Write/MultiEdit (`hook.rs`'s `ToolInput`) — so a
+    /// stale occurrence can outlive the file it points at. Filtering to occurrences
+    /// whose file still exists on disk was tried and reverted: it broke `check
+    /// backtest`'s whole premise (replaying historical content "without touching disk"
+    /// for files that may since be deleted, e.g. a session's `/tmp` scratch file) by
+    /// requiring every *other* occurrence to still physically exist, not just the file
+    /// under test. Acceptable for now since this is an advisory-only checker; revisit if
+    /// stale duplicate reports against long-gone files become a real complaint.
     fn find_duplicates(&self, file_key: &str, windows: &[(usize, String)]) -> Vec<Finding> {
         let mut findings = Vec::new();
         let mut covered_until = 0usize;
@@ -174,36 +225,44 @@ impl DuplicateIndex {
             if *start < covered_until {
                 continue;
             }
-            let occurrences = &self.windows[text];
-            if occurrences.len() < MIN_OCCURRENCES {
-                continue;
+            if let Some(finding) = self.finding_for_window(file_key, *start, text) {
+                findings.push(finding);
+                covered_until = start + MIN_BLOCK_LINES;
             }
-            let distinct_files: HashSet<&str> =
-                occurrences.iter().map(|(f, _)| f.as_str()).collect();
-            if distinct_files.len() < 2 {
-                continue;
-            }
-
-            let mut other_locations: Vec<String> = occurrences
-                .iter()
-                .filter(|(f, _)| f != file_key)
-                .map(|(f, line)| format!("{f}:{}", line + 1))
-                .collect();
-            other_locations.sort();
-            other_locations.dedup();
-
-            findings.push(Finding {
-                line: start + 1,
-                message: format!(
-                    "{MIN_BLOCK_LINES}-line block also duplicated in {} other file(s) ({}) — \
-                     consider extracting a shared function",
-                    other_locations.len(),
-                    other_locations.join(", ")
-                ),
-            });
-            covered_until = start + MIN_BLOCK_LINES;
         }
         findings
+    }
+
+    /// One window's worth of `find_duplicates`' logic: threshold checks and message
+    /// formatting — split out so `find_duplicates` stays just the `covered_until`
+    /// collapsing loop.
+    fn finding_for_window(&self, file_key: &str, start: usize, text: &str) -> Option<Finding> {
+        let occurrences = &self.windows[text];
+        if occurrences.len() < MIN_OCCURRENCES {
+            return None;
+        }
+        let distinct_files: HashSet<&str> = occurrences.iter().map(|(f, _)| f.as_str()).collect();
+        if distinct_files.len() < 2 {
+            return None;
+        }
+
+        let mut other_locations: Vec<String> = occurrences
+            .iter()
+            .filter(|(f, _)| f != file_key)
+            .map(|(f, line)| format!("{f}:{}", line + 1))
+            .collect();
+        other_locations.sort();
+        other_locations.dedup();
+
+        Some(Finding {
+            line: start + 1,
+            message: format!(
+                "{MIN_BLOCK_LINES}-line block also duplicated in {} other file(s) ({}) — \
+                 consider extracting a shared function",
+                other_locations.len(),
+                other_locations.join(", ")
+            ),
+        })
     }
 }
 
@@ -212,11 +271,8 @@ impl DuplicateIndex {
 /// key so two different blocks can never collide onto the same entry.
 fn file_windows(source: &str) -> Vec<(usize, String)> {
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
-    if normalized.len() < MIN_BLOCK_LINES {
-        return Vec::new();
-    }
-    (0..=(normalized.len() - MIN_BLOCK_LINES))
-        .filter_map(|start| qualifying_window(&normalized, start).map(|w| (start, w.join("\n"))))
+    qualifying_windows(&normalized)
+        .map(|(start, window)| (start, window.join("\n")))
         .collect()
 }
 
@@ -263,6 +319,19 @@ mod tests {
         index.reindex_file_and_find_duplicates(Path::new("a.go"), &other_file_src());
         let findings = index.reindex_file_and_find_duplicates(Path::new("b.go"), &other_file_src());
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn removing_the_only_file_holding_a_block_drops_the_window_entry_entirely() {
+        let mut index = DuplicateIndex::default();
+        index.reindex_file_and_find_duplicates(Path::new("a.go"), &other_file_src());
+        assert_eq!(index.windows.len(), 1);
+
+        index.reindex_file_and_find_duplicates(Path::new("a.go"), "package other\n");
+        assert!(
+            index.windows.is_empty(),
+            "a window with zero remaining occurrences must be removed, not left as an empty Vec"
+        );
     }
 
     #[test]
@@ -336,5 +405,69 @@ mod tests {
         let b = Path::new("/kibitzer-test-path-with-no-git-ancestor/pkg2/b.go");
         assert_eq!(discover_repo_root(a), discover_repo_root(b));
         assert_eq!(discover_repo_root(a), Path::new(NO_GIT_ROOT_FALLBACK));
+    }
+
+    #[test]
+    fn index_path_for_repo_does_not_collide_ordinary_paths_that_naive_substitution_would() {
+        // Both of these would sanitize to the identical `_home_t_my_project` under a
+        // naive `/`-to-`_` substitution — the exact collision the hash suffix exists
+        // to prevent. Neither path needs to exist on disk: `canonicalize` fails open
+        // (falls back to the raw path) for a nonexistent one, so the hash still differs.
+        let a = Path::new("/home/t/my_project");
+        let b = Path::new("/home/t/my/project");
+        assert_ne!(index_path_for_repo(a), index_path_for_repo(b));
+    }
+
+    #[test]
+    fn index_path_for_repo_is_stable_across_calls() {
+        let root = Path::new("/some/repo/root");
+        assert_eq!(index_path_for_repo(root), index_path_for_repo(root));
+    }
+
+    /// Sets up a temp `.git` repo with `pkg1/a.go`/`pkg2/b.go`/`pkg3/c.go`, each
+    /// containing `BLOCK` under a different package name, for the end-to-end test below.
+    fn e2e_fixture_repo() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "kibitzer-cross-file-checker-e2e-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        for pkg in ["pkg1", "pkg2", "pkg3"] {
+            std::fs::create_dir_all(base.join(pkg)).unwrap();
+        }
+        std::fs::write(base.join("pkg1/a.go"), format!("package pkg1\n\n{BLOCK}")).unwrap();
+        std::fs::write(base.join("pkg2/b.go"), format!("package pkg2\n\n{BLOCK}")).unwrap();
+        std::fs::write(base.join("pkg3/c.go"), format!("package pkg3\n\n{BLOCK}")).unwrap();
+        base
+    }
+
+    fn run_checker(path: &Path) -> Vec<Finding> {
+        let source = std::fs::read_to_string(path).unwrap();
+        let ctx = CheckContext {
+            source: &source,
+            tree: None,
+        };
+        CrossFileDuplicateChecker.check(path, &ctx).unwrap()
+    }
+
+    #[test]
+    fn checker_check_flags_a_cross_file_duplicate_end_to_end() {
+        // Exercises the real `Checker::check()` path (repo-root discovery, the on-disk
+        // index, glob/language dispatch via `checker::run_checker`) rather than
+        // `DuplicateIndex`'s internal methods directly — the gap the review flagged:
+        // without this, `index_path_for_repo`/`duplicate_index_dir()`'s non-override
+        // branch had zero direct coverage.
+        let _isolation = crate::backtest::DuplicateIndexIsolation::new();
+        let base = e2e_fixture_repo();
+
+        assert!(run_checker(&base.join("pkg1/a.go")).is_empty());
+        assert!(run_checker(&base.join("pkg2/b.go")).is_empty());
+        let findings = run_checker(&base.join("pkg3/c.go"));
+
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("2 other file(s)"));
     }
 }

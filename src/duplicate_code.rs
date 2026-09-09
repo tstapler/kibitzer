@@ -148,16 +148,11 @@ pub fn find_cross_file_duplicates(files: &[(PathBuf, String)]) -> Vec<CrossFileD
 fn index_cross_file_windows(normalized: &[Vec<String>]) -> HashMap<&[String], Vec<(usize, usize)>> {
     let mut occurrences: HashMap<&[String], Vec<(usize, usize)>> = HashMap::new();
     for (file_idx, lines) in normalized.iter().enumerate() {
-        if lines.len() < MIN_BLOCK_LINES {
-            continue;
-        }
-        for start in 0..=(lines.len() - MIN_BLOCK_LINES) {
-            if let Some(window) = qualifying_window(lines, start) {
-                occurrences
-                    .entry(window)
-                    .or_default()
-                    .push((file_idx, start));
-            }
+        for (start, window) in qualifying_windows(lines) {
+            occurrences
+                .entry(window)
+                .or_default()
+                .push((file_idx, start));
         }
     }
     occurrences
@@ -176,6 +171,19 @@ pub(crate) fn qualifying_window(lines: &[String], start: usize) -> Option<&[Stri
         return None;
     }
     Some(window)
+}
+
+/// Every `MIN_BLOCK_LINES`-line qualifying window in `lines`, as `(0-indexed start,
+/// window slice)` — the shared "slide a window and filter" loop every caller that scans
+/// a file's lines for duplicate candidates builds on (`index_cross_file_windows` here,
+/// and `duplicate_cross_file_checker`'s incremental per-file index).
+pub(crate) fn qualifying_windows(lines: &[String]) -> impl Iterator<Item = (usize, &[String])> {
+    let starts = if lines.len() < MIN_BLOCK_LINES {
+        0..0
+    } else {
+        0..(lines.len() - MIN_BLOCK_LINES + 1)
+    };
+    starts.filter_map(move |start| qualifying_window(lines, start).map(|w| (start, w)))
 }
 
 /// Filters `occurrences` down to groups worth reporting (at least `MIN_OCCURRENCES`,

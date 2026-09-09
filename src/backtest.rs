@@ -181,9 +181,11 @@ pub fn default_cache_path() -> PathBuf {
 
 /// Serializes every `run_backtest` call in this process against the others — needed
 /// because `DuplicateIndexIsolation` mutates a process-wide env var, and `cargo test`
-/// runs many `#[test]`s (several of which call `run_backtest`) concurrently in one
-/// process. A real `kibitzer check backtest` invocation is a one-shot CLI process with
-/// nothing else to serialize against, so this only ever matters under test.
+/// runs many `#[test]`s (several of which call `run_backtest`, and — since it's
+/// `pub(crate)` for exactly this reason — `duplicate_cross_file_checker`'s own direct
+/// `Checker::check()` test) concurrently in one process. A real `kibitzer check
+/// backtest` invocation is a one-shot CLI process with nothing else to serialize
+/// against, so this only ever matters under test.
 static DUPLICATE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// For the lifetime of one `run_backtest` call, redirects `duplicate-code-cross-file`'s
@@ -193,15 +195,18 @@ static DUPLICATE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// (always the real on-disk content) and for `kibitzer check native` (reads the file
 /// itself), but a backtest replays *reconstructed* historical snapshots that don't
 /// necessarily match what's on disk now, so writing them into the real index would
-/// corrupt what a later, real `PostToolUse` edit reads back.
-struct DuplicateIndexIsolation {
+/// corrupt what a later, real `PostToolUse` edit reads back. `pub(crate)` so any other
+/// test in this crate that exercises `duplicate-code-cross-file` through its real
+/// `Checker::check()` path (not just `DuplicateIndex`'s internal methods directly) can
+/// reuse this same isolation instead of risking a write to the real cache dir.
+pub(crate) struct DuplicateIndexIsolation {
     _lock: std::sync::MutexGuard<'static, ()>,
     previous: Option<String>,
     dir: PathBuf,
 }
 
 impl DuplicateIndexIsolation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // A single test panicking while holding this lock must not poison it for
         // every other test that acquires it afterward — same reasoning as
         // `plugin::test_support::with_xdg_data_home`.
