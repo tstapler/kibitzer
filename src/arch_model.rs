@@ -90,13 +90,9 @@ pub struct PruningSummary {
     pub total_files_scanned: usize,
 }
 
-/// One function/method call edge: `from`/`to` are `SymbolNode::id`s when `resolved` is
-/// true. When resolution failed (ambiguous or unfound target — see `resolve_call_edges`),
-/// `to` falls back to the call site's raw, unresolved callee text (e.g. `"pkg.Qux"`) so a
-/// consumer can still see *what* the call site named, per the issue's "flag unresolved
-/// edges explicitly rather than silently omitting them" requirement (ADR-001's
-/// error-shape convention: never drop information a caller might need to distinguish
-/// "no such edge" from "found it but couldn't pin it down").
+/// One call edge. `to` is a `SymbolNode::id` when `resolved`; otherwise it's the call
+/// site's raw, unresolved callee text (e.g. `"pkg.Qux"`) — never silently dropped, so a
+/// consumer can still see what the call site named (see `resolve_call_edges`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallEdge {
     pub from: String,
@@ -177,6 +173,26 @@ fn package_key_for_file(repo_root: &Path, file: &Path, import_graph: &ImportGrap
 /// the caller (CLI `arch_export.rs`, or a `ModelCache` build closure in `mcp.rs`/`lsp.rs`)
 /// collects files and reads their source before calling this.
 ///
+/// Extracts `file`'s call sites and appends them to `raw_call_sites` with `file` filled
+/// in — split out of `build_model`'s per-file loop purely to keep that loop short;
+/// resolution against the whole-repo symbol index still happens later, in
+/// `resolve_call_edges`.
+fn collect_call_sites(
+    language: Language,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    package_path: &str,
+    file: &Path,
+    raw_call_sites: &mut Vec<RawCallSite>,
+) {
+    for site in extract_call_sites_for_file(language, source, tree, package_path) {
+        raw_call_sites.push(RawCallSite {
+            file: file.to_path_buf(),
+            ..site
+        });
+    }
+}
+
 /// Groups `files` by `package_key_for_file`, skipping files with no recognized `Language`
 /// (counted in `PruningSummary.unsupported_language_files` rather than silently dropped).
 /// For each recognized file: generated files are skipped whole (`generated_files_skipped`
@@ -185,7 +201,9 @@ fn package_key_for_file(repo_root: &Path, file: &Path, import_graph: &ImportGrap
 /// contract) and, if the parse tree has any error node, the whole file is skipped for
 /// extraction (`files_with_parse_errors` records its path) rather than partially
 /// extracted. Clean files are extracted via `extract_symbols_for_file`, then pruned by
-/// `PruneConfig.include_private`.
+/// `PruneConfig.include_private`. Call sites (`collect_call_sites`) are gathered from
+/// every parsed file regardless of pruning; `resolve_call_edges` resolves them afterward
+/// against the already-pruned `packages` map.
 pub fn build_model(
     repo_root: &Path,
     files: &[(PathBuf, String)],
@@ -242,17 +260,14 @@ pub fn build_model(
             });
         }
 
-        // `resolve_call_edges` below indexes callee candidates from `packages`, which by
-        // this point only holds symbols that survived pruning — so a call site whose
-        // caller or callee was pruned by `!include_private` resolves as unresolved
-        // (raw-text `to`) rather than to a symbol id that isn't actually in this model,
-        // consistent with a pruned symbol being invisible to every other consumer.
-        for site in extract_call_sites_for_file(language, source, &tree, &package_path) {
-            raw_call_sites.push(RawCallSite {
-                file: path.clone(),
-                ..site
-            });
-        }
+        collect_call_sites(
+            language,
+            source,
+            &tree,
+            &package_path,
+            path,
+            &mut raw_call_sites,
+        );
     }
 
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
@@ -334,12 +349,10 @@ fn build_call_target_indexes(
     (functions_by_name, methods_by_name)
 }
 
-/// Resolves one `RawCallSite` against `functions_by_name`/`methods_by_name`. A bare
-/// identifier (`Foo()`) is looked up among `Function` symbols; a qualified call
-/// (`pkg.Foo()`/`recv.Method()`) is looked up among `Method` symbols by its last segment
-/// first (the common case — a receiver method call), falling back to `Function` symbols
-/// (a qualified free-function call, e.g. a package-aliased import) when no method
-/// matches. See `CallEdge`'s doc comment for the unresolved fallback.
+/// Resolves one `RawCallSite`. A bare identifier is looked up among `Function` symbols; a
+/// qualified call (`pkg.Foo()`/`recv.Method()`) is looked up among `Method` symbols by its
+/// last segment first, falling back to `Function` symbols (a qualified free-function
+/// call) when no method matches.
 fn resolve_one_call_edge(
     functions_by_name: &SymbolIndex,
     methods_by_name: &SymbolIndex,
@@ -892,6 +905,71 @@ mod tests {
             .expect("call edge from pkg::Foo");
         assert!(edge.resolved);
         assert_eq!(edge.to, "pkg::T.M");
+    }
+
+    #[test]
+    fn build_model_resolves_via_global_unique_fallback_when_no_same_package_candidate() {
+        // No `Bar` in `pkg` itself — `resolve_in`'s same-package tier has zero candidates,
+        // so this exercises its second tier: exactly one candidate anywhere in the repo.
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![
+            (
+                PathBuf::from("/repo/pkg/a.go"),
+                "package pkg\n\nfunc Foo() {\n\tBar()\n}\n".to_string(),
+            ),
+            (
+                PathBuf::from("/repo/other/b.go"),
+                "package other\n\nfunc Bar() {}\n".to_string(),
+            ),
+        ];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        let edge = model
+            .call_edges
+            .iter()
+            .find(|e| e.from == "pkg::Foo")
+            .expect("call edge from pkg::Foo");
+        assert!(edge.resolved);
+        assert_eq!(edge.to, "other::Bar");
+    }
+
+    #[test]
+    fn build_model_resolves_a_qualified_call_to_a_free_function_via_index_fallback() {
+        // `other.Compute()` looks like a receiver method call syntactically, but
+        // `Compute` is a free `Function`, not a `Method` — exercises
+        // `resolve_one_call_edge`'s fallback from the Method index to the Function index.
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![
+            (
+                PathBuf::from("/repo/pkg/a.go"),
+                "package pkg\n\nfunc Foo() {\n\tother.Compute()\n}\n".to_string(),
+            ),
+            (
+                PathBuf::from("/repo/other/b.go"),
+                "package other\n\nfunc Compute() {}\n".to_string(),
+            ),
+        ];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        let edge = model
+            .call_edges
+            .iter()
+            .find(|e| e.from == "pkg::Foo")
+            .expect("call edge from pkg::Foo");
+        assert!(edge.resolved);
+        assert_eq!(edge.to, "other::Compute");
     }
 
     #[test]

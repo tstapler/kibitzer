@@ -149,7 +149,7 @@ struct CallTraversalRequest {
     /// or `get_architecture_node`.
     node: String,
     /// How many hops to follow. Defaults to 1 (immediate callers/callees only); clamped
-    /// to [1, 10]. The walk keeps a visited-node set so a recursive or
+    /// to [1, `MAX_CALL_DEPTH`]. The walk keeps a visited-node set so a recursive or
     /// mutually-recursive call chain can't loop forever.
     #[serde(default = "default_depth")]
     depth: usize,
@@ -158,6 +158,10 @@ struct CallTraversalRequest {
 fn default_depth() -> usize {
     1
 }
+
+/// Upper bound `call_traversal` clamps `CallTraversalRequest::depth` to — a single named
+/// constant so the clamp call site and this doc comment can't drift apart.
+const MAX_CALL_DEPTH: usize = 10;
 
 #[derive(Serialize)]
 struct CallTraversalResponse {
@@ -199,14 +203,27 @@ impl CallDirection {
     }
 }
 
-/// One BFS layer: every edge in `edges` whose `direction`-relevant near-endpoint is in
-/// `frontier` is collected, and its far endpoint queued for the next layer (unless
-/// already `visited` — this is what stops a recursive/mutually-recursive call chain from
-/// looping forever). An unresolved edge's far endpoint (raw callee text, not a real
-/// symbol id) is queued the same way, but naturally never matches any edge's near
-/// endpoint on the next layer, so it just doesn't expand further.
+/// `direction`-relevant near-endpoint -> edges index, built once per `traverse_call_edges`
+/// call instead of rescanning `edges` linearly on every hop — a repo-scale call graph
+/// walked at `depth: 10` would otherwise redo an O(edges) scan per frontier node per hop.
+type CallAdjacency<'a> = std::collections::HashMap<&'a str, Vec<&'a CallEdge>>;
+
+fn build_call_adjacency(edges: &[CallEdge], direction: CallDirection) -> CallAdjacency<'_> {
+    let mut by_near: CallAdjacency = std::collections::HashMap::new();
+    for edge in edges {
+        by_near
+            .entry(direction.endpoints(edge).0)
+            .or_default()
+            .push(edge);
+    }
+    by_near
+}
+
+/// One BFS layer: every edge in `by_near` keyed by a node in `frontier` is collected, and
+/// its far endpoint queued for the next layer unless already `visited` — the guard that
+/// stops a recursive/mutually-recursive call chain from looping forever.
 fn expand_call_frontier(
-    edges: &[CallEdge],
+    by_near: &CallAdjacency,
     direction: CallDirection,
     frontier: &[String],
     visited: &mut std::collections::HashSet<String>,
@@ -214,12 +231,12 @@ fn expand_call_frontier(
 ) -> Vec<String> {
     let mut next = Vec::new();
     for node in frontier {
+        let Some(edges) = by_near.get(node.as_str()) else {
+            continue;
+        };
         for edge in edges {
-            let (near, far) = direction.endpoints(edge);
-            if near != node {
-                continue;
-            }
-            collected.push(edge.clone());
+            collected.push((*edge).clone());
+            let far = direction.endpoints(edge).1;
             if visited.insert(far.to_string()) {
                 next.push(far.to_string());
             }
@@ -228,26 +245,18 @@ fn expand_call_frontier(
     next
 }
 
-/// True if any node in `frontier` still has at least one outgoing edge in `direction` —
-/// i.e. expanding one more hop would actually surface more edges, not just re-discover
-/// nodes already in `collected`.
-fn frontier_has_more(edges: &[CallEdge], direction: CallDirection, frontier: &[String]) -> bool {
-    frontier
-        .iter()
-        .any(|node| edges.iter().any(|e| direction.endpoints(e).0 == node))
-}
-
 /// Bounded BFS over `edges` from `start` (a `SymbolNode::id`), in `direction`. Returns
-/// the collected edges and whether a further hop would actually surface more edges (see
-/// `CallTraversalResponse::truncated`) — checked via `frontier_has_more` rather than just
-/// "was the frontier non-empty," so reaching a true leaf at exactly `depth` correctly
-/// reports `truncated: false` instead of leaving the caller to guess.
+/// the collected edges and whether a further hop would actually surface more edges — a
+/// node in the final frontier still being a `by_near` key means expanding once more would
+/// find something, vs. `false` when `depth` happened to land exactly on a leaf (see
+/// `CallTraversalResponse::truncated`).
 fn traverse_call_edges(
     edges: &[CallEdge],
     start: &str,
     depth: usize,
     direction: CallDirection,
 ) -> (Vec<CallEdge>, bool) {
+    let by_near = build_call_adjacency(edges, direction);
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(start.to_string());
     let mut frontier: Vec<String> = vec![start.to_string()];
@@ -255,12 +264,14 @@ fn traverse_call_edges(
 
     for hop in 0..depth {
         let next_frontier =
-            expand_call_frontier(edges, direction, &frontier, &mut visited, &mut collected);
+            expand_call_frontier(&by_near, direction, &frontier, &mut visited, &mut collected);
         if next_frontier.is_empty() {
             return (collected, false);
         }
         if hop + 1 == depth {
-            let truncated = frontier_has_more(edges, direction, &next_frontier);
+            let truncated = next_frontier
+                .iter()
+                .any(|n| by_near.contains_key(n.as_str()));
             return (collected, truncated);
         }
         frontier = next_frontier;
@@ -882,7 +893,7 @@ impl KibitzerServer {
             Ok(root) => root,
             Err(e) => return json_error(e),
         };
-        let depth = req.depth.clamp(1, 10);
+        let depth = req.depth.clamp(1, MAX_CALL_DEPTH);
 
         // Same default-model choice as `get_architecture_node`: unscoped, exported-only,
         // sharing that tool's cache slot.
@@ -951,6 +962,55 @@ mod tests {
         // `coupling` deliberately has no canned recommendation — see this file's own
         // comment at `recommendation_for`'s definition and plan.md Story 6.2.1.
         assert!(recommendation_for("coupling").is_none());
+    }
+
+    // --- traverse_call_edges: direct BFS unit tests against hand-built CallEdge literals,
+    // decoupled from file I/O/parsing/resolution so a BFS bug fails independently of a
+    // resolution bug (the fixture-based list_callers/list_callees tests below still cover
+    // the full extraction-through-traversal path end to end).
+
+    fn edge(from: &str, to: &str, resolved: bool) -> CallEdge {
+        CallEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            resolved,
+            file: PathBuf::new(),
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn traverse_call_edges_callees_stops_at_depth_and_reports_truncated() {
+        let edges = vec![edge("a", "b", true), edge("b", "c", true)];
+        let (collected, truncated) = traverse_call_edges(&edges, "a", 1, CallDirection::Callees);
+        assert_eq!(collected, vec![edge("a", "b", true)]);
+        assert!(truncated, "b still calls c beyond depth 1");
+    }
+
+    #[test]
+    fn traverse_call_edges_callees_at_exact_leaf_depth_reports_not_truncated() {
+        let edges = vec![edge("a", "b", true), edge("b", "c", true)];
+        let (collected, truncated) = traverse_call_edges(&edges, "a", 2, CallDirection::Callees);
+        assert_eq!(collected, vec![edge("a", "b", true), edge("b", "c", true)]);
+        assert!(!truncated, "c has no further callees");
+    }
+
+    #[test]
+    fn traverse_call_edges_callers_walks_the_reverse_direction() {
+        let edges = vec![edge("a", "b", true), edge("b", "c", true)];
+        let (collected, _) = traverse_call_edges(&edges, "c", 2, CallDirection::Callers);
+        assert_eq!(collected, vec![edge("b", "c", true), edge("a", "b", true)]);
+    }
+
+    #[test]
+    fn traverse_call_edges_self_loop_terminates_via_visited_set_not_depth() {
+        let edges = vec![edge("a", "a", true)];
+        let (collected, _) = traverse_call_edges(&edges, "a", 5, CallDirection::Callees);
+        assert_eq!(
+            collected,
+            vec![edge("a", "a", true)],
+            "the self-edge is collected once, not once per remaining hop"
+        );
     }
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1663,6 +1723,29 @@ mod tests {
             .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
         // The self-edge is collected exactly once, not once per would-be hop — proves the
         // visited set stopped the walk instead of looping until `depth` ran out.
+        let edges = json["edges"].as_array().expect("edges array");
+        assert_eq!(edges.len(), 1, "got: {json}");
+        assert_eq!(edges[0]["from"], "fixture/chain::Recursive", "got: {json}");
+        assert_eq!(edges[0]["to"], "fixture/chain::Recursive", "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_callers_on_a_recursive_function_terminates_via_the_visited_set() {
+        // Mirrors the callees case above for the Callers direction specifically — a
+        // near/far mixup in `CallDirection::endpoints` for `Callers` wouldn't be caught by
+        // a Callees-only test.
+        let dir = tmp_dir("callers-recursive");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callers(Parameters(call_req(&dir, "fixture/chain::Recursive", 5)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
         let edges = json["edges"].as_array().expect("edges array");
         assert_eq!(edges.len(), 1, "got: {json}");
         assert_eq!(edges[0]["from"], "fixture/chain::Recursive", "got: {json}");

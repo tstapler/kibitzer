@@ -557,22 +557,10 @@ fn call_graph_supports(language: Language) -> bool {
     )
 }
 
-/// Reads a `call_expression`'s target text for name resolution: the bare identifier for
-/// `Foo()`, or the full qualified text for a qualified call (Go's `selector_expression` /
-/// TS-JS's `member_expression`, e.g. `pkg.Foo()` → `"pkg.Foo"`, `recv.Method()` →
-/// `"recv.Method"`) — kept qualified (not trimmed to the last segment here) so
-/// `arch_model::resolve_call_edges` can itself tell a bare call from a qualified one
-/// (`callee_text.contains('.')`) and choose which symbol index to search first. A
-/// receiver/package prefix still can't be statically resolved to a concrete symbol
-/// without type inference this crate doesn't do — resolution only ever uses the last
-/// segment, and leaves the edge unresolved (`resolved: false`) rather than guessing
-/// further when that segment is ambiguous.
-///
-/// Field names verified against real `to_sexp()` output for both grammars (not guessed):
-/// Go's `call_expression` has a `function` field that's either an `identifier` or a
-/// `selector_expression` (fields `operand`/`field`); TS/JS's `call_expression` has the
-/// same `function` field, either an `identifier` or a `member_expression` (fields
-/// `object`/`property`).
+/// Reads a `call_expression`'s target text: the bare identifier for `Foo()`, or the full
+/// qualified text for `pkg.Foo()`/`recv.Method()` — kept qualified (not trimmed to the
+/// last segment here) so `arch_model::resolve_call_edges` can itself tell a bare call
+/// from a qualified one and pick which symbol index to search first.
 fn callee_text_for(call: Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     match function.kind() {
