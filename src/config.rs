@@ -564,6 +564,7 @@ pub fn default_checks() -> Vec<Check> {
             ..native_check("markdown-link-integrity", Severity::Blocking, &["**/*.md"])
         },
         native_check("primitive-obsession", Severity::Advisory, &["**/*.go"]),
+        native_check("file-complexity", Severity::Advisory, &["**/*.go"]),
         native_check(
             "duplicate-code",
             Severity::Advisory,

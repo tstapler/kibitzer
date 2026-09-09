@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
 use crate::comment_quality::CommentQualityChecker;
+use crate::complexity::FileComplexityChecker;
 use crate::duplicate_code::DuplicateCodeChecker;
 use crate::duplicate_cross_file_checker::CrossFileDuplicateChecker;
 use crate::file_size::FileSizeChecker;
@@ -148,6 +149,7 @@ pub trait Checker {
 pub fn registry() -> Vec<Box<dyn Checker>> {
     vec![
         Box::new(PrimitiveObsessionChecker),
+        Box::new(FileComplexityChecker),
         Box::new(MarkdownLinkIntegrityChecker),
         Box::new(DuplicateCodeChecker),
         Box::new(CrossFileDuplicateChecker),
