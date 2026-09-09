@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::arch_model::{
-    ArchModel, ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model,
+    ArchModel, CallEdge, ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model,
 };
 use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
@@ -141,12 +141,131 @@ struct GetArchitectureNodeRequest {
     node: String,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct CallTraversalRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// The `SymbolNode::id` to traverse from — as returned by `list_architecture_symbols`
+    /// or `get_architecture_node`.
+    node: String,
+    /// How many hops to follow. Defaults to 1 (immediate callers/callees only); clamped
+    /// to [1, 10]. The walk keeps a visited-node set so a recursive or
+    /// mutually-recursive call chain can't loop forever.
+    #[serde(default = "default_depth")]
+    depth: usize,
+}
+
+fn default_depth() -> usize {
+    1
+}
+
+#[derive(Serialize)]
+struct CallTraversalResponse {
+    node: String,
+    depth: usize,
+    /// True when the walk still had unexpanded nodes left when `depth` ran out —
+    /// increasing `depth` may surface more edges. `false` means every reachable edge
+    /// within the graph was already collected.
+    truncated: bool,
+    edges: Vec<CallEdge>,
+}
+
 /// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain
 /// string) so a caller of these two JSON-returning tools never has to branch on response
 /// shape between the success and failure path, per ADR-001.
 fn json_error(message: String) -> String {
     serde_json::to_string(&serde_json::json!({ "error": message }))
         .unwrap_or_else(|_| "{\"error\":\"failed to serialize error\"}".to_string())
+}
+
+/// Which direction `traverse_call_edges` walks — an enum instead of a boolean flag so
+/// call sites read as `CallDirection::Callees`/`Callers` rather than a bare `true`/`false`.
+#[derive(Debug, Clone, Copy)]
+enum CallDirection {
+    /// Follows `from -> to`: "what does this node call?"
+    Callees,
+    /// Follows `to -> from`: "what calls this node?"
+    Callers,
+}
+
+impl CallDirection {
+    /// `(near, far)`: `near` is the endpoint a frontier node is matched against, `far` is
+    /// the endpoint that continues the walk.
+    fn endpoints(self, edge: &CallEdge) -> (&str, &str) {
+        match self {
+            CallDirection::Callees => (&edge.from, &edge.to),
+            CallDirection::Callers => (&edge.to, &edge.from),
+        }
+    }
+}
+
+/// One BFS layer: every edge in `edges` whose `direction`-relevant near-endpoint is in
+/// `frontier` is collected, and its far endpoint queued for the next layer (unless
+/// already `visited` — this is what stops a recursive/mutually-recursive call chain from
+/// looping forever). An unresolved edge's far endpoint (raw callee text, not a real
+/// symbol id) is queued the same way, but naturally never matches any edge's near
+/// endpoint on the next layer, so it just doesn't expand further.
+fn expand_call_frontier(
+    edges: &[CallEdge],
+    direction: CallDirection,
+    frontier: &[String],
+    visited: &mut std::collections::HashSet<String>,
+    collected: &mut Vec<CallEdge>,
+) -> Vec<String> {
+    let mut next = Vec::new();
+    for node in frontier {
+        for edge in edges {
+            let (near, far) = direction.endpoints(edge);
+            if near != node {
+                continue;
+            }
+            collected.push(edge.clone());
+            if visited.insert(far.to_string()) {
+                next.push(far.to_string());
+            }
+        }
+    }
+    next
+}
+
+/// True if any node in `frontier` still has at least one outgoing edge in `direction` —
+/// i.e. expanding one more hop would actually surface more edges, not just re-discover
+/// nodes already in `collected`.
+fn frontier_has_more(edges: &[CallEdge], direction: CallDirection, frontier: &[String]) -> bool {
+    frontier
+        .iter()
+        .any(|node| edges.iter().any(|e| direction.endpoints(e).0 == node))
+}
+
+/// Bounded BFS over `edges` from `start` (a `SymbolNode::id`), in `direction`. Returns
+/// the collected edges and whether a further hop would actually surface more edges (see
+/// `CallTraversalResponse::truncated`) — checked via `frontier_has_more` rather than just
+/// "was the frontier non-empty," so reaching a true leaf at exactly `depth` correctly
+/// reports `truncated: false` instead of leaving the caller to guess.
+fn traverse_call_edges(
+    edges: &[CallEdge],
+    start: &str,
+    depth: usize,
+    direction: CallDirection,
+) -> (Vec<CallEdge>, bool) {
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(start.to_string());
+    let mut frontier: Vec<String> = vec![start.to_string()];
+    let mut collected: Vec<CallEdge> = Vec::new();
+
+    for hop in 0..depth {
+        let next_frontier =
+            expand_call_frontier(edges, direction, &frontier, &mut visited, &mut collected);
+        if next_frontier.is_empty() {
+            return (collected, false);
+        }
+        if hop + 1 == depth {
+            let truncated = frontier_has_more(edges, direction, &next_frontier);
+            return (collected, truncated);
+        }
+        frontier = next_frontier;
+    }
+    (collected, false)
 }
 
 fn symbol_kind_matches(kind: SymbolKind, want: &str) -> bool {
@@ -727,6 +846,63 @@ impl KibitzerServer {
         serde_json::to_string(&value)
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
+
+    #[tool(
+        description = "Backward call-graph traversal: who calls `node` (a SymbolNode id), up to \
+                        `depth` hops — returns JSON ({node, depth, truncated, edges}), not prose. \
+                        An edge with resolved: false carries the call site's raw, unresolved \
+                        callee text instead of a symbol id (best-effort static resolution — dynamic \
+                        dispatch/DI/reflection can leave gaps). Use for impact analysis ('what \
+                        breaks if I change this function') or dead-code checks (an exported symbol \
+                        with zero callers)."
+    )]
+    async fn list_callers(&self, req: Parameters<CallTraversalRequest>) -> String {
+        self.call_traversal(req.0, CallDirection::Callers).await
+    }
+
+    #[tool(
+        description = "Forward call-graph traversal: what `node` (a SymbolNode id) calls, up to \
+                        `depth` hops — returns JSON ({node, depth, truncated, edges}), not prose. \
+                        An edge with resolved: false carries the call site's raw, unresolved \
+                        callee text instead of a symbol id (best-effort static resolution — dynamic \
+                        dispatch/DI/reflection can leave gaps). Use for impact analysis ('what does \
+                        this function actually reach') or security path verification."
+    )]
+    async fn list_callees(&self, req: Parameters<CallTraversalRequest>) -> String {
+        self.call_traversal(req.0, CallDirection::Callees).await
+    }
+}
+
+impl KibitzerServer {
+    /// Shared body for `list_callers`/`list_callees` — the two tools differ only in
+    /// which direction they walk `ArchModel::call_edges`.
+    async fn call_traversal(&self, req: CallTraversalRequest, direction: CallDirection) -> String {
+        let path = PathBuf::from(&req.path);
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
+        };
+        let depth = req.depth.clamp(1, 10);
+
+        // Same default-model choice as `get_architecture_node`: unscoped, exported-only,
+        // sharing that tool's cache slot.
+        let model = match self.load_model_off_stack(repo_root, false).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+
+        let (edges, truncated) =
+            traverse_call_edges(&model.call_edges, &req.node, depth, direction);
+
+        let response = CallTraversalResponse {
+            node: req.node,
+            depth,
+            truncated,
+            edges,
+        };
+        serde_json::to_string(&response)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -740,8 +916,9 @@ impl ServerHandler for KibitzerServer {
                  architecture_assessment for a whole-repo structural + complexity review \
                  (all three return prose). For a scoped query into the repo's architecture \
                  model instead of a whole-repo report, use list_architecture_symbols (a \
-                 paginated, filtered symbol slice) or get_architecture_node (one package or \
-                 symbol by exact reference) — both return JSON, not prose."
+                 paginated, filtered symbol slice), get_architecture_node (one package or \
+                 symbol by exact reference), or list_callers/list_callees (function-level \
+                 call-graph traversal, Go/TS/JS only) — all four return JSON, not prose."
                     .to_string(),
             ),
             ..Default::default()
@@ -1357,6 +1534,179 @@ mod tests {
         .unwrap();
     }
 
+    /// `Entry` calls `Middle`, which calls `Leaf` — a 2-hop chain for depth-clamping
+    /// tests — plus `Recursive` calling itself (to exercise the visited-set) and an
+    /// `Unresolvable` call to an ambiguous same-named function in two other packages.
+    fn write_call_graph_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        std::fs::create_dir_all(dir.join("chain")).unwrap();
+        std::fs::write(
+            dir.join("chain/c.go"),
+            "package chain\n\nfunc Leaf() {}\n\nfunc Middle() {\n\tLeaf()\n}\n\nfunc Entry() {\n\tMiddle()\n}\n\nfunc Recursive() {\n\tRecursive()\n}\n\nfunc Unresolvable() {\n\tAmbiguous()\n}\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.join("one")).unwrap();
+        std::fs::write(dir.join("one/o.go"), "package one\n\nfunc Ambiguous() {}\n").unwrap();
+
+        std::fs::create_dir_all(dir.join("two")).unwrap();
+        std::fs::write(dir.join("two/t.go"), "package two\n\nfunc Ambiguous() {}\n").unwrap();
+    }
+
+    fn call_req(dir: &std::path::Path, node: &str, depth: usize) -> CallTraversalRequest {
+        CallTraversalRequest {
+            path: dir.display().to_string(),
+            node: node.to_string(),
+            depth,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_callees_follows_one_hop_by_default() {
+        let dir = tmp_dir("callees-one-hop");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callees(Parameters(call_req(&dir, "fixture/chain::Entry", 1)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let edges = json["edges"].as_array().expect("edges array");
+        assert_eq!(edges.len(), 1, "got: {json}");
+        assert_eq!(edges[0]["from"], "fixture/chain::Entry", "got: {json}");
+        assert_eq!(edges[0]["to"], "fixture/chain::Middle", "got: {json}");
+        assert_eq!(edges[0]["resolved"], true, "got: {json}");
+        assert_eq!(
+            json["truncated"], true,
+            "Middle still calls Leaf beyond depth 1: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_callees_depth_two_reaches_the_leaf_and_reports_not_truncated() {
+        let dir = tmp_dir("callees-two-hops");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callees(Parameters(call_req(&dir, "fixture/chain::Entry", 2)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let targets: Vec<&str> = json["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .map(|e| e["to"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["fixture/chain::Middle", "fixture/chain::Leaf"],
+            "got: {json}"
+        );
+        assert_eq!(
+            json["truncated"], false,
+            "Leaf has no further callees: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_callers_walks_backward_from_the_leaf() {
+        let dir = tmp_dir("callers-backward");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callers(Parameters(call_req(&dir, "fixture/chain::Leaf", 2)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let callers: Vec<&str> = json["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .map(|e| e["from"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            callers,
+            vec!["fixture/chain::Middle", "fixture/chain::Entry"],
+            "got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_callees_on_a_recursive_function_terminates_via_the_visited_set() {
+        let dir = tmp_dir("callees-recursive");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callees(Parameters(call_req(&dir, "fixture/chain::Recursive", 5)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        // The self-edge is collected exactly once, not once per would-be hop — proves the
+        // visited set stopped the walk instead of looping until `depth` ran out.
+        let edges = json["edges"].as_array().expect("edges array");
+        assert_eq!(edges.len(), 1, "got: {json}");
+        assert_eq!(edges[0]["from"], "fixture/chain::Recursive", "got: {json}");
+        assert_eq!(edges[0]["to"], "fixture/chain::Recursive", "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_callees_reports_an_ambiguous_target_as_unresolved_with_raw_text() {
+        let dir = tmp_dir("callees-unresolved");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callees(Parameters(call_req(&dir, "fixture/chain::Unresolvable", 1)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let edges = json["edges"].as_array().expect("edges array");
+        assert_eq!(edges.len(), 1, "got: {json}");
+        assert_eq!(edges[0]["resolved"], false, "got: {json}");
+        assert_eq!(edges[0]["to"], "Ambiguous", "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_callees_returns_empty_array_not_an_error_for_an_unknown_node() {
+        let dir = tmp_dir("callees-unknown-node");
+        write_call_graph_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_callees(Parameters(call_req(&dir, "fixture/chain::DoesNotExist", 1)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0, "got: {json}");
+        assert_eq!(json["truncated"], false, "got: {json}");
+    }
+
     fn list_req(
         dir: &std::path::Path,
         package: Option<&str>,
@@ -1704,7 +2054,23 @@ mod tests {
             instructions.contains("get_architecture_node"),
             "got: {instructions}"
         );
+        assert!(instructions.contains("list_callers"), "got: {instructions}");
+        assert!(instructions.contains("list_callees"), "got: {instructions}");
         assert!(instructions.contains("JSON"), "got: {instructions}");
+    }
+
+    #[test]
+    fn call_traversal_tools_are_registered_with_json_descriptions() {
+        let router = KibitzerServer::tool_router();
+        let tools = router.list_all();
+        for name in ["list_callers", "list_callees"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            let desc = tool.description.as_ref().expect("has a description");
+            assert!(desc.contains("JSON"), "{name} got: {desc}");
+        }
     }
 
     /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
