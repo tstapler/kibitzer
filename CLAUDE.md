@@ -12,7 +12,7 @@ architecture model, a `command` a project must supply) goes in
 remember. `comment-quality-<lang>` (`docs/comment-quality.md`) is wired in
 this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
-`duplicate-code-cross-file`, and the Go-specific
+`duplicate-code-cross-file`, `file-complexity`, and the Go-specific
 `go-blank-imports`/`go-ignored-error`/`go-error-context`. A local
 `.claude/inspect.json` overlays the defaults rather than replacing them —
 see `docs/suppressing-checks.md` for how a repo disables or scopes one.
