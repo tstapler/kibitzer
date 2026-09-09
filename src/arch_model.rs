@@ -173,24 +173,23 @@ fn package_key_for_file(repo_root: &Path, file: &Path, import_graph: &ImportGrap
 /// the caller (CLI `arch_export.rs`, or a `ModelCache` build closure in `mcp.rs`/`lsp.rs`)
 /// collects files and reads their source before calling this.
 ///
-/// Extracts `file`'s call sites and appends them to `raw_call_sites` with `file` filled
-/// in — split out of `build_model`'s per-file loop purely to keep that loop short;
-/// resolution against the whole-repo symbol index still happens later, in
-/// `resolve_call_edges`.
+/// `file`'s call sites with `file` filled in — split out of `build_model`'s per-file loop
+/// purely to keep that loop short; resolution against the whole-repo symbol index still
+/// happens later, in `resolve_call_edges`.
 fn collect_call_sites(
     language: Language,
     source: &str,
     tree: &tree_sitter::Tree,
     package_path: &str,
     file: &Path,
-    raw_call_sites: &mut Vec<RawCallSite>,
-) {
-    for site in extract_call_sites_for_file(language, source, tree, package_path) {
-        raw_call_sites.push(RawCallSite {
+) -> Vec<RawCallSite> {
+    extract_call_sites_for_file(language, source, tree, package_path)
+        .into_iter()
+        .map(|site| RawCallSite {
             file: file.to_path_buf(),
             ..site
-        });
-    }
+        })
+        .collect()
 }
 
 /// Groups `files` by `package_key_for_file`, skipping files with no recognized `Language`
@@ -260,14 +259,13 @@ pub fn build_model(
             });
         }
 
-        collect_call_sites(
+        raw_call_sites.extend(collect_call_sites(
             language,
             source,
             &tree,
             &package_path,
             path,
-            &mut raw_call_sites,
-        );
+        ));
     }
 
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
