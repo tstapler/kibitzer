@@ -1120,6 +1120,21 @@ mod tests {
     }
 
     #[test]
+    fn find_repo_root_treats_a_dot_git_file_as_a_repo_root_too() {
+        let dir = tmp_dir("repo-root-git-worktree");
+        // A worktree's `.git` is a file (pointing at the parent .git/worktrees/<name>
+        // dir), not a directory — `find_repo_root` must accept either.
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/foo\n").unwrap();
+        let nested = dir.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root(&nested);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+    }
+
+    #[test]
     fn find_repo_root_falls_back_to_start_dir_when_no_dot_git_found() {
         let dir = tmp_dir("repo-root-no-git");
         // No `.git` anywhere above `dir` in a system temp dir, so the walk exhausts
