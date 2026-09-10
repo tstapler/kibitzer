@@ -16,7 +16,7 @@ use crate::arch_model::{
 use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
-use crate::config::{Check, Severity, find_config, find_effective_config};
+use crate::config::{Check, Severity, find_config, find_effective_config, find_repo_root};
 use crate::glob::matches_scope;
 
 #[derive(Debug, Clone)]
@@ -670,13 +670,17 @@ impl KibitzerServer {
         }
     }
 
-    /// Resolves `path`'s nearest `.claude/inspect.json` repo root, or a `json_error`-ready
-    /// message otherwise. Shared by `list_architecture_symbols`/`get_architecture_node`,
-    /// which previously each inlined this same `find_config` dispatch.
+    /// Resolves `path`'s nearest `.claude/inspect.json` repo root if one exists, else falls
+    /// back to the nearest `.git` root (or `path` itself) via `find_repo_root` — these
+    /// architecture-query tools only need a directory to walk for source files, not a real
+    /// config, so a missing `.claude/inspect.json` is never fatal here. Still returns `Err`
+    /// for a config file that exists but fails to parse. Shared by `list_architecture_symbols`/
+    /// `get_architecture_node`/the call-graph traversal tools, which previously each inlined
+    /// this same `find_config` dispatch.
     fn resolve_repo_root(path: &Path) -> Result<PathBuf, String> {
         match find_config(path) {
             Ok(Some((_, root))) => Ok(root),
-            Ok(None) => Err("no .claude/inspect.json found above this path".to_string()),
+            Ok(None) => Ok(find_repo_root(path)),
             Err(e) => Err(format!("error reading config: {e}")),
         }
     }
@@ -1838,6 +1842,31 @@ mod tests {
         assert_eq!(json["returned"], 3, "got: {json}");
         assert!(json["next_cursor"].is_null(), "got: {json}");
         assert_eq!(json["symbols"].as_array().unwrap().len(), 3, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_architecture_symbols_works_without_inspect_json_via_git_root() {
+        let dir = tmp_dir("list-no-config-git-root");
+        write_arch_fixture(&dir);
+        std::fs::remove_file(dir.join(".claude/inspect.json")).unwrap();
+        std::fs::remove_dir(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_architecture_symbols(Parameters(list_req(
+                &dir,
+                Some("fixture/widgets"),
+                default_limit(),
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap_or_else(|e| {
+            panic!("expected JSON, not the old config-required error: {e}\n{output}")
+        });
+        assert_eq!(json["total_matched"], 3, "got: {json}");
     }
 
     #[tokio::test]

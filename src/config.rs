@@ -474,6 +474,25 @@ fn start_dir(start: &Path) -> PathBuf {
     }
 }
 
+/// Walk upward from `start` looking for a `.git` entry (a directory for a normal clone, a
+/// file for a worktree), falling back to `start`'s own directory when neither is found
+/// anywhere above it. Unlike `find_config`, this never fails to produce a root — architecture
+/// queries (`list_architecture_symbols`, `get_architecture_node`, call-graph traversal) only
+/// need *a* directory to walk for source files, not a real `.claude/inspect.json`.
+pub fn find_repo_root(start: &Path) -> PathBuf {
+    let start = start_dir(start);
+    let mut dir = start.clone();
+    loop {
+        if dir.join(".git").exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return start,
+        }
+    }
+}
+
 /// Walk upward from `start` looking for `.claude/inspect.json`, returning the parsed
 /// config and the directory it was found in (the repo root, by convention). Returns
 /// `None` when no such file exists anywhere above `start` — this is the raw lookup;
@@ -1085,6 +1104,45 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "markdown-link-integrity")
         );
+    }
+
+    #[test]
+    fn find_repo_root_walks_up_to_nearest_dot_git() {
+        let dir = tmp_dir("repo-root-git");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let nested = dir.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root(&nested);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+    }
+
+    #[test]
+    fn find_repo_root_treats_a_dot_git_file_as_a_repo_root_too() {
+        let dir = tmp_dir("repo-root-git-worktree");
+        // A worktree's `.git` is a file (pointing at the parent .git/worktrees/<name>
+        // dir), not a directory — `find_repo_root` must accept either.
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/foo\n").unwrap();
+        let nested = dir.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root(&nested);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+    }
+
+    #[test]
+    fn find_repo_root_falls_back_to_start_dir_when_no_dot_git_found() {
+        let dir = tmp_dir("repo-root-no-git");
+        // No `.git` anywhere above `dir` in a system temp dir, so the walk exhausts
+        // every parent and falls back to `dir` itself rather than erroring.
+        let root = find_repo_root(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
     }
 
     #[test]
