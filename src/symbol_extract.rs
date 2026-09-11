@@ -531,6 +531,113 @@ pub fn extract_symbols_for_file(
     symbols
 }
 
+/// One call site found inside a function/method body: the id of the enclosing
+/// declaration (`caller_id`, built the same way `classify_node` builds `SymbolNode::id`,
+/// so it's directly comparable) and the raw, unresolved text of the call's target —
+/// resolving that text to a callee `SymbolNode::id` is `arch_model::build_model`'s job
+/// (it alone has the whole-repo symbol index needed to disambiguate a bare name).
+///
+/// `file` is left as `PathBuf::new()` here, same convention as `SymbolNode::file` —
+/// the caller (`arch_model::build_model`) fills it in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawCallSite {
+    pub caller_id: String,
+    pub callee_text: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+/// Call-graph extraction is scoped to Go and TS/JS for v1 (see the issue's "reuse
+/// existing per-language coverage" note) — every other `Language` variant returns no
+/// call sites here even though `symbol_extract_for_file` already covers it.
+fn call_graph_supports(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
+    )
+}
+
+/// Reads a `call_expression`'s target text: the bare identifier for `Foo()`, or the full
+/// qualified text for `pkg.Foo()`/`recv.Method()` — kept qualified (not trimmed to the
+/// last segment here) so `arch_model::resolve_call_edges` can itself tell a bare call
+/// from a qualified one and pick which symbol index to search first.
+fn callee_text_for(call: Node, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" | "selector_expression" | "member_expression" => {
+            Some(node_text(function, source).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Bundles `walk_calls`' per-file constants (language/config/source/package) so the
+/// recursive walk itself only threads the two things that actually change per call
+/// (`node`, `caller`) plus the output sink.
+struct CallWalkCtx<'a> {
+    language: Language,
+    cfg: &'a LangSymbolConfig,
+    source: &'a str,
+    package_path: &'a str,
+}
+
+/// Recursive walk pairing each `call_expression` with its nearest *named* enclosing
+/// function/method — an anonymous callback (e.g. a JS arrow function with no `name`
+/// field) doesn't get its own caller context, so calls inside it attribute to whichever
+/// named declaration encloses it instead, matching `classify_node`'s existing "no
+/// resolvable name → no symbol" behavior for such nodes.
+fn walk_calls(node: Node, ctx: &CallWalkCtx, caller: Option<&str>, out: &mut Vec<RawCallSite>) {
+    let mut current_caller = caller.map(str::to_string);
+    if ctx.cfg.function_kinds.contains(&node.kind())
+        && let Some(sym) = classify_node(node, ctx.language, ctx.cfg, ctx.source, ctx.package_path)
+    {
+        current_caller = Some(sym.id);
+    }
+
+    if node.kind() == "call_expression"
+        && let Some(caller_id) = &current_caller
+        && let Some(callee_text) = callee_text_for(node, ctx.source)
+    {
+        out.push(RawCallSite {
+            caller_id: caller_id.clone(),
+            callee_text,
+            file: PathBuf::new(),
+            line: node.start_position().row + 1,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_calls(child, ctx, current_caller.as_deref(), out);
+    }
+}
+
+/// Walks `tree.root_node()` and returns every call site found inside a named
+/// function/method body, paired with its enclosing declaration's `SymbolNode::id`. Empty
+/// for a language `call_graph_supports` doesn't cover yet (see its doc comment). No file
+/// I/O; `RawCallSite::file` is left empty for the caller to fill in, same convention as
+/// `extract_symbols_for_file`.
+pub fn extract_call_sites_for_file(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    package_path: &str,
+) -> Vec<RawCallSite> {
+    if !call_graph_supports(language) {
+        return Vec::new();
+    }
+    let cfg = lang_symbol_config(language);
+    let ctx = CallWalkCtx {
+        language,
+        cfg: &cfg,
+        source,
+        package_path,
+    };
+    let mut sites = Vec::new();
+    walk_calls(tree.root_node(), &ctx, None, &mut sites);
+    sites
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +974,107 @@ mod tests {
         let f = find_by_name(&symbols, "topLevel");
         assert_eq!(f.kind, SymbolKind::Function);
         assert_eq!(f.parent, None);
+    }
+
+    // --- extract_call_sites_for_file ---
+
+    fn call_sites(language: Language, source: &str, package_path: &str) -> Vec<RawCallSite> {
+        let cache = GrammarCache::new();
+        let tree = cache.parse(language, source).expect("parses");
+        extract_call_sites_for_file(language, source, &tree, package_path)
+    }
+
+    #[test]
+    fn go_bare_call_resolves_caller_and_callee_text() {
+        let sites = call_sites(
+            Language::Go,
+            "package pkg\n\nfunc Bar() {}\n\nfunc Foo() {\n\tBar()\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].caller_id, "pkg::Foo");
+        assert_eq!(sites[0].callee_text, "Bar");
+    }
+
+    #[test]
+    fn go_selector_call_keeps_the_full_qualified_text() {
+        let sites = call_sites(
+            Language::Go,
+            "package pkg\n\nfunc Foo() {\n\tpkg.Qux()\n\tt.Method()\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 2);
+        assert!(sites.iter().all(|s| s.caller_id == "pkg::Foo"));
+        assert_eq!(sites[0].callee_text, "pkg.Qux");
+        assert_eq!(sites[1].callee_text, "t.Method");
+    }
+
+    #[test]
+    fn go_method_call_attributes_to_the_owner_qualified_caller_id() {
+        let sites = call_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct{}\n\nfunc (t T) M() {\n\tBar()\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].caller_id, "pkg::T.M");
+    }
+
+    #[test]
+    fn go_call_with_no_enclosing_function_is_dropped() {
+        // A call outside any function/method body has no caller context to attribute to
+        // (e.g. a package-level var initializer) — this crate doesn't model that as a
+        // call edge at all rather than inventing a synthetic caller id.
+        let sites = call_sites(Language::Go, "package pkg\n\nvar x = Bar()\n", "pkg");
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn ts_bare_and_member_calls_both_attribute_to_enclosing_function() {
+        let sites = call_sites(
+            Language::TypeScript,
+            "function bar() {}\n\nfunction foo() {\n  bar();\n  obj.method();\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 2);
+        assert!(sites.iter().all(|s| s.caller_id == "pkg::foo"));
+        assert_eq!(sites[0].callee_text, "bar");
+        assert_eq!(sites[1].callee_text, "obj.method");
+    }
+
+    #[test]
+    fn ts_call_inside_anonymous_arrow_attributes_to_the_named_enclosing_function() {
+        let sites = call_sites(
+            Language::TypeScript,
+            "function foo() {\n  const cb = () => { bar(); };\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].caller_id, "pkg::foo");
+        assert_eq!(sites[0].callee_text, "bar");
+    }
+
+    #[test]
+    fn ts_class_method_call_attributes_to_owner_qualified_caller_id() {
+        let sites = call_sites(
+            Language::TypeScript,
+            "class T {\n  method() {\n    bar();\n  }\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].caller_id, "pkg::T.method");
+    }
+
+    #[test]
+    fn python_call_sites_are_unsupported_in_v1() {
+        // Call-graph extraction is scoped to Go/TS/JS for v1 (see the issue's scope
+        // notes) — Python symbol extraction exists, but call sites are deliberately not
+        // extracted for it yet.
+        let sites = call_sites(
+            Language::Python,
+            "def bar():\n    pass\n\ndef foo():\n    bar()\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
     }
 }

@@ -713,6 +713,7 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             packages,
             import_edges: vec![],
+            call_edges: vec![],
             pruning: empty_pruning(),
         }
     }

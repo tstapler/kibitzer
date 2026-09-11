@@ -24,6 +24,11 @@ struct HookInput {
     /// edit. Absent for callers that don't send it, in which case dedup is skipped.
     #[serde(default)]
     tool_use_id: Option<String>,
+    /// Only present on a `Stop` event — the session transcript's path, consulted by
+    /// `task_stop::run_stop_hook` instead of anything in `tool_input` (which a `Stop`
+    /// payload doesn't carry at all).
+    #[serde(default)]
+    transcript_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -110,15 +115,21 @@ fn compute_changed_lines(
     }
 }
 
-/// Implements the Claude Code `PostToolUse` hook contract: read the event off stdin,
-/// run any in-scope checks, and report back via stdout (advisory) or exit 2 + stderr
-/// (blocking).
+/// Implements Claude Code's `PostToolUse` and `Stop` hook contracts, dispatching on
+/// `hook_event_name` — both are wired to the same `kibitzer hook` command (see
+/// `install.rs`), so this is the single entry point Claude Code actually invokes.
+/// `PostToolUse`: run any in-scope checks for the edit and report back via stdout
+/// (advisory) or exit 2 + stderr (blocking). `Stop`: see `task_stop::run_stop_hook`.
 pub fn run_hook() -> Result<ExitCode> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
         .context("reading hook input from stdin")?;
     let input: HookInput = serde_json::from_str(&raw).context("parsing hook input JSON")?;
+
+    if input.hook_event_name == "Stop" {
+        return crate::task_stop::run_stop_hook(&input.cwd, input.transcript_path.as_deref());
+    }
 
     if let Some(tool_use_id) = &input.tool_use_id
         && !crate::dedup::claim(tool_use_id)

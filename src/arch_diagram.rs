@@ -247,6 +247,7 @@ mod tests {
             repo_root: PathBuf::from("/repo"),
             packages,
             import_edges: vec![],
+            call_edges: vec![],
             pruning: empty_pruning(),
         }
     }
@@ -330,6 +331,7 @@ mod tests {
             repo_root: PathBuf::from("/repo"),
             packages,
             import_edges: vec![],
+            call_edges: vec![],
             pruning: empty_pruning(),
         };
 

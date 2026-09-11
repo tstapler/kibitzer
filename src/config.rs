@@ -474,6 +474,25 @@ fn start_dir(start: &Path) -> PathBuf {
     }
 }
 
+/// Walk upward from `start` looking for a `.git` entry (a directory for a normal clone, a
+/// file for a worktree), falling back to `start`'s own directory when neither is found
+/// anywhere above it. Unlike `find_config`, this never fails to produce a root — architecture
+/// queries (`list_architecture_symbols`, `get_architecture_node`, call-graph traversal) only
+/// need *a* directory to walk for source files, not a real `.claude/inspect.json`.
+pub fn find_repo_root(start: &Path) -> PathBuf {
+    let start = start_dir(start);
+    let mut dir = start.clone();
+    loop {
+        if dir.join(".git").exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return start,
+        }
+    }
+}
+
 /// Walk upward from `start` looking for `.claude/inspect.json`, returning the parsed
 /// config and the directory it was found in (the repo root, by convention). Returns
 /// `None` when no such file exists anywhere above `start` — this is the raw lookup;
@@ -507,8 +526,12 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     }
 }
 
-/// One `checker`-based `Check` running on `PostToolUse`+`batch`, the shape every entry
-/// in `default_checks()` shares.
+/// One `checker`-based `Check` running on `PostToolUse`+`batch`+[`crate::task_stop::TRIGGER`],
+/// the shape every per-file entry in `default_checks()` shares. The `Stop`-trigger opt-in
+/// closes a gap `PostToolUse`'s diff-scoping leaves open: a per-edit check only sees the
+/// lines one specific edit touched, so a finding whose location doesn't overlap that edit
+/// (e.g. a file-size threshold crossed by an earlier edit in the same file/task) can be
+/// silently dropped. Re-running unscoped once per task via `Stop` closes that gap.
 fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
     Check {
         name: name.to_string(),
@@ -517,7 +540,29 @@ fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
         architecture_checker: None,
         severity,
         scope: scope.iter().map(|s| s.to_string()).collect(),
-        triggers: vec!["PostToolUse".to_string(), "batch".to_string()],
+        triggers: vec![
+            "PostToolUse".to_string(),
+            "batch".to_string(),
+            crate::task_stop::TRIGGER.to_string(),
+        ],
+        message: None,
+        output_format: None,
+    }
+}
+
+/// One `architecture_checker`-based `Check` running batch-only, for a whole-repo default
+/// that needs no project-specific setup — `architecture_checker` checks can't run under
+/// any other trigger (see `validate` below), so they're inherently cheap regardless of
+/// edit frequency.
+fn whole_repo_check(name: &str, architecture_checker: &str) -> Check {
+    Check {
+        name: name.to_string(),
+        command: None,
+        checker: None,
+        architecture_checker: Some(architecture_checker.to_string()),
+        severity: Severity::Advisory,
+        scope: vec![],
+        triggers: vec!["batch".to_string()],
         message: None,
         output_format: None,
     }
@@ -538,8 +583,24 @@ pub fn default_checks() -> Vec<Check> {
             ..native_check("markdown-link-integrity", Severity::Blocking, &["**/*.md"])
         },
         native_check("primitive-obsession", Severity::Advisory, &["**/*.go"]),
+        native_check("file-complexity", Severity::Advisory, &["**/*.go"]),
         native_check(
             "duplicate-code",
+            Severity::Advisory,
+            &[
+                "**/*.go",
+                "**/*.ts",
+                "**/*.tsx",
+                "**/*.js",
+                "**/*.jsx",
+                "**/*.py",
+                "**/*.java",
+                "**/*.kt",
+                "**/*.rs",
+            ],
+        ),
+        native_check(
+            "duplicate-code-cross-file",
             Severity::Advisory,
             &[
                 "**/*.go",
@@ -556,6 +617,23 @@ pub fn default_checks() -> Vec<Check> {
         native_check("go-blank-imports", Severity::Advisory, &["**/*.go"]),
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
+        native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
+        whole_repo_check("go-package-size", "package-size"),
+        native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
+        native_check("tsx-file-size", Severity::Advisory, &["**/*.tsx"]),
+        native_check(
+            "javascript-file-size",
+            Severity::Advisory,
+            &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        ),
+        native_check("python-file-size", Severity::Advisory, &["**/*.py"]),
+        native_check("java-file-size", Severity::Advisory, &["**/*.java"]),
+        native_check(
+            "kotlin-file-size",
+            Severity::Advisory,
+            &["**/*.kt", "**/*.kts"],
+        ),
+        native_check("rust-file-size", Severity::Advisory, &["**/*.rs"]),
         Check {
             checker: Some("syntax-rules".to_string()),
             ..native_check("syntax-rules-go", Severity::Advisory, &["**/*.go"])
@@ -1026,6 +1104,45 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "markdown-link-integrity")
         );
+    }
+
+    #[test]
+    fn find_repo_root_walks_up_to_nearest_dot_git() {
+        let dir = tmp_dir("repo-root-git");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let nested = dir.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root(&nested);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+    }
+
+    #[test]
+    fn find_repo_root_treats_a_dot_git_file_as_a_repo_root_too() {
+        let dir = tmp_dir("repo-root-git-worktree");
+        // A worktree's `.git` is a file (pointing at the parent .git/worktrees/<name>
+        // dir), not a directory — `find_repo_root` must accept either.
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/foo\n").unwrap();
+        let nested = dir.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root(&nested);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+    }
+
+    #[test]
+    fn find_repo_root_falls_back_to_start_dir_when_no_dot_git_found() {
+        let dir = tmp_dir("repo-root-no-git");
+        // No `.git` anywhere above `dir` in a system temp dir, so the walk exhausts
+        // every parent and falls back to `dir` itself rather than erroring.
+        let root = find_repo_root(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
     }
 
     #[test]
