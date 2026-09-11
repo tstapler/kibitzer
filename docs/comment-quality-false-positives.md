@@ -119,3 +119,62 @@ case (`Add(a, b) { return a + b }` — a self-contained computation, correctly *
 delegation) still fires unchanged.
 
 ## Log
+
+### 2026-09-09 — stelekit — `/`-separated prose list with a trailing `;` misread as commented-out code
+
+- **Repo**: `tstapler/stelekit` (session `stelekit-22`), file
+  `kmp/src/jvmTest/kotlin/dev/stapler/stelekit/db/QueryPlanAuditTest.kt:45`.
+- **What changed**: added a two-line prose comment documenting why a query is
+  allowlisted: `// asset_index LIKE search — tags/auto_labels/ocr_text are unindexed
+  text columns;` (line 45) continuing onto line 46. The semicolon ends the clause
+  grammatically (matching the existing style of every other entry in this same
+  allowlist block); the slashes are an "either/or" list of three column names, not
+  code.
+- **Why it's a false positive**: nothing on this line is code. `tags/auto_labels/
+  ocr_text` is prose (a slash-delimited enumeration of column names), not a division
+  expression or a path.
+- **Mechanism**: `comment_quality.rs::looks_like_code` (line ~369):
+  `text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c))`. The
+  2026-09-06 backtest (see the "Fixed" section above) narrowed the code-only
+  punctuation set from `(){}[]=<>+*/&|!` down to `{}[]=+*/&|!`, but kept `/` in the
+  narrowed set — this line shows `/` alone, in ordinary technical prose ending a
+  sentence in `;`, is *not* an unambiguous code signal either, the same way
+  `(`/`)`/`<`/`>` turned out not to be. A single `/` with no adjacent code-only
+  punctuation (no `{}[]=+*&|!`, no digits/identifiers forming a real division
+  expression) reads as a list separator far more often than as division in the
+  codebases I've seen this fire on. Not independently re-verified against a large
+  corpus the way the original backtest was — flagging as a hypothesis with one
+  concrete real-world instance, per this file's stated approach to unvalidated
+  constants.
+
+### 2026-09-09 — stelekit — brace-closing `} // ConstructName(args)` annotation comments misread as commented-out code
+
+- **Repo**: `tstapler/stelekit` (session `stelekit-22`), file
+  `kmp/src/commonMain/kotlin/dev/stapler/stelekit/ui/App.kt:1929,1935` (and `:1995`
+  before an unrelated same-session edit shifted line numbers).
+- **What changed**: nothing at these exact lines — pre-existing code, first surfaced
+  by an unscoped re-check after an edit elsewhere in the same file. The lines read
+  `} // CompositionLocalProvider(LocalWindowSizeClass)` and
+  `} // CompositionLocalProvider(LocalSpanRecorder, LocalFileSystem)` — a closing
+  brace annotated with which construct's opening line it closes, a common idiom in
+  deeply-nested Compose UI code (nesting depth was itself a separate, legitimate
+  finding on this same function).
+- **Why it's a false positive**: `CompositionLocalProvider(...)` here is not
+  commented-out code — it names the *already-live*, currently-open call several
+  hundred lines above whose closing brace this is. Deleting the comment (as the
+  finding's own message suggests) would remove a genuinely useful nesting-tracking
+  aid and leave nothing behind, since the real call is untouched code elsewhere.
+- **Mechanism**: `comment_quality.rs::looks_like_code` → `is_call_expression` (line
+  ~375). A brace-closing annotation comment naming its construct in call syntax
+  (`ConstructName(args)`) is, by construction, syntactically indistinguishable from a
+  real commented-out call — `is_call_expression`'s shape check (identifier, `(`,
+  matching `)`, optional trailing `;`) is exactly what both look like. Unlike the
+  slash-list case above, this isn't a punctuation-set tuning problem; it's a genuine
+  ambiguity between two comment idioms that share syntax. A possible fix direction
+  (not attempted here, no source change made): `check_commented_out_code` operates
+  purely on the comment node's own text with no awareness of its position relative to
+  code on the same physical line — a comment that's a *trailing* comment immediately
+  following a bare `}` as the only code on that line is a strong, cheap, and
+  well-known signal for "brace-closing annotation," and essentially never actual dead
+  code (commented-out code doesn't typically get appended after a live, unrelated
+  closing brace). Not independently verified against a broader corpus.

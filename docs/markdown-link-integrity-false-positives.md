@@ -319,3 +319,14 @@ including the caveat that this escalation only survives across edits when a
 persisted for diff-scoped per-edit hook calls, so a still-failing violation stays
 Advisory instead of escalating.
 
+Both entries previously logged here (personal-wiki `[[wiki links]]`, stapler-squad GFM
+task-list checkboxes) were fixed by enabling `Options::ENABLE_WIKILINKS |
+Options::ENABLE_TASKLISTS` on the parser in `check_source` — see the commit that
+removed these entries for the diff and its regression tests
+(`wikilinks_are_not_flagged_as_undefined_references`,
+`piped_wikilink_is_not_flagged_as_undefined_reference`,
+`task_list_checkboxes_are_not_flagged_as_undefined_references`). `LinkType::WikiLink`
+and `Event::TaskListMarker` are their own dedicated pulldown-cmark event types under
+those options, so `[[Page]]`/`[[Page|Text]]` and `- [x]`/`- [ ]` no longer fall through
+to plain CommonMark bracket parsing at all — they never reach the reference-style
+matching logic this checker runs, rather than being special-cased around it.
