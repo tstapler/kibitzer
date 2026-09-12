@@ -299,6 +299,46 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   respectively) supplies the matching `[label]:` definition — the same confirmed mechanism as the
   `dcb5a7eb` entry above, not a new false-positive sample.
 
+### 2026-09-11 — stapler-squad — `[SEVERITY: High]`-style bracket tag in a heading misread as an undefined shortcut reference link
+
+- **Repo**: `tstapler/stapler-squad`, file:
+  `docs/bugs/open/BUG-105-leaked-test-tmux-servers-exhaust-service-cgroup-cause-deploy-rollbacks.md:1`
+  (a new file at the time; later renamed under `docs/bugs/fixed/` once the bug was
+  fixed, same finding both times).
+- **What changed**: wrote a new bug-report doc whose title line ended
+  `... deploy rollbacks [SEVERITY: High]`, following this repo's own convention —
+  `docs/bugs/open/BUG-103-...md` and `BUG-104-...md` both use the identical
+  `[SEVERITY: <level>]` suffix in their `# BUG-NNN: ...` heading.
+- **Why it's a false positive**: `[SEVERITY: High]` is a plain bracketed tag, not an
+  attempted link of any kind — there is no corresponding `[SEVERITY: High]: <url>`
+  definition anywhere in the document, nor was one ever intended.
+- **Mechanism**: CommonMark's own grammar makes `[text]` with no following `(url)` or
+  `[ref]` a syntactically valid *shortcut reference link* candidate — pulldown-cmark
+  (which `markdown_link_integrity.rs::check_source` walks) emits it as
+  `LinkType::ShortcutUnknown` whenever no matching `[label]: target` definition
+  exists, and `reference_style_flags` (line ~216) classifies every `*Unknown` link
+  type as dangling. There is no square-bracket syntax in CommonMark that means
+  "plain literal bracketed text, definitely not a link attempt" — the ambiguity is in
+  the spec itself, not a bug in this checker's own logic. This is a distinct
+  mechanism from every other entry in this log (all of which are about *timing* —
+  a valid reference-style link whose definition lands in a later edit — not about
+  *misclassifying non-link bracket text as a link at all*), and is likely to recur
+  on any doc using a `[TAG]`-style convention in a heading or plain sentence — this
+  same repo's own `code:review` skill output format uses `[BLOCKER]`/`[CRITICAL]`/
+  `[MAJOR]`/`[NIT]` severity tags the same way. Not independently verified against a
+  broader corpus. A possible fix direction (not attempted here, no source change
+  made): only treat a `ShortcutUnknown` as dangling if the bracketed text itself
+  looks like a plausible reference label (e.g. a slug-like `[a-z0-9-]+` pattern, or
+  no internal whitespace) rather than free-form prose/tags containing spaces and
+  punctuation — `SEVERITY: High` contains both a colon and a space, unlike every
+  legitimate reference label already in this corpus (`appendix-live-conversations`,
+  `pr-crd-sync-no-token`).
+- **Workaround applied in the session**: changed the heading to parenthesize the tag
+  (`(SEVERITY: High)`) instead of bracketing it, since this was blocking a same-session
+  edit and no suppression was in place — worked around rather than fixed at the
+  source, logged here per this doc's own instruction not to just note a false positive
+  in passing.
+
 ## Resolution: native `markdown-link-integrity` checker + grace period
 
 `markdown-link-integrity` is no longer a `markdownlint-cli2`/`doc_report.py`
