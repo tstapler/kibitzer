@@ -55,18 +55,7 @@ impl Checker for PrimitiveObsessionChecker {
 /// predate the `Checker`/registry machinery and check a Go source string directly.
 #[cfg(test)]
 fn check_source(src: &str) -> Result<Vec<Finding>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .context("loading tree-sitter-go grammar")?;
-    let tree = parser
-        .parse(src, None)
-        .context("parsing Go source with tree-sitter")?;
-    let ctx = CheckContext {
-        source: src,
-        tree: Some(&tree),
-    };
-    PrimitiveObsessionChecker.check(Path::new("<source>"), &ctx)
+    crate::test_support::check_go_source(&PrimitiveObsessionChecker, src)
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {

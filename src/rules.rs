@@ -994,13 +994,7 @@ mod tests {
     use super::*;
 
     fn check_source(src: &str) -> Result<Vec<Finding>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .context("loading tree-sitter-go grammar")?;
-        let tree = parser
-            .parse(src, None)
-            .context("parsing Go source with tree-sitter")?;
+        let tree = crate::test_support::parse_go(src)?;
 
         let cfg = lang_config(Language::Go);
         let mut findings = Vec::new();

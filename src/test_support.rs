@@ -5,7 +5,43 @@
 
 #![cfg(test)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use tree_sitter::Tree;
+
+use crate::checker::{CheckContext, Checker, Finding};
+
+/// Parses `src` as Go with tree-sitter — half of the setup every Go native checker's own
+/// tests repeat before building a `CheckContext` and calling `checker.check(...)` (see
+/// [`check_go_source`] for the fully-collapsed form; this half stays separate for the one
+/// caller — `rules.rs`'s `check_source` — whose tail diverges into `walk_declarations`
+/// instead of a `Checker::check` call).
+pub(crate) fn parse_go(src: &str) -> Result<Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .context("loading tree-sitter-go grammar")?;
+    parser
+        .parse(src, None)
+        .context("parsing Go source with tree-sitter")
+}
+
+/// Parses `src` as Go and runs `checker` against it — the full boilerplate every Go
+/// native checker's own tests repeat (parse, build a `CheckContext`, call
+/// `checker.check(...)`) collapsed into one call, since the `Tree`'s lifetime only
+/// needs to outlive the `CheckContext` borrowing it, both of which stay inside this
+/// function. Extracted once a corpus backtest sweep flagged the un-collapsed version as
+/// a genuine repeated block across `go_blank_imports.rs`, `primitive_obsession.rs`,
+/// `go_ignored_error.rs`, and `go_error_context_tests.rs`.
+pub(crate) fn check_go_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    let tree = parse_go(src)?;
+    let ctx = CheckContext {
+        source: src,
+        tree: Some(&tree),
+    };
+    checker.check(Path::new("<source>"), &ctx)
+}
 
 /// The compiled `kibitzer` binary's path. Cargo only sets `CARGO_BIN_EXE_<name>` for
 /// integration tests/benches (this crate has no `tests/` directory — everything is inline

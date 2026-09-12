@@ -588,15 +588,18 @@ fn is_assignment(text: &str) -> bool {
     if matches!(after, Some(b'=' | b'>')) || matches!(before, Some(b'=' | b'!' | b'<' | b'>')) {
         return false;
     }
-    let lhs = text[..pos].trim();
-    let rhs = text[pos + 1..].trim();
+    is_assignment_lhs(text[..pos].trim()) && is_assignment_rhs(text[pos + 1..].trim())
+}
+
+/// A real assignment's LHS is a non-empty, dotted-path-shaped identifier.
+/// `true`/`false`/`nil` can never legitimately sit on an assignment's LHS (`true = ...`
+/// doesn't compile) — only the character class was checked before, which let doc
+/// shorthand like "true = no matching session" (explaining what a bool field's value
+/// means) through as a fake "assignment" — a real backtest finding
+/// (docs/comment-quality-false-positives.md).
+fn is_assignment_lhs(lhs: &str) -> bool {
     !lhs.is_empty()
         && !lhs.contains(' ')
-        // `true`/`false`/`nil` can never legitimately sit on an assignment's LHS (`true
-        // = ...` doesn't compile) — only the character class was checked before, which
-        // let doc shorthand like "true = no matching session" (explaining what a bool
-        // field's value means) through as a fake "assignment" — a real backtest finding
-        // (docs/comment-quality-false-positives.md).
         && !matches!(lhs, "true" | "false" | "nil")
         && lhs
             .chars()
@@ -605,21 +608,20 @@ fn is_assignment(text: &str) -> bool {
         && lhs
             .chars()
             .all(|c| c.is_alphanumeric() || "_.[]$".contains(c))
-        && !rhs.is_empty()
-        // A real single-statement assignment's RHS doesn't itself contain another bare
-        // `=` — a second one signals a narrative computation explanation instead (a
-        // real backtest finding: "FQDN=15 + 1(dot) + 55 = 71 chars" and
-        // "OOMScoreAdj = 1000 - (...) = 869" both have a valid-looking `lhs`, but their
-        // `rhs` re-derives a value through a second `=`, which no single Go/Rust/etc.
-        // assignment statement does).
-        && !rhs.contains('=')
-        // Nor does it contain a sentence boundary — a period followed by more prose
-        // (`cmd.WaitDelay = 2 * time.Second. This analyzer enforces that rule`) signals
-        // a quoted code fragment resuming into unrelated prose, not a real standalone
-        // assignment statement (a real backtest finding, same doc). A genuine RHS never
-        // contains ". " — qualified access like `time.Second` has no space after the
-        // dot.
-        && !rhs.contains(". ")
+}
+
+/// A real single-statement assignment's RHS doesn't itself contain another bare `=` —
+/// a second one signals a narrative computation explanation instead (a real backtest
+/// finding: "FQDN=15 + 1(dot) + 55 = 71 chars" and "OOMScoreAdj = 1000 - (...) = 869"
+/// both have a valid-looking `lhs`, but their `rhs` re-derives a value through a
+/// second `=`, which no single Go/Rust/etc. assignment statement does). Nor does it
+/// contain a sentence boundary — a period followed by more prose (`cmd.WaitDelay = 2 *
+/// time.Second. This analyzer enforces that rule`) signals a quoted code fragment
+/// resuming into unrelated prose, not a real standalone assignment statement (a real
+/// backtest finding, same doc). A genuine RHS never contains ". " — qualified access
+/// like `time.Second` has no space after the dot.
+fn is_assignment_rhs(rhs: &str) -> bool {
+    !rhs.is_empty() && !rhs.contains('=') && !rhs.contains(". ")
 }
 
 fn walk_declarations_for_proportionality(
