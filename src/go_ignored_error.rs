@@ -268,14 +268,7 @@ mod tests {
 
     impl TempModule {
         fn new(module_path: &str, helper_func_src: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "kibitzer-go-ignored-error-module-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let root = crate::test_support::unique_temp_dir("go-ignored-error-module");
             let helper_dir = root.join("helper");
             std::fs::create_dir_all(&helper_dir).unwrap();
             std::fs::write(

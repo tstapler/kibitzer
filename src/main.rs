@@ -1,3 +1,4 @@
+mod accepted_findings;
 mod arch_diagram;
 mod arch_export;
 mod arch_model;
@@ -626,15 +627,7 @@ mod architecture_cli_tests {
 
     impl TempRepo {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "kibitzer-main-cli-test-{}-{name}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::unique_temp_dir(&format!("main-cli-test-{name}"));
             Self { dir }
         }
 

@@ -467,6 +467,15 @@ fn run_native_check(
         passed_raw
     };
 
+    let passed = if passed {
+        passed
+    } else {
+        let (filtered, still_failing) =
+            drop_accepted_findings(&combined, repo_root, file_path, checker_name)?;
+        combined = filtered;
+        !still_failing
+    };
+
     let mut severity = check.severity;
     let mut message = check.message.clone();
 
@@ -493,6 +502,37 @@ fn run_native_check(
         findings: Vec::new(),
         plugin_missing: false,
     })
+}
+
+/// Drops any deliberately-accepted finding (`.claude/kibitzer-accepted.json`, see
+/// docs/accepting-findings.md) from `combined`, after diff-scoping rather than instead
+/// of it — an edit that didn't even touch the accepted line shouldn't need the
+/// accepted-findings machinery at all to already be scoped out. Native-only: a
+/// shell-out check's `passed` comes from its process exit code, not "output is empty"
+/// the way a native check's does, so filtering its text couldn't safely recompute
+/// pass/fail the same way — this is only ever called from the native-check path.
+/// Returns the filtered output and whether it still has any finding left in it.
+fn drop_accepted_findings(
+    combined: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    checker_name: &str,
+) -> anyhow::Result<(String, bool)> {
+    // Propagated, not swallowed: a malformed `.claude/kibitzer-accepted.json` (bad
+    // JSON, or an entry missing its required `reason`) must surface as a real error
+    // rather than silently behaving as "no accepted findings" — the same treatment
+    // `find_config` gives a malformed `.claude/inspect.json`.
+    let accepted = crate::accepted_findings::find_accepted_findings(repo_root)?;
+    let rel_file = relativize(repo_root, file_path);
+    let (filtered, _dropped_any) = crate::accepted_findings::filter_accepted(
+        combined,
+        file_path,
+        &rel_file,
+        checker_name,
+        &accepted,
+    );
+    let still_failing = !filtered.trim().is_empty();
+    Ok((filtered, still_failing))
 }
 
 /// Runs `checker_name` against `source` (as if it were the content of `file_path`),
@@ -2575,6 +2615,108 @@ mod native_check_tests {
         assert_eq!(result.output, "");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_accepted_findings(dir: &Path, json: &str) {
+        std::fs::create_dir_all(dir.join(crate::config::CONFIG_DIR)).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_DIR)
+                .join(crate::accepted_findings::ACCEPTED_FINDINGS_FILENAME),
+            json,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepted_finding_with_unchanged_content_suppresses_the_native_finding() {
+        let dir = tmp_dir("accepted-unchanged");
+        let file = dir.join("user.go");
+        std::fs::write(
+            &file,
+            "package main\n\nfunc newUser(name, email string) {}\n",
+        )
+        .unwrap();
+        write_accepted_findings(
+            &dir,
+            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
+        );
+
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+        )
+        .unwrap();
+        assert!(result.passed, "output: {}", result.output);
+        assert_eq!(result.output, "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_finding_stops_suppressing_once_the_line_content_drifts() {
+        let dir = tmp_dir("accepted-stale");
+        let file = dir.join("user.go");
+        // The signature grew a third same-typed parameter since the entry below was
+        // written — the recorded `content` no longer matches, so the (now different)
+        // finding must still surface rather than being silently swallowed forever.
+        std::fs::write(
+            &file,
+            "package main\n\nfunc newUser(name, email, nickname string) {}\n",
+        )
+        .unwrap();
+        write_accepted_findings(
+            &dir,
+            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
+        );
+
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+        )
+        .unwrap();
+        assert!(!result.passed);
+        assert!(
+            result.output.contains("3 identifiers"),
+            "output: {}",
+            result.output
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_accepted_findings_file_surfaces_as_a_real_error() {
+        let dir = tmp_dir("accepted-malformed");
+        let file = dir.join("user.go");
+        std::fs::write(
+            &file,
+            "package main\n\nfunc newUser(name, email string) {}\n",
+        )
+        .unwrap();
+        write_accepted_findings(
+            &dir,
+            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": ""}]}"#,
+        );
+
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+        );
+        let is_err = result.is_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            is_err,
+            "an entry with an empty reason must not be silently accepted"
+        );
     }
 }
 
