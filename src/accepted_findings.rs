@@ -22,12 +22,8 @@ pub struct AcceptedFinding {
     /// `Check::scope` glob patterns use (`check::relativize`).
     pub file: String,
     pub line: usize,
-    /// The flagged line's exact source text (leading/trailing whitespace ignored) at
-    /// the time this entry was written. A finding only matches when the line's
-    /// *current* content still agrees — once it drifts, the entry silently stops
-    /// suppressing (the finding reappears) rather than papering over a since-changed
-    /// line, so an accepted tradeoff can't quietly outlive the code it was actually
-    /// about.
+    /// The flagged line's exact text when accepted. If the current line no longer
+    /// matches, suppression silently lapses and the finding reappears.
     pub content: String,
     /// Required, non-empty (enforced by [`find_accepted_findings`]) — the whole point
     /// of this file over a global disable is that the tradeoff gets written down.
@@ -53,11 +49,7 @@ impl AcceptedFindings {
 /// error) when no such file exists anywhere above `start` — accepting findings is
 /// opt-in, most repos will never have one.
 pub fn find_accepted_findings(start: &Path) -> Result<AcceptedFindings> {
-    let mut dir = if start.is_file() {
-        start.parent().unwrap_or(start).to_path_buf()
-    } else {
-        start.to_path_buf()
-    };
+    let mut dir = crate::config::start_dir(start);
     loop {
         let candidate = dir.join(CONFIG_DIR).join(ACCEPTED_FINDINGS_FILENAME);
         if candidate.is_file() {
@@ -91,17 +83,25 @@ fn validate(parsed: &AcceptedFindings, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The rule id embedded in a native checker's message via its own `[rule-id]`
-/// self-prefix convention (most native checkers do this — `syntax-rules-*`,
-/// `comment-quality-*`, the architecture checks), or `fallback` (the check's own
-/// registered name) for a message that doesn't self-prefix one (e.g.
-/// `primitive-obsession`, `duplicate-code`, `file-complexity`) — the same fallback
-/// `scripts/backtest-triage.py` uses for the same reason.
+/// The `[rule-id]` a checker self-prefixes its message with, or `fallback` (the
+/// checker's own name) when it doesn't.
 fn extract_rule<'a>(message: &'a str, fallback: &'a str) -> &'a str {
     message
         .strip_prefix('[')
         .and_then(|rest| rest.find(']').map(|end| &rest[..end]))
         .unwrap_or(fallback)
+}
+
+/// Output of [`filter_accepted`]: the filtered text plus whether anything was
+/// actually dropped from it, so a caller recomputing `passed` can tell "genuinely
+/// clean" from "clean only because every finding was accepted away."
+pub(crate) struct FilterOutcome {
+    pub output: String,
+    // `drop_accepted_findings` derives `passed` from `output` alone (empty vs.
+    // non-empty) rather than from this flag — read by this module's own tests, not
+    // yet consumed by any production caller, hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    pub dropped_any: bool,
 }
 
 /// Drops any line of `output` (the `{file}:{line}: {message}` convention every native
@@ -110,21 +110,22 @@ fn extract_rule<'a>(message: &'a str, fallback: &'a str) -> &'a str {
 /// line-oriented parsing as `check::scope_output_to_changed_lines`, since
 /// `CheckResult` carries no structured per-finding data for these check kinds (only
 /// architecture checks do, via `ArchFinding`, out of scope here — see
-/// `docs/accepting-findings.md`). Returns the filtered output and whether anything
-/// was actually dropped, so a caller recomputing `passed` can tell "genuinely clean"
-/// from "clean only because every finding was accepted away."
+/// `docs/accepting-findings.md`).
 pub fn filter_accepted(
     output: &str,
     file_path: &Path,
     rel_file: &str,
     checker_name: &str,
     accepted: &AcceptedFindings,
-) -> (String, bool) {
+) -> FilterOutcome {
     // Only worth reading the file at all if some entry actually names it — most
     // repos' accepted-findings entries, if any exist, are scattered across many
     // files, so this skips a disk read for every other file being checked.
     if !accepted.accepted.iter().any(|e| e.file == rel_file) {
-        return (output.to_string(), false);
+        return FilterOutcome {
+            output: output.to_string(),
+            dropped_any: false,
+        };
     }
     let source = std::fs::read_to_string(file_path).unwrap_or_default();
     let source_lines: Vec<&str> = source.lines().collect();
@@ -152,7 +153,10 @@ pub fn filter_accepted(
         }
     }
 
-    (kept.join("\n"), dropped_any)
+    FilterOutcome {
+        output: kept.join("\n"),
+        dropped_any,
+    }
 }
 
 #[cfg(test)]
@@ -198,8 +202,8 @@ mod tests {
     fn find_accepted_findings_returns_empty_when_no_file_present() {
         let dir = temp_dir("missing");
         let found = find_accepted_findings(&dir).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
         assert!(found.accepted.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -212,9 +216,30 @@ mod tests {
             r#"{"accepted": [{"rule": "flag-argument", "file": "main.go", "line": 1, "content": "package main", "reason": ""}]}"#,
         );
         let result = find_accepted_findings(&dir);
-        std::fs::remove_dir_all(&dir).ok();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty reason"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Precedent: `config.rs`'s `find_repo_root_walks_up_to_nearest_dot_git` tests the
+    /// same kind of upward walk for `.git`; this is the equivalent for
+    /// `.claude/kibitzer-accepted.json`.
+    #[test]
+    fn find_accepted_findings_walks_upward_from_a_nested_directory() {
+        let dir = temp_dir("upward-walk");
+        write_repo(
+            &dir,
+            "main.go",
+            "package main\n",
+            r#"{"accepted": [{"rule": "flag-argument", "file": "main.go", "line": 1, "content": "package main", "reason": "walked up to find this"}]}"#,
+        );
+        let nested = dir.join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let found = find_accepted_findings(&nested).unwrap();
+        assert_eq!(found.accepted.len(), 1);
+        assert_eq!(found.accepted[0].file, "main.go");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -232,11 +257,10 @@ mod tests {
             "{}:3: [flag-argument] boolean parameter `verbose` is branched on directly...",
             file_path.display()
         );
-        let (filtered, dropped) =
-            filter_accepted(&output, &file_path, "main.go", "syntax-rules-go", &accepted);
+        let outcome = filter_accepted(&output, &file_path, "main.go", "syntax-rules-go", &accepted);
+        assert!(outcome.dropped_any);
+        assert!(outcome.output.is_empty());
         std::fs::remove_dir_all(&dir).ok();
-        assert!(dropped);
-        assert!(filtered.is_empty());
     }
 
     #[test]
@@ -254,11 +278,10 @@ mod tests {
             "{}:3: [flag-argument] boolean parameter `verbose` is branched on directly...",
             file_path.display()
         );
-        let (filtered, dropped) =
-            filter_accepted(&output, &file_path, "main.go", "syntax-rules-go", &accepted);
+        let outcome = filter_accepted(&output, &file_path, "main.go", "syntax-rules-go", &accepted);
+        assert!(!outcome.dropped_any);
+        assert_eq!(outcome.output, output);
         std::fs::remove_dir_all(&dir).ok();
-        assert!(!dropped);
-        assert_eq!(filtered, output);
     }
 
     #[test]
@@ -276,11 +299,10 @@ mod tests {
             "{}:3: [long-function] body spans 41 lines...",
             file_path.display()
         );
-        let (filtered, dropped) =
-            filter_accepted(&output, &file_path, "main.go", "syntax-rules-go", &accepted);
+        let outcome = filter_accepted(&output, &file_path, "main.go", "syntax-rules-go", &accepted);
+        assert!(!outcome.dropped_any);
+        assert_eq!(outcome.output, output);
         std::fs::remove_dir_all(&dir).ok();
-        assert!(!dropped);
-        assert_eq!(filtered, output);
     }
 
     #[test]
@@ -298,15 +320,48 @@ mod tests {
             "{}:3: parameter declaration names 2 identifiers of primitive type `string`...",
             file_path.display()
         );
-        let (filtered, dropped) = filter_accepted(
+        let outcome = filter_accepted(
             &output,
             &file_path,
             "user.go",
             "primitive-obsession",
             &accepted,
         );
+        assert!(outcome.dropped_any);
+        assert!(outcome.output.is_empty());
         std::fs::remove_dir_all(&dir).ok();
-        assert!(dropped);
-        assert!(filtered.is_empty());
+    }
+
+    /// The early-return fast path (no entry names this file) must leave `output`
+    /// completely untouched and never even attempt to read the checked file from
+    /// disk — proven concretely here by pointing `file_path` at a file that doesn't
+    /// exist at all; a build that tried to read it would panic or return an error
+    /// instead of the unchanged output this asserts.
+    #[test]
+    fn filter_accepted_fast_path_skips_the_disk_read_for_an_unrelated_file() {
+        let dir = temp_dir("unrelated-file-fast-path");
+        write_repo(
+            &dir,
+            "main.go",
+            "package main\n\nfunc f(verbose bool) {}\n",
+            r#"{"accepted": [{"rule": "flag-argument", "file": "main.go", "line": 3, "content": "func f(verbose bool) {}", "reason": "CLI -v toggle, standard exception"}]}"#,
+        );
+        let accepted = find_accepted_findings(&dir).unwrap();
+        let nonexistent = dir.join("does-not-exist-on-disk.go");
+        let output = format!(
+            "{}:1: [flag-argument] boolean parameter `x`...",
+            nonexistent.display()
+        );
+
+        let outcome = filter_accepted(
+            &output,
+            &nonexistent,
+            "does-not-exist-on-disk.go",
+            "syntax-rules-go",
+            &accepted,
+        );
+        assert!(!outcome.dropped_any);
+        assert_eq!(outcome.output, output);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
