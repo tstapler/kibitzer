@@ -165,6 +165,76 @@ delegation) still fires unchanged.
   The brace-closing idiom doesn't occur in the locally-cloned Go/Rust corpus repos, so the
   Kotlin regression test above is this fix's primary evidence.
 
+### 2026-09-12 — kubernetes/kubernetes + stapler-squad corpus backtest — `"used by"` banned-phrase matched ordinary Godoc consumer documentation
+
+- **Symptom**: "PodSubnet is the subnet used by pods." (kubernetes/kubernetes) and "defaultSessionRetentionDays is
+  used by RetentionDaysOrDefault..." (stapler-squad) both flagged — ordinary Godoc sentences describing a field's
+  consumer, with no reference to any specific caller, PR, or fix. Across a 40-finding corpus sample this single
+  mechanism accounted for roughly a third of all `comment-quality-go` false positives.
+- **Mechanism**: `contains_whole_phrase` (`src/comment_quality.rs`) matched the bare substring "used by" anywhere
+  in a comment — `BANNED_PHRASES`' reason ("this belongs in the commit message, not a comment that outlives its
+  caller") targets a comment naming an impermanent change/caller, but the bare-substring match also caught the
+  ubiquitous, encouraged Godoc idiom "X is used by Y."
+- **Fixed by**: `contains_issue_number_token` — "used by" now only fires when it co-occurs with a `#\d+`-shaped
+  issue/PR reference in the same comment, preserving the actual intended catch ("used by the fix in issue #456")
+  while eliminating the Godoc-consumer-doc false positive. Verified directly: both cited examples produce zero
+  "used by" findings, a backtest across `session/ent/` found 4 more real instances of the same false positive
+  (all eliminated), and a synthetic "used by the fix in issue #456" case still flags.
+
+### 2026-09-12 — kubernetes/kubernetes + stapler-squad corpus backtest — unfenced doc-comment code examples read as commented-out code
+
+- **Symptom**: an indented callback-signature example (`func(ctx context.Context, data []byte)`, kubernetes/kubernetes
+  `vendor/github.com/onsi/ginkgo/v2/core_dsl.go`) and an ent-generated `OnConflict` usage example ending
+  `Exec(ctx)` (stapler-squad `session/ent/classificationanalytics_create.go`) both flagged — real, intentional
+  documentation examples, not dead code.
+- **Mechanism**: the previously-fixed "fenced doc-comment code examples" exclusion only recognized triple-backtick
+  fences. Go/Godoc's much more common idiom — an indented, unfenced `//` code example with no backticks — wasn't
+  covered.
+- **Fixed by**: `is_indented_code_example_line` + `block_comment_baseline_indent`, recognizing Godoc's real
+  convention (a line indented beyond its paragraph, via a tab/2+ spaces after `//`/`///`/`//!`, or beyond a
+  computed per-comment baseline for `/* */` continuation lines — tolerating uniformly source-indented block
+  comments). Verified directly: `session/ent/` alone dropped from 462 to 0 `[commented-out-code]` findings; 6
+  sampled eliminations by hand were all genuine ent-generated Godoc examples, no dead code lost.
+
+### 2026-09-12 — kubernetes/kubernetes corpus backtest — `is_call_expression` matched a math-notation formula, not a function call
+
+- **Symptom**: `LendableCL(i) = round( NominalCL(i) * lendablePercent(i)/100.0 )` (kubernetes/kubernetes
+  `staging/src/k8s.io/client-go/applyconfigurations/flowcontrol/v1beta2/exemptprioritylevelconfiguration.go:50`)
+  flagged — prose describing a formula, not a leftover call statement.
+- **Mechanism**: `is_call_expression` only checked that alphanumeric text preceded the *first* `(` and that the
+  text ended with `)` — never validating balanced parens or that nothing followed the closing paren, so a
+  multi-term formula with several `name(args)` sub-expressions read as one call.
+- **Fixed by**: rewrote `is_call_expression` to require balanced parens via `matching_close_paren`, rejecting
+  anything following the call's own matching close paren. Nested real calls (`Foo(Bar(1), Baz(2))`) still match.
+  Verified directly: the cited line no longer flags.
+
+### 2026-09-12 — kubernetes/kubernetes corpus backtest — quoted proto-IDL field declaration misread as commented-out Go
+
+- **Symptom**: `// optional bool alpha_enum = 1060;` (kubernetes/kubernetes
+  `vendor/github.com/container-storage-interface/spec/lib/go/csi/csi.pb.go:7644`) flagged — quoted Protocol
+  Buffers `.proto` IDL syntax, not commented-out Go.
+- **Mechanism**: matched `looks_like_code`'s `text.ends_with(';') && text.chars().any(|c| "{}[]=+*&|!".contains(c))`
+  branch — the proto declaration ends in `;` and contains `=`, which the code-only punctuation heuristic treated
+  as unambiguous code.
+- **Fixed by**: `is_proto_field_declaration`, narrowly scoped to the exact shape `<optional|repeated|required>
+  <type> <field> = <digits>;` — cheap and safe since a real assignment (e.g. `optionalFlag =
+  computeDefault();`) doesn't match this shape and stays flagged. Verified directly: the cited line no longer
+  flags, and a lookalike real assignment was confirmed still caught.
+
+### 2026-09-12 — stapler-squad corpus backtest — `is_assignment` still under-constrained beyond the documented second-`=` guard
+
+- **Symptom**: `// cmd.WaitDelay = 2 * time.Second. This analyzer enforces that rule` (stapler-squad
+  `tools/lint/norawexec/analyzer.go:13`, a code fragment quoted mid-sentence followed by unrelated prose) and
+  `// true = no matching stapler-squad session` (stapler-squad `gen/proto/go/session/v1/insights.pb.go:41`, doc
+  shorthand explaining a boolean field) both flagged as assignments.
+- **Mechanism**: the already-fixed "unchecked RHS" gap only excluded a RHS containing a second bare `=`. Neither
+  case has one: `is_assignment` never checked that the RHS was the whole remaining comment text (missing a
+  sentence-boundary check), and accepted a bare boolean literal (`true`) as a valid "LHS identifier" since it
+  only checked character class, not that it's an actual variable/field reference.
+- **Fixed by**: (a) reject a RHS containing `". "` (a sentence boundary — a real RHS never has a space after a
+  dot); (b) reject `true`/`false`/`nil` as LHS identifiers, since a boolean/nil literal can never legitimately be
+  assigned to in real Go code. Verified directly: both cited lines no longer flag.
+
 ## Log
 
 ### 2026-09-11 — stapler-squad — mathematical interval notation `[a, b)` in prose misread as commented-out code
@@ -193,3 +263,4 @@ delegation) still fires unchanged.
   either when used for mathematical interval notation in prose. Not independently
   verified against a broader corpus — flagging as a hypothesis with one concrete
   real-world instance, per this file's stated approach to unvalidated constants.
+

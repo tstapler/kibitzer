@@ -1,0 +1,1 @@
+{"commit": "d320c038ceea6eb1ec6e193f9611f1540a49f25f", "file": "config/types.go", "line": 83, "note": "\"used by\" banned-phrase matches ordinary Godoc consumer docs", "permalink": "https://github.com/tstapler/stapler-squad/blob/d320c038ceea6eb1ec6e193f9611f1540a49f25f/config/types.go#L83", "rule": "verbose-comment", "verdict": "false_positive"}

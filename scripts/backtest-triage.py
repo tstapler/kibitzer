@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TRIAGE_DIR = Path(__file__).resolve().parent.parent / "docs" / "backtest-triage"
-FINDING_RE = re.compile(r"^(?P<file>.+):(?P<line>\d+): \[(?P<rule>[\w-]+)\] (?P<message>.*)$")
+FINDING_RE = re.compile(r"^(?P<file>.+):(?P<line>\d+): (?:\[(?P<rule>[\w-]+)\] )?(?P<message>.*)$")
 VERDICTS = ("true_positive", "false_positive", "needs_discussion")
 GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$")
 
@@ -104,7 +104,7 @@ def build_permalink(owner: str, repo: str, sha: str, rec: dict) -> str:
     return f"https://github.com/{owner}/{repo}/blob/{sha}/{rec['file']}#{fragment}"
 
 
-def run_checker(repo_dir: Path, checker: str, glob: str, kibitzer_bin: str) -> list[dict]:
+def run_native_outputs(repo_dir: Path, checker: str, glob: str, kibitzer_bin: str) -> list[str]:
     files = sorted(str(p.relative_to(repo_dir)) for p in repo_dir.rglob(glob) if p.is_file())
 
     def check_one(rel_path: str) -> str:
@@ -116,21 +116,43 @@ def run_checker(repo_dir: Path, checker: str, glob: str, kibitzer_bin: str) -> l
         )
         return result.stdout
 
-    findings = []
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
-        for stdout in pool.map(check_one, files):
-            for line in stdout.splitlines():
-                m = FINDING_RE.match(line)
-                if not m:
-                    continue
-                findings.append(
-                    {
-                        "file": m.group("file"),
-                        "line": int(m.group("line")),
-                        "rule": m.group("rule"),
-                        "message": m.group("message"),
-                    }
-                )
+        return list(pool.map(check_one, files))
+
+
+def run_checker(
+    repo_dir: Path, checker: str, glob: str | None, kibitzer_bin: str, mode: str = "native"
+) -> list[dict]:
+    if mode == "architecture":
+        # Whole-repo checker (see `check::lookup_any_architecture_checker`) — one
+        # invocation over the repo root, not a per-file loop.
+        result = subprocess.run(
+            [kibitzer_bin, "check", "architecture", checker, "."],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        outputs = [result.stdout]
+    else:
+        outputs = run_native_outputs(repo_dir, checker, glob, kibitzer_bin)
+
+    findings = []
+    for stdout in outputs:
+        for line in stdout.splitlines():
+            m = FINDING_RE.match(line)
+            if not m:
+                continue
+            findings.append(
+                {
+                    "file": m.group("file"),
+                    "line": int(m.group("line")),
+                    # Not every native checker self-prefixes its message with
+                    # "[rule-id]" (e.g. go-blank-imports, primitive-obsession) —
+                    # fall back to the checker name so those aren't silently dropped.
+                    "rule": m.group("rule") or checker,
+                    "message": m.group("message"),
+                }
+            )
     return findings
 
 
@@ -140,13 +162,9 @@ def print_finding(f: dict, indent: str = "    ") -> None:
         print(f"{indent}  {f['permalink']}")
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    repo_dir = Path(args.repo_dir).expanduser().resolve()
-    findings = run_checker(repo_dir, args.checker, args.glob, args.kibitzer_bin)
-    if args.rule:
-        findings = [f for f in findings if f["rule"] == args.rule]
-
-    store = load_shard(args.repo_slug, args.rule) if args.rule else load_all(args.repo_slug)
+def diff_against_store(
+    findings: list[dict], store: dict[Key, dict]
+) -> tuple[dict[str, list[dict]], list[dict], list[dict]]:
     seen_keys = set()
     by_verdict: dict[str, list[dict]] = {v: [] for v in VERDICTS}
     new: list[dict] = []
@@ -161,6 +179,19 @@ def cmd_run(args: argparse.Namespace) -> None:
             by_verdict.setdefault(rec["verdict"], []).append({**f, **rec})
 
     stale = [rec for key, rec in store.items() if key not in seen_keys]
+    return by_verdict, new, stale
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    if args.mode == "native" and not args.glob:
+        sys.exit("--glob is required for --mode native")
+    repo_dir = Path(args.repo_dir).expanduser().resolve()
+    findings = run_checker(repo_dir, args.checker, args.glob, args.kibitzer_bin, args.mode)
+    if args.rule:
+        findings = [f for f in findings if f["rule"] == args.rule]
+
+    store = load_shard(args.repo_slug, args.rule) if args.rule else load_all(args.repo_slug)
+    by_verdict, new, stale = diff_against_store(findings, store)
 
     print(f"=== {args.repo_slug} / {args.checker}" + (f" [{args.rule}]" if args.rule else "") + " ===")
     print(f"{len(findings)} findings this run, {len(store)} previously triaged")
@@ -228,7 +259,14 @@ def main() -> None:
     p_run.add_argument("--repo-slug", required=True)
     p_run.add_argument("--repo-dir", required=True)
     p_run.add_argument("--checker", required=True)
-    p_run.add_argument("--glob", required=True, help="e.g. '*.go'")
+    p_run.add_argument(
+        "--mode",
+        choices=("native", "architecture"),
+        default="native",
+        help="'architecture' runs a whole-repo checker (check::lookup_any_architecture_checker) "
+        "once against the repo root instead of looping per file",
+    )
+    p_run.add_argument("--glob", help="e.g. '*.go' — required for --mode native, ignored for architecture")
     p_run.add_argument("--rule", help="filter to one rule id, e.g. flag-argument")
     p_run.add_argument("--show-known", action="store_true", help="also print already-triaged findings")
     p_run.add_argument("--kibitzer-bin", default=os.environ.get("KIBITZER_BIN", "kibitzer"))

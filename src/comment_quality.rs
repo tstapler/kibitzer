@@ -112,10 +112,6 @@ const BANNED_PHRASES: &[(&str, &str)] = &[
         "only document what the code actually does, not speculative future use",
     ),
     (
-        "used by",
-        "this belongs in the commit message, not a comment that outlives its caller",
-    ),
-    (
         "added for the",
         "this belongs in the commit message, not a comment describing why it was added",
     ),
@@ -156,6 +152,23 @@ const BANNED_PHRASES: &[(&str, &str)] = &[
         "cut the filler and state the fact directly",
     ),
 ];
+
+/// `"used by"` was previously a plain `BANNED_PHRASES` entry, but a bare substring
+/// match also caught the ubiquitous, encouraged Godoc idiom "X is used by Y"
+/// ("PodSubnet is the subnet used by pods.") — a 40-finding corpus sample found this
+/// was the single largest false-positive mechanism (~15/40 hits; see
+/// docs/comment-quality-false-positives.md). The phrase is only meant to catch a
+/// comment naming a specific, impermanent caller/PR/issue ("used by the fix in PR
+/// #123"), so it now also requires a PR/issue-number token (`#123`) in the same
+/// comment — the one thing that actually distinguishes that pattern from ordinary
+/// consumer documentation.
+const USED_BY_REASON: &str =
+    "this belongs in the commit message, not a comment that outlives its caller";
+
+fn contains_issue_number_token(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|i| bytes[i] == b'#' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+}
 
 fn comment_kinds(lang: Language) -> &'static [&'static str] {
     match lang {
@@ -290,6 +303,12 @@ fn check_verbose_phrases(comment: Node, text: &str, findings: &mut Vec<Finding>)
             });
         }
     }
+    if contains_whole_phrase(&lower, "used by") && contains_issue_number_token(&lower) {
+        findings.push(Finding {
+            line: comment.start_position().row + 1,
+            message: format!("[verbose-comment] contains \"used by\" — {USED_BY_REASON}"),
+        });
+    }
 }
 
 /// Scans one comment node's lines for dead code, skipping anything inside a fenced
@@ -311,6 +330,7 @@ fn check_commented_out_code(
     // A trailing comment is only "trailing" (i.e. sharing a physical row with other
     // code) on the comment node's own first line — see `is_brace_closing_annotation`.
     let skip_brace_closing_annotation = is_brace_closing_annotation(comment, src);
+    let baseline_indent = block_comment_baseline_indent(text);
     for (offset, raw_line) in text.lines().enumerate() {
         let stripped = strip_comment_markers(raw_line);
         if stripped.starts_with("```") {
@@ -323,6 +343,9 @@ fn check_commented_out_code(
         if offset == 0 && skip_brace_closing_annotation {
             continue;
         }
+        if is_indented_code_example_line(raw_line, offset, baseline_indent) {
+            continue;
+        }
         if looks_like_code(stripped) {
             findings.push(Finding {
                 line: start_row + offset + 1,
@@ -331,6 +354,66 @@ fn check_commented_out_code(
         }
     }
     in_fence
+}
+
+/// Godoc's real "this is a code example" signal (https://pkg.go.dev/go/doc/comment):
+/// a line indented further than the surrounding paragraph — not a triple-backtick
+/// fence, which `go doc` doesn't render specially at all. A real backtest finding
+/// (docs/comment-quality-false-positives.md): both an indented callback-signature
+/// example in a `/* */` doc comment and an indented method-chain example in `//`
+/// lines were misread as dead code by the fence-only exclusion.
+///
+/// Two shapes carry the signal depending on which physical line this is: a
+/// `//`/`///`/`//!`-prefixed line where the marker is followed by a tab or 2+ spaces
+/// before its content (gofmt normalizes ordinary doc-comment prose to a single space
+/// after the marker; more than that is deliberate) — this needs no baseline, since
+/// the indentation shows up right after the marker on every such line — or, inside a
+/// `/* */` block comment (whose lines all share one comment node), a continuation
+/// line indented further than `baseline_indent`.
+fn is_indented_code_example_line(
+    raw_line: &str,
+    offset: usize,
+    baseline_indent: Option<usize>,
+) -> bool {
+    let trimmed = raw_line.trim_start();
+    for marker in ["///", "//!", "//"] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return rest.starts_with('\t') || rest.starts_with("  ");
+        }
+    }
+    // No `//`-family marker on this physical line: either the block comment's own
+    // opening line (its leading whitespace is the comment's own source indentation,
+    // not comment-internal indentation — not a useful signal here) or a bare
+    // continuation line.
+    if offset == 0 {
+        return false;
+    }
+    let Some(baseline) = baseline_indent else {
+        return false;
+    };
+    if trimmed.is_empty() {
+        return false;
+    }
+    let indent = raw_line.chars().take_while(|c| c.is_whitespace()).count();
+    indent > baseline
+}
+
+/// The minimum leading-whitespace width among a `/* */` block comment's own
+/// continuation lines (everything but the opening `/*` line, and any line that
+/// itself carries a `//`-family marker) — used as the "normal paragraph indentation"
+/// baseline `is_indented_code_example_line` compares against. Taking the minimum
+/// (rather than assuming 0) correctly tolerates a block comment that's uniformly
+/// indented to match its surrounding source code: every line then shares that same
+/// minimum, so none of them reads as "indented further than the rest." `None` when
+/// the comment has no such continuation line (e.g. a single-line `//` comment, whose
+/// own indentation check doesn't need a baseline at all).
+fn block_comment_baseline_indent(text: &str) -> Option<usize> {
+    text.lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
+        .min()
 }
 
 /// Whether `comment` is a trailing comment whose only preceding content on its own
@@ -397,6 +480,9 @@ fn strip_comment_markers(line: &str) -> &str {
 /// with no other code-only punctuation is rare enough as dead code, vs. common enough
 /// as prose, to accept the same way the other exclusions above were).
 fn looks_like_code(text: &str) -> bool {
+    if is_proto_field_declaration(text) {
+        return false;
+    }
     if text.ends_with('{') || text == "}" || text.ends_with("});") {
         return true;
     }
@@ -406,23 +492,89 @@ fn looks_like_code(text: &str) -> bool {
     is_call_expression(text) || is_assignment(text)
 }
 
+/// A quoted Protocol Buffers IDL field declaration (`optional bool alpha_enum =
+/// 1060;`), a real backtest finding (docs/comment-quality-false-positives.md) —
+/// generated `.pb.go` files sometimes quote the source `.proto` field for
+/// documentation, which otherwise matches `looks_like_code`'s semicolon-plus-`=`
+/// branch. No real Go/Rust/etc. statement starts with a bare `optional`/`repeated`/
+/// `required` keyword followed by a type name, so this is scoped narrowly (exactly
+/// `<cardinality> <type> <field> = <digits>;`) to avoid also swallowing real
+/// commented-out code that happens to start with one of those words.
+fn is_proto_field_declaration(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let [cardinality, ty, field, eq, num] = words[..] else {
+        return false;
+    };
+    matches!(cardinality, "optional" | "repeated" | "required")
+        && eq == "="
+        && is_plain_identifier(ty)
+        && is_plain_identifier(field)
+        && num
+            .strip_suffix(';')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_plain_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// A call (`foo(...)`, `a.b.c(...)`) spanning the WHOLE trimmed line, not just its
+/// first paren group — requires the parens immediately after `name` to be balanced,
+/// with nothing (beyond an already-stripped trailing `;`) following the matching
+/// close. A real backtest finding (docs/comment-quality-false-positives.md): a
+/// multi-term formula like `LendableCL(i) = round(NominalCL(i) * pct(i)/100.0)` has
+/// alnum text before its first `(` and ends in `)`, so the old check — which only
+/// looked at the first `(` and the last `)` — misread it as one call. The
+/// ` = round(...)` that follows the first call's own matching close paren is what
+/// actually makes it a formula/assignment, not a call.
 fn is_call_expression(text: &str) -> bool {
     let core = text.strip_suffix(';').unwrap_or(text);
     let Some(open) = core.find('(') else {
         return false;
     };
-    if !core.ends_with(')') {
-        return false;
-    }
     let name = &core[..open];
-    !name.is_empty()
-        && name
+    if name.is_empty()
+        || !name
             .chars()
             .next()
             .is_some_and(|c| c.is_alphabetic() || c == '_')
-        && name
+        || !name
             .chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return false;
+    }
+    let Some(close) = matching_close_paren(core, open) else {
+        return false;
+    };
+    core[close + 1..].trim().is_empty()
+}
+
+/// Byte index of the `)` matching the `(` at `open`, respecting nesting — `None` if
+/// unbalanced. Byte-indexed scanning is safe here since `(`/`)` are single-byte ASCII
+/// and never appear as a continuation byte of a multi-byte UTF-8 character.
+fn matching_close_paren(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, &b) in s.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn is_assignment(text: &str) -> bool {
@@ -440,6 +592,12 @@ fn is_assignment(text: &str) -> bool {
     let rhs = text[pos + 1..].trim();
     !lhs.is_empty()
         && !lhs.contains(' ')
+        // `true`/`false`/`nil` can never legitimately sit on an assignment's LHS (`true
+        // = ...` doesn't compile) — only the character class was checked before, which
+        // let doc shorthand like "true = no matching session" (explaining what a bool
+        // field's value means) through as a fake "assignment" — a real backtest finding
+        // (docs/comment-quality-false-positives.md).
+        && !matches!(lhs, "true" | "false" | "nil")
         && lhs
             .chars()
             .next()
@@ -455,6 +613,13 @@ fn is_assignment(text: &str) -> bool {
         // `rhs` re-derives a value through a second `=`, which no single Go/Rust/etc.
         // assignment statement does).
         && !rhs.contains('=')
+        // Nor does it contain a sentence boundary — a period followed by more prose
+        // (`cmd.WaitDelay = 2 * time.Second. This analyzer enforces that rule`) signals
+        // a quoted code fragment resuming into unrelated prose, not a real standalone
+        // assignment statement (a real backtest finding, same doc). A genuine RHS never
+        // contains ". " — qualified access like `time.Second` has no space after the
+        // dot.
+        && !rhs.contains(". ")
 }
 
 fn walk_declarations_for_proportionality(
@@ -1088,6 +1253,192 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    // --- Regression tests for the five 2026-09-12 backtest findings ---
+
+    /// Fix 1 — regression guard for the real kubernetes/kubernetes
+    /// (`cmd/kubeadm/app/apis/kubeadm/v1/types.go:292`) and stapler-squad
+    /// (`config/types.go:83`) occurrences: ordinary Godoc consumer documentation with
+    /// no caller/PR/issue reference must not trip the "used by" banned phrase.
+    #[test]
+    fn ordinary_godoc_used_by_sentence_is_not_flagged() {
+        let src = "package main\n\n// PodSubnet is the subnet used by pods.\ntype T struct{}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("\"used by\"")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn stapler_squad_style_used_by_consumer_doc_is_not_flagged() {
+        let src = "package main\n\n// defaultSessionRetentionDays is used by RetentionDaysOrDefault to\n// determine session cleanup.\ntype T struct{}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("\"used by\"")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 1 — the phrase still catches the pattern it was meant for: a comment
+    /// naming a specific, impermanent caller/PR/issue.
+    #[test]
+    fn used_by_with_issue_number_is_still_flagged() {
+        let src =
+            "package main\n\n// This workaround is used by the fix in issue #456.\nfunc f() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings.iter().any(|f| f.message.contains("\"used by\"")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 2 — regression guard for the real kubernetes/kubernetes
+    /// (`vendor/.../ginkgo/v2/core_dsl.go:720`) occurrence: an indented callback-
+    /// signature example inside a `/* */` doc comment, with no backtick fence, is a
+    /// real Godoc code example.
+    #[test]
+    fn indented_block_comment_code_example_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\n/*\nThe callback can have any of the following signatures:\n\n\tfunc(ctx context.Context, data []byte)\n\nEither of these is accepted.\n*/\nfunc F() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 2 — regression guard for the real stapler-squad
+    /// (`session/ent/classificationanalytics_create.go:439`) occurrence: an indented,
+    /// unfenced method-chain example in `//` lines.
+    #[test]
+    fn tab_indented_line_comment_code_example_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\n// Example usage:\n//\n//\tClient.Create().\n//\t\tExec(ctx)\nfunc F() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 2 — a genuinely uniform-indented block comment (matching its own source
+    /// indentation, not an internal code example) must not have that indentation
+    /// mistaken for a code example.
+    #[test]
+    fn uniformly_indented_block_comment_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t/*\n\tThis whole comment is indented to match the\n\tsurrounding code, not to mark a code example.\n\t*/\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 3 — regression guard for the real kubernetes/kubernetes
+    /// (`.../exemptprioritylevelconfiguration.go:50`) occurrence: a multi-term
+    /// formula using call-like notation for its variables, not a real call.
+    #[test]
+    fn math_formula_with_call_like_notation_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// LendableCL(i) = round( NominalCL(i) * lendablePercent(i)/100.0 )\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 3 — a genuine call expression (including one with nested parens) is still
+    /// caught.
+    #[test]
+    fn nested_call_expression_is_still_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// Foo(Bar(1), Baz(2))\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 4 — regression guard for the real kubernetes/kubernetes
+    /// (`vendor/.../csi/csi.pb.go:7644`) occurrence: a quoted `.proto` field
+    /// declaration, not commented-out Go.
+    #[test]
+    fn proto_idl_field_declaration_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// optional bool alpha_enum = 1060;\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 4 — a real commented-out assignment that happens to start with
+    /// "optional"-shaped text (but isn't proto field syntax) is still caught.
+    #[test]
+    fn non_proto_assignment_starting_with_cardinality_word_is_still_flagged() {
+        let src = "package main\n\nfunc F() {\n\t// optionalFlag = computeDefault();\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 5(a) — regression guard for the real stapler-squad
+    /// (`tools/lint/norawexec/analyzer.go:13`) occurrence: a quoted code fragment
+    /// followed by unrelated prose in the same comment.
+    #[test]
+    fn quoted_fragment_followed_by_prose_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// cmd.WaitDelay = 2 * time.Second. This analyzer enforces that rule.\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 5(b) — regression guard for the real stapler-squad
+    /// (`gen/proto/go/session/v1/insights.pb.go:41`) occurrence: a bare boolean
+    /// literal used as doc shorthand, not a real LHS.
+    #[test]
+    fn boolean_literal_doc_shorthand_is_not_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// true = no matching session\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Fix 5 — a genuine single-line assignment statement is still caught.
+    #[test]
+    fn genuine_simple_assignment_is_still_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// total = 5\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
     }

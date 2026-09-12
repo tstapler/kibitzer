@@ -1,0 +1,1 @@
+{"commit": "d320c038ceea6eb1ec6e193f9611f1540a49f25f", "file": "server/features/features_test.go", "line": 9, "note": "row-1 lookback blocked by intervening named import", "permalink": "https://github.com/tstapler/stapler-squad/blob/d320c038ceea6eb1ec6e193f9611f1540a49f25f/server/features/features_test.go#L9", "rule": "go-blank-imports", "verdict": "false_positive"}

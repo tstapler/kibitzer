@@ -36,6 +36,58 @@ Repeat once per (checker, corpus-repo) pair. This prints counts by verdict plus 
 one rule id (e.g. `over-commented`) when chasing one specific symptom a user
 reported, instead of triaging the whole checker cold.
 
+This covers per-file native checkers only (`checker::registry()`). For a checker
+that runs once over the whole repo instead — anything under
+`check::lookup_any_architecture_checker` (`kibitzer check architecture <name> <dir>`),
+including the diagram/export/change-coupling commands — see Step 1b instead.
+
+## Step 1b — Whole-repo (architecture) checks
+
+Some checks aren't per-file at all — they run once over an entire repo (see
+`check::lookup_any_architecture_checker` / `architecture_checks.rs`). `backtest-triage.py
+run` supports these via `--mode architecture` (no `--glob`, one invocation instead of a
+per-file loop):
+
+```sh
+python3 scripts/backtest-triage.py run \
+  --repo-slug kubernetes-kubernetes \
+  --repo-dir ~/code/github.com/kubernetes/kubernetes \
+  --checker import-cycle --mode architecture
+```
+
+This only produces usable NEW/triaged diffs for checkers whose findings carry a real
+`file`/`line` — currently `import-cycle` and `layering`. Everything else in that
+registry (`coupling`, `package-size`, `instability`, `dip-concrete-coupling`, and any
+future package-level metric) reports at package granularity with no file or line at
+all, so the `(file, line, rule)` triage-store key doesn't fit them — `--mode
+architecture` will faithfully run them but every finding will parse as untracked
+(no match ever lands in the store). For those, skip the triage store and review by
+hand instead:
+
+```sh
+kibitzer check architecture instability ~/code/github.com/kubernetes/kubernetes
+```
+
+Read the output directly, apply Step 2's same true/false-positive/needs-discussion
+judgment per package, and jump straight to Step 3 for anything confirmed — cite the
+package name and a `tree`-style permalink (`.../tree/<sha>/<path>`, not a line anchor)
+instead of a `blob`+`#L<n>` one.
+
+`change-coupling` is different again: per its own doc comment in `main.rs`, it's
+"a look-here prioritization report, not a per-edit pass/fail check" with no verdict
+concept — nothing to triage as true/false-positive. Run it (`kibitzer architecture
+change-coupling <dir>`) and skim for pairs that are obviously wrong (e.g. two files
+that only co-occur because of a repo-wide mechanical change, not real coupling); log
+those as a `needs_discussion`-style note directly in Step 3's doc if worth recording,
+otherwise there's nothing to do here.
+
+`diagram`/`export` (`kibitzer architecture diagram|export <dir>`) aren't checks at
+all — no findings, no verdicts. Treat running them against a corpus repo as a feature
+smoke test, not a triage pass: confirm the command completes without error and the
+output (Mermaid text / JSON model) looks structurally sane for a repo this size. If
+something crashes or the output is obviously broken, that's a bug report, not a
+false-positive log entry — file it the normal way, not through this skill's doc.
+
 ## Step 2 — Triage every NEW finding
 
 For each NEW finding, read the actual source with enough surrounding context — a

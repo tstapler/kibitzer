@@ -19,6 +19,7 @@ mod duplicate_cross_file_checker;
 mod file_size;
 mod glob;
 mod go_blank_imports;
+mod go_call_resolution;
 mod go_error_context;
 mod go_ignored_error;
 mod hook;

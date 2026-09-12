@@ -86,6 +86,43 @@ just one that introduces a new same-typed-parameter signature.
   `certCurrent` sat untouched elsewhere in the file: only `LoadTLSConfig` fired,
   `certCurrent` did not.
 
+### 2026-09-12 — kubernetes/kubernetes + stapler-squad corpus backtest — named return-value list misclassified as a parameter list
+
+- **Symptom**: `func (in *FlowSchemaList) APILifecycleIntroduced() (major, minor int)` (kubernetes/kubernetes,
+  703 occurrences of this shape alone across 61 `zz_generated.prerelease-lifecycle.go`-style codegen files) and
+  `Acknowledged() (r bool, exists bool)` (stapler-squad `session/ent/mutation.go`) both flagged — neither is an
+  input parameter list, so there's no call-site-mixup risk to catch.
+- **Mechanism**: `tree-sitter-go`'s grammar gives a function's `result` field the same node kind
+  (`parameter_list`) as its `parameters` field. `walk()` (`src/primitive_obsession.rs`) matched on
+  `node.kind() == "parameter_list"` with no check on which field it came from.
+- **Fixed by**: `is_named_return_list(node)` checks whether the `parameter_list` was reached via its parent's
+  `result` field, and `walk()` now skips such nodes — verified this field is used identically by
+  `function_declaration`, `method_declaration`, `func_literal`, `function_type`, and `method_elem`, so the one
+  field check covers every parent kind. Regression-guarded by `ignores_named_return_list_on_function_declaration`,
+  `ignores_named_return_list_on_method_declaration`, `ignores_named_return_list_on_func_literal`, and
+  `still_flags_parameters_when_named_return_list_present` (a true-positive guard: params still flag even when the
+  same function also has a same-shaped named return list) in `src/primitive_obsession.rs`'s test module. Verified
+  directly: both corpus files now produce zero findings at the cited lines, while the doc's cited true positive
+  (`cmd/kubeadm/app/cmd/util/join.go:51`, kubernetes/kubernetes, a real 3-bool boolean trap) still flags.
+
+### 2026-09-12 — stapler-squad corpus backtest — blank identifier `_` counted as a named identifier
+
+- **Symptom**: `CallBlocking(_, _ string, ...)` (stapler-squad `session/autonomous_driver_test.go:28`, a test fake
+  with both parameters intentionally discarded) flagged, even though nothing can be passed in the wrong order to a
+  value nobody reads.
+- **Mechanism**: `describe_param` (`src/primitive_obsession.rs`) computed `name_count` via
+  `decl.children_by_field_name("name", &mut cursor).count()`. Go's blank identifier `_` parses as a plain
+  `identifier` node, so `_, _ string` yielded `name_count == 2` and fired the "multiple names in one declaration"
+  branch exactly as if both names were meaningful.
+- **Fixed by**: `describe_param` now also computes a blank-excluding `real_name_count`, and the "multiple names"
+  branch fires on `real_name_count >= 2` instead — so both `_, _ string` (0 real names) and `x, _ string` (1 real
+  name) no longer fire, since a blank name can never be confused with anything in the function body. Raw
+  `name_count` is unchanged for the unrelated "run of same-typed single-name declarations" branch. Regression-guarded
+  by `ignores_all_blank_names` and `ignores_mixed_blank_and_real_name` (`src/primitive_obsession.rs`'s test
+  module), plus a true-positive guard `flags_real_multi_named_parameter_list`. Verified directly: the corpus
+  file's line 28 finding is gone, while two unrelated genuine positives elsewhere in the same file (lines 1408,
+  1417) still flag.
+
 ## Log
 
 No open entries.

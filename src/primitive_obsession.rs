@@ -70,7 +70,7 @@ fn check_source(src: &str) -> Result<Vec<Finding>> {
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "parameter_list" {
+    if node.kind() == "parameter_list" && !is_named_return_list(node) {
         check_parameter_list(node, src, findings);
     }
     let mut cursor = node.walk();
@@ -79,9 +79,30 @@ fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
     }
 }
 
+/// True when `node` is the `result` field of its parent signature node.
+///
+/// `tree-sitter-go`'s grammar reuses the `parameter_list` node kind for named
+/// return-value lists (`function_declaration`/`method_declaration`/`func_literal`/
+/// `function_type`/`method_elem` all mark it via a `result` field — see
+/// `tree-sitter-go`'s `grammar.js`). A named return list carries none of the
+/// call-site-mixup risk this check targets, so it's excluded regardless of which
+/// of those parent kinds it hangs off of.
+fn is_named_return_list(node: Node) -> bool {
+    node.parent()
+        .and_then(|parent| parent.child_by_field_name("result"))
+        .is_some_and(|result| result == node)
+}
+
 struct Param<'a> {
     node: Node<'a>,
+    /// Total names in the declaration, blank (`_`) identifiers included — used
+    /// to detect single-name declarations for the run check (case b).
     name_count: usize,
+    /// Names excluding blank (`_`) identifiers — used to detect a real
+    /// multi-name declaration for case (a). A blank identifier can never be
+    /// confused with another variable in the function body, so it carries none
+    /// of the naming-mixup risk that branch targets.
+    real_name_count: usize,
     primitive_type: Option<&'a str>,
 }
 
@@ -95,14 +116,14 @@ fn check_parameter_list<'a>(list: Node<'a>, src: &'a [u8], findings: &mut Vec<Fi
 
     // Case (a): one declaration naming multiple identifiers of one primitive type.
     for param in &params {
-        if param.name_count >= 2
+        if param.real_name_count >= 2
             && let Some(ty) = param.primitive_type
         {
             findings.push(Finding {
                 line: param.node.start_position().row + 1,
                 message: format!(
                     "parameter declaration names {} identifiers of primitive type `{ty}` — consider a newtype/value object instead",
-                    param.name_count
+                    param.real_name_count
                 ),
             });
         }
@@ -142,7 +163,12 @@ fn single_name_primitive<'a>(param: &Param<'a>) -> Option<&'a str> {
 
 fn describe_param<'a>(decl: Node<'a>, src: &'a [u8]) -> Param<'a> {
     let mut cursor = decl.walk();
-    let name_count = decl.children_by_field_name("name", &mut cursor).count();
+    let names: Vec<Node<'a>> = decl.children_by_field_name("name", &mut cursor).collect();
+    let name_count = names.len();
+    let real_name_count = names
+        .iter()
+        .filter(|n| n.utf8_text(src).unwrap_or("") != "_")
+        .count();
 
     let primitive_type = decl.child_by_field_name("type").and_then(|ty| {
         if ty.kind() == "type_identifier" {
@@ -156,6 +182,7 @@ fn describe_param<'a>(decl: Node<'a>, src: &'a [u8]) -> Param<'a> {
     Param {
         node: decl,
         name_count,
+        real_name_count,
         primitive_type,
     }
 }
@@ -212,5 +239,73 @@ mod tests {
         let findings = check_source("package main\nfunc f(a, b string, c string) {}\n").unwrap();
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("2 identifiers"));
+    }
+
+    #[test]
+    fn flags_real_multi_named_parameter_list() {
+        // True-positive regression: a genuine call-site parameter list should
+        // still fire even after excluding named-return `parameter_list`s.
+        let findings = check_source("package main\nfunc newUser(name, email string) {}\n").unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("2 identifiers"));
+    }
+
+    #[test]
+    fn ignores_named_return_list_on_function_declaration() {
+        // Regression for the 2026-09-12 false positive: tree-sitter-go gives a
+        // named return list the same `parameter_list` node kind as a call-site
+        // parameter list (e.g. kubernetes/kubernetes's generated
+        // `(major, minor int)` shape).
+        let findings =
+            check_source("package main\nfunc f() (major, minor int) { return 1, 0 }\n").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ignores_named_return_list_on_method_declaration() {
+        // Same shape as stapler-squad's `session/ent/mutation.go:12536`:
+        // `Acknowledged() (r bool, exists bool)`.
+        let findings = check_source(
+            "package main\ntype T struct{}\nfunc (t T) M() (r bool, exists bool) { return false, false }\n",
+        )
+        .unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ignores_named_return_list_on_func_literal() {
+        let findings = check_source(
+            "package main\nfunc f() { g := func() (major, minor int) { return 1, 0 }; _ = g }\n",
+        )
+        .unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn still_flags_parameters_when_named_return_list_present() {
+        // A real parameter-list primitive pile-up shouldn't get a pass just
+        // because the same function also has a named return list.
+        let findings =
+            check_source("package main\nfunc f(a, b string) (x, y string) { return a, b }\n")
+                .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("2 identifiers"));
+    }
+
+    #[test]
+    fn ignores_all_blank_names() {
+        // Regression for stapler-squad's `session/autonomous_driver_test.go:28`:
+        // `CallBlocking(_, _ string, ...)` — both names discarded, so there's no
+        // real identifier to mix up.
+        let findings = check_source("package main\nfunc f(_, _ string) {}\n").unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ignores_mixed_blank_and_real_name() {
+        // Only one real (non-blank) name in the declaration — nothing in the
+        // function body can confuse `x` for `_`, so this shouldn't fire either.
+        let findings = check_source("package main\nfunc f(x, _ string) {}\n").unwrap();
+        assert!(findings.is_empty());
     }
 }

@@ -77,6 +77,53 @@ fn collect_import_spec_rows(node: Node, rows: &mut std::collections::HashSet<usi
     }
 }
 
+/// Walks backward from `node` through its preceding siblings (import specs and
+/// comments, in source order, within the same import declaration/list) looking
+/// for a leading comment that justifies the whole uninterrupted run. A run
+/// breaks at a blank source line — import sorting can put named imports (or a
+/// trailing comment on a prior import) between a header comment and the blank
+/// import it justifies, so passing through those siblings (not just the one
+/// immediately above) is what covers both:
+/// - a header comment above the first of several contiguous blank imports in
+///   one `import (...)` block, which should justify every sibling in the run;
+/// - a justification comment separated from its blank import by a named
+///   import that import-sorting placed between them.
+fn justified_by_leading_run(
+    node: Node,
+    leading_comment_rows: &std::collections::HashSet<usize>,
+) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let mut siblings: Vec<Node> = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.kind() == "comment" || child.kind() == "import_spec" {
+            siblings.push(child);
+        }
+    }
+    let Some(mut idx) = siblings.iter().position(|n| n.id() == node.id()) else {
+        return false;
+    };
+    while idx > 0 {
+        let prev = siblings[idx - 1];
+        let cur = siblings[idx];
+        // A blank source line between siblings breaks the contiguous run.
+        let gap = cur
+            .start_position()
+            .row
+            .saturating_sub(prev.end_position().row);
+        if gap > 1 {
+            break;
+        }
+        if prev.kind() == "comment" && leading_comment_rows.contains(&prev.start_position().row) {
+            return true;
+        }
+        idx -= 1;
+    }
+    false
+}
+
 fn collect_blank_imports(
     node: Node,
     src: &[u8],
@@ -89,10 +136,11 @@ fn collect_blank_imports(
         && name.kind() == "blank_identifier"
     {
         let row = node.start_position().row;
-        // Justified if a comment sits on the same line (trailing) or the line
-        // immediately above (leading) — either reads as "explaining this import".
+        // Justified if a comment sits on the same line (trailing), or a leading
+        // comment justifies the uninterrupted run of import specs this one is
+        // part of (see `justified_by_leading_run`).
         let justified =
-            comment_rows.contains(&row) || (row > 0 && leading_comment_rows.contains(&(row - 1)));
+            comment_rows.contains(&row) || justified_by_leading_run(node, leading_comment_rows);
         if !justified {
             let path = node
                 .child_by_field_name("path")
@@ -189,5 +237,56 @@ mod tests {
     fn empty_file_produces_no_findings() {
         let findings = check_source("package main\n").unwrap();
         assert!(findings.is_empty());
+    }
+
+    /// Regression for kubernetes/kubernetes test/e2e/providers.go and
+    /// build/tools.go: a single header comment above a contiguous run of
+    /// several blank imports in one `import (...)` block must justify every
+    /// import in that run, not just the first one right below it.
+    #[test]
+    fn leading_comment_justifies_whole_contiguous_run_of_blank_imports() {
+        let findings = check_source(
+            "package e2e\n\nimport (\n\t// ensure that cloud providers are loaded\n\t_ \"k8s.io/kubernetes/test/e2e/cloud/aws\"\n\t_ \"k8s.io/kubernetes/test/e2e/cloud/azure\"\n\t_ \"k8s.io/kubernetes/test/e2e/cloud/gce\"\n\t_ \"k8s.io/kubernetes/test/e2e/cloud/kubemark\"\n)\n",
+        )
+        .unwrap();
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
+    }
+
+    /// Regression for stapler-squad server/features/features_test.go:9: a real
+    /// justification comment sits above a *named* import that import-sorting
+    /// placed between the comment and the blank import it actually describes.
+    #[test]
+    fn leading_comment_justifies_blank_import_past_intervening_named_import() {
+        let findings = check_source(
+            "package features_test\n\nimport (\n\t// Side-effect import: triggers all init() registrations in server/features\n\t\"testing\"\n\t_ \"github.com/tstapler/stapler-squad/server/features\"\n)\n",
+        )
+        .unwrap();
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn blank_line_breaks_the_run_so_earlier_comment_does_not_justify_later_import() {
+        let findings = check_source(
+            "package main\n\nimport (\n\t// justifies only the next group\n\t_ \"justified/pkg\"\n\n\t_ \"unjustified/pkg\"\n)\n",
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("unjustified/pkg"));
+    }
+
+    #[test]
+    fn flags_blank_import_with_no_comment_anywhere_nearby() {
+        let findings = check_source(
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t_ \"unjustified/pkg\"\n)\n",
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("unjustified/pkg"));
     }
 }
