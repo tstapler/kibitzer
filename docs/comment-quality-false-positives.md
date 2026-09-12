@@ -118,66 +118,54 @@ real examples above rather than only synthetic cases. A genuinely-restating synt
 case (`Add(a, b) { return a + b }` — a self-contained computation, correctly *not* a
 delegation) still fires unchanged.
 
-## Log
-
 ### 2026-09-09 — stelekit — `/`-separated prose list with a trailing `;` misread as commented-out code
 
-- **Repo**: `tstapler/stelekit` (session `stelekit-22`), file
-  `kmp/src/jvmTest/kotlin/dev/stapler/stelekit/db/QueryPlanAuditTest.kt:45`.
-- **What changed**: added a two-line prose comment documenting why a query is
-  allowlisted: `// asset_index LIKE search — tags/auto_labels/ocr_text are unindexed
-  text columns;` (line 45) continuing onto line 46. The semicolon ends the clause
-  grammatically (matching the existing style of every other entry in this same
-  allowlist block); the slashes are an "either/or" list of three column names, not
-  code.
-- **Why it's a false positive**: nothing on this line is code. `tags/auto_labels/
-  ocr_text` is prose (a slash-delimited enumeration of column names), not a division
-  expression or a path.
-- **Mechanism**: `comment_quality.rs::looks_like_code` (line ~369):
-  `text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c))`. The
-  2026-09-06 backtest (see the "Fixed" section above) narrowed the code-only
-  punctuation set from `(){}[]=<>+*/&|!` down to `{}[]=+*/&|!`, but kept `/` in the
-  narrowed set — this line shows `/` alone, in ordinary technical prose ending a
-  sentence in `;`, is *not* an unambiguous code signal either, the same way
-  `(`/`)`/`<`/`>` turned out not to be. A single `/` with no adjacent code-only
-  punctuation (no `{}[]=+*&|!`, no digits/identifiers forming a real division
-  expression) reads as a list separator far more often than as division in the
-  codebases I've seen this fire on. Not independently re-verified against a large
-  corpus the way the original backtest was — flagging as a hypothesis with one
-  concrete real-world instance, per this file's stated approach to unvalidated
-  constants.
+- **Symptom**: a prose comment ending a clause in `;` with a bare `/` list separator
+  (`tags/auto_labels/ocr_text`, from `kmp/src/jvmTest/kotlin/.../QueryPlanAuditTest.kt:45`
+  in `tstapler/stelekit`) fired `[commented-out-code]`, even though nothing on the line
+  was code.
+- **Mechanism**: `looks_like_code`'s semicolon-ending branch (`src/comment_quality.rs:403`)
+  still included a bare `/` in its code-only punctuation set after the 2026-09-06 backtest
+  narrowed it from `(){}[]=<>+*/&|!` to `{}[]=+*/&|!` — `/` alone, with no other code-only
+  punctuation nearby, reads as a list separator far more often than as division.
+- **Fixed by**: dropping `/` from the set, leaving `{}[]=+*&|!`. Regression-guarded by
+  `slash_separated_prose_list_ending_in_semicolon_is_not_flagged_as_commented_out_code`
+  (built from the real stelekit example) and
+  `division_assignment_expression_is_still_flagged_as_commented_out_code` (confirms a
+  genuine `total = width / height;` is still caught via `is_assignment`, independent of
+  the punctuation set).
+- **Backtested**: pre/post-fix release binaries diffed against `servo/servo`,
+  `BurntSushi/ripgrep`, `denoland/deno`, and `kubernetes/kubernetes` — 51 findings dropped
+  across the four repos, zero new findings, and every dropped finding manually confirmed
+  to be prose (URLs, paths, "and/or" lists) ending in `;` with a bare `/`. A pre-existing
+  true positive (`main.go:56`'s real commented-out `delete(...)` call) is still flagged in
+  both binaries.
 
 ### 2026-09-09 — stelekit — brace-closing `} // ConstructName(args)` annotation comments misread as commented-out code
 
-- **Repo**: `tstapler/stelekit` (session `stelekit-22`), file
-  `kmp/src/commonMain/kotlin/dev/stapler/stelekit/ui/App.kt:1929,1935` (and `:1995`
-  before an unrelated same-session edit shifted line numbers).
-- **What changed**: nothing at these exact lines — pre-existing code, first surfaced
-  by an unscoped re-check after an edit elsewhere in the same file. The lines read
-  `} // CompositionLocalProvider(LocalWindowSizeClass)` and
-  `} // CompositionLocalProvider(LocalSpanRecorder, LocalFileSystem)` — a closing
-  brace annotated with which construct's opening line it closes, a common idiom in
-  deeply-nested Compose UI code (nesting depth was itself a separate, legitimate
-  finding on this same function).
-- **Why it's a false positive**: `CompositionLocalProvider(...)` here is not
-  commented-out code — it names the *already-live*, currently-open call several
-  hundred lines above whose closing brace this is. Deleting the comment (as the
-  finding's own message suggests) would remove a genuinely useful nesting-tracking
-  aid and leave nothing behind, since the real call is untouched code elsewhere.
-- **Mechanism**: `comment_quality.rs::looks_like_code` → `is_call_expression` (line
-  ~375). A brace-closing annotation comment naming its construct in call syntax
-  (`ConstructName(args)`) is, by construction, syntactically indistinguishable from a
-  real commented-out call — `is_call_expression`'s shape check (identifier, `(`,
-  matching `)`, optional trailing `;`) is exactly what both look like. Unlike the
-  slash-list case above, this isn't a punctuation-set tuning problem; it's a genuine
-  ambiguity between two comment idioms that share syntax. A possible fix direction
-  (not attempted here, no source change made): `check_commented_out_code` operates
-  purely on the comment node's own text with no awareness of its position relative to
-  code on the same physical line — a comment that's a *trailing* comment immediately
-  following a bare `}` as the only code on that line is a strong, cheap, and
-  well-known signal for "brace-closing annotation," and essentially never actual dead
-  code (commented-out code doesn't typically get appended after a live, unrelated
-  closing brace). Not independently verified against a broader corpus.
+- **Symptom**: a closing brace annotated with which construct it closes
+  (`} // CompositionLocalProvider(LocalWindowSizeClass)`, a common idiom in deeply-nested
+  Compose UI code — `kmp/src/commonMain/kotlin/.../App.kt` in `tstapler/stelekit`) fired
+  `[commented-out-code]`, even though the named call is live code several hundred lines
+  above, not something commented out.
+- **Mechanism**: `is_call_expression` (`src/comment_quality.rs:409`) matches purely on
+  text shape (identifier, `(`, matching `)`, optional trailing `;`/`,`) with no awareness
+  of the comment's position relative to code on the same physical line — a brace-closing
+  annotation naming its construct in call syntax is syntactically indistinguishable from a
+  real commented-out call.
+- **Fixed by**: `is_brace_closing_annotation` (`src/comment_quality.rs:345`), which checks
+  whether the comment's own physical row has only a bare `}` (optionally with trailing
+  `;`/`,`) before it, and skips commented-out-code detection on that comment's first line
+  when true. Regression-guarded by
+  `brace_closing_annotation_comment_is_not_flagged_as_commented_out_code` (built from the
+  real stelekit example) and
+  `trailing_call_comment_after_real_code_is_still_flagged_as_commented_out_code` (confirms
+  a trailing `// doSomething(x, y)` after real, non-brace-closing code is still caught).
+- **Backtested**: this repo's own `src/*.rs` (`comment-quality-rust`) showed no new noise.
+  The brace-closing idiom doesn't occur in the locally-cloned Go/Rust corpus repos, so the
+  Kotlin regression test above is this fix's primary evidence.
+
+## Log
 
 ### 2026-09-11 — stapler-squad — mathematical interval notation `[a, b)` in prose misread as commented-out code
 
@@ -194,14 +182,14 @@ delegation) still fires unchanged.
   a half-open range (inclusive lower bound, exclusive upper bound), not an array/slice
   literal or any other code construct. The whole line is prose describing a numeric
   range and citing a quoted example socket name.
-- **Mechanism**: `comment_quality.rs::looks_like_code` (line ~369):
-  `text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c))`. The line
-  ends in `;` (a normal sentence-terminating semicolon, consistent with this file's
-  own comment style elsewhere) and contains `[`/`]` from the interval notation, which
-  is in the code-only punctuation set — so the combined check fires even though
+- **Mechanism**: `comment_quality.rs::looks_like_code` (line ~403, unchanged by the
+  fixes above): `text.ends_with(';') && text.chars().any(|c| "{}[]=+*&|!".contains(c))`.
+  The line ends in `;` (a normal sentence-terminating semicolon, consistent with this
+  file's own comment style elsewhere) and contains `[`/`]` from the interval notation,
+  which is in the code-only punctuation set — so the combined check fires even though
   neither the brackets nor the semicolon are code here. This is the same class of gap
-  documented above for `(`/`)`/`<`/`>` (Apache license headers, blockquote markers):
-  `[`/`]` is not an unambiguous code signal either when used for mathematical interval
-  notation in prose. Not independently verified against a broader corpus — flagging
-  as a hypothesis with one concrete real-world instance, per this file's stated
-  approach to unvalidated constants.
+  already fixed above for `(`/`)`/`<`/`>` and `/` (Apache license headers, blockquote
+  markers, slash-separated prose lists): `[`/`]` is not an unambiguous code signal
+  either when used for mathematical interval notation in prose. Not independently
+  verified against a broader corpus — flagging as a hypothesis with one concrete
+  real-world instance, per this file's stated approach to unvalidated constants.

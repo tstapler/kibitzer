@@ -79,6 +79,14 @@ fn build_edit_summary(tool_input: &ToolInput) -> crate::hook_log::EditSummary {
 /// occurrences rather than falling back to an unscoped whole-file check: that keeps
 /// unrelated, pre-existing findings elsewhere in the file suppressed, at the cost of
 /// occasionally including a same-text occurrence that isn't the one that changed.
+///
+/// A pure deletion (every `new_string` in this call is empty — nothing was added,
+/// only removed) is scoped to `Some(vec![])` rather than falling through to `None`:
+/// the edit introduced no new content for a check to flag, so there's nothing to
+/// search for in the post-edit file, but that's not the same as "unscoped" — an
+/// unscoped whole-file rescan would still re-surface unrelated, pre-existing
+/// findings elsewhere in the file (see docs/go-primitive-obsession-false-positives.md's
+/// "deletion-only edit flagged" entry).
 fn compute_changed_lines(
     tool_input: &ToolInput,
     file_path: &PathBuf,
@@ -97,10 +105,12 @@ fn compute_changed_lines(
 
     let file_content = std::fs::read_to_string(file_path).ok()?;
     let mut ranges = Vec::new();
+    let mut saw_non_empty_needle = false;
     for needle in new_strings {
         if needle.is_empty() {
             continue;
         }
+        saw_non_empty_needle = true;
         for (byte_offset, _) in file_content.match_indices(needle) {
             let start_line = file_content[..byte_offset].matches('\n').count() + 1;
             let end_line = start_line + needle.matches('\n').count();
@@ -108,7 +118,10 @@ fn compute_changed_lines(
         }
     }
 
-    if ranges.is_empty() {
+    if !saw_non_empty_needle {
+        // Every edit in this tool call was a pure deletion.
+        Some(Vec::new())
+    } else if ranges.is_empty() {
         None
     } else {
         Some(ranges)
@@ -338,6 +351,53 @@ func TestX(t *testing.T) {\n\
                 .iter()
                 .any(|&(start, end)| (start..=end).contains(&2))
         );
+    }
+
+    #[test]
+    fn deletion_only_edit_scopes_to_empty_ranges_instead_of_unscoped() {
+        // Regression for docs/go-primitive-obsession-false-positives.md's
+        // "deletion-only edit flagged" entry: an Edit whose `new_string` is empty
+        // (pure deletion, nothing added) must not fall back to `None` (unscoped —
+        // which re-triggers a whole-file rescan and re-surfaces unrelated,
+        // pre-existing findings) — it should scope to zero ranges instead.
+        let path = write_temp(
+            "deletion-only",
+            "package main\nfunc stillHere(a, b string) {}\n",
+        );
+        let tool_input = ToolInput {
+            file_path: None,
+            old_string: Some("func deadCode(a, b string) {}\n".to_string()),
+            new_string: Some(String::new()),
+            content: None,
+            edits: None,
+        };
+        let ranges = compute_changed_lines(&tool_input, &path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(ranges, Some(Vec::new()));
+    }
+
+    #[test]
+    fn multi_edit_of_only_deletions_scopes_to_empty_ranges() {
+        let path = write_temp("multi-deletion-only", "package main\n");
+        let tool_input = ToolInput {
+            file_path: None,
+            old_string: None,
+            new_string: None,
+            content: None,
+            edits: Some(vec![
+                EditItem {
+                    new_string: String::new(),
+                    old_string: Some("removed one\n".to_string()),
+                },
+                EditItem {
+                    new_string: String::new(),
+                    old_string: Some("removed two\n".to_string()),
+                },
+            ]),
+        };
+        let ranges = compute_changed_lines(&tool_input, &path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(ranges, Some(Vec::new()));
     }
 
     #[test]

@@ -226,7 +226,8 @@ impl Checker for CommentQualityChecker {
         for comment in &comments {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
             check_verbose_phrases(*comment, text, &mut findings);
-            in_fence = check_commented_out_code(*comment, text, in_fence, &mut findings);
+            in_fence =
+                check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
         }
 
         let cfg = rules::lang_config(self.lang);
@@ -301,11 +302,15 @@ fn check_verbose_phrases(comment: Node, text: &str, findings: &mut Vec<Finding>)
 fn check_commented_out_code(
     comment: Node,
     text: &str,
+    src: &str,
     in_fence: bool,
     findings: &mut Vec<Finding>,
 ) -> bool {
     let start_row = comment.start_position().row;
     let mut in_fence = in_fence;
+    // A trailing comment is only "trailing" (i.e. sharing a physical row with other
+    // code) on the comment node's own first line — see `is_brace_closing_annotation`.
+    let skip_brace_closing_annotation = is_brace_closing_annotation(comment, src);
     for (offset, raw_line) in text.lines().enumerate() {
         let stripped = strip_comment_markers(raw_line);
         if stripped.starts_with("```") {
@@ -313,6 +318,9 @@ fn check_commented_out_code(
             continue;
         }
         if in_fence || stripped.is_empty() {
+            continue;
+        }
+        if offset == 0 && skip_brace_closing_annotation {
             continue;
         }
         if looks_like_code(stripped) {
@@ -323,6 +331,26 @@ fn check_commented_out_code(
         }
     }
     in_fence
+}
+
+/// Whether `comment` is a trailing comment whose only preceding content on its own
+/// physical row is a bare closing brace (optionally followed by `;`/`,`, as in a
+/// `}(...)` expression statement or an array-of-structs entry) — the
+/// `} // ConstructName(args)` idiom common in deeply-nested code, where the comment
+/// names the construct several lines above whose closing brace this is. Call-syntax
+/// text in such a comment (`is_call_expression`) is syntactically identical to real
+/// commented-out code; this is a positional signal instead, checked once against the
+/// row the comment node actually starts on rather than against its text — a real
+/// backtest finding, see docs/comment-quality-false-positives.md.
+fn is_brace_closing_annotation(comment: Node, src: &str) -> bool {
+    let start = comment.start_position();
+    let Some(row_text) = src.lines().nth(start.row) else {
+        return false;
+    };
+    let Some(before) = row_text.get(..start.column) else {
+        return false;
+    };
+    before.trim().trim_end_matches([';', ',']).trim_end() == "}"
 }
 
 /// Strips the leading comment-marker noise (`//`, `///`, `//!`, `#`, `/*`, `*/`, a
@@ -357,16 +385,22 @@ fn strip_comment_markers(line: &str) -> &str {
 /// narrows that, but a real-world backtest (see docs/comment-quality-false-positives.md)
 /// found `(`/`)` and `<`/`>` are *not* unambiguous either: an Apache license header
 /// ("Licensed under ... (the \"License\");") and a spec-quoting blockquote ("> ... the
-/// command;") both carry those characters in ordinary prose. Only `{}[]=+*/&|!` survive
-/// as the punctuation set — narrower still, at the further cost of no longer flagging a
-/// punctuation-free statement like a bare `return;`/`break;`, or a real call expression
-/// mentioned only via this branch (already independently caught by
-/// `is_call_expression`'s stricter shape check below, so nothing is actually lost there).
+/// command;") both carry those characters in ordinary prose. A later real-world
+/// instance (see docs/comment-quality-false-positives.md) found a bare `/` is not
+/// unambiguous either: a `/`-separated prose list of names ("tags/auto_labels/
+/// ocr_text are unindexed;") reads as an enumeration far more often than as division.
+/// Only `{}[]=+*&|!` survive as the punctuation set — narrower still, at the further
+/// cost of no longer flagging a punctuation-free statement like a bare
+/// `return;`/`break;`, or a bare division/call expression mentioned only via this
+/// branch (a real call is still independently caught by `is_call_expression`'s
+/// stricter shape check below, so nothing is lost there; a bare division statement
+/// with no other code-only punctuation is rare enough as dead code, vs. common enough
+/// as prose, to accept the same way the other exclusions above were).
 fn looks_like_code(text: &str) -> bool {
     if text.ends_with('{') || text == "}" || text.ends_with("});") {
         return true;
     }
-    if text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c)) {
+    if text.ends_with(';') && text.chars().any(|c| "{}[]=+*&|!".contains(c)) {
         return true;
     }
     is_call_expression(text) || is_assignment(text)
@@ -973,6 +1007,72 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    // --- Regression tests for the two 2026-09-09 stelekit backtest findings ---
+
+    /// Regression guard for docs/comment-quality-false-positives.md's first 2026-09-09
+    /// log entry — built from the real stelekit occurrence
+    /// (`QueryPlanAuditTest.kt:45`), not just a synthetic case. The slashes are an
+    /// "either/or" enumeration of column names, not division.
+    #[test]
+    fn slash_separated_prose_list_ending_in_semicolon_is_not_flagged_as_commented_out_code() {
+        let src = "fun test() {\n    // asset_index LIKE search — tags/auto_labels/ocr_text are unindexed text columns;\n    assertTrue(true)\n}\n";
+        let findings = run(Language::Kotlin, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// A genuine division expression is still caught: unlike the bare-`/` prose case
+    /// above, this is a real assignment statement (`is_assignment` matches regardless
+    /// of the narrowed punctuation set, which only affects the semicolon-only branch
+    /// of `looks_like_code`).
+    #[test]
+    fn division_assignment_expression_is_still_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\t// total = width / height;\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Regression guard for docs/comment-quality-false-positives.md's second
+    /// 2026-09-09 log entry — built from the real stelekit occurrence (`App.kt:1929`),
+    /// not just a synthetic case. The comment names the already-live
+    /// `CompositionLocalProvider(...)` call several lines above whose closing brace
+    /// this is, not a commented-out call.
+    #[test]
+    fn brace_closing_annotation_comment_is_not_flagged_as_commented_out_code() {
+        let src = "fun App() {\n    CompositionLocalProvider(LocalWindowSizeClass) {\n        Text(\"hi\")\n    } // CompositionLocalProvider(LocalWindowSizeClass)\n}\n";
+        let findings = run(Language::Kotlin, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// A genuine trailing commented-out call is still caught when it doesn't follow a
+    /// bare closing brace — the positional exemption only fires when the closing brace
+    /// is the *only* other code on the row.
+    #[test]
+    fn trailing_call_comment_after_real_code_is_still_flagged_as_commented_out_code() {
+        let src = "package main\n\nfunc F() {\n\tx := 1 // doSomething(x, y)\n\t_ = x\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
     }

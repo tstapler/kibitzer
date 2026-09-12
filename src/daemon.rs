@@ -178,7 +178,9 @@ fn handle_run_checks(
         guard.apply_grace(&mut results, file_path, trigger);
         // A scoped result only reflects the diffed ranges, not the whole file — writing it
         // to the cache would let a later unscoped (e.g. batch) request read back a partial
-        // result as if it were a full-file one.
+        // result as if it were a full-file one. `grace_pending` isn't affected by this
+        // concern (it's not part of `entries`, the file-results cache `put` populates), so
+        // `save` still needs to run unconditionally below to persist it.
         if changed_lines.is_none() {
             guard.put(
                 file_path,
@@ -187,8 +189,12 @@ fn handle_run_checks(
                 trigger,
                 results.clone(),
             );
-            let _ = guard.save(cache_path);
         }
+        // Persist regardless of `changed_lines`: without this, a diff-scoped (Edit-tool)
+        // call under this daemon would still work correctly in-memory for as long as the
+        // daemon stays up, but a daemon restart mid-sequence would silently lose
+        // `apply_grace`'s escalation state, exactly like the no-daemon fallback below.
+        let _ = guard.save(cache_path);
     }
     Ok(results)
 }
@@ -267,7 +273,8 @@ pub fn run_checks_smart(
     let mut cache = Cache::load(&cache_path);
     cache.apply_grace(&mut results, file_path, trigger);
     // See handle_run_checks: don't let a diff-scoped partial result overwrite the
-    // full-file cache entry.
+    // full-file cache entry. `grace_pending` isn't part of that cache entry, so it still
+    // needs `save` to run unconditionally below.
     if changed_lines.is_none() {
         cache.put(
             file_path,
@@ -276,8 +283,14 @@ pub fn run_checks_smart(
             trigger,
             results.clone(),
         );
-        let _ = cache.save(&cache_path);
     }
+    // Persist regardless of `changed_lines`: this is a fresh `Cache::load` per process
+    // (no daemon running), so without an unconditional save here, `apply_grace`'s
+    // escalation state for a diff-scoped (Edit-tool) call never reaches disk at all — every
+    // subsequent `kibitzer hook` invocation would see an empty `grace_pending` and treat a
+    // still-failing check as a fresh "first occurrence" forever, so a Blocking check could
+    // never actually escalate back to blocking without a daemon.
+    let _ = cache.save(&cache_path);
 
     Ok(results)
 }

@@ -28,57 +28,64 @@ project's `.claude/settings.json` matcher (`"matcher": "Edit|Write"`) and the ch
 `scope: ["**/*.go"]` mean it fires on essentially any edit to any Go file in scope, not
 just one that introduces a new same-typed-parameter signature.
 
-## Log
+## Fixed
 
 ### 2026-08-18 — stapler-squad-tests — ambiguous-substring fallback re-scanned whole file
 
-- **Repo**: `tstapler/stapler-squad` (session `stapler-squad-tests`), file
-  `server/services/session_service_test.go`.
-- **What changed**: an `Edit` moved an identical 3-line setup block
-  (`eventBus := events.NewEventBus(8)` / `svc := NewSessionService(storage, eventBus)`
-  / `t.Cleanup(func() { svc.Shutdown() })`) into a new `t.Run("onDetected", ...)`
-  subtest of a table that already duplicates this same boilerplate across several
-  other subtests.
-- **Why it's a false positive**: the checker isn't a bug here — the underlying
-  diff-scoping infra (`src/hook.rs::compute_changed_lines`, `src/check.rs`'s
-  `changed_lines`/git-HEAD-baseline machinery) *does* exist and normally prevents
-  the whole-file rescan described above. This case bypassed it: `compute_changed_lines`
-  located an `Edit`'s `new_string` by searching for it as a unique substring of the
-  current file, and previously bailed to `None` (unscoped, whole-file check) whenever
-  that text occurred more than once — which duplicated subtest boilerplate guarantees.
-- **Fix**: `compute_changed_lines` (`src/hook.rs`) now scopes to the union of *all*
-  occurrences of an ambiguous `new_string` instead of giving up and scanning the whole
-  file. Covered by `unions_all_occurrences_when_new_string_is_ambiguous` and
+- **Symptom**: an `Edit` to `server/services/session_service_test.go` moved an
+  identical 3-line setup block into a new `t.Run` subtest of a table that already
+  duplicates that same boilerplate across several other subtests — `tstapler/stapler-squad`.
+- **Mechanism**: `compute_changed_lines` (`src/hook.rs`) located an `Edit`'s
+  `new_string` by searching for it as a unique substring of the current file, and
+  previously bailed to `None` (unscoped, whole-file check) whenever that text
+  occurred more than once — which duplicated subtest boilerplate guarantees.
+- **Fixed by**: scoping to the union of *all* occurrences of an ambiguous `new_string`
+  instead of giving up and scanning the whole file. Regression-guarded by
+  `unions_all_occurrences_when_new_string_is_ambiguous` and
   `duplicated_subtest_boilerplate_scopes_to_all_copies_not_whole_file` in
   `src/hook.rs`'s test module.
 
 ### 2026-08-10 — stapler-squad — deletion-only edit flagged
 
-- **Repo**: `tstapler/stapler-squad`
-- **What changed**: an `Edit` to `server/tls.go` that only *removed*
-  `LoadTLSConfig(certFile, keyFile string) (*tls.Config, error)` because it had become
-  dead code. No function signature was added.
-- **Why it's a false positive**: nothing new was introduced for the checklist rule to
-  flag — the edit was a pure deletion.
-- **Mechanism**: per the whole-file rescan behavior above, the hook re-parses whatever
-  is left in `server/tls.go` (and/or the sibling file also touched) after the edit and
-  flags any *other* pre-existing same-typed-parameter signature still present, or in
-  this case appears to fire independent of whether the specific edited hunk added or
-  removed anything — the tool does not distinguish "diff added this" from "file
-  contains this."
+- **Symptom**: an `Edit` to `server/tls.go` that only *removed*
+  `LoadTLSConfig(certFile, keyFile string) (*tls.Config, error)` (dead code, no
+  signature added) still re-flagged an unrelated pre-existing signature elsewhere in
+  the file — `tstapler/stapler-squad`.
+- **Mechanism**: the generic `changed_lines` scoping added for the entry above didn't
+  actually close this case. `compute_changed_lines` (`src/hook.rs`) skipped empty
+  `new_string` values (pure deletions) when building ranges, and if *every* needle was
+  empty it fell through to `None` (unscoped) — reproducing the original whole-file
+  rescan. Separately, `scope_output_to_changed_lines` (`src/check.rs`) treated an empty
+  ranges slice as "nothing to scope, return raw output" rather than "scope to nothing."
+- **Fixed by**: `compute_changed_lines` now returns `Some(Vec::new())` for an
+  all-deletion edit instead of `None`, and `scope_output_to_changed_lines` now treats
+  empty ranges (when the raw check failed) as "everything out of scope" — suppressed
+  output, passed. Regression-guarded by
+  `deletion_only_edit_scopes_to_empty_ranges_instead_of_unscoped` and
+  `multi_edit_of_only_deletions_scopes_to_empty_ranges` (`src/hook.rs`) and
+  `scope_output_empty_ranges_suppresses_all_findings` (`src/check.rs`). Verified
+  directly against a real `kibitzer hook` payload simulating a deletion-only edit on
+  `examples/go/bad.go`'s pre-existing 6-string-parameter `createUser` signature: zero
+  findings, exit 0 (previously would have re-flagged `createUser`).
 
 ### 2026-08-10 — stapler-squad — pre-existing unchanged signatures flagged
 
-- **Repo**: `tstapler/stapler-squad`
-- **What changed**: edits to `server/tls.go` and `main.go` that did not alter the shape
-  of the flagged functions.
-- **Functions flagged**: `certCurrent(certFile, hashFile, want string)` and
-  `LoadTLSConfig(certFile, keyFile string)` (`server/tls.go`) — both pre-existing,
-  unchanged in signature shape by the diff.
-- **Why it's a false positive**: these signatures were not newly introduced by the
-  edit; they already existed in the file before the edit and were untouched by it.
-- **Mechanism**: confirmed directly from source — `check_file` reads and parses the
-  *entire current file*, not a diff. Any edit to a `.go` file that contains an
-  already-flaggable signature anywhere in it will re-surface that finding on every
-  subsequent `Edit`/`Write` to that file, whether or not the edit touched that
-  particular function.
+- **Symptom**: edits to `server/tls.go`/`main.go` that didn't alter the shape of
+  `certCurrent(certFile, hashFile, want string)` or `LoadTLSConfig(certFile, keyFile
+  string)` still re-flagged them — `tstapler/stapler-squad`.
+- **Mechanism**: `check_file` reads and parses the entire current file, not a diff —
+  but `run_native_check`/`scope_output_to_changed_lines` (`src/check.rs`) is generic,
+  checker-agnostic output-line filtering that already covered `primitive-obsession`
+  the same way it covers `go-blank-imports`; this entry was stale by the time it was
+  re-investigated.
+- **Fixed by**: nothing new — already covered by the generic scoping above. Added
+  `native_primitive_obsession_check_scopes_output_to_changed_lines` and
+  `native_primitive_obsession_check_suppresses_findings_for_deletion_only_edit`
+  (`src/check.rs`) since no primitive-obsession-specific regression test existed yet.
+  Verified directly against a real edit touching only `LoadTLSConfig`'s body while
+  `certCurrent` sat untouched elsewhere in the file: only `LoadTLSConfig` fired,
+  `certCurrent` did not.
+
+## Log
+
+No open entries.
