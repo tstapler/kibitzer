@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::accepted_findings::{AcceptedFindings, FilterOutcome};
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 use crate::plugin::Registry;
@@ -158,13 +159,16 @@ mod describe_tests {
 /// 1-indexed inclusive line ranges — see [`scope_output_to_changed_lines`]. `registry`
 /// should be loaded once per batch/request by the caller (see [`run_checks_for_trigger`])
 /// rather than reloaded here — `registry.json` is read on every plugin-missing check
-/// otherwise, even for a repo with zero plugins installed.
+/// otherwise, even for a repo with zero plugins installed. `accepted` is likewise loaded
+/// once per batch/request by the caller, for the same reason (see
+/// [`run_checks_for_trigger`]'s doc comment).
 pub fn run_check(
     check: &Check,
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     registry: &Registry,
+    accepted: &AcceptedFindings,
 ) -> anyhow::Result<CheckResult> {
     run_check_with_timeout(
         check,
@@ -173,6 +177,7 @@ pub fn run_check(
         changed_lines,
         COMMAND_TIMEOUT,
         registry,
+        accepted,
     )
 }
 
@@ -186,9 +191,17 @@ fn run_check_with_timeout(
     changed_lines: Option<&[(usize, usize)]>,
     timeout: Duration,
     registry: &Registry,
+    accepted: &AcceptedFindings,
 ) -> anyhow::Result<CheckResult> {
     if let Some(checker_name) = &check.checker {
-        return run_native_check(check, checker_name, repo_root, file_path, changed_lines);
+        return run_native_check(
+            check,
+            checker_name,
+            repo_root,
+            file_path,
+            changed_lines,
+            accepted,
+        );
     }
 
     if check.architecture_checker.is_some() {
@@ -415,6 +428,7 @@ fn run_native_check(
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
+    accepted: &AcceptedFindings,
 ) -> anyhow::Result<CheckResult> {
     let cmd_str = format!(
         "kibitzer check native {checker_name} {}",
@@ -467,6 +481,15 @@ fn run_native_check(
         passed_raw
     };
 
+    let passed = if passed {
+        passed
+    } else {
+        let outcome =
+            drop_accepted_findings(&combined, repo_root, file_path, checker_name, accepted);
+        combined = outcome.output;
+        combined.trim().is_empty()
+    };
+
     let mut severity = check.severity;
     let mut message = check.message.clone();
 
@@ -493,6 +516,27 @@ fn run_native_check(
         findings: Vec::new(),
         plugin_missing: false,
     })
+}
+
+/// Drops accepted findings (`.claude/kibitzer-accepted.json`) from `combined`, run after
+/// diff-scoping so an untouched line never needs this at all. Native-only: a shell-out
+/// check's pass/fail comes from its exit code, not empty output, so this can't safely
+/// recompute pass/fail for it.
+fn drop_accepted_findings(
+    combined: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    checker_name: &str,
+    accepted: &AcceptedFindings,
+) -> FilterOutcome {
+    let rel_file = relativize(repo_root, file_path);
+    crate::accepted_findings::filter_accepted(
+        combined,
+        file_path,
+        &rel_file,
+        checker_name,
+        accepted,
+    )
 }
 
 /// Runs `checker_name` against `source` (as if it were the content of `file_path`),
@@ -1342,7 +1386,11 @@ fn map_ranges_through_hunks(ranges: &[(usize, usize)], hunks: &[DiffHunk]) -> Ve
 /// `run.rs`) should load it exactly once for the whole batch and pass the same
 /// `&Registry` into every call, instead of reloading and reparsing `registry.json` from
 /// disk once per call (or, if reloaded again inside the per-`check` loop, once per
-/// (file, check) pair).
+/// (file, check) pair). `accepted` (`.claude/kibitzer-accepted.json`) must be loaded the
+/// same way, by the same caller, for the same reason — and, more importantly, so that a
+/// malformed accepted-findings file surfaces as one clean error before any file work
+/// starts, rather than a `?` from inside this per-(file, check) loop nondeterministically
+/// discarding every result already accumulated for the batch.
 pub fn run_checks_for_trigger(
     checks: &[Check],
     trigger: &str,
@@ -1350,6 +1398,7 @@ pub fn run_checks_for_trigger(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     registry: &Registry,
+    accepted: &AcceptedFindings,
 ) -> anyhow::Result<Vec<CheckResult>> {
     let rel_path = relativize(repo_root, file_path);
     let mut results = Vec::new();
@@ -1366,6 +1415,7 @@ pub fn run_checks_for_trigger(
             file_path,
             changed_lines,
             registry,
+            accepted,
         )?);
     }
     Ok(results)
@@ -1547,6 +1597,7 @@ mod sarif_run_check_tests {
             Path::new("src/lib.rs"),
             Some(&[(1, 5)]),
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1567,6 +1618,7 @@ mod sarif_run_check_tests {
             Path::new("src/lib.rs"),
             None,
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert_eq!(result.output.trim(), "not sarif at all");
@@ -1607,6 +1659,7 @@ mod timeout_tests {
             None,
             Duration::from_millis(200),
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
 
@@ -1638,6 +1691,7 @@ mod timeout_tests {
             None,
             Duration::from_millis(200),
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
 
@@ -1703,6 +1757,7 @@ mod plugin_missing_tests {
                 Path::new("irrelevant.txt"),
                 None,
                 &registry,
+                &AcceptedFindings::default(),
             )
             .unwrap();
 
@@ -1976,6 +2031,7 @@ mod git_head_integration_tests {
             &repo.path("foo.txt"),
             Some(&[(2, 2)]),
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert!(!result.passed);
@@ -2078,6 +2134,7 @@ mod git_head_integration_tests {
             &repo.dir,
             None,
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert!(!result.passed);
@@ -2341,6 +2398,9 @@ mod native_check_tests {
         }
     }
 
+    // Predates `test_support::unique_temp_dir` and stays on its own atomic-counter
+    // scheme rather than migrating: it's already collision-resistant even under
+    // parallel test threads, which nanosecond-timestamp uniqueness alone is not.
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "kibitzer-native-check-test-{}-{name}-{}",
@@ -2362,6 +2422,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .expect("a missing file must not abort the whole check run");
         assert!(!result.passed);
@@ -2382,6 +2443,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert!(result.passed);
@@ -2418,6 +2480,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert!(
@@ -2451,7 +2514,15 @@ mod native_check_tests {
             output_format: None,
         };
 
-        let result = run_check(&check, &dir, &file, None, &Registry::default()).unwrap();
+        let result = run_check(
+            &check,
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
         assert!(result.passed);
         assert!(result.output.is_empty());
 
@@ -2475,12 +2546,14 @@ mod native_check_tests {
         // Line 4 (outside/pre-existing) is excluded; line 5 (inside) is the
         // only changed line, matching this file's `{file}:{line}:` findings.
         let registry = Registry::default();
+        let accepted = AcceptedFindings::default();
         let result = run_check(
             &blank_imports_check(),
             &dir,
             &file,
             Some(&[(5, 5)]),
             &registry,
+            &accepted,
         )
         .unwrap();
         assert!(!result.passed);
@@ -2495,6 +2568,7 @@ mod native_check_tests {
             &file,
             Some(&[(1, 1)]),
             &registry,
+            &accepted,
         )
         .unwrap();
         assert!(clean.passed);
@@ -2520,12 +2594,14 @@ mod native_check_tests {
         // Only line 7 (`LoadTLSConfig`) falls inside the edited range; line 3
         // (`certCurrent`) is pre-existing and untouched.
         let registry = Registry::default();
+        let accepted = AcceptedFindings::default();
         let result = run_check(
             &primitive_obsession_check(),
             &dir,
             &file,
             Some(&[(7, 7)]),
             &registry,
+            &accepted,
         )
         .unwrap();
         assert!(!result.passed);
@@ -2539,6 +2615,7 @@ mod native_check_tests {
             &file,
             Some(&[(4, 4)]),
             &registry,
+            &accepted,
         )
         .unwrap();
         assert!(clean.passed);
@@ -2569,11 +2646,114 @@ mod native_check_tests {
             &file,
             Some(&[]),
             &registry,
+            &AcceptedFindings::default(),
         )
         .unwrap();
         assert!(result.passed, "output: {}", result.output);
         assert_eq!(result.output, "");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_accepted_findings(dir: &Path, json: &str) {
+        std::fs::create_dir_all(dir.join(crate::config::CONFIG_DIR)).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_DIR)
+                .join(crate::accepted_findings::ACCEPTED_FINDINGS_FILENAME),
+            json,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepted_finding_with_unchanged_content_suppresses_the_native_finding() {
+        let dir = tmp_dir("accepted-unchanged");
+        let file = dir.join("user.go");
+        std::fs::write(
+            &file,
+            "package main\n\nfunc newUser(name, email string) {}\n",
+        )
+        .unwrap();
+        write_accepted_findings(
+            &dir,
+            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
+        );
+        let accepted = crate::accepted_findings::find_accepted_findings(&dir).unwrap();
+
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+            &accepted,
+        )
+        .unwrap();
+        assert!(result.passed, "output: {}", result.output);
+        assert_eq!(result.output, "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_finding_stops_suppressing_once_the_line_content_drifts() {
+        let dir = tmp_dir("accepted-stale");
+        let file = dir.join("user.go");
+        // The signature grew a third same-typed parameter since the entry below was
+        // written — the recorded `content` no longer matches, so the (now different)
+        // finding must still surface rather than being silently swallowed forever.
+        std::fs::write(
+            &file,
+            "package main\n\nfunc newUser(name, email, nickname string) {}\n",
+        )
+        .unwrap();
+        write_accepted_findings(
+            &dir,
+            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
+        );
+        let accepted = crate::accepted_findings::find_accepted_findings(&dir).unwrap();
+
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+            &accepted,
+        )
+        .unwrap();
+        assert!(!result.passed);
+        assert!(
+            result.output.contains("3 identifiers"),
+            "output: {}",
+            result.output
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_accepted_findings_file_surfaces_as_a_real_error() {
+        let dir = tmp_dir("accepted-malformed");
+        std::fs::write(
+            dir.join("user.go"),
+            "package main\n\nfunc newUser(name, email string) {}\n",
+        )
+        .unwrap();
+        write_accepted_findings(
+            &dir,
+            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": ""}]}"#,
+        );
+
+        // `AcceptedFindings` is loaded once per batch by the caller (see
+        // `run_checks_for_trigger`'s doc comment), not inside `run_check`/`run_native_check`
+        // — an entry with an empty reason must fail loudly right there, before any check
+        // in the batch ever runs, rather than nondeterministically aborting mid-batch.
+        let result = crate::accepted_findings::find_accepted_findings(&dir);
+        assert!(
+            result.is_err(),
+            "an entry with an empty reason must not be silently accepted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

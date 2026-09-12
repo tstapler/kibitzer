@@ -68,3 +68,22 @@ pub(crate) fn run_kibitzer(args: &[&str]) -> std::process::Output {
         .output()
         .expect("kibitzer binary runs (run `cargo build` first if this fails)")
 }
+
+/// A fresh, uniquely-named directory under the OS temp dir for a test that needs real
+/// filesystem fixtures (a `go.mod`, a repo root, etc.) — `label` should identify the
+/// calling test/module so a failed run's leftovers are easy to trace. Not
+/// auto-cleaned-up (callers `std::fs::remove_dir_all` when done, ignoring the result,
+/// matching every existing caller of this pattern) since a test that panics before
+/// cleanup should leave evidence behind rather than hide it.
+pub(crate) fn unique_temp_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "kibitzer-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}

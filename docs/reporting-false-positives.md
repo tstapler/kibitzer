@@ -16,6 +16,10 @@ genuine hit. If you're unsure which this is, read the checker's source
 (`src/<checker>.rs`) first; a false-positive report should identify the
 mechanism, not just the symptom.
 
+For a genuine hit you've deliberately decided to keep (a real
+`flag-argument` match on a CLI's standard `-v` toggle, say) — not a
+misfire — see `docs/accepting-findings.md` instead.
+
 ## How to file one
 
 Each checker has (or should have) a `docs/<checker-name>-false-positives.md`
@@ -75,4 +79,6 @@ Do not remove an entry just because:
 This is not a suppression mechanism — filing a report does not silence the
 check for anyone, including you, on a future run. If a finding is blocking
 real work right now, that's a separate conversation with whoever owns the
-project's `.claude/inspect.json`.
+project's `.claude/inspect.json` (see `docs/suppressing-checks.md`), or —
+for one specific, correctly-flagged finding you want to keep rather than
+fix — `docs/accepting-findings.md`.

@@ -9,9 +9,10 @@ the full list is in `docs/syntax-rules.md` and `docs/comment-quality.md`, plus
 `.claude/inspect.json`
 overlays that catalog rather than replacing it — see
 `config::find_effective_config`. There is no inline/per-line suppression
-comment (`// kibitzer:disable ...`, `# noqa`, etc.) — see
-`docs/reporting-false-positives.md`'s "What this is not" section for why. The
-levers below are all config-based.
+comment (`// kibitzer:disable ...`, `# noqa`, etc.) — the per-finding lever
+below (`docs/accepting-findings.md`) covers that granularity via a checked-in
+file instead, kept reviewable rather than scattered through source. The
+levers in this doc are all config-based.
 
 ## Turn a default check off entirely
 
@@ -64,6 +65,15 @@ checked after the positive patterns — gitignore-style:
 
 A `checks` entry with only negative patterns (no positive ones) matches
 everything except what it excludes — equivalent to starting from `**/*`.
+
+## Accept one specific, correctly-flagged finding
+
+The levers above are whole-checker or whole-file/directory. For a genuine hit at
+one specific line that you've deliberately decided to keep — a real
+`flag-argument` match on a CLI's standard `-v` toggle, say — disabling the whole
+checker for that file would also silence every other rule it covers there. See
+`docs/accepting-findings.md` for `.claude/kibitzer-accepted.json`, a per-finding
+lever that requires a written reason and only that one location.
 
 ## If a finding looks flat-out wrong
 

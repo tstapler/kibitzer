@@ -122,6 +122,10 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
     // otherwise reloads and reparses `registry.json` from disk on every single
     // dispatch, even for a repo with zero plugins installed.
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
+    // Same rationale, and additionally: a malformed `.claude/kibitzer-accepted.json`
+    // must surface as one clean error here, before any file's checks run, rather than
+    // failing nondeterministically mid-batch depending on file-walk order.
+    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
 
     for check in &repo_checks {
         if !check.triggers.is_empty() && !check.triggers.iter().any(|t| t == trigger) {
@@ -130,7 +134,7 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
         let result = if check.architecture_checker.is_some() {
             run_architecture_check(check, &repo_root, &files, &arch_config)?
         } else {
-            run_check(check, &repo_root, &repo_root, None, &registry)?
+            run_check(check, &repo_root, &repo_root, None, &registry, &accepted)?
         };
         if !result.passed && has_blocking_finding(&result) {
             any_blocking_failure = true;
@@ -139,9 +143,15 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
     }
 
     for file in &files {
-        for result in
-            run_checks_for_trigger(&file_checks, trigger, &repo_root, file, None, &registry)?
-        {
+        for result in run_checks_for_trigger(
+            &file_checks,
+            trigger,
+            &repo_root,
+            file,
+            None,
+            &registry,
+            &accepted,
+        )? {
             if !result.passed && has_blocking_finding(&result) {
                 any_blocking_failure = true;
             }
