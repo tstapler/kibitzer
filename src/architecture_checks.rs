@@ -522,23 +522,24 @@ pub fn lookup_model(name: &str) -> Option<Box<dyn ArchModelChecker>> {
     model_registry().into_iter().find(|c| c.name() == name)
 }
 
-/// A package is "stable" (hard to change safely — many dependents, few dependencies) below
-/// this instability score, and "unstable" (easy to change, safe to keep abstract or
-/// experimental) above [`UNSTABLE_MIN`].
+/// 0.3/0.7 split each metric into thirds around Martin's I/A plot — no stronger literature
+/// citation exists for these exact cutoffs than "comfortably inside vs. outside the zone,"
+/// same status as `MAX_FAN_OUT`/`MAX_FAN_IN` above.
 const STABLE_MAX: f64 = 0.3;
 const UNSTABLE_MIN: f64 = 0.7;
-/// A package is "concrete" (mostly non-interface types) below this abstractness score, and
-/// "abstract" above [`ABSTRACT_MIN`].
 const CONCRETE_MAX: f64 = 0.3;
 const ABSTRACT_MIN: f64 = 0.7;
 
-/// Robert Martin's Instability/Abstractness/Distance-from-Main-Sequence metrics
-/// (`I = Ce/(Ca+Ce)`, `A` = fraction of a package's types that are interfaces, `D = |A+I-1|`)
-/// flagging two failure zones: "zone of pain" (stable + concrete — safe abstractions were
-/// never introduced, so this package is expensive to change) and "zone of uselessness"
-/// (unstable + abstract — an interface/abstraction with essentially no dependents). A
-/// package with zero import edges at all (`Ca+Ce == 0`) has no instability signal and is
-/// skipped rather than reported as a false "zone of pain" at `I=0`.
+/// Martin's Instability metric: `I = Ce/(Ca+Ce)`, efferent over total coupling.
+fn instability_of(fan_out: usize, fan_in: usize) -> f64 {
+    fan_out as f64 / (fan_out + fan_in) as f64
+}
+
+/// Flags packages in Robert Martin's "zone of pain" (`I<=STABLE_MAX`, `A<=CONCRETE_MAX` —
+/// stable+concrete, expensive to change) or "zone of uselessness" (`I>=UNSTABLE_MIN`,
+/// `A>=ABSTRACT_MIN` — unstable+abstract, no real dependents). Skips packages with zero
+/// import edges (no instability signal) or zero `Type`/`Interface` symbols (no abstractness
+/// signal — see [`PackageNode::has_type_level_symbols`](crate::arch_model::PackageNode::has_type_level_symbols)).
 pub struct InstabilityChecker;
 
 impl ArchModelChecker for InstabilityChecker {
@@ -565,10 +566,10 @@ fn instability_finding(
     counts: &HashMap<&str, (usize, usize)>,
 ) -> Option<ArchFinding> {
     let (fan_out, fan_in) = *counts.get(pkg.path.as_str())?;
-    if fan_out + fan_in == 0 {
+    if fan_out + fan_in == 0 || !pkg.has_type_level_symbols() {
         return None;
     }
-    let instability = fan_out as f64 / (fan_out + fan_in) as f64;
+    let instability = instability_of(fan_out, fan_in);
     let abstractness = pkg.abstractness();
 
     if instability <= STABLE_MAX && abstractness <= CONCRETE_MAX {
@@ -601,14 +602,10 @@ fn instability_finding(
     None
 }
 
-/// Package-level Dependency Inversion Principle proxy: flags an import edge from a stable
-/// package into a concrete (low-abstractness) one. This is coarser than a true per-symbol
-/// DIP check — `ImportEdge` is package-granular, not symbol-granular, so this can't tell
-/// whether the *specific* imported symbol is concrete, only that the target package as a
-/// whole is mostly concrete types. A stable package importing a package that happens to
-/// also expose an interface, but reaches past it for a concrete type, won't be caught; a
-/// stable package importing a package that's concrete but exposes a widely-implemented
-/// interface elsewhere will still be flagged. Treat findings as "worth a look," not proof.
+/// Package-level DIP proxy: flags an import edge from a stable package into a mostly-
+/// concrete one. Package-granular, not symbol-granular — can miss a concrete import
+/// reached past a sibling interface, and can over-flag a package that's mostly concrete
+/// but exposes one widely-used interface. Treat findings as "worth a look," not proof.
 pub struct DipConcreteCouplingChecker;
 
 impl ArchModelChecker for DipConcreteCouplingChecker {
@@ -644,11 +641,15 @@ fn dip_finding(
     if from_out + from_in == 0 {
         return None;
     }
-    let from_instability = from_out as f64 / (from_out + from_in) as f64;
+    let from_instability = instability_of(from_out, from_in);
     if from_instability > STABLE_MAX {
         return None;
     }
-    let to_abstractness = model.package(to)?.abstractness();
+    let to_pkg = model.package(to)?;
+    if !to_pkg.has_type_level_symbols() {
+        return None;
+    }
+    let to_abstractness = to_pkg.abstractness();
     if to_abstractness > CONCRETE_MAX {
         return None;
     }

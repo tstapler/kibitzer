@@ -715,6 +715,60 @@ mod architecture_cli_tests {
         assert_eq!(exit, ExitCode::from(1));
     }
 
+    /// Same regression concern as the naming-rules test above, for the newer `Model` arm
+    /// (`AnyArchitectureChecker::Model`) added alongside `InstabilityChecker` —
+    /// `check.rs::run_architecture_check` has its own dispatch test; this proves the CLI
+    /// verb (`run_architecture_cli`'s separate match arm) reaches the checker too.
+    #[test]
+    fn cli_architecture_check_dispatches_instability_model_checker() {
+        let repo = TempRepo::new("instability");
+        repo.write(
+            "go.mod",
+            "module kibitzer.example/instabilitytest\n\ngo 1.21\n",
+        );
+        repo.write(
+            "stable/stable.go",
+            "package stable\n\ntype Widget struct{}\n",
+        );
+        repo.write(
+            "consumer/consumer.go",
+            "package consumer\n\nimport \"kibitzer.example/instabilitytest/stable\"\n\n\
+             var _ = stable.Widget{}\n",
+        );
+
+        let exit = run_architecture_cli("instability", &repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
+    }
+
+    /// `change_coupling.rs`'s own tests cover the coupling math and the real-`git log`
+    /// parsing path end-to-end; this proves `run_change_coupling` (the CLI-verb wrapper —
+    /// argument plumbing and output formatting) actually reaches it without erroring,
+    /// which none of those lower-level tests exercise.
+    #[test]
+    fn run_change_coupling_cli_verb_succeeds_against_a_real_git_repo() {
+        let repo = TempRepo::new("change-coupling");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo.dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        for i in 0..10 {
+            repo.write("a.txt", &format!("{i}"));
+            repo.write("b.txt", &format!("{i}"));
+            git(&["add", "a.txt", "b.txt"]);
+            git(&["commit", "-q", "-m", &format!("commit {i}")]);
+        }
+
+        let exit = run_change_coupling(&repo.dir, 1000, 20).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
     #[test]
     fn cli_duplicates_flags_block_repeated_across_go_files() {
         let repo = TempRepo::new("cross-file-dup");

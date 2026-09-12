@@ -68,11 +68,24 @@ pub struct PackageNode {
 }
 
 impl PackageNode {
+    /// Whether this package declares any `Type`/`Interface` symbol at all. A
+    /// pure-function/utility package (all `Function`/`Method`, no types) has no type
+    /// surface for [`abstractness`](Self::abstractness) to describe — a caller comparing
+    /// packages by "concreteness" should skip a package this returns `false` for, rather
+    /// than reading its `abstractness() == 0.0` default as "concrete."
+    pub fn has_type_level_symbols(&self) -> bool {
+        self.symbols
+            .iter()
+            .any(|s| matches!(s.kind, SymbolKind::Type | SymbolKind::Interface))
+    }
+
     /// Robert Martin's Abstractness metric: the fraction of this package's
     /// type-level (`Type`/`Interface`) symbols that are `Interface`. `Function`/`Method`
     /// symbols aren't counted — abstractness is about the type surface, not free
-    /// functions. A package with no `Type`/`Interface` symbols at all is treated as fully
-    /// concrete (`0.0`) rather than undefined, so callers never have to special-case it.
+    /// functions. A package with no `Type`/`Interface` symbols at all has no type surface
+    /// to measure and returns `0.0` here as a harmless default for arithmetic — check
+    /// [`has_type_level_symbols`](Self::has_type_level_symbols) first if that "no types at
+    /// all" case needs to be told apart from "types exist, none are interfaces."
     pub fn abstractness(&self) -> f64 {
         let mut interfaces = 0usize;
         let mut total = 0usize;
@@ -604,6 +617,27 @@ pub(crate) fn collect_repo_files(
     Ok((graph, files))
 }
 
+/// Builds an `ArchModel` from an already-walked file list: import graph + file contents +
+/// `build_model`, in one call. The one place this exact "graph, then read every file"
+/// sequence lives — `collect_repo_files` (whole-repo, walks its own file list) and
+/// `load_cached_model` (cache-miss path, reuses a file list it already walked for the
+/// staleness check) both used to repeat it inline; a third repeat almost landed in
+/// `check.rs::build_arch_model_for_check` before being folded into this instead.
+pub(crate) fn build_model_from_files(
+    repo_root: &Path,
+    files: &[PathBuf],
+    prune: &PruneConfig,
+) -> Result<ArchModel> {
+    let graph = crate::import_graph::build(repo_root, files)
+        .with_context(|| format!("building import graph for {}", repo_root.display()))?;
+    let files_with_content: Vec<(PathBuf, String)> = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok().map(|s| (f.clone(), s)))
+        .collect();
+    build_model(repo_root, &files_with_content, &graph, prune)
+        .with_context(|| format!("building architecture model for {}", repo_root.display()))
+}
+
 /// Returns the cached `ArchModel` for `(repo_root, include_private)`, rebuilding it on a
 /// cache miss/staleness. Synchronous and blocking (file walk, disk reads, and tree-sitter
 /// parsing all happen here on a miss) — a caller on the async runtime (`mcp.rs`, `lsp.rs`)
@@ -629,18 +663,7 @@ pub(crate) fn load_cached_model(
     };
 
     cache.get_or_build(key, &file_paths, || {
-        let import_graph = crate::import_graph::build(repo_root, &file_paths)
-            .with_context(|| format!("building import graph for {}", repo_root.display()))?;
-        let files: Vec<(PathBuf, String)> = file_paths
-            .iter()
-            .filter_map(|f| std::fs::read_to_string(f).ok().map(|s| (f.clone(), s)))
-            .collect();
-        build_model(
-            repo_root,
-            &files,
-            &import_graph,
-            &PruneConfig { include_private },
-        )
+        build_model_from_files(repo_root, &file_paths, &PruneConfig { include_private })
     })
 }
 
@@ -719,6 +742,21 @@ mod tests {
         pkg.symbols
             .push(symbol_of_kind("Init", SymbolKind::Function));
         assert_eq!(pkg.abstractness(), 0.0);
+    }
+
+    #[test]
+    fn has_type_level_symbols_is_false_for_pure_function_package() {
+        let mut pkg = empty_package("a");
+        pkg.symbols
+            .push(symbol_of_kind("Init", SymbolKind::Function));
+        assert!(!pkg.has_type_level_symbols());
+    }
+
+    #[test]
+    fn has_type_level_symbols_is_true_with_any_type_or_interface() {
+        let mut pkg = empty_package("a");
+        pkg.symbols.push(symbol_of_kind("Widget", SymbolKind::Type));
+        assert!(pkg.has_type_level_symbols());
     }
 
     #[test]

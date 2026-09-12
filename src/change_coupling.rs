@@ -1,10 +1,7 @@
-//! Change-coupling (temporal coupling) analysis: which file pairs change together across
-//! git history, independent of any import/call relationship between them. Reimplements the
-//! coupling formula from [code-maat](https://github.com/adamtornhill/code-maat) (GPLv3 — not
-//! linked against, formula reimplemented directly to avoid copyleft entanglement) and applies
-//! CodeScene's published noise-filter thresholds. Batch-only: this is a "look here"
-//! prioritization report over repo history, not a per-edit pass/fail check, so it's never
-//! wired into `default_checks()` or hook mode.
+//! Change-coupling: file pairs that change together across git history, independent of
+//! import/call relationships. Reimplements [code-maat](https://github.com/adamtornhill/code-maat)'s
+//! formula directly (not linked, to avoid GPLv3 entanglement) using CodeScene's noise-filter
+//! thresholds. Batch-only — never wired into `default_checks()`/hook mode.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -86,12 +83,10 @@ fn git_log_commits(repo_root: &Path, limit: usize) -> Result<Vec<Vec<String>>> {
     Ok(parse_name_only_log(&text))
 }
 
-/// Computes temporal coupling over `commits` (each a list of files changed in one commit,
-/// oldest-history-window-bounded by the caller). Pure function — no git I/O — so the
-/// coupling math is unit-testable without a repo fixture. Commits touching more than
-/// [`MAX_FILES_PER_COMMIT`] files are dropped before counting (mass-refactor noise).
-/// Results are filtered to [`MIN_TOTAL_REVISIONS`]/[`MIN_SHARED_COMMITS`]/[`MIN_COUPLING`]
-/// and sorted by coupling percentage, descending.
+/// Computes temporal coupling over `commits` (each a list of files changed in one commit).
+/// Drops commits over [`MAX_FILES_PER_COMMIT`] (mass-refactor noise) and results below
+/// [`MIN_TOTAL_REVISIONS`]/[`MIN_SHARED_COMMITS`]/[`MIN_COUPLING`]; sorts by coupling
+/// percentage, descending.
 pub fn compute_coupling(commits: &[Vec<String>]) -> Vec<CoupledPair> {
     let (revisions, shared) = tally_revisions_and_shared_commits(commits);
     let mut pairs = pairs_above_thresholds(&revisions, &shared);
@@ -103,12 +98,12 @@ pub fn compute_coupling(commits: &[Vec<String>]) -> Vec<CoupledPair> {
     pairs
 }
 
-/// First pass over `commits`: per-file revision counts and per-pair shared-commit counts,
-/// skipping empty and mass-refactor commits.
 /// Per-file revision counts and per-file-pair shared-commit counts, both keyed by borrowed
 /// file paths from the input commits.
 type RevisionAndSharedCounts<'a> = (BTreeMap<&'a str, u32>, BTreeMap<(&'a str, &'a str), u32>);
 
+/// First pass over `commits`: per-file revision counts and per-pair shared-commit counts,
+/// skipping empty and mass-refactor commits.
 fn tally_revisions_and_shared_commits(commits: &[Vec<String>]) -> RevisionAndSharedCounts<'_> {
     let mut revisions: BTreeMap<&str, u32> = BTreeMap::new();
     let mut shared: BTreeMap<(&str, &str), u32> = BTreeMap::new();
@@ -163,10 +158,15 @@ fn pairs_above_thresholds<'a>(
         .collect()
 }
 
-/// Runs the full change-coupling report over `repo_root`'s last `limit` non-merge commits,
-/// returning the top `top_n` coupled pairs.
+/// Hard ceiling on `analyze`'s `limit`: `git log`'s output is buffered in memory in full
+/// before parsing (see `git_log_commits`), so an uncapped `--limit` on a huge repo would
+/// let a user request unbounded memory growth from a single flag.
+const MAX_LIMIT: usize = 50_000;
+
+/// Runs the full change-coupling report over `repo_root`'s last `limit` non-merge commits
+/// (clamped to [`MAX_LIMIT`]), returning the top `top_n` coupled pairs.
 pub fn analyze(repo_root: &Path, limit: usize, top_n: usize) -> Result<Vec<CoupledPair>> {
-    let commits = git_log_commits(repo_root, limit)?;
+    let commits = git_log_commits(repo_root, limit.min(MAX_LIMIT))?;
     let mut pairs = compute_coupling(&commits);
     pairs.truncate(top_n);
     Ok(pairs)
@@ -181,6 +181,70 @@ mod tests {
             .iter()
             .map(|files| files.iter().map(|s| s.to_string()).collect())
             .collect()
+    }
+
+    struct TempGitRepo {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempGitRepo {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "kibitzer-change-coupling-test-{}-{name}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self::run(&dir, &["init", "-q"]);
+            Self::run(&dir, &["config", "user.email", "test@example.com"]);
+            Self::run(&dir, &["config", "user.name", "test"]);
+            Self { dir }
+        }
+
+        fn run(dir: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+
+        fn commit_touching(&self, files: &[&str], msg: &str) {
+            for f in files {
+                std::fs::write(self.dir.join(f), msg).unwrap();
+            }
+            Self::run(&self.dir, &[&["add"], files].concat());
+            Self::run(&self.dir, &["commit", "-q", "-m", msg]);
+        }
+    }
+
+    impl Drop for TempGitRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Exercises the real `git log` subprocess path (`git_log_commits`) and `analyze`'s
+    /// end-to-end composition — every other test in this module drives `compute_coupling`
+    /// directly with hand-built commit lists, which never proves real git output actually
+    /// parses the way `parse_name_only_log` expects.
+    #[test]
+    fn analyze_end_to_end_against_a_real_git_repo() {
+        let repo = TempGitRepo::new("e2e");
+        for i in 0..10 {
+            repo.commit_touching(&["a.txt", "b.txt"], &format!("commit {i}"));
+        }
+
+        let pairs = analyze(&repo.dir, 1000, 20).unwrap();
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].file_a, "a.txt");
+        assert_eq!(pairs[0].file_b, "b.txt");
+        assert_eq!(pairs[0].shared_commits, 10);
     }
 
     #[test]
