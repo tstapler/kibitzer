@@ -4,6 +4,7 @@ mod arch_model;
 mod architecture_checks;
 mod backtest;
 mod cache;
+mod change_coupling;
 mod check;
 mod checker;
 mod comment_quality;
@@ -176,6 +177,21 @@ enum ArchitectureAction {
         /// File to write the combined text-tree + Mermaid output to. Defaults to stdout.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Batch-only temporal-coupling report: file pairs that change together across git
+    /// history, independent of any import/call relationship (see `change_coupling.rs`).
+    /// Never wired into `default_checks()`/hook mode — this is a "look here"
+    /// prioritization report, not a per-edit pass/fail check.
+    ChangeCoupling {
+        /// Any path inside the repo to analyze (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// How many of the most recent non-merge commits to scan.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// How many top-coupled pairs to report.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
     },
 }
 
@@ -367,6 +383,9 @@ fn main() -> Result<ExitCode> {
                 level,
                 out,
             } => arch_diagram::run_diagram(path, scope, level, out),
+            ArchitectureAction::ChangeCoupling { path, limit, top } => {
+                run_change_coupling(&path, limit, top)
+            }
         },
         Command::Plugin { action } => match action {
             PluginAction::Install {
@@ -476,6 +495,11 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
                 .with_context(|| format!("building import graph for {}", dir.display()))?;
             checker.check(&graph, &arch_config)
         }
+        check::AnyArchitectureChecker::Model(checker) => {
+            let model = check::build_arch_model_for_check(dir, &files)
+                .with_context(|| format!("building architecture model for {}", dir.display()))?;
+            checker.check(&model, &arch_config)
+        }
         check::AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             let graph = declarations::build(dir, &files, &components)
@@ -497,6 +521,32 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         println!("{location}{}", finding.message);
     }
     Ok(ExitCode::from(1))
+}
+
+/// `kibitzer architecture change-coupling`: reports temporal coupling (see
+/// `change_coupling.rs`) over `path`'s git history. Always exits `ExitCode::SUCCESS` when
+/// the analysis itself succeeds, regardless of what it finds — same "report, don't
+/// gate" convention as `run_export` (no pass/fail concept for a prioritization report).
+fn run_change_coupling(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
+    let pairs = change_coupling::analyze(path, limit, top)
+        .with_context(|| format!("analyzing change coupling for {}", path.display()))?;
+
+    if pairs.is_empty() {
+        println!("[kibitzer] no coupled file pairs found above threshold");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for pair in &pairs {
+        println!(
+            "{:.0}% coupled ({}/{} shared revisions): {} <-> {}",
+            pair.coupling * 100.0,
+            pair.shared_commits,
+            pair.revisions_a + pair.revisions_b - pair.shared_commits,
+            pair.file_a,
+            pair.file_b
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Covers every language `duplicate-code` (single-file) covers — see
@@ -663,6 +713,60 @@ mod architecture_cli_tests {
 
         let exit = run_architecture_cli("naming-rules", &repo.dir).unwrap();
         assert_eq!(exit, ExitCode::from(1));
+    }
+
+    /// Same regression concern as the naming-rules test above, for the newer `Model` arm
+    /// (`AnyArchitectureChecker::Model`) added alongside `InstabilityChecker` —
+    /// `check.rs::run_architecture_check` has its own dispatch test; this proves the CLI
+    /// verb (`run_architecture_cli`'s separate match arm) reaches the checker too.
+    #[test]
+    fn cli_architecture_check_dispatches_instability_model_checker() {
+        let repo = TempRepo::new("instability");
+        repo.write(
+            "go.mod",
+            "module kibitzer.example/instabilitytest\n\ngo 1.21\n",
+        );
+        repo.write(
+            "stable/stable.go",
+            "package stable\n\ntype Widget struct{}\n",
+        );
+        repo.write(
+            "consumer/consumer.go",
+            "package consumer\n\nimport \"kibitzer.example/instabilitytest/stable\"\n\n\
+             var _ = stable.Widget{}\n",
+        );
+
+        let exit = run_architecture_cli("instability", &repo.dir).unwrap();
+        assert_eq!(exit, ExitCode::from(1));
+    }
+
+    /// `change_coupling.rs`'s own tests cover the coupling math and the real-`git log`
+    /// parsing path end-to-end; this proves `run_change_coupling` (the CLI-verb wrapper —
+    /// argument plumbing and output formatting) actually reaches it without erroring,
+    /// which none of those lower-level tests exercise.
+    #[test]
+    fn run_change_coupling_cli_verb_succeeds_against_a_real_git_repo() {
+        let repo = TempRepo::new("change-coupling");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo.dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        for i in 0..10 {
+            repo.write("a.txt", &format!("{i}"));
+            repo.write("b.txt", &format!("{i}"));
+            git(&["add", "a.txt", "b.txt"]);
+            git(&["commit", "-q", "-m", &format!("commit {i}")]);
+        }
+
+        let exit = run_change_coupling(&repo.dir, 1000, 20).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
     }
 
     #[test]

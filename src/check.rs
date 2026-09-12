@@ -1005,39 +1005,54 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     Some(result.ok()?.status.success())
 }
 
-/// One check name resolved against either whole-repo checker registry: the existing
-/// import-graph-based [`crate::architecture_checks::ArchitectureChecker`]s
-/// (`import-cycles`/`layering`/`coupling`, and `component-deps` once Epic 1.1 lands), or
-/// the declaration-based checkers [`crate::declaration_checks`] will register starting
-/// Phase 2 (`content-rules`/`naming-rules`). [`run_architecture_check`] is the single
-/// dispatch point that branches on this so callers (`validate()`, batch execution, the
-/// `kibitzer check architecture` CLI verb) don't need to know which registry a given
-/// name lives in.
+/// One check name resolved against three registries — import-graph
+/// ([`ArchitectureChecker`](crate::architecture_checks::ArchitectureChecker)), `ArchModel`
+/// ([`ArchModelChecker`](crate::architecture_checks::ArchModelChecker), needs symbol
+/// composition), or declaration-based — so callers don't need to know which one a name
+/// lives in.
 pub enum AnyArchitectureChecker {
     Import(Box<dyn crate::architecture_checks::ArchitectureChecker>),
+    Model(Box<dyn crate::architecture_checks::ArchModelChecker>),
     Declaration(Box<dyn crate::declaration_checks::DeclarationChecker>),
 }
 
-/// Resolves `name` against [`crate::architecture_checks::registry()`] first, falling
-/// back to [`crate::declaration_checks::registry()`]'s (Phase-2-only, currently stubbed
-/// to always miss) lookup. Returns `None` when `name` isn't found in either — the
-/// "unknown architecture checker" case both `validate()` and `run_architecture_check`
-/// report.
+/// Resolves `name` against [`crate::architecture_checks::registry()`] first, then
+/// [`crate::architecture_checks::model_registry()`], falling back to
+/// [`crate::declaration_checks::registry()`]'s (Phase-2-only, currently stubbed to always
+/// miss) lookup. Returns `None` when `name` isn't found in any of the three — the "unknown
+/// architecture checker" case both `validate()` and `run_architecture_check` report.
 pub fn lookup_any_architecture_checker(name: &str) -> Option<AnyArchitectureChecker> {
     if let Some(checker) = crate::architecture_checks::lookup(name) {
         return Some(AnyArchitectureChecker::Import(checker));
     }
+    if let Some(checker) = crate::architecture_checks::lookup_model(name) {
+        return Some(AnyArchitectureChecker::Model(checker));
+    }
     crate::declaration_checks::lookup(name).map(AnyArchitectureChecker::Declaration)
+}
+
+/// Builds the `ArchModel` an [`AnyArchitectureChecker::Model`] checker needs, reusing
+/// `files` (already walked by the caller) instead of walking the repo a second time.
+/// Thin wrapper over [`crate::arch_model::build_model_from_files`] — see that function for
+/// the actual graph+read-files logic, shared with `arch_model::collect_repo_files`.
+pub(crate) fn build_arch_model_for_check(
+    repo_root: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<crate::arch_model::ArchModel> {
+    crate::arch_model::build_model_from_files(
+        repo_root,
+        files,
+        &crate::arch_model::PruneConfig::default(),
+    )
 }
 
 /// Runs a whole-repo, in-process architecture/declaration checker resolved through
 /// [`lookup_any_architecture_checker`] — the native counterpart to `run_check`'s
 /// shell-out path for `WholeRepoNative` checks. `files` is expected to already be
 /// walked/collected by the caller (batch mode builds it once and reuses it across every
-/// whole-repo check, native or not).
-///
-/// Signature is unchanged from before the dual-registry dispatch was added (Epic 1.2) —
-/// every existing caller in `check.rs`/`mcp.rs` keeps working without modification.
+/// whole-repo check, native or not). Signature is unchanged from before the dual-registry
+/// dispatch was added (Epic 1.2) — every existing caller in `check.rs`/`mcp.rs` keeps
+/// working without modification.
 pub fn run_architecture_check(
     check: &Check,
     repo_root: &Path,
@@ -1050,58 +1065,43 @@ pub fn run_architecture_check(
         .expect("config-load validation guarantees architecture_checker is set");
 
     let cmd_str = format!("kibitzer check architecture {arch_name}");
+    let error_result = |output: String| CheckResult {
+        check_name: check.name.clone(),
+        severity: check.severity,
+        passed: false,
+        output,
+        message: check.message.clone(),
+        command: cmd_str.clone(),
+        findings: Vec::new(),
+        plugin_missing: false,
+    };
 
-    let any_checker = match lookup_any_architecture_checker(arch_name) {
-        Some(checker) => checker,
-        None => {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!("no architecture checker named '{arch_name}' registered"),
-                message: check.message.clone(),
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-            });
-        }
+    let Some(any_checker) = lookup_any_architecture_checker(arch_name) else {
+        return Ok(error_result(format!(
+            "no architecture checker named '{arch_name}' registered"
+        )));
     };
 
     let findings = match any_checker {
         AnyArchitectureChecker::Import(checker) => {
             let graph = match crate::import_graph::build(repo_root, files) {
                 Ok(graph) => graph,
-                Err(err) => {
-                    return Ok(CheckResult {
-                        check_name: check.name.clone(),
-                        severity: check.severity,
-                        passed: false,
-                        output: format!("{err:#}"),
-                        message: check.message.clone(),
-                        command: cmd_str,
-                        findings: Vec::new(),
-                        plugin_missing: false,
-                    });
-                }
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
             };
             checker.check(&graph, arch_config)
+        }
+        AnyArchitectureChecker::Model(checker) => {
+            let model = match build_arch_model_for_check(repo_root, files) {
+                Ok(model) => model,
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
+            };
+            checker.check(&model, arch_config)
         }
         AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             let graph = match crate::declarations::build(repo_root, files, &components) {
                 Ok(graph) => graph,
-                Err(err) => {
-                    return Ok(CheckResult {
-                        check_name: check.name.clone(),
-                        severity: check.severity,
-                        passed: false,
-                        output: format!("{err:#}"),
-                        message: check.message.clone(),
-                        command: cmd_str,
-                        findings: Vec::new(),
-                        plugin_missing: false,
-                    });
-                }
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
             };
             checker.check(&graph, arch_config)
         }
@@ -1217,6 +1217,9 @@ fn check_native_against_git_head_repo(
                 .ok()
                 .map(|graph| checker.check(&graph, arch_config).is_empty())
         }
+        AnyArchitectureChecker::Model(checker) => build_arch_model_for_check(&snapshot_dir, &files)
+            .ok()
+            .map(|model| checker.check(&model, arch_config).is_empty()),
         AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             crate::declarations::build(&snapshot_dir, &files, &components)
@@ -2207,6 +2210,64 @@ mod git_head_integration_tests {
             run_architecture_check(&naming_rules_check(), &repo.dir, &files, &arch_config).unwrap();
 
         assert!(!result.passed);
+        assert_eq!(result.severity, Severity::Advisory);
+        assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    fn instability_check() -> Check {
+        Check {
+            name: "instability".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("instability".to_string()),
+            severity: Severity::Blocking,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("instability violation".to_string()),
+            output_format: None,
+        }
+    }
+
+    /// Regression guard for the `AnyArchitectureChecker::Model` dispatch arm added
+    /// alongside `InstabilityChecker`/`DipConcreteCouplingChecker`: proves
+    /// `run_architecture_check` actually builds an `ArchModel` and reaches the checker
+    /// (not just that the checker's own unit tests pass against a hand-built model), and
+    /// — via the blocking-severity downgrade path — that `check_native_against_git_head_repo`
+    /// resolves the `Model` arm too, matching the coverage the `Import`/`Declaration` arms
+    /// already have (`naming_rules_blocking_violation_downgrades_when_it_predates_head`
+    /// above).
+    #[test]
+    fn instability_model_checker_blocking_violation_downgrades_when_it_predates_head() {
+        let repo = TempRepo::new("instability-predates-head");
+        repo.write_and_commit(
+            "go.mod",
+            "module kibitzer.example/instabilitytest\n\ngo 1.21\n",
+            "init",
+        );
+        repo.write_and_commit(
+            "stable/stable.go",
+            "package stable\n\ntype Widget struct{}\n",
+            "init",
+        );
+        repo.write_and_commit(
+            "consumer/consumer.go",
+            "package consumer\n\nimport \"kibitzer.example/instabilitytest/stable\"\n\n\
+             var _ = stable.Widget{}\n",
+            "init",
+        );
+        repo.write_uncommitted("README.md", "unrelated edit\n");
+
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+        let result = run_architecture_check(
+            &instability_check(),
+            &repo.dir,
+            &files,
+            &crate::config::ArchitectureConfig::default(),
+        )
+        .unwrap();
+
+        assert!(!result.passed);
+        assert!(result.output.contains("[instability]"));
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
     }
