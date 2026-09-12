@@ -178,3 +178,30 @@ delegation) still fires unchanged.
   well-known signal for "brace-closing annotation," and essentially never actual dead
   code (commented-out code doesn't typically get appended after a live, unrelated
   closing brace). Not independently verified against a broader corpus.
+
+### 2026-09-11 — stapler-squad — mathematical interval notation `[a, b)` in prose misread as commented-out code
+
+- **Repo**: `tstapler/stapler-squad`, file
+  `testutil/tmuxreap/tmuxreap.go` (line number shifted repeatedly across a session's
+  edits — reported at `:216`, then `:222`, then `:232` as unrelated lines were added
+  above it; content unchanged throughout).
+- **What changed**: nothing at this line — pre-existing doc comment, first surfaced
+  by an unscoped re-check after unrelated edits elsewhere in the same function. The
+  line reads (after stripping `//`): `"test-isolated-1234"). PID range on this
+  system is [2, 4194304);` — part of `extractTestSocketPID`'s doc comment
+  explaining the valid PID range using half-open interval notation.
+- **Why it's a false positive**: `[2, 4194304)` is standard mathematical notation for
+  a half-open range (inclusive lower bound, exclusive upper bound), not an array/slice
+  literal or any other code construct. The whole line is prose describing a numeric
+  range and citing a quoted example socket name.
+- **Mechanism**: `comment_quality.rs::looks_like_code` (line ~369):
+  `text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c))`. The line
+  ends in `;` (a normal sentence-terminating semicolon, consistent with this file's
+  own comment style elsewhere) and contains `[`/`]` from the interval notation, which
+  is in the code-only punctuation set — so the combined check fires even though
+  neither the brackets nor the semicolon are code here. This is the same class of gap
+  documented above for `(`/`)`/`<`/`>` (Apache license headers, blockquote markers):
+  `[`/`]` is not an unambiguous code signal either when used for mathematical interval
+  notation in prose. Not independently verified against a broader corpus — flagging
+  as a hypothesis with one concrete real-world instance, per this file's stated
+  approach to unvalidated constants.
