@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ArchitectureConfig, DependencyRule, Severity, component_of};
 use crate::glob::matches_scope;
-use crate::import_graph::ImportGraph;
+use crate::import_graph::{ImportEdge, ImportGraph};
 
 /// A finding produced by a whole-repo architecture checker. Carries a file+line where
 /// the underlying import graph could attribute one (e.g. the specific import statement
@@ -141,43 +141,57 @@ impl ArchitectureChecker for LayeringChecker {
 const MAX_FAN_OUT: usize = 10;
 const MAX_FAN_IN: usize = 10;
 
-pub struct CouplingChecker;
-
-impl ArchitectureChecker for CouplingChecker {
-    fn name(&self) -> &str {
-        "coupling"
+/// Per-node `(fan_out, fan_in)` — efferent coupling `Ce` (distinct packages this node
+/// imports) and afferent coupling `Ca` (distinct packages that import this node) — counted
+/// straight off a set of import edges. Takes a plain edge slice (rather than
+/// `&ImportGraph`) so [`InstabilityChecker`] can reuse it from `ArchModel::import_edges`
+/// too — the two checkers can't drift on what `Ca`/`Ce` mean.
+pub fn fan_in_out(edges: &[ImportEdge]) -> HashMap<&str, (usize, usize)> {
+    let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+    for edge in edges {
+        counts.entry(edge.from.as_str()).or_default().0 += 1;
+        counts.entry(edge.to.as_str()).or_default().1 += 1;
     }
+    counts
+}
 
-    fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
-        let mut fan_out: HashMap<&str, usize> = HashMap::new();
-        let mut fan_in: HashMap<&str, usize> = HashMap::new();
-        for edge in &graph.edges {
-            *fan_out.entry(edge.from.as_str()).or_default() += 1;
-            *fan_in.entry(edge.to.as_str()).or_default() += 1;
-        }
+fn fan_out_findings(
+    graph: &ImportGraph,
+    counts: &HashMap<&str, (usize, usize)>,
+) -> Vec<ArchFinding> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let out = counts.get(node.as_str()).map_or(0, |(out, _)| *out);
+            if out > MAX_FAN_OUT {
+                Some(ArchFinding {
+                    file: None,
+                    line: None,
+                    message: format!(
+                        "[coupling] {node} imports {out} distinct packages (over {MAX_FAN_OUT}) \
+                         — consider splitting its responsibilities"
+                    ),
+                    severity_override: None,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
-        let mut findings: Vec<ArchFinding> = graph
-            .nodes
-            .iter()
-            .filter_map(|node| {
-                let out = *fan_out.get(node.as_str()).unwrap_or(&0);
-                if out > MAX_FAN_OUT {
-                    Some(ArchFinding {
-                        file: None,
-                        line: None,
-                        message: format!(
-                            "[coupling] {node} imports {out} distinct packages (over {MAX_FAN_OUT}) \
-                             — consider splitting its responsibilities"
-                        ),
-                        severity_override: None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        findings.extend(graph.nodes.iter().filter_map(|node| {
-            let in_count = *fan_in.get(node.as_str()).unwrap_or(&0);
+fn fan_in_findings(
+    graph: &ImportGraph,
+    counts: &HashMap<&str, (usize, usize)>,
+) -> Vec<ArchFinding> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let in_count = counts
+                .get(node.as_str())
+                .map_or(0, |(_, in_count)| *in_count);
             if in_count > MAX_FAN_IN {
                 Some(ArchFinding {
                     file: None,
@@ -191,7 +205,21 @@ impl ArchitectureChecker for CouplingChecker {
             } else {
                 None
             }
-        }));
+        })
+        .collect()
+}
+
+pub struct CouplingChecker;
+
+impl ArchitectureChecker for CouplingChecker {
+    fn name(&self) -> &str {
+        "coupling"
+    }
+
+    fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+        let counts = fan_in_out(&graph.edges);
+        let mut findings = fan_out_findings(graph, &counts);
+        findings.extend(fan_in_findings(graph, &counts));
         findings
     }
 }
@@ -464,6 +492,177 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
         .into_iter()
         .filter(|scc| scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0]))
         .collect()
+}
+
+// ---------------------------------------------------------------------------------
+// ArchModel-based checkers: unlike `ArchitectureChecker` (ImportGraph only), these need
+// per-package symbol composition (interface vs. concrete type counts) that only
+// `ArchModel` carries. Mirrors the `ArchitectureChecker`/`DeclarationChecker` dual-registry
+// split in `check.rs::AnyArchitectureChecker` — a third checker "shape" for a third graph
+// type, dispatched the same way.
+// ---------------------------------------------------------------------------------
+
+pub trait ArchModelChecker {
+    fn name(&self) -> &str;
+    fn check(
+        &self,
+        model: &crate::arch_model::ArchModel,
+        config: &ArchitectureConfig,
+    ) -> Vec<ArchFinding>;
+}
+
+pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
+    vec![
+        Box::new(InstabilityChecker),
+        Box::new(DipConcreteCouplingChecker),
+    ]
+}
+
+pub fn lookup_model(name: &str) -> Option<Box<dyn ArchModelChecker>> {
+    model_registry().into_iter().find(|c| c.name() == name)
+}
+
+/// A package is "stable" (hard to change safely — many dependents, few dependencies) below
+/// this instability score, and "unstable" (easy to change, safe to keep abstract or
+/// experimental) above [`UNSTABLE_MIN`].
+const STABLE_MAX: f64 = 0.3;
+const UNSTABLE_MIN: f64 = 0.7;
+/// A package is "concrete" (mostly non-interface types) below this abstractness score, and
+/// "abstract" above [`ABSTRACT_MIN`].
+const CONCRETE_MAX: f64 = 0.3;
+const ABSTRACT_MIN: f64 = 0.7;
+
+/// Robert Martin's Instability/Abstractness/Distance-from-Main-Sequence metrics
+/// (`I = Ce/(Ca+Ce)`, `A` = fraction of a package's types that are interfaces, `D = |A+I-1|`)
+/// flagging two failure zones: "zone of pain" (stable + concrete — safe abstractions were
+/// never introduced, so this package is expensive to change) and "zone of uselessness"
+/// (unstable + abstract — an interface/abstraction with essentially no dependents). A
+/// package with zero import edges at all (`Ca+Ce == 0`) has no instability signal and is
+/// skipped rather than reported as a false "zone of pain" at `I=0`.
+pub struct InstabilityChecker;
+
+impl ArchModelChecker for InstabilityChecker {
+    fn name(&self) -> &str {
+        "instability"
+    }
+
+    fn check(
+        &self,
+        model: &crate::arch_model::ArchModel,
+        _config: &ArchitectureConfig,
+    ) -> Vec<ArchFinding> {
+        let counts = fan_in_out(&model.import_edges);
+        model
+            .packages
+            .values()
+            .filter_map(|pkg| instability_finding(pkg, &counts))
+            .collect()
+    }
+}
+
+fn instability_finding(
+    pkg: &crate::arch_model::PackageNode,
+    counts: &HashMap<&str, (usize, usize)>,
+) -> Option<ArchFinding> {
+    let (fan_out, fan_in) = *counts.get(pkg.path.as_str())?;
+    if fan_out + fan_in == 0 {
+        return None;
+    }
+    let instability = fan_out as f64 / (fan_out + fan_in) as f64;
+    let abstractness = pkg.abstractness();
+
+    if instability <= STABLE_MAX && abstractness <= CONCRETE_MAX {
+        return Some(ArchFinding {
+            file: None,
+            line: None,
+            message: format!(
+                "[instability] {} is in the zone of pain (I={instability:.2}, A={abstractness:.2}): \
+                 stable (many dependents) and concrete (no interfaces) — changes here are \
+                 expensive and risky; consider extracting an interface other packages can \
+                 depend on instead",
+                pkg.path
+            ),
+            severity_override: None,
+        });
+    }
+    if instability >= UNSTABLE_MIN && abstractness >= ABSTRACT_MIN {
+        return Some(ArchFinding {
+            file: None,
+            line: None,
+            message: format!(
+                "[instability] {} is in the zone of uselessness (I={instability:.2}, \
+                 A={abstractness:.2}): unstable and abstract — an interface/abstraction \
+                 with essentially no dependents; consider inlining or removing it",
+                pkg.path
+            ),
+            severity_override: None,
+        });
+    }
+    None
+}
+
+/// Package-level Dependency Inversion Principle proxy: flags an import edge from a stable
+/// package into a concrete (low-abstractness) one. This is coarser than a true per-symbol
+/// DIP check — `ImportEdge` is package-granular, not symbol-granular, so this can't tell
+/// whether the *specific* imported symbol is concrete, only that the target package as a
+/// whole is mostly concrete types. A stable package importing a package that happens to
+/// also expose an interface, but reaches past it for a concrete type, won't be caught; a
+/// stable package importing a package that's concrete but exposes a widely-implemented
+/// interface elsewhere will still be flagged. Treat findings as "worth a look," not proof.
+pub struct DipConcreteCouplingChecker;
+
+impl ArchModelChecker for DipConcreteCouplingChecker {
+    fn name(&self) -> &str {
+        "dip-concrete-coupling"
+    }
+
+    fn check(
+        &self,
+        model: &crate::arch_model::ArchModel,
+        _config: &ArchitectureConfig,
+    ) -> Vec<ArchFinding> {
+        let counts = fan_in_out(&model.import_edges);
+        let mut pairs: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
+        for edge in &model.import_edges {
+            pairs.insert((edge.from.as_str(), edge.to.as_str()));
+        }
+
+        pairs
+            .into_iter()
+            .filter_map(|(from, to)| dip_finding(model, &counts, from, to))
+            .collect()
+    }
+}
+
+fn dip_finding(
+    model: &crate::arch_model::ArchModel,
+    counts: &HashMap<&str, (usize, usize)>,
+    from: &str,
+    to: &str,
+) -> Option<ArchFinding> {
+    let (from_out, from_in) = *counts.get(from)?;
+    if from_out + from_in == 0 {
+        return None;
+    }
+    let from_instability = from_out as f64 / (from_out + from_in) as f64;
+    if from_instability > STABLE_MAX {
+        return None;
+    }
+    let to_abstractness = model.package(to)?.abstractness();
+    if to_abstractness > CONCRETE_MAX {
+        return None;
+    }
+    Some(ArchFinding {
+        file: None,
+        line: None,
+        message: format!(
+            "[dip-concrete-coupling] {from} (stable, I={from_instability:.2}) imports {to} \
+             (concrete, A={to_abstractness:.2}) directly — a stable package depending on a \
+             concrete implementation is expensive to change if that implementation needs to \
+             vary; consider depending on an interface instead"
+        ),
+        severity_override: None,
+    })
 }
 
 #[cfg(test)]
@@ -1163,6 +1362,204 @@ mod tests {
         assert!(
             PackageSizeChecker
                 .check(&graph, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    fn model_package(
+        path: &str,
+        symbols: Vec<crate::arch_model::SymbolNode>,
+    ) -> crate::arch_model::PackageNode {
+        crate::arch_model::PackageNode {
+            path: path.to_string(),
+            files: vec![],
+            symbols,
+        }
+    }
+
+    fn model_symbol(
+        name: &str,
+        kind: crate::arch_model::SymbolKind,
+    ) -> crate::arch_model::SymbolNode {
+        crate::arch_model::SymbolNode {
+            id: format!("{name}::{name}"),
+            name: name.to_string(),
+            kind,
+            file: PathBuf::from(format!("{name}.go")),
+            line: 1,
+            exported: true,
+            parent: None,
+        }
+    }
+
+    fn model_of(
+        packages: Vec<crate::arch_model::PackageNode>,
+        import_edges: Vec<ImportEdge>,
+    ) -> crate::arch_model::ArchModel {
+        crate::arch_model::ArchModel {
+            repo_root: PathBuf::from("/repo"),
+            packages: packages.into_iter().map(|p| (p.path.clone(), p)).collect(),
+            import_edges,
+            call_edges: vec![],
+            pruning: crate::arch_model::PruningSummary {
+                include_private: false,
+                excluded_dirs: vec![],
+                generated_files_skipped: 0,
+                private_symbols_skipped: 0,
+                pruned_symbol_ids: vec![],
+                files_with_parse_errors: vec![],
+                unsupported_language_files: 0,
+                total_files_scanned: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn lookup_model_finds_instability_checker() {
+        assert!(lookup_model("instability").is_some());
+        assert!(lookup_model("dip-concrete-coupling").is_some());
+        assert!(lookup_model("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn instability_flags_zone_of_pain() {
+        // "stable" has 10 dependents and 0 dependencies (I=0), and no interfaces (A=0).
+        let stable = model_package(
+            "stable",
+            vec![model_symbol("Widget", crate::arch_model::SymbolKind::Type)],
+        );
+        let edges: Vec<ImportEdge> = (0..10)
+            .map(|i| edge(&format!("dependent{i}"), "stable"))
+            .collect();
+        let model = model_of(vec![stable], edges);
+
+        let findings = InstabilityChecker.check(&model, &ArchitectureConfig::default());
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.starts_with("[instability]"));
+        assert!(findings[0].message.contains("zone of pain"));
+    }
+
+    #[test]
+    fn instability_flags_zone_of_uselessness() {
+        // "unused_iface" has 10 dependencies and 0 dependents (I=1), all-interface (A=1).
+        let unused = model_package(
+            "unused_iface",
+            vec![model_symbol(
+                "Reader",
+                crate::arch_model::SymbolKind::Interface,
+            )],
+        );
+        let edges: Vec<ImportEdge> = (0..10)
+            .map(|i| edge("unused_iface", &format!("dependency{i}")))
+            .collect();
+        let model = model_of(vec![unused], edges);
+
+        let findings = InstabilityChecker.check(&model, &ArchitectureConfig::default());
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("zone of uselessness"));
+    }
+
+    #[test]
+    fn instability_skips_package_with_no_edges() {
+        let isolated = model_package(
+            "isolated",
+            vec![model_symbol("Widget", crate::arch_model::SymbolKind::Type)],
+        );
+        let model = model_of(vec![isolated], vec![]);
+
+        assert!(
+            InstabilityChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn instability_does_not_flag_balanced_package() {
+        // 5 dependents, 5 dependencies (I=0.5), half-interface (A=0.5) — neither zone.
+        let balanced = model_package(
+            "balanced",
+            vec![
+                model_symbol("Widget", crate::arch_model::SymbolKind::Type),
+                model_symbol("Reader", crate::arch_model::SymbolKind::Interface),
+            ],
+        );
+        let mut edges: Vec<ImportEdge> = (0..5)
+            .map(|i| edge(&format!("dependent{i}"), "balanced"))
+            .collect();
+        edges.extend((0..5).map(|i| edge("balanced", &format!("dependency{i}"))));
+        let model = model_of(vec![balanced], edges);
+
+        assert!(
+            InstabilityChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dip_flags_stable_package_importing_concrete_package() {
+        // "stable" has 10 dependents, 1 dependency (I≈0.09, stable) on "concrete", which
+        // has no interfaces (A=0).
+        let concrete = model_package(
+            "concrete",
+            vec![model_symbol("Impl", crate::arch_model::SymbolKind::Type)],
+        );
+        let stable = model_package("stable", vec![]);
+        let mut edges: Vec<ImportEdge> = (0..10)
+            .map(|i| edge(&format!("dependent{i}"), "stable"))
+            .collect();
+        edges.push(edge("stable", "concrete"));
+        let model = model_of(vec![concrete, stable], edges);
+
+        let findings = DipConcreteCouplingChecker.check(&model, &ArchitectureConfig::default());
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.starts_with("[dip-concrete-coupling]"));
+        assert!(findings[0].message.contains("stable"));
+        assert!(findings[0].message.contains("concrete"));
+    }
+
+    #[test]
+    fn dip_does_not_flag_stable_package_importing_an_interface_heavy_package() {
+        let abstract_pkg = model_package(
+            "iface_heavy",
+            vec![model_symbol(
+                "Reader",
+                crate::arch_model::SymbolKind::Interface,
+            )],
+        );
+        let stable = model_package("stable", vec![]);
+        let mut edges: Vec<ImportEdge> = (0..10)
+            .map(|i| edge(&format!("dependent{i}"), "stable"))
+            .collect();
+        edges.push(edge("stable", "iface_heavy"));
+        let model = model_of(vec![abstract_pkg, stable], edges);
+
+        assert!(
+            DipConcreteCouplingChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dip_does_not_flag_unstable_package_importing_concrete_package() {
+        // "unstable" has 0 dependents, so I=1 — not stable, shouldn't be flagged even
+        // though its dependency is fully concrete.
+        let concrete = model_package(
+            "concrete",
+            vec![model_symbol("Impl", crate::arch_model::SymbolKind::Type)],
+        );
+        let unstable = model_package("unstable", vec![]);
+        let edges = vec![edge("unstable", "concrete")];
+        let model = model_of(vec![concrete, unstable], edges);
+
+        assert!(
+            DipConcreteCouplingChecker
+                .check(&model, &ArchitectureConfig::default())
                 .is_empty()
         );
     }

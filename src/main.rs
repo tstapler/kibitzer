@@ -4,6 +4,7 @@ mod arch_model;
 mod architecture_checks;
 mod backtest;
 mod cache;
+mod change_coupling;
 mod check;
 mod checker;
 mod comment_quality;
@@ -176,6 +177,21 @@ enum ArchitectureAction {
         /// File to write the combined text-tree + Mermaid output to. Defaults to stdout.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Batch-only temporal-coupling report: file pairs that change together across git
+    /// history, independent of any import/call relationship (see `change_coupling.rs`).
+    /// Never wired into `default_checks()`/hook mode — this is a "look here"
+    /// prioritization report, not a per-edit pass/fail check.
+    ChangeCoupling {
+        /// Any path inside the repo to analyze (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// How many of the most recent non-merge commits to scan.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// How many top-coupled pairs to report.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
     },
 }
 
@@ -367,6 +383,9 @@ fn main() -> Result<ExitCode> {
                 level,
                 out,
             } => arch_diagram::run_diagram(path, scope, level, out),
+            ArchitectureAction::ChangeCoupling { path, limit, top } => {
+                run_change_coupling(&path, limit, top)
+            }
         },
         Command::Plugin { action } => match action {
             PluginAction::Install {
@@ -476,6 +495,11 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
                 .with_context(|| format!("building import graph for {}", dir.display()))?;
             checker.check(&graph, &arch_config)
         }
+        check::AnyArchitectureChecker::Model(checker) => {
+            let model = check::build_arch_model_for_check(dir, &files)
+                .with_context(|| format!("building architecture model for {}", dir.display()))?;
+            checker.check(&model, &arch_config)
+        }
         check::AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             let graph = declarations::build(dir, &files, &components)
@@ -497,6 +521,32 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         println!("{location}{}", finding.message);
     }
     Ok(ExitCode::from(1))
+}
+
+/// `kibitzer architecture change-coupling`: reports temporal coupling (see
+/// `change_coupling.rs`) over `path`'s git history. Always exits `ExitCode::SUCCESS` when
+/// the analysis itself succeeds, regardless of what it finds — same "report, don't
+/// gate" convention as `run_export` (no pass/fail concept for a prioritization report).
+fn run_change_coupling(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
+    let pairs = change_coupling::analyze(path, limit, top)
+        .with_context(|| format!("analyzing change coupling for {}", path.display()))?;
+
+    if pairs.is_empty() {
+        println!("[kibitzer] no coupled file pairs found above threshold");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for pair in &pairs {
+        println!(
+            "{:.0}% coupled ({}/{} shared revisions): {} <-> {}",
+            pair.coupling * 100.0,
+            pair.shared_commits,
+            pair.revisions_a + pair.revisions_b - pair.shared_commits,
+            pair.file_a,
+            pair.file_b
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Covers every language `duplicate-code` (single-file) covers — see

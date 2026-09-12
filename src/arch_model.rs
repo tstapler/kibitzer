@@ -67,6 +67,33 @@ pub struct PackageNode {
     pub symbols: Vec<SymbolNode>,
 }
 
+impl PackageNode {
+    /// Robert Martin's Abstractness metric: the fraction of this package's
+    /// type-level (`Type`/`Interface`) symbols that are `Interface`. `Function`/`Method`
+    /// symbols aren't counted — abstractness is about the type surface, not free
+    /// functions. A package with no `Type`/`Interface` symbols at all is treated as fully
+    /// concrete (`0.0`) rather than undefined, so callers never have to special-case it.
+    pub fn abstractness(&self) -> f64 {
+        let mut interfaces = 0usize;
+        let mut total = 0usize;
+        for symbol in &self.symbols {
+            match symbol.kind {
+                SymbolKind::Interface => {
+                    interfaces += 1;
+                    total += 1;
+                }
+                SymbolKind::Type => total += 1,
+                SymbolKind::Function | SymbolKind::Method => {}
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            interfaces as f64 / total as f64
+        }
+    }
+}
+
 /// What a `build_model` run excluded and why, embedded in `ArchModel` so a consumer
 /// never mistakes "pruned" for "doesn't exist," and never mistakes "no supported
 /// language in this file" for "no code here."
@@ -672,6 +699,48 @@ mod tests {
             files: vec![],
             symbols: vec![],
         }
+    }
+
+    fn symbol_of_kind(name: &str, kind: SymbolKind) -> SymbolNode {
+        SymbolNode {
+            id: format!("pkg::{name}"),
+            name: name.to_string(),
+            kind,
+            file: PathBuf::from("pkg/file.go"),
+            line: 1,
+            exported: true,
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn abstractness_is_zero_with_no_type_level_symbols() {
+        let mut pkg = empty_package("a");
+        pkg.symbols
+            .push(symbol_of_kind("Init", SymbolKind::Function));
+        assert_eq!(pkg.abstractness(), 0.0);
+    }
+
+    #[test]
+    fn abstractness_ignores_functions_and_methods() {
+        let mut pkg = empty_package("a");
+        pkg.symbols.push(symbol_of_kind("Widget", SymbolKind::Type));
+        pkg.symbols
+            .push(symbol_of_kind("Reader", SymbolKind::Interface));
+        pkg.symbols
+            .push(symbol_of_kind("New", SymbolKind::Function));
+        pkg.symbols.push(symbol_of_kind("Read", SymbolKind::Method));
+        assert_eq!(pkg.abstractness(), 0.5);
+    }
+
+    #[test]
+    fn abstractness_is_one_when_all_types_are_interfaces() {
+        let mut pkg = empty_package("a");
+        pkg.symbols
+            .push(symbol_of_kind("Reader", SymbolKind::Interface));
+        pkg.symbols
+            .push(symbol_of_kind("Writer", SymbolKind::Interface));
+        assert_eq!(pkg.abstractness(), 1.0);
     }
 
     fn empty_model(repo_root: &Path) -> ArchModel {

@@ -1005,27 +1005,33 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     Some(result.ok()?.status.success())
 }
 
-/// One check name resolved against either whole-repo checker registry: the existing
+/// One check name resolved against any of three whole-repo checker registries: the
 /// import-graph-based [`crate::architecture_checks::ArchitectureChecker`]s
-/// (`import-cycles`/`layering`/`coupling`, and `component-deps` once Epic 1.1 lands), or
-/// the declaration-based checkers [`crate::declaration_checks`] will register starting
-/// Phase 2 (`content-rules`/`naming-rules`). [`run_architecture_check`] is the single
-/// dispatch point that branches on this so callers (`validate()`, batch execution, the
-/// `kibitzer check architecture` CLI verb) don't need to know which registry a given
-/// name lives in.
+/// (`import-cycles`/`layering`/`coupling`/`component-deps`/`package-size`), the
+/// `ArchModel`-based [`crate::architecture_checks::ArchModelChecker`]s
+/// (`instability`/`dip-concrete-coupling` — need per-package symbol composition
+/// `ImportGraph` alone doesn't carry), or the declaration-based checkers
+/// [`crate::declaration_checks`] (`content-rules`/`naming-rules`).
+/// [`run_architecture_check`] is the single dispatch point that branches on this so callers
+/// (`validate()`, batch execution, the `kibitzer check architecture` CLI verb) don't need to
+/// know which registry a given name lives in.
 pub enum AnyArchitectureChecker {
     Import(Box<dyn crate::architecture_checks::ArchitectureChecker>),
+    Model(Box<dyn crate::architecture_checks::ArchModelChecker>),
     Declaration(Box<dyn crate::declaration_checks::DeclarationChecker>),
 }
 
-/// Resolves `name` against [`crate::architecture_checks::registry()`] first, falling
-/// back to [`crate::declaration_checks::registry()`]'s (Phase-2-only, currently stubbed
-/// to always miss) lookup. Returns `None` when `name` isn't found in either — the
-/// "unknown architecture checker" case both `validate()` and `run_architecture_check`
-/// report.
+/// Resolves `name` against [`crate::architecture_checks::registry()`] first, then
+/// [`crate::architecture_checks::model_registry()`], falling back to
+/// [`crate::declaration_checks::registry()`]'s (Phase-2-only, currently stubbed to always
+/// miss) lookup. Returns `None` when `name` isn't found in any of the three — the "unknown
+/// architecture checker" case both `validate()` and `run_architecture_check` report.
 pub fn lookup_any_architecture_checker(name: &str) -> Option<AnyArchitectureChecker> {
     if let Some(checker) = crate::architecture_checks::lookup(name) {
         return Some(AnyArchitectureChecker::Import(checker));
+    }
+    if let Some(checker) = crate::architecture_checks::lookup_model(name) {
+        return Some(AnyArchitectureChecker::Model(checker));
     }
     crate::declaration_checks::lookup(name).map(AnyArchitectureChecker::Declaration)
 }
@@ -1036,6 +1042,29 @@ pub fn lookup_any_architecture_checker(name: &str) -> Option<AnyArchitectureChec
 /// walked/collected by the caller (batch mode builds it once and reuses it across every
 /// whole-repo check, native or not).
 ///
+/// Builds the `ArchModel` an [`AnyArchitectureChecker::Model`] checker needs: the import
+/// graph plus every file's contents, same inputs `arch_model::collect_repo_files` would
+/// gather itself — but this reuses `files` (already walked by the caller) instead of
+/// walking the repo a second time.
+pub(crate) fn build_arch_model_for_check(
+    repo_root: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<crate::arch_model::ArchModel> {
+    let graph = crate::import_graph::build(repo_root, files)
+        .with_context(|| format!("building import graph for {}", repo_root.display()))?;
+    let files_with_content: Vec<(PathBuf, String)> = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok().map(|s| (f.clone(), s)))
+        .collect();
+    crate::arch_model::build_model(
+        repo_root,
+        &files_with_content,
+        &graph,
+        &crate::arch_model::PruneConfig::default(),
+    )
+    .with_context(|| format!("building architecture model for {}", repo_root.display()))
+}
+
 /// Signature is unchanged from before the dual-registry dispatch was added (Epic 1.2) —
 /// every existing caller in `check.rs`/`mcp.rs` keeps working without modification.
 pub fn run_architecture_check(
@@ -1050,58 +1079,43 @@ pub fn run_architecture_check(
         .expect("config-load validation guarantees architecture_checker is set");
 
     let cmd_str = format!("kibitzer check architecture {arch_name}");
+    let error_result = |output: String| CheckResult {
+        check_name: check.name.clone(),
+        severity: check.severity,
+        passed: false,
+        output,
+        message: check.message.clone(),
+        command: cmd_str.clone(),
+        findings: Vec::new(),
+        plugin_missing: false,
+    };
 
-    let any_checker = match lookup_any_architecture_checker(arch_name) {
-        Some(checker) => checker,
-        None => {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!("no architecture checker named '{arch_name}' registered"),
-                message: check.message.clone(),
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-            });
-        }
+    let Some(any_checker) = lookup_any_architecture_checker(arch_name) else {
+        return Ok(error_result(format!(
+            "no architecture checker named '{arch_name}' registered"
+        )));
     };
 
     let findings = match any_checker {
         AnyArchitectureChecker::Import(checker) => {
             let graph = match crate::import_graph::build(repo_root, files) {
                 Ok(graph) => graph,
-                Err(err) => {
-                    return Ok(CheckResult {
-                        check_name: check.name.clone(),
-                        severity: check.severity,
-                        passed: false,
-                        output: format!("{err:#}"),
-                        message: check.message.clone(),
-                        command: cmd_str,
-                        findings: Vec::new(),
-                        plugin_missing: false,
-                    });
-                }
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
             };
             checker.check(&graph, arch_config)
+        }
+        AnyArchitectureChecker::Model(checker) => {
+            let model = match build_arch_model_for_check(repo_root, files) {
+                Ok(model) => model,
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
+            };
+            checker.check(&model, arch_config)
         }
         AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             let graph = match crate::declarations::build(repo_root, files, &components) {
                 Ok(graph) => graph,
-                Err(err) => {
-                    return Ok(CheckResult {
-                        check_name: check.name.clone(),
-                        severity: check.severity,
-                        passed: false,
-                        output: format!("{err:#}"),
-                        message: check.message.clone(),
-                        command: cmd_str,
-                        findings: Vec::new(),
-                        plugin_missing: false,
-                    });
-                }
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
             };
             checker.check(&graph, arch_config)
         }
@@ -1217,6 +1231,9 @@ fn check_native_against_git_head_repo(
                 .ok()
                 .map(|graph| checker.check(&graph, arch_config).is_empty())
         }
+        AnyArchitectureChecker::Model(checker) => build_arch_model_for_check(&snapshot_dir, &files)
+            .ok()
+            .map(|model| checker.check(&model, arch_config).is_empty()),
         AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             crate::declarations::build(&snapshot_dir, &files, &components)
