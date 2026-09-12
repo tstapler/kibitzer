@@ -782,8 +782,17 @@ fn scope_output_to_changed_lines(
     ranges: &[(usize, usize)],
     passed_raw: bool,
 ) -> (String, bool) {
-    if passed_raw || ranges.is_empty() {
+    if passed_raw {
         return (output.to_string(), passed_raw);
+    }
+    if ranges.is_empty() {
+        // Diff-scoping is active (the caller only reaches this function when
+        // `changed_lines` was `Some(_)`) but there are zero changed-line ranges to
+        // scope to — e.g. a pure-deletion edit (see `hook::compute_changed_lines`).
+        // Nothing can be attributed to this edit, so every finding is out of scope,
+        // not "unscoped" — unlike the `changed_lines: None` case, this must not fall
+        // back to the raw whole-file output.
+        return (String::new(), true);
     }
 
     let prefix = format!("{}:", file_path.display());
@@ -1476,6 +1485,18 @@ mod diff_scoping_tests {
     #[test]
     fn scope_output_noop_when_already_passing() {
         let (filtered, passed) = scope_output_to_changed_lines("", &file(), &[(12, 15)], true);
+        assert!(passed);
+        assert_eq!(filtered, "");
+    }
+
+    #[test]
+    fn scope_output_empty_ranges_suppresses_all_findings() {
+        // Regression for docs/go-primitive-obsession-false-positives.md's
+        // "deletion-only edit flagged" entry: `changed_lines` present but empty
+        // (a pure-deletion edit — see `hook::compute_changed_lines`) must suppress
+        // every finding, not fall back to raw whole-file output.
+        let output = "src/foo.go:5: pre-existing finding\n";
+        let (filtered, passed) = scope_output_to_changed_lines(output, &file(), &[], false);
         assert!(passed);
         assert_eq!(filtered, "");
     }
@@ -2416,6 +2437,81 @@ mod native_check_tests {
         )
         .unwrap();
         assert!(clean.passed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression for docs/go-primitive-obsession-false-positives.md's "pre-existing
+    // unchanged signatures flagged" entry: `changed_lines` scoping (already generic
+    // across every native checker via `run_native_check`) must exclude a
+    // primitive-obsession finding whose signature sits outside the edited range,
+    // even though `check_file` itself still parses and flags the whole file.
+    #[test]
+    fn native_primitive_obsession_check_scopes_output_to_changed_lines() {
+        let dir = tmp_dir("primitive-obsession-scoping");
+        let file = dir.join("tls.go");
+        std::fs::write(
+            &file,
+            "package main\n\nfunc certCurrent(certFile, hashFile, want string) bool {\n\treturn true\n}\n\nfunc LoadTLSConfig(certFile, keyFile string) (int, error) {\n\treturn 0, nil\n}\n",
+        )
+        .unwrap();
+
+        // Only line 7 (`LoadTLSConfig`) falls inside the edited range; line 3
+        // (`certCurrent`) is pre-existing and untouched.
+        let registry = Registry::default();
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            Some(&[(7, 7)]),
+            &registry,
+        )
+        .unwrap();
+        assert!(!result.passed);
+        assert!(result.output.contains("LoadTLSConfig") || result.output.contains(":7:"));
+        assert!(!result.output.contains("certCurrent"));
+
+        // Scoping to a range that touches neither flagged signature reports a pass.
+        let clean = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            Some(&[(4, 4)]),
+            &registry,
+        )
+        .unwrap();
+        assert!(clean.passed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression for docs/go-primitive-obsession-false-positives.md's "deletion-only
+    // edit flagged" entry: a pure-deletion edit (`hook::compute_changed_lines` now
+    // returns `Some(vec![])` for one, instead of `None`/unscoped) must not re-surface
+    // an unrelated, pre-existing flaggable signature still left in the file.
+    #[test]
+    fn native_primitive_obsession_check_suppresses_findings_for_deletion_only_edit() {
+        let dir = tmp_dir("primitive-obsession-deletion-only");
+        let file = dir.join("tls.go");
+        // What's left in the file after a hypothetical deletion of dead code —
+        // `certCurrent` was already here, untouched by the edit.
+        std::fs::write(
+            &file,
+            "package main\n\nfunc certCurrent(certFile, hashFile, want string) bool {\n\treturn true\n}\n",
+        )
+        .unwrap();
+
+        let registry = Registry::default();
+        let result = run_check(
+            &primitive_obsession_check(),
+            &dir,
+            &file,
+            Some(&[]),
+            &registry,
+        )
+        .unwrap();
+        assert!(result.passed, "output: {}", result.output);
+        assert_eq!(result.output, "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -30,6 +30,45 @@ was heading somewhere valid. This reads to the user as "the hook fires on deleti
 blocks," because the edit that introduces the not-yet-resolved reference is very often
 also the one that deletes/shrinks the old inline-link prose it's replacing.
 
+## Fixed
+
+### 2026-08-13 — design-docs — both directions of the mechanism in one session, self-resolving each time
+
+- **Symptom**: a reference-style link's *use* and its *definition* landing in separate
+  `Edit` calls, in either order, got the earlier one blocked even though the very next
+  edit resolved it (`nop-self-service-project-creation/README.md`, `tstapler/design-docs`,
+  3 blocks across 41 edits) — see git history for the full original entry.
+- **Mechanism**: `Cache::apply_grace` ([src/cache.rs:138](src/cache.rs#L138)) applies
+  generically to every `Blocking`-severity `CheckResult`, keyed on `(file_path,
+  check_name)` — not specific to native vs. shelled-out checks, and not gated on
+  `design-docs` migrating off `doc_report.py`/`markdownlint-cli2` as this doc previously
+  assumed. It downgrades a check's *first* failure on a file to Advisory, escalating to
+  Blocking only if that same check fails again on the next touch to that file with no
+  passing result in between — exactly the "fail once, pass on the immediate next edit"
+  shape both directions of this entry describe. The native `markdown-link-integrity`
+  checker (`src/markdown_link_integrity.rs`) also reimplements `doc_report.py`'s
+  bidirectional rule — `unused_definition_findings`
+  ([src/markdown_link_integrity.rs:264](src/markdown_link_integrity.rs#L264)) flags a
+  dangling *definition* with no use, not just a dangling *use*, and both feed the same
+  `check_name` so both get identical grace treatment.
+- **Real bug found and fixed along the way**: grace state (`grace_pending`) wasn't
+  actually surviving between separate `kibitzer hook` process invocations for
+  diff-scoped `Edit` calls — `cache.save()` (`src/daemon.rs`, both the daemon-resident
+  path and the no-daemon fallback) was only called when `changed_lines.is_none()` (i.e.
+  a `Write`), never for an `Edit`, which is the shape of every entry in this doc. Fixed
+  by making the save unconditional. Confirmed empirically: a test isolating
+  `XDG_RUNTIME_DIR` (so it can't accidentally hit a real background daemon) failed before
+  this fix and passes after it.
+- **Regression-guarded** by `markdown_link_integrity_dangling_reference_then_its_definition_never_hard_blocks`,
+  `markdown_link_integrity_dangling_definition_then_its_use_never_hard_blocks`, and
+  `blocking_check_grace_persists_across_diff_scoped_edits_without_a_daemon`
+  (`tests/hook_contract.rs`).
+- **Known limit, still open**: the grace window is exactly one edit-to-that-file wide —
+  a violation that survives more than one subsequent touch to the same file without an
+  intervening pass still hard-blocks on the second touch, same as before this fix. The
+  remaining `## Log` entries below (multi-edit gaps of 4+ tool calls, or a violation that
+  never gets fixed within the session) are NOT covered by this fix — see each entry.
+
 ## Log
 
 ### 2026-08-10 — design-docs — reference link introduced before its definition
@@ -57,6 +96,12 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   the reference-style *use* as part of the same hunk that removes the old inline link.
   No cleaner (pure-deletion-only) example of this check firing has been found yet in
   the sessions audited so far — see `checking-invocations.md` for how to look for one.
+- **Status (2026-09-11 re-audit)**: still open. `Cache::apply_grace`'s window (see the
+  `## Fixed` section above) only covers a violation surviving exactly one subsequent
+  touch to the file; the definition here lands "a later `Edit`," not confirmed to be
+  the *immediate* next one, and (per `docs/reporting-false-positives.md`'s removal
+  policy) this session predates the grace-persistence bugfix's own landing time, so it
+  wouldn't have applied even if the gap were narrow enough.
 
 ### 2026-08-13 — design-docs — unrelated edit blocked by a dangling reference a prior edit in the same turn introduced
 
@@ -93,6 +138,12 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
 - **Not a pure deletion**: net shrink (`290` → `279`), but irrelevant here — the point
   isn't deletion vs. addition, it's that the edit's content has nothing to do with the
   violation that blocked it.
+- **Status (2026-09-11 re-audit)**: still open, and not just a `design-docs`-migration
+  gap — `Cache::apply_grace` (see the `## Fixed` section above) now confirmed to apply
+  regardless of native-vs-shelled checker. But the gap here (~8 tool calls between the
+  edit that introduced the dangling refs and the one that got blocked) far exceeds
+  grace's one-touch window: any intervening touch to *this* file would already have
+  escalated to Blocking on its second consecutive failure. Would still reproduce today.
 
 ### 2026-08-12 — design-docs — 9 blocks in one session, same file, `doc-structure-report` only
 
@@ -125,43 +176,13 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
 - **Not a pure deletion**: all 9 edits in this session net-grew the file; irrelevant here
   regardless — several of the blocked edits (see above) didn't touch reference-link
   content in either direction.
-
-### 2026-08-13 — design-docs — both directions of the mechanism in one session, self-resolving each time
-
-- **Repo**: `tstapler/design-docs`, file: `nop-self-service-project-creation/README.md`
-- **Session**: `~/.claude/projects/-Users-tstapler-Documents-design-docs/dcb5a7eb-7e8e-4ef4-93bf-2e37a7ccbbaf.jsonl` (01:03–01:19), `doc-structure-report` only, 3 blocks across 41 `Edit` calls to this file.
-- **Block 1 (use before definition, the already-documented direction)**: `toolu_01U2KRAG9EiQyD9kchP7C8sA`
-  (edit 5 of 41; `old_len=2464`, `new_len=3566`) self-introduces 6 reference-style uses
-  (`[PR #424][pr-424]`, `[#499][pr-499]` … `[#503][pr-503]`) with no definitions yet.
-  Resolved by the very next edit, `toolu_01PMwHHcQWTh2P9nNQWn6HqG` (edit 6), which adds
-  the matching `[pr-424]: https://git.example.com/org/repo/pull/424` etc.
-- **Blocks 2–3 (definition before use — the mirror-image direction, not previously logged)**:
-  `toolu_01Xqz5iqDaK7U8qwAww2tYdG` (edit 27; `old_len=203`, `new_len=445`) rewrites the
-  doc's `## References` section, adding 3 *new* definitions with no uses anywhere yet —
-  `[current-state]:`, `[open-decisions]:`, `[milestone-breakdown]:` — confirmed by diffing
-  its `old_string`/`new_string`: the section's other two definitions,
-  `[argocd-machine-access]:` and `[constraint-verification]:`, were already present
-  unchanged in `old_string` (pre-existing from an earlier edit, along with their uses —
-  not part of this violation, despite initially looking like 5 new definitions from a
-  surface grep). This edit got blocked because `doc-structure-report`'s "unused reference
-  def" check fires symmetrically: a definition with no use is exactly as much a violation
-  as a use with no definition. The very next edit, `toolu_01YLumTXFQLaY4cUND8GnAtQ`
-  (edit 28), adds matching uses for all 3 — `[current state][current-state]`,
-  `[milestone breakdown][milestone-breakdown]`, `[open decisions][open-decisions]` — in
-  a sentence prose-editing an unrelated part of the doc (a bug-report callout), fully
-  resolving the violation one edit later, same as block 1.
-- **Mechanism**: same whole-repo, non-diff-aware `doc-structure-report` re-check already
-  confirmed against `scripts/doc_report.py`'s source in the 2026-08-13 entry above,
-  reapplied here without a fresh source re-read (already confirmed earlier in this
-  investigation, and the script's behavior wouldn't have changed since). The new
-  observation is that the check's "unused reference def" condition is bidirectional: it
-  blocks equally on a dangling *use* (block 1, matches the 2026-08-10/-13 entries above)
-  and on a dangling *definition* (blocks 2–3) — both are just "reference and definition
-  don't both exist yet," and a multi-step edit sequence that adds them in either order
-  gets blocked mid-way regardless of which one lands first.
-- **Not a pure deletion**: all 3 blocked edits net-grew the file; irrelevant here anyway —
-  each blocked edit's own content is the direct (self-caused) source of its violation,
-  resolved by the immediately following edit in the same turn.
+- **Status (2026-09-11 re-audit)**: still open. `apply_grace`'s semantics (see the
+  `## Fixed` section above) explain the pattern exactly — only the very first failure on
+  this file downgrades; blocks 2–9 occur while the same (file, check) pair is still
+  failing with no intervening pass, so each escalates immediately. That's grace working
+  as designed, not a gap in it — but it still means a growing set of dangling references
+  built up in stages blocks every edit after the first, which is the behavior this entry
+  flags as surprising. Would still reproduce today.
 
 ### 2026-08-11 — design-docs — the session that first introduced the argocd-machine-access/constraint-verification refs later seen in dcb5a7eb
 
@@ -198,6 +219,16 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   the mechanism already confirmed against source earlier in this investigation.
 - **Not a pure deletion**: both blocked edits net-grew the file substantially; each is
   self-caused (introduces the very reference that trips the check).
+- **Status (2026-09-11 re-audit)**: blocks 1–2 were correct catches per the entry's own
+  text, not false positives — leave as-is. The "why didn't edits 6–24 re-block on the
+  still-dangling `hard-constraint`" anomaly remains unexplained: `apply_grace` keys purely
+  on `(file_path, check_name)` with no per-violation identity, so a still-failing whole-file
+  check *should* re-escalate on the next touch to this file regardless of which specific
+  reference is dangling — this doesn't fit that model and isn't traceable to anything in
+  kibitzer's own `src/cache.rs`/`src/daemon.rs`. The most likely remaining explanation lives
+  in `design-docs`' own (kibitzer-external) `doc_report.py`, not confirmed. Left open per
+  `docs/reporting-false-positives.md`'s policy against closing an entry on an unresolved
+  open question.
 
 ### 2026-08-13 — design-docs — pure punctuation edit blocked by an earlier, uninspected edit's dangling reference
 
@@ -232,6 +263,10 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   already confirmed against source earlier in this investigation.
 - **Not a pure deletion**: near-net-neutral length change (`332` → `328`); irrelevant here —
   the edit's content has nothing to do with the violation that blocked it.
+- **Status (2026-09-11 re-audit)**: still open — the dangling reference here persists for
+  the rest of the session with no intervening pass, so `apply_grace`'s window (one touch)
+  is exceeded the same way as the `fdb9431f`/`55b4e258` entries above. Would still
+  reproduce today.
 
 ### 2026-08-13 — design-docs — the edit that *resolves* its own dangling reference gets blocked, not the edit that created it
 
@@ -266,6 +301,15 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   `scripts/doc_report.py`'s source to confirm this theory) was not available this pass — left
   as an open question rather than asserted as fact.
 - **Not a pure deletion**: both edits net-grew the file substantially.
+- **Status (2026-09-11 re-audit, INFERRED not confirmed)**: best-fit explanation under
+  `apply_grace`'s actual semantics (see the `## Fixed` section above): edit 1 likely
+  wasn't a clean pass but a first-failure grace-downgrade on some *other*, pre-existing
+  dangling reference elsewhere in this large file (which reads as "passed" in a coarse
+  pass/fail transcript read) — edit 2's block is then the second-consecutive-failure
+  escalation for that same other reference, not for `imv2` (which edit 2 does fully
+  resolve). Can't confirm without the raw transcript attachment for edit 1 (session file
+  on a macOS path, inaccessible from this audit's machine) — left open per policy rather
+  than asserted.
 
 ### 2026-08-10 — design-docs — edit with no link syntax at all gets blocked, first hit of a 6-block session
 
@@ -298,6 +342,12 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   later edit in the same session (`toolu_01Qk142v33bDQvTKLYc2anFP` and `toolu_014V4Cw6CeWdQVfuTm9ZgC7F`
   respectively) supplies the matching `[label]:` definition — the same confirmed mechanism as the
   `dcb5a7eb` entry above, not a new false-positive sample.
+- **Status (2026-09-11 re-audit)**: still open. This transcript (13:07 PDT, 2026-08-10)
+  predates the `apply_grace` grace-persistence bugfix's own landing time (`980f09c`,
+  20:42 PDT the same day) entirely, so grace didn't exist yet at the time. The root
+  violation itself remains unreconstructable (per this entry's own admission) — even
+  replayed today, a violation surviving this long in the transcript would already have
+  exceeded grace's one-touch window regardless.
 
 ### 2026-09-11 — stapler-squad — `[SEVERITY: High]`-style bracket tag in a heading misread as an undefined shortcut reference link
 
