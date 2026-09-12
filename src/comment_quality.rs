@@ -30,6 +30,21 @@ const MIN_COMMENT_LINES_FOR_RATIO: usize = 4;
 const PARAM_COUNT_RATIO_BONUS: f64 = 0.25;
 const PARAM_COUNT_RATIO_BASELINE: usize = 2;
 
+/// Number of interior blank/paragraph-marker line breaks a comment needs before
+/// `has_structured_paragraph_breaks` treats it as deliberately structured explanation
+/// rather than a single restating blob padded to look substantial. Two breaks means
+/// at least three distinct paragraphs — see that function's doc comment for the real
+/// corpus evidence behind this.
+const MIN_PARAGRAPH_BREAKS: usize = 2;
+
+/// Minimum number of diagram-shaped lines (`is_diagram_shaped_line`) `has_diagram_content`
+/// requires before exempting a comment, and the minimum fraction of the comment's
+/// non-blank lines they must make up. Unlike the other thresholds here, this one has
+/// no confirmed real-world instance behind it — see `has_diagram_content`'s doc
+/// comment for what the corpus search did and didn't find.
+const MIN_DIAGRAM_LINES: usize = 3;
+const DIAGRAM_LINE_FRACTION: f64 = 0.3;
+
 /// Marketing filler, hedge words, and invented-rationale phrases that add nothing a
 /// reader couldn't already see, plus the task/fix/caller-referencing anti-pattern
 /// (comments should describe the code, not the change that produced it — those belong
@@ -522,6 +537,12 @@ fn check_proportionality(
     if has_safety_section(&leading_nodes, src) {
         return;
     }
+    if has_diagram_content(&leading_nodes, body, comment_kinds, src) {
+        return;
+    }
+    if has_structured_paragraph_breaks(&leading_nodes, body, comment_kinds, src) {
+        return;
+    }
 
     findings.push(Finding {
         line: leading_start_line.unwrap_or(decl.start_position().row + 1),
@@ -603,6 +624,150 @@ fn has_safety_section(leading_nodes: &[Node], src: &[u8]) -> bool {
         node.utf8_text(src)
             .is_ok_and(|t| t.to_lowercase().contains("# safety"))
     })
+}
+
+/// Every comment line feeding `check_proportionality`'s ratio — the leading doc
+/// comment plus every comment found inside the body — flattened to stripped,
+/// per-physical-line text in source order. The diagram/paragraph exemptions below
+/// need actual comment *content* line-by-line, unlike `collect_comment_rows` (counts
+/// rows only) or `has_safety_section` (leading-only text): the real corpus evidence
+/// for `has_structured_paragraph_breaks` is a comment sitting *inside* the body, not
+/// the leading doc comment, so leading-only text would miss it.
+fn comment_line_texts(
+    leading_nodes: &[Node],
+    body: Node,
+    comment_kinds: &[&str],
+    src: &[u8],
+) -> Vec<String> {
+    let mut nodes: Vec<Node> = leading_nodes.iter().rev().copied().collect();
+    collect_comment_nodes(body, comment_kinds, &mut nodes);
+    nodes
+        .into_iter()
+        .filter_map(|node| node.utf8_text(src).ok())
+        .flat_map(|text| {
+            text.lines()
+                .map(|line| strip_comment_markers(line).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn collect_comment_nodes<'a>(node: Node<'a>, comment_kinds: &[&str], out: &mut Vec<Node<'a>>) {
+    if comment_kinds.contains(&node.kind()) {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_comment_nodes(child, comment_kinds, out);
+    }
+}
+
+/// A comment built from several distinct paragraphs — separated either by a blank
+/// `///`/`//`/`*`/`#` line, or by Javadoc's own paragraph marker (a bare `<p>`/`<p/>`
+/// line, since Javadoc convention never uses a blank line for this) — is deliberate,
+/// structured explanation, not a comment restating the code it sits over. It scales
+/// with the complexity being explained, not with the body's line count, which is
+/// exactly why comment length alone must not exempt it — this checks paragraph
+/// *count* instead.
+///
+/// Two real corpus findings back this, both from `apache/cassandra` and both
+/// confirmed still firing `[over-commented]` before this exemption existed:
+/// `IAuthenticator.supportsEarlyAuthentication()`
+/// (`src/java/org/apache/cassandra/auth/IAuthenticator.java:42`) carries 4
+/// `<p>`-separated paragraphs (rationale, a worked example, and the default-behavior
+/// note) over a 3-line `return false;` body. `SchemaCQLHelper.getUserTypesAsCQL()`
+/// (`src/java/org/apache/cassandra/db/SchemaCQLHelper.java:86`) carries an
+/// "Implementation note" block comment with 7 blank-line-separated paragraphs
+/// (including a worked CQL example) inside a body whose only real statement is one
+/// delegating `.stream().map(...)` chain — `is_delegating_single_statement_body`
+/// doesn't catch this one, since the in-body comment sits between the leading doc
+/// comment and that statement, not attached to it as the sole content.
+fn has_structured_paragraph_breaks(
+    leading_nodes: &[Node],
+    body: Node,
+    comment_kinds: &[&str],
+    src: &[u8],
+) -> bool {
+    let lines = comment_line_texts(leading_nodes, body, comment_kinds, src);
+    let mut breaks = 0;
+    let mut seen_content = false;
+    let mut in_gap = false;
+    for line in &lines {
+        let is_break_marker =
+            line.is_empty() || matches!(line.to_lowercase().as_str(), "<p>" | "<p/>");
+        if is_break_marker {
+            if seen_content {
+                in_gap = true;
+            }
+        } else {
+            if in_gap {
+                breaks += 1;
+            }
+            in_gap = false;
+            seen_content = true;
+        }
+    }
+    breaks >= MIN_PARAGRAPH_BREAKS
+}
+
+/// Whether `text` (already stripped of comment markers) reads as one row of an
+/// ASCII/Unicode diagram rather than a sentence: dominated by structural punctuation
+/// (box-drawing characters, or a dense run of `+-|/\<>=`) with at most a couple of
+/// real words — a label like "s = simple" or "if level(T) = level(L)", not a clause.
+/// Deliberately conservative, in the spirit of `looks_like_code`: ordinary technical
+/// prose that happens to contain a stray `->` or `|` has far more than two real words
+/// around it and won't match.
+fn is_diagram_shaped_line(text: &str) -> bool {
+    const DIAGRAM_CHARS: &[char] = &[
+        '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '→', '←', '↑', '↓', '▶', '+', '|',
+        '<', '>', '=', '-', '/', '\\',
+    ];
+    if text.is_empty() {
+        return false;
+    }
+    let punct_count = text.chars().filter(|c| DIAGRAM_CHARS.contains(c)).count();
+    let word_count = text
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .count();
+    let len = text.chars().count() as f64;
+    punct_count >= 4 && word_count <= 2 && (punct_count as f64) > len * 0.35
+}
+
+/// A comment block where a meaningful fraction of its non-blank lines are
+/// diagram-shaped (`is_diagram_shaped_line`) is visual documentation — a
+/// state/sequence/architecture diagram the code can't express any other way — not
+/// restatement, no matter how long it runs.
+///
+/// Unlike every other exemption in this file, no confirmed real-world instance
+/// clears the ratio: every `[over-commented]` finding across the
+/// kubernetes/cassandra/servo/ripgrep/deno/vscode/stapler-squad backtest corpus (see
+/// docs/backtest-repos.md) was inspected for diagram content, and none were diagrams.
+/// Real diagrams do exist in that corpus (e.g. kubernetes's `RunWithContext`
+/// shutdown-signal diagram, Cassandra's `Envelope` wire-format diagram) but every one
+/// found sits either over a body long enough that the ratio never trips, or over a
+/// struct/interface declaration `check_proportionality` doesn't examine at all (it
+/// only walks `cfg.function_kinds`). Implemented proactively from a live user report
+/// anyway, the same way `PARAM_COUNT_RATIO_BONUS` was — treat `MIN_DIAGRAM_LINES`/
+/// `DIAGRAM_LINE_FRACTION` as a starting hypothesis, not a corpus-derived constant.
+fn has_diagram_content(
+    leading_nodes: &[Node],
+    body: Node,
+    comment_kinds: &[&str],
+    src: &[u8],
+) -> bool {
+    let lines = comment_line_texts(leading_nodes, body, comment_kinds, src);
+    let nonblank: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
+    if nonblank.is_empty() {
+        return false;
+    }
+    let diagram_lines = nonblank
+        .iter()
+        .filter(|l| is_diagram_shaped_line(l))
+        .count();
+    diagram_lines >= MIN_DIAGRAM_LINES
+        && (diagram_lines as f64) >= DIAGRAM_LINE_FRACTION * nonblank.len() as f64
 }
 
 /// A single-line comment's `end_position()` sometimes lands at column 0 of the row
@@ -1083,6 +1248,113 @@ mod tests {
         // baseline, so no bonus applies) and the same comment/body line counts —
         // this must still fire at the plain 2.0x ratio.
         let src = "// f validates a and b against their expected ranges before use,\n// since callers frequently pass swapped or stale values here and the\n// resulting corruption is silent until much later in an unrelated request.\n// This line and the next two exist only to reach the required comment count.\n// Padding line two.\n// Padding line three.\n// Padding line four.\nfunc f(a, b int) int {\n\treturn a + b + a + b + a + b\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    // --- Regression tests for the 2026-09-11 diagram/multi-paragraph exemptions ---
+
+    /// Mirrors `apache/cassandra`'s `IAuthenticator.supportsEarlyAuthentication()`
+    /// (`src/java/org/apache/cassandra/auth/IAuthenticator.java:42`) almost verbatim:
+    /// confirmed via `kibitzer check native comment-quality-java` to fire
+    /// `[over-commented]` (15 comment lines / 3 body lines) before this exemption
+    /// existed. Javadoc's paragraph convention is a bare `<p>` tag, not a blank line.
+    #[test]
+    fn javadoc_paragraphs_separated_by_p_tags_are_exempt_from_over_commented() {
+        let src = "public interface Auth {\n    /**\n     * Whether the authenticator supports early authentication without a round trip.\n     * <p>\n     * An example use case of this would be if the client is authenticated using a\n     * certificate present on a TLS-encrypted connection, as done elsewhere.\n     * <p>\n     * If this returns true, no AUTHENTICATE request is sent to the client at all,\n     * which can confuse a driver implementation expecting one.\n     * <p>\n     * If false (the default), an AUTHENTICATE request is always sent.\n     */\n    default boolean supportsEarlyAuthentication()\n    {\n        return false;\n    }\n}\n";
+        let findings = run(Language::Java, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Mirrors `apache/cassandra`'s `SchemaCQLHelper.getUserTypesAsCQL()`
+    /// (`src/java/org/apache/cassandra/db/SchemaCQLHelper.java:86`): an
+    /// "Implementation note" block comment sitting *inside* the body (not the leading
+    /// doc comment) with several blank-line-separated paragraphs, over a body whose
+    /// only real statement is one delegating chain. Confirmed via `kibitzer check
+    /// native comment-quality-java` to fire `[over-commented]` (37 comment lines / 5
+    /// body lines) before this exemption existed — `is_delegating_single_statement_body`
+    /// alone doesn't save it, since the in-body comment isn't attached to that
+    /// statement as its sole content.
+    #[test]
+    fn in_body_comment_with_blank_line_paragraphs_is_exempt_from_over_commented() {
+        let src = "public class Helper {\n    /**\n     * Build a CQL string for the types used by the given table.\n     */\n    public static Stream<String> getTypesAsCQL(Metadata metadata, Types types)\n    {\n        /*\n         * Implementation note: at first this looks like it doesn't need the\n         * Types argument, since full definitions live on the Metadata already.\n         *\n         * However, the type found on Metadata may have been frozen in a way\n         * that makes it ambiguous which nesting level was actually declared.\n         *\n         * Consider a user who created nested types A and B, then a table using\n         * a frozen<B>: there's no way to tell, after the fact, whether A itself\n         * should be dumped as frozen or not, only that *something* must be.\n         *\n         * This is a real limitation, not a bug we can silently paper over here.\n         */\n        return metadata.getReferencedTypes().stream().map(types::toCqlString);\n    }\n}\n";
+        let findings = run(Language::Java, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Mirrors `denoland/deno`'s `WorkerThread::drop`
+    /// (`runtime/ops/worker_host.rs:136`): a `Drop` impl whose leading doc comment is
+    /// empty but whose body opens with a long, blank-line-paragraph-structured
+    /// rationale comment, over a short body. Confirmed via `kibitzer check native
+    /// comment-quality-rust` to fire `[over-commented]` (29 comment lines / 12 body
+    /// lines) before this exemption existed.
+    #[test]
+    fn rust_in_body_comment_with_blank_line_paragraphs_is_exempt_from_over_commented() {
+        let src = "impl Drop for WorkerThread {\n    fn drop(&mut self) {\n        // Promptly release the worker's held locks so other clients waiting on\n        // them don't stay blocked until the worker thread fully unwinds.\n        //\n        // This narrows the window but can't fully close it: a native op already\n        // in flight on the worker keeps running until it returns to JS, and a\n        // lock acquired in that gap isn't released here.\n        //\n        // Any lock left held in that residual window is still released by the\n        // resource-drop backstop when the worker's runtime drops.\n        let handle = self.worker_handle.clone();\n        if let Some(id) = &self.lock_client_id {\n            handle.terminate_execution();\n            release_locks(id);\n        }\n    }\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// A long comment with no paragraph structure at all — the exact restating shape
+    /// `[over-commented]` exists to catch — must still fire even after the
+    /// paragraph-break exemption exists. Guards against a threshold that's
+    /// accidentally satisfied by comment length alone.
+    #[test]
+    fn unstructured_long_comment_over_short_body_is_still_flagged_as_over_commented() {
+        let src = "// This function adds two numbers together.\n// It takes a and b as parameters.\n// It returns the sum of a and b.\n// It never returns anything else.\n// It has no side effects.\n// There is nothing more to say about it.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Synthetic (no corpus instance cleared the ratio — see `has_diagram_content`'s
+    /// doc comment) but exercises the diagram exemption directly: a state-transition
+    /// diagram drawn with box-drawing/ASCII arrows over a trivial getter.
+    #[test]
+    fn ascii_diagram_over_short_body_is_exempt_from_over_commented() {
+        let src = "/// State machine for a connection:\n///\n/// +--------+   dial    +------------+   ack   +---------+\n/// | Closed | --------> | Connecting | ------> | Open    |\n/// +--------+           +------------+         +---------+\n///      ^                                            |\n///      +----------------- close --------------------+\nfn state(&self) -> State {\n    self.state\n}\n";
+        let findings = run(Language::Rust, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// Ordinary prose that merely contains a stray `->`/`|` must not be swept into the
+    /// diagram exemption — the bar is "this line is visually a diagram row," not "this
+    /// line contains any special character."
+    #[test]
+    fn prose_with_a_stray_arrow_is_not_treated_as_a_diagram() {
+        // Two-statement body (not a bare delegating call), so `is_delegating_single_
+        // statement_body` doesn't preempt this before the diagram check runs. 8
+        // comment lines over the 4-line body clears the flat 2.0x ratio.
+        let src = "// Retry calls fn up to attempts times -> returns the first success, or the\n// last error if every attempt fails. Callers that need cancellation | timeout\n// support should wrap fn themselves, since Retry accepts neither directly.\n// A caller -> Retry -> fn call chain still only ever runs fn synchronously.\n// This padding line exists only to reach the required comment count.\n// Padding line two.\n// Padding line three.\n// Padding line four.\nfunc Retry(fn func() (int, error)) (int, error) {\n\tresult, err := fn()\n\treturn result, err\n}\n";
         let findings = run(Language::Go, src);
         assert!(
             findings
