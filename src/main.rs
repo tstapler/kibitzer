@@ -35,6 +35,7 @@ mod plugin;
 mod primitive_obsession;
 mod rules;
 mod run;
+mod schema;
 mod status;
 mod symbol_extract;
 mod task_stop;
@@ -428,7 +429,7 @@ fn main() -> Result<ExitCode> {
                 }
             },
         },
-        Command::Schema { out } => config::run_schema(out),
+        Command::Schema { out } => schema::run_schema(out),
     }
 }
 

@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -381,24 +380,6 @@ pub struct Config {
     pub disabled: Vec<String>,
 }
 
-/// Generates the JSON Schema for `.claude/inspect.json` (derived from [`Config`]) and
-/// either prints it or writes it to `out`. Field doc comments above become the schema's
-/// per-property `description`, so this is the single source of truth for both — see
-/// issue #7 and `schema/README.md`.
-pub fn run_schema(out: Option<PathBuf>) -> Result<ExitCode> {
-    let schema = schemars::schema_for!(Config);
-    let rendered = serde_json::to_string_pretty(&schema)? + "\n";
-    match out {
-        Some(path) => {
-            std::fs::write(&path, &rendered)
-                .with_context(|| format!("writing {}", path.display()))?;
-            println!("[kibitzer] wrote {}", path.display());
-        }
-        None => print!("{rendered}"),
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 fn validate(config: &Config, config_path: &Path) -> Result<()> {
     for layer in &config.architecture.layers {
         if config
@@ -759,24 +740,6 @@ mod tests {
         let config: Config = serde_json::from_str(json)?;
         validate(&config, Path::new(".claude/inspect.json"))?;
         Ok(config)
-    }
-
-    /// Catches a checked-in `schema/inspect.schema.json` that's gone stale after a
-    /// `Config`/`Check`/etc. field or doc-comment change — regenerate it with
-    /// `cargo run -- schema --out schema/inspect.schema.json` (see `schema/README.md`).
-    #[test]
-    fn checked_in_schema_matches_generated_schema() {
-        let generated =
-            serde_json::to_string_pretty(&schemars::schema_for!(Config)).unwrap() + "\n";
-        let checked_in = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/inspect.schema.json"),
-        )
-        .expect("schema/inspect.schema.json should exist — run `cargo run -- schema --out schema/inspect.schema.json`");
-        assert_eq!(
-            generated, checked_in,
-            "schema/inspect.schema.json is stale — regenerate with \
-             `cargo run -- schema --out schema/inspect.schema.json`"
-        );
     }
 
     #[test]
