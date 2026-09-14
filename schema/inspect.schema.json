@@ -1,0 +1,249 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "architecture": {
+      "$ref": "#/definitions/ArchitectureConfig"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Check"
+      }
+    },
+    "disabled": {
+      "description": "Names of built-in default checks (`default_checks()`) to turn off for this repo. Has no effect on a check that isn't one of the defaults — just don't add it to `checks` in the first place. See docs/suppressing-checks.md.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "definitions": {
+    "ArchitectureConfig": {
+      "description": "Project-wide settings consumed by `architecture_checker`s that need more than the import graph itself — currently just the declared layer order for `layering`.",
+      "type": "object",
+      "properties": {
+        "components": {
+          "description": "Named components that `dependency_rules`/`content_rules`/`naming_rules` reference by name. See [`ArchitectureConfig::effective_components`] for how these combine with `layers`-desugared components.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Component"
+          }
+        },
+        "content_rules": {
+          "description": "Per-component allowed-declaration-kind rules.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ContentRule"
+          }
+        },
+        "dependency_rules": {
+          "description": "Per-component dependency allow/deny rules. See [`ArchitectureConfig::effective_dependency_rules`] for how these combine with `layers`-desugared rules.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DependencyRule"
+          }
+        },
+        "layers": {
+          "description": "Declared layers, highest-level first (e.g. `[\"handlers\", \"domain\", \"infra\"]`). A package/module belongs to the first layer whose name matches one of its path segments exactly; packages matching no layer are ignored by `layering`. An import edge from a package in an earlier layer to one in a later layer is expected (higher layers depend on lower ones); an edge running the other way — a later layer reaching back into an earlier one — is flagged.\n\n`layers` desugars into `components`/`dependency_rules` via [`ArchitectureConfig::effective_components`]/[`ArchitectureConfig::effective_dependency_rules`] — declaring a component with the same name as a layer is a config-load error.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "naming_rules": {
+          "description": "Per-component, per-kind naming pattern rules.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NamingRule"
+          }
+        }
+      }
+    },
+    "Check": {
+      "type": "object",
+      "required": [
+        "name",
+        "severity"
+      ],
+      "properties": {
+        "architecture_checker": {
+          "description": "Name of a natively implemented whole-repo architecture checker (looked up in `architecture_checks::registry()`) that runs once per batch against the whole repo's import graph, instead of once per triggering file. Mutually exclusive with `command`/`checker`. `triggers` must be empty or `[\"batch\"]` — rebuilding the import graph on every `PostToolUse` edit is too expensive.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checker": {
+          "description": "Name of a natively implemented checker (looked up in `checker::registry()`) to run in-process instead of shelling out via `command`. Mutually exclusive with `command`/`architecture_checker`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "Shell command to run. `{file}` is substituted with the triggering file path.\n\nWhen kibitzer knows which lines an edit actually touched (the Claude Code hook, not batch mode), a check can opt into diff-aware scoping two ways:\n\n- `{changed_lines}`: substituted with a comma-separated list of 1-indexed, inclusive `start-end` ranges (e.g. `12-15,40-40`), or empty if no ranges are known — pass this to a linter/tool that supports scoping its own scan to a line range. - Automatic output filtering: if a check's command emits output lines in the `{file}:{line}: message` convention (most linters do), kibitzer filters those lines down to ones inside the changed ranges and recomputes pass/fail from what survives — no command changes needed. Output that doesn't follow this convention is left untouched (conservatively kept, so unrecognized output can't be silently swallowed).\n\nMutually exclusive with `checker`/`architecture_checker` — exactly one of the three must be set.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Message shown to the agent alongside command output when the check fails.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "output_format": {
+          "description": "A structured shape kibitzer should parse from `command`'s stdout instead of treating the check as pure exit-code pass/fail. Requires `command` — native checkers already report structured findings. See `docs/output-formats.md`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OutputFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "description": "Glob patterns (supporting `**`) a file path must match for this check to apply.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "severity": {
+          "$ref": "#/definitions/Severity"
+        },
+        "triggers": {
+          "description": "Which hook events / run triggers this check fires on (e.g. \"PostToolUse\", \"batch\").",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Component": {
+      "description": "A named, glob-mapped set of graph-node/file-path identifiers — the unit `DependencyRule`/`ContentRule`/`NamingRule` reference.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "paths": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ContentRule": {
+      "description": "Per-component allowed-declaration-kind list, e.g. \"domain may only contain struct\".",
+      "type": "object",
+      "required": [
+        "allowed_kinds",
+        "component"
+      ],
+      "properties": {
+        "allowed_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "component": {
+          "type": "string"
+        }
+      }
+    },
+    "DependencyRule": {
+      "description": "Per-component allow-list (`may_depend_on`) and/or deny-list (`deny_depend_on`) of other component names. Deny wins when both apply to the same target.",
+      "type": "object",
+      "required": [
+        "component"
+      ],
+      "properties": {
+        "component": {
+          "type": "string"
+        },
+        "deny_depend_on": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "may_depend_on": {
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "NamingRule": {
+      "description": "Per-component, per-`DeclKind` regex pattern a declaration's name must match. Consumed by `declaration_checks::NamingChecker` (Story 3.1.1); `pattern` is validated as a compilable regex at config-load time by `validate_naming_rule_patterns` below.",
+      "type": "object",
+      "required": [
+        "component",
+        "kind",
+        "pattern"
+      ],
+      "properties": {
+        "component": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        }
+      }
+    },
+    "OutputFormat": {
+      "description": "A structured output shape kibitzer knows how to parse from a `command` check's stdout, instead of only reading the process exit code. See `docs/output-formats.md`.",
+      "oneOf": [
+        {
+          "description": "SARIF 2.1.0 (`https://sarifweb.azurewebsites.net/`) — the format most linters with a `--format sarif`/`--output-format sarif` flag already emit.",
+          "type": "string",
+          "enum": [
+            "sarif"
+          ]
+        }
+      ]
+    },
+    "Severity": {
+      "type": "string",
+      "enum": [
+        "blocking",
+        "advisory"
+      ]
+    }
+  }
+}

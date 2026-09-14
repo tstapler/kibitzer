@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILENAME: &str = "inspect.json";
 pub const CONFIG_DIR: &str = ".claude";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Blocking,
@@ -16,7 +18,7 @@ pub enum Severity {
 
 /// A structured output shape kibitzer knows how to parse from a `command` check's
 /// stdout, instead of only reading the process exit code. See `docs/output-formats.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     /// SARIF 2.1.0 (`https://sarifweb.azurewebsites.net/`) — the format most linters
@@ -24,7 +26,7 @@ pub enum OutputFormat {
     Sarif,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct Check {
     pub name: String,
     /// Shell command to run. `{file}` is substituted with the triggering file path.
@@ -118,7 +120,7 @@ impl Check {
 
 /// A named, glob-mapped set of graph-node/file-path identifiers — the unit
 /// `DependencyRule`/`ContentRule`/`NamingRule` reference.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct Component {
     pub name: String,
     // Read by `component_of`/`ComponentDependencyChecker` starting Phase 1 — not yet
@@ -130,7 +132,7 @@ pub struct Component {
 
 /// Per-component allow-list (`may_depend_on`) and/or deny-list (`deny_depend_on`) of
 /// other component names. Deny wins when both apply to the same target.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct DependencyRule {
     pub component: String,
     #[serde(default)]
@@ -142,7 +144,7 @@ pub struct DependencyRule {
 /// Per-component allowed-declaration-kind list, e.g. "domain may only contain struct".
 // Consumed by `ContentChecker` starting Phase 2 — not yet read outside tests.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ContentRule {
     pub component: String,
     pub allowed_kinds: Vec<String>,
@@ -151,7 +153,7 @@ pub struct ContentRule {
 /// Per-component, per-`DeclKind` regex pattern a declaration's name must match. Consumed
 /// by `declaration_checks::NamingChecker` (Story 3.1.1); `pattern` is validated as a
 /// compilable regex at config-load time by `validate_naming_rule_patterns` below.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct NamingRule {
     pub component: String,
     pub kind: String,
@@ -160,7 +162,7 @@ pub struct NamingRule {
 
 /// Project-wide settings consumed by `architecture_checker`s that need more than the
 /// import graph itself — currently just the declared layer order for `layering`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ArchitectureConfig {
     /// Declared layers, highest-level first (e.g. `["handlers", "domain", "infra"]`).
     /// A package/module belongs to the first layer whose name matches one of its path
@@ -366,7 +368,7 @@ fn validate_naming_rule_patterns(config: &Config, config_path: &Path) -> Result<
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct Config {
     #[serde(default)]
     pub checks: Vec<Check>,
@@ -377,6 +379,24 @@ pub struct Config {
     /// `checks` in the first place. See docs/suppressing-checks.md.
     #[serde(default)]
     pub disabled: Vec<String>,
+}
+
+/// Generates the JSON Schema for `.claude/inspect.json` (derived from [`Config`]) and
+/// either prints it or writes it to `out`. Field doc comments above become the schema's
+/// per-property `description`, so this is the single source of truth for both — see
+/// issue #7 and `schema/README.md`.
+pub fn run_schema(out: Option<PathBuf>) -> Result<ExitCode> {
+    let schema = schemars::schema_for!(Config);
+    let rendered = serde_json::to_string_pretty(&schema)? + "\n";
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &rendered)
+                .with_context(|| format!("writing {}", path.display()))?;
+            println!("[kibitzer] wrote {}", path.display());
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn validate(config: &Config, config_path: &Path) -> Result<()> {
@@ -739,6 +759,24 @@ mod tests {
         let config: Config = serde_json::from_str(json)?;
         validate(&config, Path::new(".claude/inspect.json"))?;
         Ok(config)
+    }
+
+    /// Catches a checked-in `schema/inspect.schema.json` that's gone stale after a
+    /// `Config`/`Check`/etc. field or doc-comment change — regenerate it with
+    /// `cargo run -- schema --out schema/inspect.schema.json` (see `schema/README.md`).
+    #[test]
+    fn checked_in_schema_matches_generated_schema() {
+        let generated =
+            serde_json::to_string_pretty(&schemars::schema_for!(Config)).unwrap() + "\n";
+        let checked_in = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/inspect.schema.json"),
+        )
+        .expect("schema/inspect.schema.json should exist — run `cargo run -- schema --out schema/inspect.schema.json`");
+        assert_eq!(
+            generated, checked_in,
+            "schema/inspect.schema.json is stale — regenerate with \
+             `cargo run -- schema --out schema/inspect.schema.json`"
+        );
     }
 
     #[test]
