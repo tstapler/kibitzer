@@ -463,7 +463,7 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start_dir(start: &Path) -> PathBuf {
+pub(crate) fn start_dir(start: &Path) -> PathBuf {
     if start.is_dir() {
         start.to_path_buf()
     } else {

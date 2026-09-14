@@ -448,6 +448,12 @@ impl KibitzerServer {
             Ok(c) => c,
             Err(e) => return format!("error reading config: {e}"),
         };
+        // Loaded once for the whole assessment (every checker, every file below)
+        // instead of once per (file, checker) pair — same rationale as `registry`.
+        let accepted = match crate::accepted_findings::find_accepted_findings(&repo_root) {
+            Ok(a) => a,
+            Err(e) => return format!("error reading accepted findings: {e}"),
+        };
 
         let mut files = match walk_and_collect_files(&repo_root) {
             Ok(files) => files,
@@ -548,16 +554,17 @@ impl KibitzerServer {
             // unused `registry.json` load on every (file, checker) pair in this loop.
             let no_plugins = crate::plugin::Registry::default();
             for file in &files {
-                let result = match run_check(&synthetic, &repo_root, file, None, &no_plugins) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        lines.push(format!(
-                            "error running {checker_name} on {}: {e}",
-                            file.display()
-                        ));
-                        continue;
-                    }
-                };
+                let result =
+                    match run_check(&synthetic, &repo_root, file, None, &no_plugins, &accepted) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            lines.push(format!(
+                                "error running {checker_name} on {}: {e}",
+                                file.display()
+                            ));
+                            continue;
+                        }
+                    };
                 if result.passed || result.output.is_empty() {
                     continue;
                 }
@@ -632,6 +639,7 @@ impl KibitzerServer {
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CheckResult>> {
             let (config, repo_root) = find_effective_config(&file_path)?;
             let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
+            let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
             run_checks_for_trigger(
                 &config.checks,
                 &trigger,
@@ -639,6 +647,7 @@ impl KibitzerServer {
                 &file_path,
                 None,
                 &registry,
+                &accepted,
             )
         })
         .await;
