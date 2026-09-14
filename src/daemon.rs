@@ -49,7 +49,8 @@ pub fn default_socket_path() -> PathBuf {
 /// Run the daemon in the foreground on `socket_path` until it receives a `Shutdown`
 /// request or the process is killed. Callers that want it in the background are
 /// expected to background it themselves (`kibitzer daemon &`, a systemd/launchd unit,
-/// etc.) — the daemon does not self-detach.
+/// etc.) — the daemon does not self-detach. `run_checks_smart` is one such caller: its
+/// `maybe_spawn_daemon` backgrounds this automatically when no daemon is reachable.
 pub fn run_daemon(socket_path: &Path) -> Result<()> {
     if socket_path.exists() {
         // A stale socket from a crashed prior daemon; a live daemon would have failed
@@ -281,16 +282,39 @@ fn maybe_spawn_daemon() {
     if spawn_is_debounced(marker_modified, SystemTime::now()) {
         return;
     }
-    let _ = std::fs::write(&marker, b"");
+    // Claim the marker atomically rather than read-mtime-then-write: two `hook`
+    // processes racing through the staleness check above could otherwise both pass
+    // it and both spawn a daemon. `create_new` makes the loser's claim fail instead,
+    // so at most one spawns per debounce window even under a race.
+    let _ = std::fs::remove_file(&marker);
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .is_err()
+    {
+        return;
+    }
+    spawn_detached_daemon();
+}
 
+/// The actual `kibitzer daemon start` spawn, split out of `maybe_spawn_daemon` so that
+/// function's debounce/marker logic stays readable on its own.
+fn spawn_detached_daemon() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    // `process_group(0)` detaches the child into its own session/process group so it
+    // outlives this short-lived hook process even if the hook's whole group gets
+    // signaled (e.g. on a hook timeout) — otherwise the "background" daemon would die
+    // right along with the hook invocation that spawned it.
+    use std::os::unix::process::CommandExt;
     let _ = std::process::Command::new(exe)
         .args(["daemon", "start"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn();
 }
 
