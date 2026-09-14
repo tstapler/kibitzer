@@ -49,7 +49,9 @@ kibitzer check list                  # list all natively implemented checkers
 kibitzer schema [--out <file>]       # emit .claude/inspect.json's JSON Schema
 ```
 
-See `docs/checking-invocations.md` for how checks are wired up.
+New to kibitzer? See `docs/getting-started.md` for a walkthrough of wiring
+it into a repo end to end. See `docs/checking-invocations.md` for how
+checks are wired up.
 
 ### `inspect.json` schema
 
