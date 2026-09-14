@@ -518,7 +518,7 @@ fn run_native_check(
     })
 }
 
-/// Drops accepted findings (`.claude/kibitzer-accepted.json`) from `combined`, run after
+/// Drops accepted findings (`accepted_findings::ACCEPTED_FINDINGS_DIR`) from `combined`, run after
 /// diff-scoping so an untouched line never needs this at all. Native-only: a shell-out
 /// check's pass/fail comes from its exit code, not empty output, so this can't safely
 /// recompute pass/fail for it.
@@ -1386,11 +1386,11 @@ fn map_ranges_through_hunks(ranges: &[(usize, usize)], hunks: &[DiffHunk]) -> Ve
 /// `run.rs`) should load it exactly once for the whole batch and pass the same
 /// `&Registry` into every call, instead of reloading and reparsing `registry.json` from
 /// disk once per call (or, if reloaded again inside the per-`check` loop, once per
-/// (file, check) pair). `accepted` (`.claude/kibitzer-accepted.json`) must be loaded the
-/// same way, by the same caller, for the same reason — and, more importantly, so that a
-/// malformed accepted-findings file surfaces as one clean error before any file work
-/// starts, rather than a `?` from inside this per-(file, check) loop nondeterministically
-/// discarding every result already accumulated for the batch.
+/// (file, check) pair). `accepted` (`accepted_findings::ACCEPTED_FINDINGS_DIR`) must be
+/// loaded the same way, by the same caller, for the same reason — and, more importantly,
+/// so that a malformed accepted-findings entry surfaces as one clean error before any
+/// file work starts, rather than a `?` from inside this per-(file, check) loop
+/// nondeterministically discarding every result already accumulated for the batch.
 pub fn run_checks_for_trigger(
     checks: &[Check],
     trigger: &str,
@@ -2655,14 +2655,15 @@ mod native_check_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `json` is the old `{"accepted": [...]}` shape purely so call sites can keep
+    /// listing entries inline — split into one file per entry, the real on-disk layout.
     fn write_accepted_findings(dir: &Path, json: &str) {
-        std::fs::create_dir_all(dir.join(crate::config::CONFIG_DIR)).unwrap();
-        std::fs::write(
-            dir.join(crate::config::CONFIG_DIR)
-                .join(crate::accepted_findings::ACCEPTED_FINDINGS_FILENAME),
-            json,
-        )
-        .unwrap();
+        let accepted_dir = dir.join(crate::accepted_findings::ACCEPTED_FINDINGS_DIR);
+        std::fs::create_dir_all(&accepted_dir).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        for (i, entry) in parsed["accepted"].as_array().unwrap().iter().enumerate() {
+            std::fs::write(accepted_dir.join(format!("{i}.json")), entry.to_string()).unwrap();
+        }
     }
 
     #[test]

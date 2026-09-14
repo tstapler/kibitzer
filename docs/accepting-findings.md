@@ -17,21 +17,22 @@ would also silence every other rule it covers there; a note in the repo's own
 `CLAUDE.md` documents the reasoning for a human but is invisible to kibitzer, which
 will re-flag the same line on every future edit.
 
-## `.claude/kibitzer-accepted.json`
+## `.kibitzer/accepted/`
 
-A checked-in, hand-authored file, one entry per accepted finding:
+A checked-in directory of hand-authored files, one JSON file per accepted finding —
+not one shared array, so two people accepting different findings on different
+branches each add a new file instead of both editing the same list, and the merge
+never conflicts. Filename doesn't matter (kibitzer globs every `*.json` file directly
+in the directory); name it however makes the entry easy to find later, e.g.
+`flag-argument-main-rs-42.json`:
 
 ```json
 {
-  "accepted": [
-    {
-      "rule": "flag-argument",
-      "file": "crates/cli/src/main.rs",
-      "line": 42,
-      "content": "pub fn from_dry_run_flag(dry_run: bool) -> Mode {",
-      "reason": "the one boundary adapter converting a clap bool flag into a Mode enum — something has to do that conversion once"
-    }
-  ]
+  "rule": "flag-argument",
+  "file": "crates/cli/src/main.rs",
+  "line": 42,
+  "content": "pub fn from_dry_run_flag(dry_run: bool) -> Mode {",
+  "reason": "the one boundary adapter converting a clap bool flag into a Mode enum — something has to do that conversion once"
 }
 ```
 
@@ -53,13 +54,12 @@ A checked-in, hand-authored file, one entry per accepted finding:
   the original judgment call needs a fresh look, not a rubber stamp on whatever's
   there now. There's no separate "stale" warning to check for; a reappeared finding
   *is* the signal.
-- **`reason`** — required, and must be non-empty. A malformed file (bad JSON, or any
-  entry with an empty `reason`) is a hard error on the next check run, not a
-  silent no-op — the whole point of this file over `disabled` is that the tradeoff
-  gets written down.
+- **`reason`** — required, and must be non-empty. A malformed entry (bad JSON, or an
+  empty `reason`) is a hard error on the next check run, not a silent no-op — the
+  whole point of this directory over `disabled` is that the tradeoff gets written down.
 
 Walked upward from the checked file the same way `.claude/inspect.json` is (so one
-`.claude/kibitzer-accepted.json` at the repo root covers the whole tree).
+`.kibitzer/accepted/` at the repo root covers the whole tree).
 
 ## Scope
 
@@ -71,15 +71,15 @@ is empty, so accepting away one of its output lines can't safely flip that check
 "passed" the way it can for a native one — out of scope for now. Whole-repo
 architecture checks (`instability`, `layering`, `change-coupling`, etc.) are also out
 of scope; they report at package/component granularity, not a specific line, so this
-file's `(rule, file, line, content)` key doesn't fit them.
+directory's `(rule, file, line, content)` key doesn't fit them.
 
-There's still no inline suppression comment (`// kibitzer:accept ...`) — this file is
-the mechanism, kept checked-in and reviewable rather than scattered through source, and
-consistent with `docs/suppressing-checks.md`'s existing config-based-only stance.
+There's still no inline suppression comment (`// kibitzer:accept ...`) — this directory
+is the mechanism, kept checked-in and reviewable rather than scattered through source,
+and consistent with `docs/suppressing-checks.md`'s existing config-based-only stance.
 
 ## Removing an entry
 
-Delete it once the accepted tradeoff no longer applies — a refactor removed the flag
-argument, the file was deleted, or you've reconsidered and want to fix the underlying
-finding instead. There's no automatic pruning: an entry whose line has drifted just
-stops suppressing (see `content` above) but stays in the file until someone removes it.
+Delete its file once the accepted tradeoff no longer applies — a refactor removed the
+flag argument, the file was deleted, or you've reconsidered and want to fix the
+underlying finding instead. There's no automatic pruning: an entry whose line has
+drifted just stops suppressing (see `content` above) but stays until someone deletes it.

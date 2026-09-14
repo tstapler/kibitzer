@@ -72,8 +72,8 @@ The levers above are whole-checker or whole-file/directory. For a genuine hit at
 one specific line that you've deliberately decided to keep — a real
 `flag-argument` match on a CLI's standard `-v` toggle, say — disabling the whole
 checker for that file would also silence every other rule it covers there. See
-`docs/accepting-findings.md` for `.claude/kibitzer-accepted.json`, a per-finding
-lever that requires a written reason and only that one location.
+`docs/accepting-findings.md` for `.kibitzer/accepted/`, a per-finding lever that
+requires a written reason and only that one location.
 
 ## If a finding looks flat-out wrong
 

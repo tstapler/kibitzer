@@ -122,9 +122,10 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
     // otherwise reloads and reparses `registry.json` from disk on every single
     // dispatch, even for a repo with zero plugins installed.
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    // Same rationale, and additionally: a malformed `.claude/kibitzer-accepted.json`
-    // must surface as one clean error here, before any file's checks run, rather than
-    // failing nondeterministically mid-batch depending on file-walk order.
+    // Same rationale, and additionally: a malformed entry under
+    // `accepted_findings::ACCEPTED_FINDINGS_DIR` must surface as one clean error here,
+    // before any file's checks run, rather than failing nondeterministically mid-batch
+    // depending on file-walk order.
     let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
 
     for check in &repo_checks {

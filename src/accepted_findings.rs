@@ -3,9 +3,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::config::CONFIG_DIR;
-
-pub const ACCEPTED_FINDINGS_FILENAME: &str = "kibitzer-accepted.json";
+/// Repo-root-relative directory holding one file per accepted finding — deliberately
+/// its own top-level dir rather than living under `.claude` (that's Claude Code's own
+/// config namespace, not kibitzer's) and deliberately a directory of many small files
+/// rather than one shared JSON array: two branches each adding an entry create two new
+/// files instead of both editing the same array, so merging never conflicts.
+pub const ACCEPTED_FINDINGS_DIR: &str = ".kibitzer/accepted";
 
 /// One deliberately-accepted finding: a specific checker rule firing correctly at a
 /// specific line, kept on purpose rather than fixed or globally suppressed. Distinct
@@ -44,21 +47,18 @@ impl AcceptedFindings {
     }
 }
 
-/// Walks upward from `start` looking for `.claude/kibitzer-accepted.json`, the same
+/// Walks upward from `start` looking for a `.kibitzer/accepted/` directory, the same
 /// convention as `config::find_config`. Returns an empty [`AcceptedFindings`] (not an
-/// error) when no such file exists anywhere above `start` — accepting findings is
-/// opt-in, most repos will never have one.
+/// error) when no such directory exists anywhere above `start` — accepting findings is
+/// opt-in, most repos will never have one. Every `*.json` file directly inside it (not
+/// recursed into subdirectories) holds one [`AcceptedFinding`] object; entries are
+/// collected in filename order for deterministic output.
 pub fn find_accepted_findings(start: &Path) -> Result<AcceptedFindings> {
     let mut dir = crate::config::start_dir(start);
     loop {
-        let candidate = dir.join(CONFIG_DIR).join(ACCEPTED_FINDINGS_FILENAME);
-        if candidate.is_file() {
-            let raw = std::fs::read_to_string(&candidate)
-                .with_context(|| format!("reading {}", candidate.display()))?;
-            let parsed: AcceptedFindings = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", candidate.display()))?;
-            validate(&parsed, &candidate)?;
-            return Ok(parsed);
+        let candidate = dir.join(ACCEPTED_FINDINGS_DIR);
+        if candidate.is_dir() {
+            return read_accepted_dir(&candidate);
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
@@ -67,8 +67,21 @@ pub fn find_accepted_findings(start: &Path) -> Result<AcceptedFindings> {
     }
 }
 
-fn validate(parsed: &AcceptedFindings, path: &Path) -> Result<()> {
-    for entry in &parsed.accepted {
+fn read_accepted_dir(dir: &Path) -> Result<AcceptedFindings> {
+    let mut entry_paths: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    entry_paths.sort();
+
+    let mut accepted = Vec::with_capacity(entry_paths.len());
+    for path in entry_paths {
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let entry: AcceptedFinding = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
         if entry.reason.trim().is_empty() {
             anyhow::bail!(
                 "{}: entry for [{}] {}:{} has an empty reason — a reason is required, \
@@ -79,8 +92,9 @@ fn validate(parsed: &AcceptedFindings, path: &Path) -> Result<()> {
                 entry.line
             );
         }
+        accepted.push(entry);
     }
-    Ok(())
+    Ok(AcceptedFindings { accepted })
 }
 
 /// The `[rule-id]` a checker self-prefixes its message with, or `fallback` (the
@@ -182,13 +196,16 @@ mod tests {
         );
     }
 
+    /// `accepted_json` is the old `{"accepted": [...]}` shape purely so every call site
+    /// below can keep listing entries inline — it's split into one file per array entry
+    /// under `ACCEPTED_FINDINGS_DIR`, the real on-disk layout `read_accepted_dir` parses.
     fn write_repo(dir: &Path, file_rel: &str, file_content: &str, accepted_json: &str) {
-        std::fs::create_dir_all(dir.join(CONFIG_DIR)).unwrap();
-        std::fs::write(
-            dir.join(CONFIG_DIR).join(ACCEPTED_FINDINGS_FILENAME),
-            accepted_json,
-        )
-        .unwrap();
+        let accepted_dir = dir.join(ACCEPTED_FINDINGS_DIR);
+        std::fs::create_dir_all(&accepted_dir).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(accepted_json).unwrap();
+        for (i, entry) in parsed["accepted"].as_array().unwrap().iter().enumerate() {
+            std::fs::write(accepted_dir.join(format!("{i}.json")), entry.to_string()).unwrap();
+        }
         let file_path = dir.join(file_rel);
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(&file_path, file_content).unwrap();
@@ -223,7 +240,7 @@ mod tests {
 
     /// Precedent: `config.rs`'s `find_repo_root_walks_up_to_nearest_dot_git` tests the
     /// same kind of upward walk for `.git`; this is the equivalent for
-    /// `.claude/kibitzer-accepted.json`.
+    /// `ACCEPTED_FINDINGS_DIR`.
     #[test]
     fn find_accepted_findings_walks_upward_from_a_nested_directory() {
         let dir = temp_dir("upward-walk");
@@ -239,6 +256,33 @@ mod tests {
         let found = find_accepted_findings(&nested).unwrap();
         assert_eq!(found.accepted.len(), 1);
         assert_eq!(found.accepted[0].file, "main.go");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of one-file-per-finding: two entries added independently (as two
+    /// separate files, the way two branches each adding one would land after a
+    /// conflict-free merge) both load, regardless of which filename sorts first.
+    #[test]
+    fn find_accepted_findings_aggregates_every_file_in_the_directory() {
+        let dir = temp_dir("multi-file");
+        let accepted_dir = dir.join(ACCEPTED_FINDINGS_DIR);
+        std::fs::create_dir_all(&accepted_dir).unwrap();
+        std::fs::write(
+            accepted_dir.join("flag-argument-main-go-3.json"),
+            r#"{"rule": "flag-argument", "file": "main.go", "line": 3, "content": "func f(verbose bool) {}", "reason": "CLI -v toggle"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            accepted_dir.join("primitive-obsession-user-go-3.json"),
+            r#"{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype"}"#,
+        )
+        .unwrap();
+        // A stray non-JSON file in the same directory (e.g. a README explaining the
+        // convention) must be ignored rather than failing the whole load.
+        std::fs::write(accepted_dir.join("README.md"), "see docs/accepting-findings.md").unwrap();
+
+        let found = find_accepted_findings(&dir).unwrap();
+        assert_eq!(found.accepted.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
