@@ -46,9 +46,25 @@ kibitzer check native markdown-link-integrity <file> # flag broken markdown refe
 kibitzer check native file-complexity <file>       # flag a Go file with several functions over a cyclomatic-complexity threshold
 kibitzer check duplicates <dir>      # cross-file duplicate-code detection, repo-wide (batch)
 kibitzer check list                  # list all natively implemented checkers
+kibitzer schema [--out <file>]       # emit .claude/inspect.json's JSON Schema
 ```
 
 See `docs/checking-invocations.md` for how checks are wired up.
+
+### `inspect.json` schema
+
+`kibitzer schema [--out <file>]` prints the JSON Schema for `.claude/inspect.json`,
+generated from `config::Config`'s own type definitions (so it can't drift from what
+kibitzer actually parses) — each field's doc comment becomes its schema `description`,
+covering `scope` glob syntax, `triggers`, `{file}`/`{changed_lines}` substitution, and
+everything else in `Check`/`ArchitectureConfig`. A generated copy is checked in at
+`schema/inspect.schema.json`; reference it for editor autocomplete/validation:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/tstapler/kibitzer/master/schema/inspect.schema.json"
+}
+```
 
 ### Migrating off `markdownlint-cli2` / `scripts/doc_report.py`
 

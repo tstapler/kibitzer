@@ -35,6 +35,7 @@ mod plugin;
 mod primitive_obsession;
 mod rules;
 mod run;
+mod schema;
 mod status;
 mod symbol_extract;
 mod task_stop;
@@ -105,6 +106,13 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Emit the JSON Schema for `.claude/inspect.json` (derived from `config::Config`),
+    /// for a `"$schema"` reference / editor autocomplete. See `schema/README.md`.
+    Schema {
+        /// File to write the schema to. Defaults to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -421,6 +429,7 @@ fn main() -> Result<ExitCode> {
                 }
             },
         },
+        Command::Schema { out } => schema::run_schema(out),
     }
 }
 
