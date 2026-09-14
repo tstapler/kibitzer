@@ -1,8 +1,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -247,9 +248,56 @@ pub fn try_run_checks_via_daemon(
     if response.ok { response.results } else { None }
 }
 
+/// Minimum time between background-spawn attempts, so a daemon that keeps failing to
+/// start (e.g. permission denied binding the socket) doesn't get re-spawned on every
+/// single hook invocation.
+const SPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// True when `marker_modified` is recent enough that another spawn attempt should be
+/// skipped. Split out from `maybe_spawn_daemon` so the debounce window can be tested
+/// without actually spawning a process or touching the real socket path.
+fn spawn_is_debounced(marker_modified: Option<SystemTime>, now: SystemTime) -> bool {
+    marker_modified
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed < SPAWN_RETRY_INTERVAL)
+}
+
+/// Best-effort: spawn `kibitzer daemon start` detached in the background when no daemon
+/// is reachable, so caching kicks in for later calls without the user having to remember
+/// to start one themselves. Errors are swallowed — the caller already has an in-process
+/// fallback, so a failed spawn just means the next call falls back the same way.
+///
+/// Set `KIBITZER_NO_AUTO_DAEMON` (any value) to disable — `tests/hook_contract.rs` does,
+/// since it exercises the deterministic no-daemon fallback path itself and a real daemon
+/// racing to life mid-test would otherwise answer later calls instead.
+fn maybe_spawn_daemon() {
+    if std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
+        return;
+    }
+    let marker = default_socket_path().with_extension("spawn-attempt");
+    let marker_modified = std::fs::metadata(&marker)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    if spawn_is_debounced(marker_modified, SystemTime::now()) {
+        return;
+    }
+    let _ = std::fs::write(&marker, b"");
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 /// Run checks via the daemon if one is up, otherwise run them directly in-process
-/// (uncached). This is the entry point `hook`/`run` should use instead of calling
-/// `find_config` + `run_checks_for_trigger` themselves.
+/// (uncached) and kick off a background daemon (see `maybe_spawn_daemon`) so later calls
+/// don't pay the uncached cost too. This is the entry point `hook`/`run` should use
+/// instead of calling `find_config` + `run_checks_for_trigger` themselves.
 pub fn run_checks_smart(
     cwd: &Path,
     file_path: &Path,
@@ -259,6 +307,19 @@ pub fn run_checks_smart(
     if let Some(results) = try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines) {
         return Ok(results);
     }
+    maybe_spawn_daemon();
+    run_uncached(cwd, file_path, trigger, changed_lines)
+}
+
+/// The no-daemon-reachable path of `run_checks_smart`: run checks in-process and persist
+/// results/grace-state to the on-disk cache directly, split out so `run_checks_smart`
+/// itself stays a short dispatch between the daemon and this fallback.
+fn run_uncached(
+    cwd: &Path,
+    file_path: &Path,
+    trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Result<Vec<CheckResult>> {
     let (config, repo_root) = find_effective_config(cwd)?;
     let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
@@ -297,4 +358,27 @@ pub fn run_checks_smart(
     let _ = cache.save(&cache_path);
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod spawn_debounce_tests {
+    use super::*;
+
+    #[test]
+    fn debounces_a_recent_attempt() {
+        let now = SystemTime::now();
+        assert!(spawn_is_debounced(Some(now), now));
+    }
+
+    #[test]
+    fn allows_a_retry_once_the_interval_elapses() {
+        let now = SystemTime::now();
+        let stale = now - SPAWN_RETRY_INTERVAL - Duration::from_secs(1);
+        assert!(!spawn_is_debounced(Some(stale), now));
+    }
+
+    #[test]
+    fn allows_the_first_attempt() {
+        assert!(!spawn_is_debounced(None, SystemTime::now()));
+    }
 }

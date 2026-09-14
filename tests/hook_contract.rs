@@ -7,7 +7,10 @@
 //! socket path from it) so these subprocesses never silently talk to a real `kibitzer
 //! daemon` left running on the dev machine — without this, a stray daemon answers
 //! `try_run_checks_via_daemon` instead of exercising the no-daemon fallback path
-//! these tests mean to cover.
+//! these tests mean to cover. Also sets `KIBITZER_NO_AUTO_DAEMON` — otherwise the first
+//! no-daemon call in a test would spawn a real background daemon (even isolated to this
+//! test's own `XDG_RUNTIME_DIR`) that could then race to life and answer a later call in
+//! the same test, the same problem as the stray-daemon case above.
 
 use serde_json::json;
 use std::io::Write as _;
@@ -103,6 +106,7 @@ impl TempRepo {
             .current_dir(&self.dir)
             .env("XDG_CACHE_HOME", &self.cache_dir)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .env("KIBITZER_NO_AUTO_DAEMON", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

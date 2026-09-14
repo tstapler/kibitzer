@@ -45,10 +45,13 @@ entries into `settings.json` using the resolved absolute path to the
 installed binary — idempotent, safe to rerun, and it won't clobber other
 hooks already configured there.
 
-## 4. Optionally start the daemon
+## 4. The daemon (optional, auto-starts itself)
 
 Repeat invocations (one per edit, via the hook) re-parse and re-check from
-scratch unless a daemon is caching results:
+scratch unless a daemon is caching results. `kibitzer hook` auto-spawns one
+in the background the first time it finds none reachable, so there's no
+manual step — later hook calls in the same session just find it already
+running. Manage it directly if you want:
 
 ```bash
 kibitzer daemon start   # runs in the foreground — background it yourself
