@@ -7,7 +7,10 @@
 //! socket path from it) so these subprocesses never silently talk to a real `kibitzer
 //! daemon` left running on the dev machine — without this, a stray daemon answers
 //! `try_run_checks_via_daemon` instead of exercising the no-daemon fallback path
-//! these tests mean to cover.
+//! these tests mean to cover. Also sets `KIBITZER_NO_AUTO_DAEMON` — otherwise the first
+//! no-daemon call in a test would spawn a real background daemon (even isolated to this
+//! test's own `XDG_RUNTIME_DIR`) that could then race to life and answer a later call in
+//! the same test, the same problem as the stray-daemon case above.
 
 use serde_json::json;
 use std::io::Write as _;
@@ -103,6 +106,7 @@ impl TempRepo {
             .current_dir(&self.dir)
             .env("XDG_CACHE_HOME", &self.cache_dir)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .env("KIBITZER_NO_AUTO_DAEMON", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -167,6 +171,38 @@ fn passing_check_exits_zero_with_no_output() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
+}
+
+/// The whole isolation strategy this file relies on (see the module doc comment) rests
+/// on `KIBITZER_NO_AUTO_DAEMON` actually suppressing `maybe_spawn_daemon`'s background
+/// spawn — nothing else in this suite would fail if that gate silently stopped working,
+/// since a real daemon racing to life just makes other tests flaky rather than crash
+/// outright. Assert it directly: `spawn_hook` always sets the var, so no marker file
+/// (written unconditionally before the gate's early return would ever be skipped) should
+/// appear under the isolated `XDG_RUNTIME_DIR`.
+#[test]
+fn no_auto_daemon_env_var_suppresses_the_background_spawn() {
+    let repo = TempRepo::new(
+        "no-auto-daemon-gate",
+        json!({
+            "name": "always-passes",
+            "command": "true",
+            "severity": "advisory",
+            "message": "n/a",
+        }),
+    );
+    let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
+    let marker = repo
+        .runtime_dir
+        .join(format!("kibitzer-{user}.spawn-attempt"));
+
+    let (code, _, stderr) = repo.run_hook("foo.txt", "ok\n");
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        !marker.exists(),
+        "KIBITZER_NO_AUTO_DAEMON=1 must suppress the spawn-attempt marker entirely"
+    );
 }
 
 #[test]
