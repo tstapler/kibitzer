@@ -68,20 +68,23 @@ pub fn find_accepted_findings(start: &Path) -> Result<AcceptedFindings> {
 }
 
 fn read_accepted_dir(dir: &Path) -> Result<AcceptedFindings> {
-    let mut entry_paths: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
+    let mut entry_paths = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("reading an entry of {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            entry_paths.push(path);
+        }
+    }
     entry_paths.sort();
 
     let mut accepted = Vec::with_capacity(entry_paths.len());
     for path in entry_paths {
-        let raw =
-            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let entry: AcceptedFinding = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let entry: AcceptedFinding =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         if entry.reason.trim().is_empty() {
             anyhow::bail!(
                 "{}: entry for [{}] {}:{} has an empty reason — a reason is required, \
@@ -279,10 +282,18 @@ mod tests {
         .unwrap();
         // A stray non-JSON file in the same directory (e.g. a README explaining the
         // convention) must be ignored rather than failing the whole load.
-        std::fs::write(accepted_dir.join("README.md"), "see docs/accepting-findings.md").unwrap();
+        std::fs::write(
+            accepted_dir.join("README.md"),
+            "see docs/accepting-findings.md",
+        )
+        .unwrap();
 
         let found = find_accepted_findings(&dir).unwrap();
         assert_eq!(found.accepted.len(), 2);
+        // Pins the "filename order" half of the doc comment's determinism claim, not
+        // just the count: "flag-argument-..." sorts before "primitive-obsession-...".
+        assert_eq!(found.accepted[0].rule, "flag-argument");
+        assert_eq!(found.accepted[1].rule, "primitive-obsession");
         std::fs::remove_dir_all(&dir).ok();
     }
 

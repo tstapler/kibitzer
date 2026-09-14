@@ -22,9 +22,12 @@ will re-flag the same line on every future edit.
 A checked-in directory of hand-authored files, one JSON file per accepted finding —
 not one shared array, so two people accepting different findings on different
 branches each add a new file instead of both editing the same list, and the merge
-never conflicts. Filename doesn't matter (kibitzer globs every `*.json` file directly
-in the directory); name it however makes the entry easy to find later, e.g.
-`flag-argument-main-rs-42.json`:
+never conflicts. The tradeoff: if two branches happen to accept the *same*
+`(rule, file, line)`, the merge is still conflict-free, but you now have two files
+for one finding and whichever sorts first by filename silently wins — worth a glance
+at `.kibitzer/accepted/` after a merge if you suspect that happened. Filename doesn't
+matter otherwise (kibitzer globs every `*.json` file directly in the directory); name
+it however makes the entry easy to find later, e.g. `flag-argument-main-rs-42.json`:
 
 ```json
 {
