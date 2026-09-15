@@ -38,6 +38,20 @@ const ISP_MIN_INTERFACE_METHODS: usize = 5;
 /// it, splitting the interface wouldn't actually decouple that consumer from anything.
 const ISP_MAX_USAGE_FRACTION: f64 = 0.5;
 
+/// Minimum number of *distinct* same-package consumers observed before "the heaviest one
+/// uses only M of N methods" is worth reporting at all. Confirmed as a real gap
+/// backtesting against `kubernetes/kubernetes`: consumers here are same-package-only (see
+/// this checker's doc comment), which undercounts a widely-shared, cross-package-exported
+/// interface badly — `metav1.Object` showed only 5 same-package consumers even though
+/// `grep -rl 'metav1\.Object\b'` across the whole repo finds 100 files referencing it, and
+/// several other findings had exactly 1 observed consumer, which is not a pattern, it's a
+/// single data point. Requiring several observed consumers before flagging doesn't fix the
+/// same-package undercounting itself (that's the documented "known ceiling, not fixed for
+/// v1" above), but it does stop the checker from asserting a design smell off evidence too
+/// thin to support it. No stronger literature citation than "a sample of one proves
+/// nothing," same status as `ISP_MIN_INTERFACE_METHODS`/`GOD_CLASS_MIN_METHODS`.
+const ISP_MIN_CONSUMERS: usize = 3;
+
 /// ISP fat-interface detector. See this module's doc comment for the full design and its
 /// scope (Go-only, same-package-only, declared-methods-only).
 ///
@@ -117,6 +131,9 @@ fn isp_findings_for_package(pkg: &PackageNode) -> Vec<ArchFinding> {
                 return None;
             }
             let usages = usage.get(interface_name)?;
+            if usages.len() < ISP_MIN_CONSUMERS {
+                return None;
+            }
             let max_used = *usages.iter().max()?;
             let fraction = max_used as f64 / methods.len() as f64;
             if fraction > ISP_MAX_USAGE_FRACTION {
@@ -126,9 +143,12 @@ fn isp_findings_for_package(pkg: &PackageNode) -> Vec<ArchFinding> {
                 file: None,
                 line: None,
                 message: format!(
-                    "[isp-fat-interface] {}::{interface_name} declares {} methods, but the \
-                     heaviest of {} observed consumers uses only {max_used} — no consumer \
-                     needs the whole interface; consider splitting it by usage",
+                    "[isp-fat-interface] {}::{interface_name} declares {} methods; of {} \
+                     observed same-package consumers, the heaviest used only {max_used} — \
+                     likely means no consumer needs the whole interface, though this only \
+                     sees consumers in the same package (see the checker's own documented \
+                     ceiling); worth a second look, not proof — consider splitting it by \
+                     usage",
                     pkg.path,
                     methods.len(),
                     usages.len()
@@ -296,6 +316,42 @@ mod tests {
             "package pkg\n\n\
              type Store interface {\n\tA()\n\tB()\n\tC()\n\tD()\n\tE()\n\tF()\n}\n\n\
              func UseAB(s Store) {\n\ts.A()\n\ts.B()\n}\n\n\
+             func UseC(s Store) {\n\ts.C()\n}\n\n\
+             func UseD(s Store) {\n\ts.D()\n}\n",
+        );
+        let pkg = package(
+            "pkg",
+            vec![
+                interface_symbol("pkg", "Store", &file, 3),
+                function_symbol("pkg", "UseAB", &file, 12),
+                function_symbol("pkg", "UseC", &file, 17),
+                function_symbol("pkg", "UseD", &file, 21),
+            ],
+            vec![file],
+        );
+        let findings = isp_findings_for_package(&pkg);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("declares 6 methods"));
+        assert!(findings[0].message.contains("heaviest used only 2"));
+        assert!(
+            findings[0]
+                .message
+                .contains("3 observed same-package consumers")
+        );
+    }
+
+    #[test]
+    fn does_not_flag_below_the_minimum_consumer_count() {
+        // Same shape as the "flags" test above but with only 2 consumers, one below
+        // ISP_MIN_CONSUMERS - a small same-package sample must not be reported as a
+        // design smell, regardless of what fraction it happens to show.
+        let dir = crate::test_support::unique_temp_dir("isp-too-few-consumers");
+        let file = write_go_file(
+            &dir,
+            "t.go",
+            "package pkg\n\n\
+             type Store interface {\n\tA()\n\tB()\n\tC()\n\tD()\n\tE()\n\tF()\n}\n\n\
+             func UseAB(s Store) {\n\ts.A()\n\ts.B()\n}\n\n\
              func UseC(s Store) {\n\ts.C()\n}\n",
         );
         let pkg = package(
@@ -307,11 +363,10 @@ mod tests {
             ],
             vec![file],
         );
-        let findings = isp_findings_for_package(&pkg);
-        assert_eq!(findings.len(), 1, "got: {findings:?}");
-        assert!(findings[0].message.contains("declares 6 methods"));
-        assert!(findings[0].message.contains("uses only 2"));
-        assert!(findings[0].message.contains("2 observed consumers"));
+        assert!(
+            isp_findings_for_package(&pkg).is_empty(),
+            "2 observed consumers is below ISP_MIN_CONSUMERS"
+        );
     }
 
     #[test]
@@ -322,17 +377,26 @@ mod tests {
             "t.go",
             "package pkg\n\n\
              type Store interface {\n\tA()\n\tB()\n\tC()\n\tD()\n\tE()\n\tF()\n}\n\n\
-             func UseAlmostAll(s Store) {\n\ts.A()\n\ts.B()\n\ts.C()\n\ts.D()\n}\n",
+             func UseAlmostAll(s Store) {\n\ts.A()\n\ts.B()\n\ts.C()\n\ts.D()\n}\n\n\
+             func UseA(s Store) {\n\ts.A()\n}\n\n\
+             func UseB(s Store) {\n\ts.B()\n}\n",
         );
         let pkg = package(
             "pkg",
             vec![
                 interface_symbol("pkg", "Store", &file, 3),
                 function_symbol("pkg", "UseAlmostAll", &file, 12),
+                function_symbol("pkg", "UseA", &file, 19),
+                function_symbol("pkg", "UseB", &file, 23),
             ],
             vec![file],
         );
-        assert!(isp_findings_for_package(&pkg).is_empty());
+        assert!(
+            isp_findings_for_package(&pkg).is_empty(),
+            "3 consumers clears ISP_MIN_CONSUMERS, but the heaviest uses 4/6 (over the \
+             fraction threshold) - this must fail on the fraction check, not the count \
+             gate, to actually exercise what this test is named for"
+        );
     }
 
     #[test]
