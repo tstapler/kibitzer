@@ -618,6 +618,7 @@ pub fn default_checks() -> Vec<Check> {
         native_check("go-blank-imports", Severity::Advisory, &["**/*.go"]),
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
+        native_check("go-type-switch-density", Severity::Advisory, &["**/*.go"]),
         native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
         whole_repo_check("go-package-size", "package-size"),
         native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),

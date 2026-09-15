@@ -113,7 +113,7 @@ impl PackageNode {
 /// What a `build_model` run excluded and why, embedded in `ArchModel` so a consumer
 /// never mistakes "pruned" for "doesn't exist," and never mistakes "no supported
 /// language in this file" for "no code here."
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PruningSummary {
     pub include_private: bool,
     pub excluded_dirs: Vec<String>,
