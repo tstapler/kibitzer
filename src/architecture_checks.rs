@@ -822,12 +822,25 @@ fn union_same_type_calls(
 /// method with no connectivity signal of its own is excluded before it ever reaches here,
 /// rather than being counted as a forced singleton component.
 ///
-/// `None` when this type has no connectivity signal at all — e.g. every `Method`'s
-/// receiver's underlying Go type isn't a struct (`type Set[T comparable] map[T]struct{}`),
-/// so `field_accesses` has zero entries and the type would otherwise misread as "maximally
-/// disconnected" rather than "unknown." Distinguished from a real struct whose methods
-/// simply don't share any field (a legitimate LCOM4 finding), which still has *some*
-/// `field_accesses`/same-type `call_edges` entries, just not overlapping ones.
+/// A type with zero connectivity signal at all — e.g. every `Method`'s receiver's
+/// underlying Go type isn't a struct (`type Set[T comparable] map[T]struct{}`), so
+/// `field_accesses` has zero entries — never reaches this function in the first place:
+/// every one of its methods fails `methods_with_own_signal`'s per-method filter (no field
+/// access, no same-type call), so `lcom_findings_for_package`'s `evaluated.len() <
+/// LCOM_MIN_METHODS` gate returns early before calling here (see
+/// `lcom_skips_a_type_with_zero_field_or_call_signal_at_all`, which is the real regression
+/// test for that case). Once `method_ids` is non-empty, `has_field_signal`/
+/// `has_call_signal` below are structurally guaranteed to include at least one — every
+/// member of `method_ids` cleared the same own-signal filter, and both endpoints of the
+/// field-access/call-edge entry that gave it that signal land in `index` together (a call
+/// edge's `to` gets the identical signal as its `from`; a field access's `from` is by
+/// construction the method that produced it). The `debug_assert!` below encodes that
+/// invariant rather than silently trusting it — earlier code returned `Option<usize>` for
+/// a case this function could never actually observe from its one call site, once
+/// `methods_with_own_signal` existed (this was PR #84's deferred "whole-type vs
+/// per-method zero-signal skip" ceiling — the granularity gap it described was already
+/// closed by `methods_with_own_signal` itself; the dead `None` branch here just hadn't
+/// been noticed and removed yet).
 ///
 /// Known false-positive ceiling, confirmed backtesting against `k8s.io/apimachinery`: a
 /// large struct with one independent getter/setter pair per field (`ObjectMeta`) reports a
@@ -838,7 +851,7 @@ fn lcom4_components(
     method_ids: &[&str],
     model: &crate::arch_model::ArchModel,
     type_prefix: &str,
-) -> Option<usize> {
+) -> usize {
     let index: HashMap<&str, usize> = method_ids
         .iter()
         .enumerate()
@@ -848,16 +861,16 @@ fn lcom4_components(
 
     let has_field_signal = union_shared_field_accesses(&index, model, &mut parent);
     let has_call_signal = union_same_type_calls(&index, model, type_prefix, &mut parent);
-    if !has_field_signal && !has_call_signal {
-        return None;
-    }
+    debug_assert!(
+        method_ids.is_empty() || has_field_signal || has_call_signal,
+        "every method_ids entry must have cleared methods_with_own_signal, which \
+         guarantees at least one field-access or same-type call edge exists for this type"
+    );
 
-    Some(
-        (0..method_ids.len())
-            .map(|i| crate::union_find::root(&mut parent, i))
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-    )
+    (0..method_ids.len())
+        .map(|i| crate::union_find::root(&mut parent, i))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 fn lcom_findings_for_package(
@@ -872,7 +885,7 @@ fn lcom_findings_for_package(
             if evaluated.len() < LCOM_MIN_METHODS {
                 return None;
             }
-            let components = lcom4_components(&evaluated, model, &type_prefix)?;
+            let components = lcom4_components(&evaluated, model, &type_prefix);
             if components <= 1 {
                 return None;
             }
