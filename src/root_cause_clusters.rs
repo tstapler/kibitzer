@@ -132,86 +132,108 @@ fn shared_files_of<'a>(members: &[usize], commits: &'a [TaggedCommit]) -> Vec<&'
 }
 
 /// Every architecture finding kibitzer's own checkers produce against the repo at
-/// `repo_root` right now, tagged with the checker name that produced it (`ArchFinding`
-/// itself carries no checker-name field). Runs every `ArchitectureChecker`/
-/// `ArchModelChecker` with default config, same as `architecture_assessment`'s whole-repo
-/// survey — this function exists so `corroborate` has something to cross-reference against
-/// without requiring the caller to already have an `ArchModel`/`ImportGraph` in hand.
-fn current_findings(repo_root: &Path) -> Result<(ArchModel, Vec<(&'static str, ArchFinding)>)> {
+/// `repo_root` right now (`ArchFinding.message` already carries its own `[checker-name]`
+/// tag by this codebase's convention, so nothing further tags them here). Runs every
+/// `ArchitectureChecker`/`ArchModelChecker` with default config, same as
+/// `architecture_assessment`'s whole-repo survey — this function exists so `corroborate`
+/// has something to cross-reference against without requiring the caller to already have
+/// an `ArchModel`/`ImportGraph` in hand.
+fn current_findings(repo_root: &Path) -> Result<(ArchModel, Vec<ArchFinding>)> {
     let (graph, files) = arch_model::collect_repo_files(repo_root)
         .with_context(|| format!("walking {}", repo_root.display()))?;
     let model = arch_model::build_model(repo_root, &files, &graph, &PruneConfig::default())
         .with_context(|| format!("building architecture model for {}", repo_root.display()))?;
     let config = ArchitectureConfig::default();
 
-    let mut findings: Vec<(&'static str, ArchFinding)> = Vec::new();
+    let mut findings: Vec<ArchFinding> = Vec::new();
     for checker in architecture_checks::registry() {
-        for finding in checker.check(&graph, &config) {
-            findings.push((checker_static_name(checker.name()), finding));
-        }
+        findings.extend(checker.check(&graph, &config));
     }
     for checker in architecture_checks::model_registry() {
-        for finding in checker.check(&model, &config) {
-            findings.push((checker_static_name(checker.name()), finding));
-        }
+        findings.extend(checker.check(&model, &config));
     }
     Ok((model, findings))
 }
 
-/// `ArchitectureChecker::name`/`ArchModelChecker::name` return `&str` borrowed from the
-/// boxed checker (dropped at the end of the loop it's called in), but every real
-/// implementation actually returns a `'static` string literal — this leaks nothing new,
-/// it just re-asserts that fact so the name can outlive the checker box.
-fn checker_static_name(name: &str) -> &'static str {
-    match name {
-        "import-cycles" => "import-cycles",
-        "layering" => "layering",
-        "coupling" => "coupling",
-        "component-deps" => "component-deps",
-        "package-size" => "package-size",
-        "instability" => "instability",
-        "dip-concrete-coupling" => "dip-concrete-coupling",
-        "lcom" => "lcom",
-        _ => "unknown-checker",
-    }
+/// Repo-root-relative, forward-slash-normalized form of `path` — matches both git log's
+/// path format and `shared_files`'s. `path` may be absolute or relative depending on how
+/// the caller's `repo_root` was given to `build_model` (e.g. `.` walked into
+/// `./src/foo.go`, or an absolute temp-dir path walked into
+/// `/tmp/.../src/foo.go`) — `strip_prefix` handles both; falls back to `path` unchanged if
+/// it isn't actually under `repo_root` (shouldn't happen for a finding produced from this
+/// same model, but avoids silently dropping it if it ever does).
+///
+/// `corroborate`'s file-match branch needs this: comparing an un-normalized `finding.file`
+/// directly against `shared_files` (bare git-relative paths) only coincides by accident,
+/// since `ArchFinding.file` carries whatever path form the model was built with.
+fn normalize_repo_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
-/// Repo-root-relative path (forward-slash-normalized, matching git's own path format) for
-/// every file in every package of `model` — the lookup `corroborate` uses to map a
-/// package-level finding's package path back to the files it owns.
+/// `path`-relative form of every file in every package of `model` — the lookup
+/// `corroborate` uses to map a package-level finding's package path back to the files it
+/// owns.
 fn files_by_package(model: &ArchModel) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for pkg in model.packages.values() {
         for file in &pkg.files {
-            let rel = file
-                .strip_prefix(&model.repo_root)
-                .unwrap_or(file)
-                .to_string_lossy()
-                .replace('\\', "/");
-            map.insert(rel, pkg.path.clone());
+            map.insert(
+                normalize_repo_path(&model.repo_root, file),
+                pkg.path.clone(),
+            );
         }
     }
     map
 }
 
+/// Characters that continue a path/identifier segment — used by [`package_mentioned_in`]
+/// to tell a real package-boundary match from a partial-segment substring collision.
+fn is_segment_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Whether `pkg` appears in `message` as a whole path-segment sequence, not merely as a
+/// substring — a bare `message.contains(pkg)` would let `"internal/db"` match inside
+/// `"internal/dbmigrate"`. A match counts only if the character immediately before and
+/// after it (when present) isn't itself a segment-continuation character
+/// ([`is_segment_char`]); a `/`, `.`, `:`, whitespace, punctuation, or start/end of string
+/// all count as a real boundary.
+fn package_mentioned_in(message: &str, pkg: &str) -> bool {
+    if pkg.is_empty() {
+        return false;
+    }
+    message.match_indices(pkg).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_ok = message[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_segment_char(c));
+        let after_ok = message[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_segment_char(c));
+        before_ok && after_ok
+    })
+}
+
 /// Cross-references `shared_files` against `findings`: a finding with a `file` matching
-/// one of `shared_files` exactly corroborates directly; a package-level finding (`file:
-/// None` — `instability`/`dip-concrete-coupling`/most `coupling`/`component-deps`
-/// findings) corroborates if its message mentions the package that owns one of
-/// `shared_files` (per `file_packages`) — messages always embed the package path
-/// literally, so a substring match is a legitimate, if imperfect, cross-reference; a
-/// coincidental substring match is possible but unlikely given package paths are
-/// multi-segment. Returns the first match found, in `findings`' order — not the
-/// "best" or most specific one, since there's no principled way to rank them here.
+/// one of `shared_files` (both normalized via [`normalize_repo_path`]) corroborates
+/// directly; a package-level finding (`file: None` — `instability`/`dip-concrete-coupling`/
+/// most `coupling`/`component-deps` findings) corroborates if its message mentions
+/// ([`package_mentioned_in`]) the package that owns one of `shared_files` (per
+/// `file_packages`). Returns the first match found, in `findings`' order — not the "best"
+/// or most specific one, since there's no principled way to rank them here.
 /// `ArchFinding.message` is already bracket-tagged with its checker name by this
 /// codebase's own convention (`[import-cycles] ...`, `[instability] ...`), so it's
-/// returned as-is rather than tagged a second time — `checker` (the `&'static str` this
-/// finding was collected under) is only needed to make that convention explicit here, not
-/// to build a new prefix.
+/// returned as-is rather than tagged a second time.
 fn corroborate(
+    repo_root: &Path,
     shared_files: &[&str],
     file_packages: &HashMap<String, String>,
-    findings: &[(&'static str, ArchFinding)],
+    findings: &[ArchFinding],
 ) -> Option<String> {
     let shared: HashSet<&str> = shared_files.iter().copied().collect();
     let packages: HashSet<&str> = shared_files
@@ -219,23 +241,26 @@ fn corroborate(
         .filter_map(|f| file_packages.get(*f).map(String::as_str))
         .collect();
 
-    findings.iter().find_map(|(_checker, finding)| {
+    findings.iter().find_map(|finding| {
         let file_match = finding
             .file
             .as_ref()
-            .is_some_and(|f| shared.contains(f.to_string_lossy().replace('\\', "/").as_str()));
-        let package_match =
-            finding.file.is_none() && packages.iter().any(|pkg| finding.message.contains(pkg));
+            .is_some_and(|f| shared.contains(normalize_repo_path(repo_root, f).as_str()));
+        let package_match = finding.file.is_none()
+            && packages
+                .iter()
+                .any(|pkg| package_mentioned_in(&finding.message, pkg));
         (file_match || package_match).then(|| finding.message.clone())
     })
 }
 
 /// Builds one cluster's evidence packet from its member commit indices.
 fn evidence_packet(
+    repo_root: &Path,
     members: &[usize],
     bug_fixes: &[TaggedCommit],
     file_packages: &HashMap<String, String>,
-    findings: &[(&'static str, ArchFinding)],
+    findings: &[ArchFinding],
 ) -> RootCauseCluster {
     let shared_files = shared_files_of(members, bug_fixes);
     let file_lists: Vec<Vec<String>> = members
@@ -243,7 +268,7 @@ fn evidence_packet(
         .map(|&i| bug_fixes[i].files.clone())
         .collect();
     let coupled_pairs = change_coupling::compute_coupling_unfiltered(&file_lists);
-    let corroborating_finding = corroborate(&shared_files, file_packages, findings);
+    let corroborating_finding = corroborate(repo_root, &shared_files, file_packages, findings);
 
     RootCauseCluster {
         commit_shas: members.iter().map(|&i| bug_fixes[i].sha.clone()).collect(),
@@ -280,7 +305,7 @@ pub fn analyze(repo_root: &Path, limit: usize) -> Result<Vec<RootCauseCluster>> 
 
     let mut out: Vec<RootCauseCluster> = clusters
         .iter()
-        .map(|members| evidence_packet(members, &bug_fixes, &file_packages, &findings))
+        .map(|members| evidence_packet(repo_root, members, &bug_fixes, &file_packages, &findings))
         .collect();
 
     out.sort_by(|a, b| {
@@ -348,12 +373,35 @@ mod tests {
             message: "[import-cycles] cycle involves a.rs".to_string(),
             severity_override: None,
         };
-        let findings = vec![("import-cycles", finding)];
-        let result = corroborate(&["a.rs"], &HashMap::new(), &findings);
+        let findings = vec![finding];
+        let result = corroborate(Path::new(""), &["a.rs"], &HashMap::new(), &findings);
         assert_eq!(
             result,
             Some("[import-cycles] cycle involves a.rs".to_string())
         );
+    }
+
+    /// Regression: `finding.file` isn't a bare git-relative path in practice — it's
+    /// whatever form `repo_root` was walked from (absolute repo_root -> absolute
+    /// `finding.file`; `.` -> `./...`). `corroborate` used to compare it against
+    /// `shared_files` (always bare git-relative) with no normalization, so this case could
+    /// never match before the fix — see [`normalize_repo_path`].
+    #[test]
+    fn corroborate_matches_a_file_level_finding_whose_path_needs_repo_root_stripped() {
+        let finding = ArchFinding {
+            file: Some(PathBuf::from("/repo/pkg/a.rs")),
+            line: Some(3),
+            message: "[import-cycles] cycle involves pkg/a.rs".to_string(),
+            severity_override: None,
+        };
+        let findings = vec![finding];
+        let result = corroborate(
+            Path::new("/repo"),
+            &["pkg/a.rs"],
+            &HashMap::new(),
+            &findings,
+        );
+        assert!(result.is_some(), "got: {result:?}");
     }
 
     #[test]
@@ -364,11 +412,16 @@ mod tests {
             message: "[instability] pkg/domain is in the zone of pain".to_string(),
             severity_override: None,
         };
-        let findings = vec![("instability", finding)];
+        let findings = vec![finding];
         let mut file_packages = HashMap::new();
         file_packages.insert("pkg/domain/a.go".to_string(), "pkg/domain".to_string());
 
-        let result = corroborate(&["pkg/domain/a.go"], &file_packages, &findings);
+        let result = corroborate(
+            Path::new(""),
+            &["pkg/domain/a.go"],
+            &file_packages,
+            &findings,
+        );
         assert!(result.is_some(), "got: {result:?}");
     }
 
@@ -380,7 +433,95 @@ mod tests {
             message: "cycle involves unrelated.rs".to_string(),
             severity_override: None,
         };
-        let findings = vec![("import-cycles", finding)];
-        assert_eq!(corroborate(&["a.rs"], &HashMap::new(), &findings), None);
+        let findings = vec![finding];
+        assert_eq!(
+            corroborate(Path::new(""), &["a.rs"], &HashMap::new(), &findings),
+            None
+        );
+    }
+
+    // --- package_mentioned_in (#2: unanchored substring match) ---
+
+    #[test]
+    fn package_mentioned_in_does_not_match_a_longer_sibling_package() {
+        // "internal/db" must not match inside "internal/dbmigrate".
+        assert!(!package_mentioned_in(
+            "[instability] internal/dbmigrate is in the zone of pain",
+            "internal/db"
+        ));
+    }
+
+    #[test]
+    fn package_mentioned_in_matches_at_a_real_boundary() {
+        assert!(package_mentioned_in(
+            "[instability] internal/db is in the zone of pain",
+            "internal/db"
+        ));
+        assert!(package_mentioned_in(
+            "kibitzer::checker imports kibitzer::comment_quality directly",
+            "kibitzer::comment_quality"
+        ));
+    }
+
+    /// End-to-end regression for the blocker: a real `ImportCycleChecker` violation (real
+    /// `ArchModel`, walked from an absolute temp-repo path — the actual path shape the CLI
+    /// produces, not an idealized relative string) plus a real bug-fix-commit cluster
+    /// touching the cycle's file must corroborate.
+    #[test]
+    fn analyze_corroborates_a_real_import_cycle_against_a_real_git_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-root-cause-clusters-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("domain")).unwrap();
+        std::fs::create_dir_all(dir.join("handlers")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.join("domain/domain.go"),
+            "package domain\n\nimport \"fixture/handlers\"\n\nfunc Do() { handlers.Do() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("handlers/handlers.go"),
+            "package handlers\n\nimport \"fixture/domain\"\n\nfunc Do() { domain.Do() }\n",
+        )
+        .unwrap();
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        for i in 0..2 {
+            std::fs::write(dir.join("domain/domain.go"), format!("// v{i}\npackage domain\n\nimport \"fixture/handlers\"\n\nfunc Do() {{ handlers.Do() }}\n")).unwrap();
+            std::fs::write(dir.join("handlers/handlers.go"), format!("// v{i}\npackage handlers\n\nimport \"fixture/domain\"\n\nfunc Do() {{ domain.Do() }}\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("fix: bug {i}")]);
+        }
+
+        let clusters = analyze(&dir, 1000).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(clusters.len(), 1, "got: {clusters:?}");
+        let corroboration = clusters[0]
+            .corroborating_finding
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected corroboration, got: {:?}", clusters[0]));
+        assert!(
+            corroboration.contains("import-cycle"),
+            "got: {corroboration}"
+        );
     }
 }

@@ -161,25 +161,31 @@ fn hac_partitions(n: usize, sim: &[Vec<f64>]) -> Vec<Vec<Vec<usize>>> {
 /// that would cross the new class boundary) using call-graph data this module doesn't
 /// have cheap access to per candidate cut; that refinement is future work, not attempted
 /// here.
-/// Total similarity of method `m` to every other member of `cluster` (excluding `m`
-/// itself).
-fn total_similarity_to(m: usize, cluster: &[usize], sim: &[Vec<f64>]) -> f64 {
-    cluster
-        .iter()
-        .filter(|&&x| x != m)
-        .map(|&x| sim[m][x])
-        .sum()
+/// Average similarity of method `m` to every other member of `cluster` (excluding `m`
+/// itself if present — `m` is never a member of an "other" cluster it's being compared
+/// against, so the exclusion is a no-op there). `0.0` for a cluster with no other members
+/// to compare against. Averaging, not summing, matters: a bigger cluster otherwise wins by
+/// sheer member count even when each individual similarity is weak (e.g. five members at
+/// 0.3 each summing to 1.5, beating one true clustermate at 0.9) — that would bias
+/// [`is_well_placed`] toward large, loosely-related clusters over small, tightly cohesive
+/// ones.
+fn mean_similarity_to(m: usize, cluster: &[usize], sim: &[Vec<f64>]) -> f64 {
+    let others: Vec<usize> = cluster.iter().copied().filter(|&x| x != m).collect();
+    if others.is_empty() {
+        return 0.0;
+    }
+    others.iter().map(|&x| sim[m][x]).sum::<f64>() / others.len() as f64
 }
 
-/// Whether method `m` (a member of `clusters[own_idx]`) is at least as similar to its own
-/// cluster as to every other individual cluster.
+/// Whether method `m` (a member of `clusters[own_idx]`) is at least as similar, on
+/// average, to its own cluster as to every other individual cluster.
 fn is_well_placed(m: usize, own_idx: usize, clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> bool {
-    let own_sim = total_similarity_to(m, &clusters[own_idx], sim);
+    let own_sim = mean_similarity_to(m, &clusters[own_idx], sim);
     let best_other = clusters
         .iter()
         .enumerate()
         .filter(|(idx, _)| *idx != own_idx)
-        .map(|(_, other)| other.iter().map(|&x| sim[m][x]).sum::<f64>())
+        .map(|(_, other)| mean_similarity_to(m, other, sim))
         .fold(0.0_f64, f64::max);
     own_sim >= best_other
 }
@@ -204,6 +210,52 @@ fn entity_placement_score(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> f64 {
 /// returns the highest-scoring one, provided it clears [`MIN_ENTITY_PLACEMENT_SCORE`].
 /// Ties prefer the earliest-scanned (highest `k`, i.e. more granular) partition — an
 /// arbitrary but deterministic tie-break, not a claim that finer splits are better.
+/// Mean similarity within `clusters`' groups vs. mean similarity across them. A method
+/// with uniform similarity to every other method (e.g. every method reads/writes the same
+/// single field) has no real cluster structure at all — every entity is equally
+/// "well-placed" wherever the clustering happens to cut, so [`entity_placement_score`]
+/// alone can't tell a genuine split from an arbitrary one on perfectly uniform data. This
+/// exists to gate that: `best_candidate_split` only considers a partition where intra-group
+/// similarity is *strictly* higher than inter-group similarity — a uniform-similarity type
+/// (intra == inter) never clears it, so it correctly produces no candidate.
+/// Sums `sim[a][b]` over every `a` in `cluster` and `b` in `other`, plus the pair count —
+/// `separates_meaningfully`'s cross-group accumulation, split out to keep that function's
+/// nesting shallow.
+fn accumulate_pairs(cluster: &[usize], other: &[usize], sim: &[Vec<f64>]) -> (f64, usize) {
+    let mut total = 0.0;
+    for &a in cluster {
+        for &b in other {
+            total += sim[a][b];
+        }
+    }
+    (total, cluster.len() * other.len())
+}
+
+fn separates_meaningfully(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> bool {
+    let mut intra = (0.0_f64, 0usize);
+    let mut inter = (0.0_f64, 0usize);
+    for (i, cluster) in clusters.iter().enumerate() {
+        for (a_pos, &a) in cluster.iter().enumerate() {
+            let (total, count) = accumulate_pairs(&[a], &cluster[(a_pos + 1)..], sim);
+            intra.0 += total;
+            intra.1 += count;
+        }
+        for other in &clusters[(i + 1)..] {
+            let (total, count) = accumulate_pairs(cluster, other, sim);
+            inter.0 += total;
+            inter.1 += count;
+        }
+    }
+    let mean = |(total, count): (f64, usize)| {
+        if count == 0 {
+            0.0
+        } else {
+            total / count as f64
+        }
+    };
+    mean(intra) > mean(inter)
+}
+
 fn best_candidate_split(ids: &[&str], sim: &[Vec<f64>]) -> Option<(Vec<Vec<usize>>, f64)> {
     let n = ids.len();
     if n < 3 {
@@ -216,7 +268,9 @@ fn best_candidate_split(ids: &[&str], sim: &[Vec<f64>]) -> Option<(Vec<Vec<usize
             let clusters = &partitions[i];
             (clusters.clone(), entity_placement_score(clusters, sim))
         })
-        .filter(|(_, score)| *score >= MIN_ENTITY_PLACEMENT_SCORE)
+        .filter(|(clusters, score)| {
+            *score >= MIN_ENTITY_PLACEMENT_SCORE && separates_meaningfully(clusters, sim)
+        })
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
 
@@ -436,5 +490,73 @@ mod tests {
     fn jaccard_of_identical_sets_is_one() {
         let a: HashSet<&str> = ["x", "y"].into_iter().collect();
         assert_eq!(jaccard(&a, &a), 1.0);
+    }
+
+    // --- mean_similarity_to / is_well_placed / entity_placement_score (sum-vs-average) ---
+
+    #[test]
+    fn is_well_placed_averages_rather_than_sums_across_cluster_size() {
+        // Method 0's own (small, tight) cluster has one other member at similarity 0.9. A
+        // larger 5-member "other" cluster has similarity 0.3 to method 0 with each of its
+        // members. Summing (the old, buggy behavior) gives the other cluster 1.5 > 0.9,
+        // reading method 0 as better placed in the big, loosely-related cluster than its
+        // own tight one. Averaging correctly gives the other cluster 0.3 < 0.9.
+        let clusters = vec![vec![0, 1], vec![2, 3, 4, 5, 6]];
+        let n = 7;
+        let mut sim = vec![vec![0.0; n]; n];
+        sim[0][1] = 0.9;
+        sim[1][0] = 0.9;
+        for &j in &[2, 3, 4, 5, 6] {
+            sim[0][j] = 0.3;
+            sim[j][0] = 0.3;
+        }
+
+        assert!(is_well_placed(0, 0, &clusters, &sim));
+    }
+
+    #[test]
+    fn entity_placement_score_is_perfect_when_a_small_tight_cluster_beats_a_larger_loose_one() {
+        // Same asymmetry as above, but through the full entity_placement_score path: every
+        // member of both clusters is well-placed once similarity is averaged, not summed —
+        // under the old sum-based scoring, method 0 (and by symmetry method 1) would have
+        // flipped to "better placed in the big cluster," dragging the score below 1.0.
+        let clusters = vec![vec![0, 1], vec![2, 3, 4, 5, 6]];
+        let n = 7;
+        let mut sim = vec![vec![0.0; n]; n];
+        sim[0][1] = 0.9;
+        sim[1][0] = 0.9;
+        for &i in &[0, 1] {
+            for &j in &[2, 3, 4, 5, 6] {
+                sim[i][j] = 0.3;
+                sim[j][i] = 0.3;
+            }
+        }
+        for &i in &[2, 3, 4, 5, 6] {
+            for &j in &[2, 3, 4, 5, 6] {
+                if i != j {
+                    sim[i][j] = 0.5;
+                }
+            }
+        }
+
+        assert_eq!(entity_placement_score(&clusters, &sim), 1.0);
+    }
+
+    #[test]
+    fn separates_meaningfully_is_false_for_uniform_similarity() {
+        let clusters = vec![vec![0, 1], vec![2, 3]];
+        let sim = vec![vec![1.0; 4]; 4];
+        assert!(!separates_meaningfully(&clusters, &sim));
+    }
+
+    #[test]
+    fn separates_meaningfully_is_true_when_intra_beats_inter() {
+        let clusters = vec![vec![0, 1], vec![2, 3]];
+        let mut sim = vec![vec![0.0; 4]; 4];
+        sim[0][1] = 1.0;
+        sim[1][0] = 1.0;
+        sim[2][3] = 1.0;
+        sim[3][2] = 1.0;
+        assert!(separates_meaningfully(&clusters, &sim));
     }
 }
