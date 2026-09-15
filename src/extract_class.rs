@@ -1,26 +1,20 @@
 //! JDeodorant-style Extract Class candidate generation (#38): build a Jaccard-distance
 //! graph over a type's methods (edge weight = shared field-access overlap, from
-//! `ArchModel::field_accesses`, #39), cluster the methods via average-linkage hierarchical
-//! agglomerative clustering (HAC), then rank candidate cuts of that dendrogram by an
-//! Entity-Placement-inspired cohesion score (Fokaefs et al., *Identification and
-//! application of Extract Class refactorings in object-oriented systems*, JSS 2012).
+//! `ArchModel::field_accesses`, #39), cluster via average-linkage hierarchical
+//! agglomerative clustering (HAC), then rank dendrogram cuts by an Entity-Placement-inspired
+//! cohesion score (Fokaefs et al., *Identification and application of Extract Class
+//! refactorings in object-oriented systems*, JSS 2012) — not a literal reproduction of that
+//! paper's formula, see [`entity_placement_score`]'s doc for the simplification used here.
+//! Naming the extracted class is out of scope (a human/LLM step, per the issue); this
+//! module only proposes *which methods* would split cleanly.
 //!
-//! This is **not** a literal reproduction of that paper's Entity Placement formula, which
-//! needs data (call-graph edge weights split by whether the caller lives inside or outside
-//! the candidate class) beyond what's cheaply available from field-access data alone —
-//! see [`entity_placement_score`]'s doc comment for the documented simplification used
-//! here instead. Naming the extracted class is explicitly out of scope (a human/LLM step,
-//! per the issue) — this module only proposes *which methods* would split cleanly, never a
-//! name for the result.
-//!
-//! Go-only, same scope as `ArchModel::field_accesses`: a method with zero field accesses
-//! (either because it genuinely touches no field, or because its receiver's underlying
-//! type isn't a struct — see `architecture_checks::LcomChecker`'s doc comment on that
-//! ceiling) is excluded from clustering entirely rather than guessed at.
+//! Go-only, same scope as `ArchModel::field_accesses`: a method with zero field accesses is
+//! excluded from clustering entirely rather than guessed at.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind};
+use crate::jaccard::jaccard;
 
 /// A type needs at least this many methods with field-access data before clustering is
 /// attempted — matches `architecture_checks::LCOM_MIN_METHODS`'s bar (not shared as a
@@ -28,6 +22,14 @@ use crate::arch_model::{ArchModel, PackageNode, SymbolKind};
 /// convention, e.g. `MAX_FAN_OUT`/`STABLE_MAX`). Also the minimum needed for a `[2, n-1]`
 /// candidate-cut range to be non-empty (`n=4` gives cuts at `k=2,3`).
 const MIN_METHODS_FOR_CLUSTERING: usize = 4;
+
+/// Upper bound on methods-with-field-access-data clustered for one type: `hac_partitions`
+/// is O(n³) and `candidate_splits` adds an O(n²)-per-cut pass on top, so an unbounded type
+/// (a large generated or god-class type with hundreds of methods) could burn real CPU time
+/// with no per-type or total-time budget elsewhere in `extract_class_candidates`'s repo-wide
+/// loop. A type above this is skipped, not an error — clustering advice on a type this
+/// large is marginal anyway.
+const MAX_METHODS_FOR_CLUSTERING: usize = 80;
 
 /// Minimum Entity Placement score (see [`entity_placement_score`]) for a candidate split
 /// to be worth surfacing — below this, too many methods are ambiguously placed for the
@@ -79,15 +81,6 @@ fn method_field_sets<'a>(
         }
     }
     sets
-}
-
-fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
-    let union = a.union(b).count();
-    if union == 0 {
-        0.0
-    } else {
-        a.intersection(b).count() as f64 / union as f64
-    }
 }
 
 /// Builds the full pairwise Jaccard-similarity matrix for `ids[0..n]`'s field-access sets
@@ -204,14 +197,6 @@ fn entity_placement_score(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> f64 {
     well_placed as f64 / n as f64
 }
 
-/// Mean similarity within `clusters`' groups vs. mean similarity across them. A method
-/// with uniform similarity to every other method (e.g. every method reads/writes the same
-/// single field) has no real cluster structure at all — every entity is equally
-/// "well-placed" wherever the clustering happens to cut, so [`entity_placement_score`]
-/// alone can't tell a genuine split from an arbitrary one on perfectly uniform data. This
-/// exists to gate that: `candidate_splits` only considers a partition where intra-group
-/// similarity is *strictly* higher than inter-group similarity — a uniform-similarity type
-/// (intra == inter) never clears it, so it correctly produces no candidate.
 /// Sums `sim[a][b]` over every `a` in `cluster` and `b` in `other`, plus the pair count —
 /// `separates_meaningfully`'s cross-group accumulation, split out to keep that function's
 /// nesting shallow.
@@ -225,6 +210,13 @@ fn accumulate_pairs(cluster: &[usize], other: &[usize], sim: &[Vec<f64>]) -> (f6
     (total, cluster.len() * other.len())
 }
 
+/// Mean similarity within `clusters`' groups vs. mean similarity across them. A method
+/// with uniform similarity to every other method has no real cluster structure at all —
+/// every entity is equally "well-placed" wherever the clustering happens to cut, so
+/// [`entity_placement_score`] alone can't tell a genuine split from an arbitrary one on
+/// uniform data. `candidate_splits` only considers a partition where intra-group similarity
+/// is *strictly* higher than inter-group similarity, so a uniform-similarity type never
+/// clears it.
 fn separates_meaningfully(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> bool {
     let mut intra = (0.0_f64, 0usize);
     let mut inter = (0.0_f64, 0usize);
@@ -250,15 +242,10 @@ fn separates_meaningfully(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> bool {
     mean(intra) > mean(inter)
 }
 
-/// Every dendrogram cut tied for the best qualifying [`entity_placement_score`] — issue
-/// #38 specifies this tool return "a closed set of graph-legal moves (no ranking beyond
-/// genuine ties)," so picking a single winner among cuts with genuinely different scores
-/// would itself be an unprincipled ranking; only cuts that are indistinguishable by this
-/// metric are returned together. Scores are exact-equality-comparable here: every
-/// candidate partition for one type shares the same `n` (method count), so
-/// `entity_placement_score`'s `well_placed / n` is the ratio of two integers with a fixed
-/// denominator — two partitions tie iff they have the exact same `well_placed` count,
-/// which produces bit-identical `f64`s.
+/// Every dendrogram cut tied for the best qualifying [`entity_placement_score`], not a
+/// single winner — issue #38 specifies "a closed set of graph-legal moves, no ranking
+/// beyond genuine ties," so picking among cuts with genuinely different scores would itself
+/// be an unprincipled ranking.
 fn candidate_splits(ids: &[&str], sim: &[Vec<f64>]) -> Vec<(Vec<Vec<usize>>, f64)> {
     let n = ids.len();
     if n < 3 {
@@ -297,7 +284,8 @@ fn candidates_for_type(
     type_name: &str,
 ) -> Vec<ExtractClassCandidate> {
     let field_sets = method_field_sets(model, pkg, type_name);
-    if field_sets.len() < MIN_METHODS_FOR_CLUSTERING {
+    if field_sets.len() < MIN_METHODS_FOR_CLUSTERING || field_sets.len() > MAX_METHODS_FOR_CLUSTERING
+    {
         return Vec::new();
     }
     // Sorted, not left in HashMap iteration order: std's HashMap seeds its hasher randomly
@@ -463,6 +451,28 @@ mod tests {
     }
 
     #[test]
+    fn skips_types_above_the_maximum_method_threshold_without_hanging() {
+        // hac_partitions is O(n^3); if the cap didn't gate this, MAX_METHODS_FOR_CLUSTERING+1
+        // methods would take real CPU time to cluster. The test only needs to prove the type
+        // is skipped, not clustered, so it should return instantly either way.
+        let n = MAX_METHODS_FOR_CLUSTERING + 1;
+        let symbols: Vec<SymbolNode> = (0..n)
+            .map(|i| method("pkg", "T", &format!("M{i}")))
+            .collect();
+        let pkg = PackageNode {
+            path: "pkg".to_string(),
+            files: vec![],
+            symbols,
+        };
+        let field_accesses: Vec<FieldAccessEdge> = (0..n)
+            .map(|i| access(&format!("pkg::T.M{i}"), &format!("pkg::T.F{i}")))
+            .collect();
+        let model = model_of(pkg, field_accesses);
+
+        assert!(extract_class_candidates(&model).is_empty());
+    }
+
+    #[test]
     fn skips_types_below_the_minimum_method_threshold() {
         let pkg = PackageNode {
             path: "pkg".to_string(),
@@ -504,18 +514,6 @@ mod tests {
         let all_methods: Vec<&String> = candidates[0].groups.iter().flatten().collect();
         assert!(!all_methods.contains(&&"pkg::T.NoFieldAccess".to_string()));
         assert_eq!(all_methods.len(), 4);
-    }
-
-    #[test]
-    fn jaccard_of_two_empty_sets_is_zero() {
-        let empty: HashSet<&str> = HashSet::new();
-        assert_eq!(jaccard(&empty, &empty), 0.0);
-    }
-
-    #[test]
-    fn jaccard_of_identical_sets_is_one() {
-        let a: HashSet<&str> = ["x", "y"].into_iter().collect();
-        assert_eq!(jaccard(&a, &a), 1.0);
     }
 
     // --- mean_similarity_to / is_well_placed / entity_placement_score (sum-vs-average) ---

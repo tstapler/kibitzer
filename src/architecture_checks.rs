@@ -672,6 +672,12 @@ fn dip_finding(
 /// components technically number more than one (e.g. two independent one-line getters).
 /// No stronger literature citation than "too small to be worth splitting," same status as
 /// `MAX_FAN_OUT`/`STABLE_MAX` above.
+///
+/// Known ceiling: this gates per *type*, not per method, so a type with real cohesion
+/// elsewhere plus one legitimate zero-signal helper (e.g. a `String()` that only reads
+/// other methods' return values) still counts that helper as its own isolated component,
+/// inflating LCOM4 by one — deferred rather than rushed, since fixing it changes what this
+/// constant should count against (all methods, or only those with signal).
 const LCOM_MIN_METHODS: usize = 4;
 
 /// SRP proxy: LCOM4 — the number of connected components in the graph where a type's own
@@ -679,30 +685,11 @@ const LCOM_MIN_METHODS: usize = 4;
 /// or write, from `ArchModel::field_accesses`, #39) or call each other. `LCOM4 == 1` means
 /// every method participates in one cohesive cluster; `LCOM4 > 1` means the methods split
 /// into that many mutually-disconnected groups — a deterministic proxy for "this type
-/// bundles more than one responsibility" (the literature's God Class/Blob smell — see
-/// PMD's `GodClassRule` and iPlasma's TCC/LCOM thresholds, both of which combine LCOM with
-/// WMC/ATFD rather than trusting it alone; this checker is intentionally the single-metric
-/// slice of that, not the full combination) and a candidate input for Extract Class.
-/// Go-only, same scope as `ArchModel::field_accesses`.
-///
-/// Known ceiling, confirmed backtesting against `k8s.io/apimachinery`: a large struct with
-/// one independent getter/setter pair per field (`ObjectMeta`, `metav1.Time`) reports a
-/// high LCOM4 — every accessor genuinely touches only its own field, so the metric is
-/// technically correct, but the advice ("consider Extract Class") is poor for a plain data
-/// holder. This is the exact well-documented weakness LCOM's own literature cites as the
-/// reason to combine it with WMC/ATFD rather than trust it alone (see this doc comment's
-/// first paragraph); doing that combination is out of scope here — it's a separate,
-/// already-proposed checker (issue #38's "God-class flags" item). Treat a finding as
-/// "worth a second look," not proof, same convention as `DipConcreteCouplingChecker`.
-///
-/// A second, narrower known ceiling: the zero-signal skip in [`lcom4_components`] operates
-/// per *type*, not per method — a type with real cohesion elsewhere plus one legitimate
-/// zero-signal helper (e.g. a `String()` that only reads other methods' return values, no
-/// field access) still counts that helper as its own isolated component, inflating LCOM4
-/// by one. Excluding individual zero-signal methods from the graph (rather than gating the
-/// whole type) would fix this, but changes what `LCOM_MIN_METHODS` should count against
-/// (all methods, or only those with signal) — a real design question, not a small change,
-/// so deferred rather than rushed.
+/// bundles more than one responsibility" (the literature's God Class/Blob smell; this
+/// checker is intentionally the single-metric slice of that, not the WMC/ATFD-combined
+/// version PMD/iPlasma use) and a candidate input for Extract Class. Go-only, same scope
+/// as `ArchModel::field_accesses`. See [`lcom4_components`]'s doc for a known
+/// false-positive ceiling on plain data holders.
 pub struct LcomChecker;
 
 impl ArchModelChecker for LcomChecker {
@@ -746,25 +733,9 @@ fn methods_by_type(pkg: &crate::arch_model::PackageNode) -> BTreeMap<&str, Vec<&
     map
 }
 
-/// Counts LCOM4's connected components over `method_ids` (all belonging to one type,
-/// `type_prefix` being that type's owner-qualifying `"{package}::{type}."` id prefix):
-/// unions any pair of methods sharing a field access, then any pair joined by a resolved
-/// call edge within the same type, and returns the number of distinct roots left.
-/// `None` when this type has no connectivity signal at all — every `Method` symbol whose
-/// receiver's underlying Go type isn't a struct (a named map/slice/etc. type, e.g.
-/// `type Set[T comparable] map[T]struct{}`) never produces a single `recv.Field` selector,
-/// so `field_accesses` has zero entries for it and it would otherwise read as "maximally
-/// disconnected" (every method its own component) purely because kibitzer has no way to
-/// observe its state sharing — not because the methods are actually unrelated. Confirmed
-/// against a real false-positive backtest: `k8s.io/apimachinery/pkg/util/sets.Byte`
-/// (`map[byte]struct{}`, 16 independent methods, zero shared state kibitzer can see) — see
-/// this checker's doc comment. Distinguished from a real struct whose methods simply don't
-/// share any field (a legitimate LCOM4 finding): that case still has *some*
-/// `field_accesses`/same-type `call_edges` entries, just not overlapping ones.
 /// Unions every pair of methods (by index into `parent`) sharing a field access. Returns
 /// whether kibitzer observed *any* field access for this type at all — `false` means zero
-/// accesses total, not just zero shared ones (see `lcom4_components`'s doc comment on why
-/// that distinction matters).
+/// accesses total, not just zero shared ones (see `lcom4_components`'s doc comment).
 fn union_shared_field_accesses(
     index: &HashMap<&str, usize>,
     model: &crate::arch_model::ArchModel,
@@ -811,17 +782,18 @@ fn union_same_type_calls(
     found
 }
 
-/// `None` when this type has no connectivity signal at all — every `Method` symbol whose
-/// receiver's underlying Go type isn't a struct (a named map/slice/etc. type, e.g.
-/// `type Set[T comparable] map[T]struct{}`) never produces a single `recv.Field` selector,
-/// so `field_accesses` has zero entries for it and it would otherwise read as "maximally
-/// disconnected" (every method its own component) purely because kibitzer has no way to
-/// observe its state sharing — not because the methods are actually unrelated. Confirmed
-/// against a real false-positive backtest: `k8s.io/apimachinery/pkg/util/sets.Byte`
-/// (`map[byte]struct{}`, 16 independent methods, zero shared state kibitzer can see).
-/// Distinguished from a real struct whose methods simply don't share any field (a
-/// legitimate LCOM4 finding): that case still has *some* `field_accesses`/same-type
-/// `call_edges` entries, just not overlapping ones.
+/// `None` when this type has no connectivity signal at all — e.g. every `Method`'s
+/// receiver's underlying Go type isn't a struct (`type Set[T comparable] map[T]struct{}`),
+/// so `field_accesses` has zero entries and the type would otherwise misread as "maximally
+/// disconnected" rather than "unknown." Distinguished from a real struct whose methods
+/// simply don't share any field (a legitimate LCOM4 finding), which still has *some*
+/// `field_accesses`/same-type `call_edges` entries, just not overlapping ones.
+///
+/// Known false-positive ceiling, confirmed backtesting against `k8s.io/apimachinery`: a
+/// large struct with one independent getter/setter pair per field (`ObjectMeta`) reports a
+/// high, technically-correct LCOM4 even though "split this up" is poor advice for a plain
+/// data holder — treat a finding as "worth a second look," not proof, same convention as
+/// `DipConcreteCouplingChecker`.
 fn lcom4_components(
     method_ids: &[&str],
     model: &crate::arch_model::ArchModel,

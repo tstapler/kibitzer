@@ -28,6 +28,7 @@ mod hook;
 mod hook_log;
 mod import_graph;
 mod install;
+mod jaccard;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;

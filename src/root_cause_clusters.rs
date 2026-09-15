@@ -24,6 +24,7 @@ use crate::arch_model::{self, ArchModel, PruneConfig};
 use crate::architecture_checks::{self, ArchFinding};
 use crate::change_coupling::{self, CoupledPair, TaggedCommit};
 use crate::config::ArchitectureConfig;
+use crate::jaccard::jaccard;
 
 /// Minimum Jaccard overlap of touched files between two bug-fix commits before they're
 /// considered connected for clustering. No stronger literature citation than "meaningfully
@@ -51,15 +52,6 @@ pub struct RootCauseCluster {
     /// package that owns one) — stronger evidence this is a real architectural defect, not
     /// just co-change. `None` means co-change only.
     pub corroborating_finding: Option<String>,
-}
-
-fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
-    let union = a.union(b).count();
-    if union == 0 {
-        0.0
-    } else {
-        a.intersection(b).count() as f64 / union as f64
-    }
 }
 
 /// Groups `commits` (already filtered to bug fixes) into connected components by
@@ -204,16 +196,11 @@ fn package_mentioned_in(message: &str, pkg: &str) -> bool {
     })
 }
 
-/// Cross-references `shared_files` against `findings`: a finding with a `file` matching
-/// one of `shared_files` (both normalized via [`normalize_repo_path`]) corroborates
-/// directly; a package-level finding (`file: None` — `instability`/`dip-concrete-coupling`/
-/// most `coupling`/`component-deps` findings) corroborates if its message mentions
-/// ([`package_mentioned_in`]) the package that owns one of `shared_files` (per
-/// `file_packages`). Returns the first match found, in `findings`' order — not the "best"
-/// or most specific one, since there's no principled way to rank them here.
-/// `ArchFinding.message` is already bracket-tagged with its checker name by this
-/// codebase's own convention (`[import-cycles] ...`, `[instability] ...`), so it's
-/// returned as-is rather than tagged a second time.
+/// Cross-references `shared_files` against `findings`: matches by file path
+/// ([`normalize_repo_path`]) directly, or by package-name mention ([`package_mentioned_in`])
+/// for a package-level finding (`file: None`). Returns the first match in `findings`'
+/// order — not the "best" or most specific one, since there's no principled way to rank
+/// them here.
 fn corroborate(
     repo_root: &Path,
     shared_files: &[&str],

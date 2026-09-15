@@ -965,8 +965,14 @@ impl KibitzerServer {
         let scope: Vec<String> = req.scope.iter().cloned().collect();
         let filtered = model.filtered(&scope, ModelLevel::Code);
 
-        let candidates: Vec<RefactorCandidateEntry> =
-            crate::extract_class::extract_class_candidates(&filtered)
+        // HAC clustering is CPU-bound (O(n^3) per type), so it must not run inline on the
+        // async call stack — same reasoning as `load_model_off_stack`.
+        let candidates: Vec<RefactorCandidateEntry> = match tokio::task::spawn_blocking(
+            move || crate::extract_class::extract_class_candidates(&filtered),
+        )
+        .await
+        {
+            Ok(candidates) => candidates
                 .into_iter()
                 .map(|c| RefactorCandidateEntry {
                     package: c.package,
@@ -974,7 +980,9 @@ impl KibitzerServer {
                     groups: c.groups,
                     entity_placement_score: c.entity_placement_score,
                 })
-                .collect();
+                .collect(),
+            Err(e) => return json_error(format!("extract class clustering task failed: {e}")),
+        };
         let possibly_pruned = candidates.is_empty()
             && !req.include_private
             && !model.pruning.pruned_symbol_ids.is_empty();
@@ -2284,9 +2292,6 @@ mod tests {
         }
     }
 
-    /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
-    /// plugin-backed check whose binary is missing, instead of raw shell noise a real
-    /// command failure would look like.
     /// A type whose 4 methods split cleanly into two field-disjoint groups (A/B on `X`,
     /// C/D on `Y`) — the minimal fixture `extract_class::extract_class_candidates` needs
     /// to propose a 2-group split.
@@ -2427,6 +2432,9 @@ mod tests {
         );
     }
 
+    /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
+    /// plugin-backed check whose binary is missing, instead of raw shell noise a real
+    /// command failure would look like.
     mod plugin_missing_rendering_tests {
         use super::*;
         use crate::config::OutputFormat;
