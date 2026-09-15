@@ -837,6 +837,13 @@ fn method_field_access_ctx(node: Node, source: &str, package_path: &str) -> Opti
 /// caller-context-threading shape, but Go-only (`method_declaration` is the only node kind
 /// checked, rather than every `function_kinds` entry) since field access is Go-only (see
 /// `field_access_supports`).
+///
+/// Known ceiling, not fixed for v1: this matches purely on the receiver identifier's name,
+/// not lexical scope — a local variable or parameter that shadows the receiver name inside
+/// the method body (`func (t T) M(t int) { ... }`, or a closure parameter reusing `t`)
+/// would be misattributed as a field access on the receiver. Unusual in idiomatic Go (a
+/// shadowed receiver name is itself a lint smell most style guides already flag), so left
+/// undetected rather than adding scope tracking for it.
 fn walk_field_accesses(
     node: Node,
     source: &str,

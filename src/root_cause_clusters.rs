@@ -62,21 +62,6 @@ fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
     }
 }
 
-fn union_find_root(parent: &mut [usize], x: usize) -> usize {
-    if parent[x] != x {
-        parent[x] = union_find_root(parent, parent[x]);
-    }
-    parent[x]
-}
-
-fn union_find_join(parent: &mut [usize], a: usize, b: usize) {
-    let ra = union_find_root(parent, a);
-    let rb = union_find_root(parent, b);
-    if ra != rb {
-        parent[ra] = rb;
-    }
-}
-
 /// Groups `commits` (already filtered to bug fixes) into connected components by
 /// [`MIN_COMMIT_FILE_JACCARD`]-overlapping touched-file sets — transitive, so commit A and
 /// commit C can end up in the same cluster via a shared intermediate commit B even if A
@@ -93,7 +78,7 @@ fn cluster_bug_fix_commits(commits: &[TaggedCommit]) -> Vec<Vec<usize>> {
     for i in 0..n {
         for j in (i + 1)..n {
             if jaccard(&file_sets[i], &file_sets[j]) >= MIN_COMMIT_FILE_JACCARD {
-                union_find_join(&mut parent, i, j);
+                crate::union_find::union(&mut parent, i, j);
             }
         }
     }
@@ -101,7 +86,7 @@ fn cluster_bug_fix_commits(commits: &[TaggedCommit]) -> Vec<Vec<usize>> {
     let mut by_root: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..n {
         by_root
-            .entry(union_find_root(&mut parent, i))
+            .entry(crate::union_find::root(&mut parent, i))
             .or_default()
             .push(i);
     }
@@ -285,14 +270,15 @@ fn evidence_packet(
 /// Runs the full root-cause-clustering recipe over `repo_root`'s last `limit` non-merge
 /// commits: tags bug fixes, clusters them by touched-file overlap, computes each
 /// cluster's own temporal coupling, and cross-references against current static findings.
-/// Clusters are returned sorted by shared-file count, descending (more shared files is a
-/// stronger co-change signal), ties broken by first commit sha for determinism.
-pub fn analyze(repo_root: &Path, limit: usize) -> Result<Vec<RootCauseCluster>> {
+/// Clusters are sorted by shared-file count, descending (more shared files is a stronger
+/// co-change signal), ties broken by first commit sha for determinism, and truncated to
+/// the top `top_n` — the same `--top` convention `change_coupling::analyze` uses.
+pub fn analyze(repo_root: &Path, limit: usize, top_n: usize) -> Result<Vec<RootCauseCluster>> {
     let commits = change_coupling::git_log_commits_with_subject(repo_root, limit)
         .with_context(|| format!("reading git log for {}", repo_root.display()))?;
     let bug_fixes: Vec<TaggedCommit> = commits
         .into_iter()
-        .filter(|c| change_coupling::is_bug_fix_commit(&c.subject))
+        .filter(|c| change_coupling::is_bug_fix_commit(&c.subject, &c.body))
         .collect();
 
     let clusters = cluster_bug_fix_commits(&bug_fixes);
@@ -314,6 +300,7 @@ pub fn analyze(repo_root: &Path, limit: usize) -> Result<Vec<RootCauseCluster>> 
             .cmp(&a.shared_files.len())
             .then_with(|| a.commit_shas.first().cmp(&b.commit_shas.first()))
     });
+    out.truncate(top_n);
     Ok(out)
 }
 
@@ -326,6 +313,7 @@ mod tests {
         TaggedCommit {
             sha: sha.to_string(),
             subject: subject.to_string(),
+            body: String::new(),
             files: files.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -511,7 +499,7 @@ mod tests {
             git(&["commit", "-q", "-m", &format!("fix: bug {i}")]);
         }
 
-        let clusters = analyze(&dir, 1000).unwrap();
+        let clusters = analyze(&dir, 1000, 20).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(clusters.len(), 1, "got: {clusters:?}");
@@ -523,5 +511,56 @@ mod tests {
             corroboration.contains("import-cycle"),
             "got: {corroboration}"
         );
+    }
+
+    #[test]
+    fn analyze_truncates_to_top_n() {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-root-cause-clusters-topn-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+
+        // Cluster 1: 3 shared files across its two commits.
+        for i in 0..2 {
+            std::fs::write(dir.join("a1.go"), format!("// v{i}\npackage a\n")).unwrap();
+            std::fs::write(dir.join("a2.go"), format!("// v{i}\npackage a\n")).unwrap();
+            std::fs::write(dir.join("a3.go"), format!("// v{i}\npackage a\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("fix: cluster a {i}")]);
+        }
+        // Cluster 2: 1 shared file across its two commits — fewer shared files, so
+        // top_n=1 must keep cluster 1 and drop this one.
+        for i in 0..2 {
+            std::fs::write(dir.join("b1.go"), format!("// v{i}\npackage b\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("fix: cluster b {i}")]);
+        }
+
+        let all = analyze(&dir, 1000, 20).unwrap();
+        assert_eq!(all.len(), 2, "got: {all:?}");
+
+        let top_one = analyze(&dir, 1000, 1).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(top_one.len(), 1, "got: {top_one:?}");
+        assert_eq!(top_one[0].shared_files.len(), 3, "got: {top_one:?}");
     }
 }

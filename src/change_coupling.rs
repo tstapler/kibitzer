@@ -3,7 +3,7 @@
 //! formula directly (not linked, to avoid GPLv3 entanglement) using CodeScene's noise-filter
 //! thresholds. Batch-only — never wired into `default_checks()`/hook mode.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
@@ -139,18 +139,24 @@ pub fn compute_coupling_unfiltered(commits: &[Vec<String>]) -> Vec<CoupledPair> 
 
 /// One commit, tagged with enough information for `root_cause_clusters.rs` to classify it
 /// and cluster it by touched files — unlike [`git_log_commits`]'s plain file lists, this
-/// keeps the commit hash and subject line (discarded by that function's
-/// `--pretty=format:\u{1}`, which exists only to delimit commits).
+/// keeps the commit hash, subject line, and body (discarded by that function's
+/// `--pretty=format:\u{1}`, which exists only to delimit commits). `body` matters for
+/// classification even when `subject` mentions no issue: a squash-merge commonly carries
+/// GitHub's auto-appended "Fixes #123" (from the linked PR) only in the body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaggedCommit {
     pub sha: String,
     pub subject: String,
+    pub body: String,
     pub files: Vec<String>,
 }
 
 /// Parses `git log --name-only --no-merges --pretty=format:'\u{1}%H\u{1}%s'` output: each
 /// commit's header line starts with `\u{1}`, followed by its hash, another `\u{1}`, and its
-/// subject; subsequent non-empty lines until the next header are its changed files.
+/// subject; subsequent non-empty lines until the next header are its changed files. `body`
+/// is left empty here — `git_log_commits_with_subject` fills it in from a second git-log
+/// call ([`git_log_full_messages`]) since a multi-line commit body can't be told apart
+/// from this format's newline-delimited file list.
 fn parse_name_only_log_with_subject(output: &str) -> Vec<TaggedCommit> {
     let mut commits = Vec::new();
     let mut current: Option<TaggedCommit> = None;
@@ -163,6 +169,7 @@ fn parse_name_only_log_with_subject(output: &str) -> Vec<TaggedCommit> {
             current = Some(TaggedCommit {
                 sha: parts.next().unwrap_or_default().to_string(),
                 subject: parts.next().unwrap_or_default().to_string(),
+                body: String::new(),
                 files: Vec::new(),
             });
         } else if !line.is_empty()
@@ -177,8 +184,43 @@ fn parse_name_only_log_with_subject(output: &str) -> Vec<TaggedCommit> {
     commits
 }
 
+/// Runs `git log --no-merges --pretty=format:'\u{2}%H\u{1}%B'` and returns each commit's
+/// full raw message (subject + body, via `%B`) keyed by hash. Uses `\u{2}` (STX) as the
+/// commit delimiter and `\u{1}` (SOH) only to separate the hash from the message —
+/// distinct control characters, so a multi-paragraph body (which can contain blank lines,
+/// unlike the single-line `%s`) never gets misparsed as a new commit boundary. Kept as a
+/// separate call from [`git_log_commits_with_subject`]'s `--name-only` one specifically
+/// because that one's file-list parsing is newline-delimited and can't coexist with an
+/// arbitrary multi-line body in the same output stream.
+fn git_log_full_messages(repo_root: &Path, limit: usize) -> Result<HashMap<String, String>> {
+    let output = Command::new("git")
+        .args([
+            "log",
+            "--no-merges",
+            "--pretty=format:\u{2}%H\u{1}%B",
+            &format!("-n{limit}"),
+        ])
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git log")?;
+    if !output.status.success() {
+        bail!(
+            "git log exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .split('\u{2}')
+        .filter(|block| !block.is_empty())
+        .filter_map(|block| block.split_once('\u{1}'))
+        .map(|(sha, message)| (sha.to_string(), message.trim_end().to_string()))
+        .collect())
+}
+
 /// Runs `git log --name-only --no-merges -n <limit>` in `repo_root`, keeping each commit's
-/// hash and subject alongside its file list — the [`TaggedCommit`] sibling of
+/// hash, subject, and body alongside its file list — the [`TaggedCommit`] sibling of
 /// [`git_log_commits`], for callers (`root_cause_clusters.rs`) that need to classify
 /// commits by message, not just tally file co-changes.
 pub fn git_log_commits_with_subject(repo_root: &Path, limit: usize) -> Result<Vec<TaggedCommit>> {
@@ -201,26 +243,52 @@ pub fn git_log_commits_with_subject(repo_root: &Path, limit: usize) -> Result<Ve
         );
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_name_only_log_with_subject(&text))
+    let mut commits = parse_name_only_log_with_subject(&text);
+
+    let full_messages = git_log_full_messages(repo_root, limit)?;
+    for commit in &mut commits {
+        if let Some(message) = full_messages.get(&commit.sha) {
+            // %B is "subject\n\nbody..." — strip the subject line back off, since
+            // TaggedCommit keeps it separately (from %s) and callers scan subject/body
+            // independently.
+            commit.body = message
+                .strip_prefix(&commit.subject)
+                .unwrap_or(message)
+                .trim_start_matches('\n')
+                .to_string();
+        }
+    }
+    Ok(commits)
 }
 
-/// Matches a `fix(es|ed)? #123`-style issue reference anywhere in a commit subject —
-/// deliberately requires the issue number, so a bare "fix" mention (`fix typo`, no
-/// tracked issue) doesn't match; that case is still caught by the conventional-commit
-/// `fix:`/`fix(scope):` prefix check in [`is_bug_fix_commit`] when the author used it.
+/// Matches a `fix(es|ed)?`/`clos(e|es|ed)?`/`resolv(e|es|ed)? #123`-style issue reference
+/// anywhere in a commit subject or body — the same keywords GitHub auto-links from a PR to
+/// an issue (https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue),
+/// which a squash-merge commonly carries only in the body.
 static FIX_ISSUE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bfix(?:e[sd])?\s+#\d+").expect("FIX_ISSUE_RE is a valid pattern")
+    Regex::new(r"(?i)\b(?:fix(?:e[sd])?|clos(?:e[sd])?|resolv(?:e[sd])?)\s+#\d+")
+        .expect("FIX_ISSUE_RE is a valid pattern")
 });
 
-/// Whether `subject` (a commit's first line) looks like a bug-fix commit: a
-/// conventional-commit `fix:`/`fix(scope):` prefix, or an explicit `fix(es|ed)? #123`
-/// issue reference anywhere in the subject. A heuristic, not a guarantee — a real bug fix
-/// that uses neither convention goes untagged, and this deliberately does *not* match a
-/// bare "fix" substring (e.g. `fix typo`) without one of those two stronger signals, to
-/// avoid tagging routine wording as a bug fix.
-pub fn is_bug_fix_commit(subject: &str) -> bool {
-    let lower = subject.to_lowercase();
-    lower.starts_with("fix:") || lower.starts_with("fix(") || FIX_ISSUE_RE.is_match(subject)
+/// Matches `fix` as a whole word at the start of a subject — covers both the
+/// conventional-commit `fix:`/`fix(scope):` prefix and a bare imperative `Fix ...` subject
+/// with no colon at all (a convention this very codebase's own history uses, e.g. "Fix
+/// cargo fmt and clippy CI failures on master"). Deliberately broad: this also matches
+/// something like "Fix typo in README" with no tracked issue — over-tagging a small,
+/// harmless commit as a "bug fix" for clustering purposes costs nothing (it only
+/// participates in a cluster if it happens to co-touch files with another tagged commit),
+/// which is a better trade than under-tagging real fixes that don't follow either stronger
+/// convention.
+static FIX_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^fix\b").expect("FIX_PREFIX_RE is a valid pattern"));
+
+/// Whether a commit looks like a bug fix: a `fix`-prefixed subject ([`FIX_PREFIX_RE`]), or
+/// an explicit issue reference ([`FIX_ISSUE_RE`]) anywhere in the subject or body. A
+/// heuristic, not a guarantee — a real bug fix using none of these conventions goes
+/// untagged, and "Fixed a subtle race condition" (past tense, no issue number) isn't
+/// caught by the bare-prefix check either, only by an issue reference if one's present.
+pub fn is_bug_fix_commit(subject: &str, body: &str) -> bool {
+    FIX_PREFIX_RE.is_match(subject) || FIX_ISSUE_RE.is_match(subject) || FIX_ISSUE_RE.is_match(body)
 }
 
 /// Per-file revision counts and per-file-pair shared-commit counts, both keyed by borrowed
@@ -500,21 +568,59 @@ mod tests {
 
     #[test]
     fn is_bug_fix_commit_matches_conventional_commit_prefix() {
-        assert!(is_bug_fix_commit("fix: correct off-by-one in pagination"));
-        assert!(is_bug_fix_commit("fix(cache): evict stale entries"));
+        assert!(is_bug_fix_commit(
+            "fix: correct off-by-one in pagination",
+            ""
+        ));
+        assert!(is_bug_fix_commit("fix(cache): evict stale entries", ""));
+    }
+
+    #[test]
+    fn is_bug_fix_commit_matches_a_bare_imperative_fix_subject() {
+        // Regression: a real commit in this repo's own history ("Fix cargo fmt and clippy
+        // CI failures on master") used no colon at all — the old prefix check
+        // (`starts_with("fix:")`/`starts_with("fix(")`) missed it entirely.
+        assert!(is_bug_fix_commit(
+            "Fix cargo fmt and clippy CI failures on master",
+            ""
+        ));
     }
 
     #[test]
     fn is_bug_fix_commit_matches_an_explicit_issue_reference() {
-        assert!(is_bug_fix_commit("Fixes #123: pagination cursor wraps"));
-        assert!(is_bug_fix_commit("fix #45"));
-        assert!(is_bug_fix_commit("Fixed #7 double-free in cache eviction"));
+        assert!(is_bug_fix_commit("Fixes #123: pagination cursor wraps", ""));
+        assert!(is_bug_fix_commit("fix #45", ""));
+        assert!(is_bug_fix_commit(
+            "Fixed #7 double-free in cache eviction",
+            ""
+        ));
     }
 
     #[test]
-    fn is_bug_fix_commit_does_not_match_a_bare_fix_mention() {
-        assert!(!is_bug_fix_commit("fix typo in README"));
-        assert!(!is_bug_fix_commit("refactor: simplify fix detection logic"));
+    fn is_bug_fix_commit_matches_closes_and_resolves_keywords() {
+        assert!(is_bug_fix_commit("Add pagination support", "Closes #88"));
+        assert!(is_bug_fix_commit("Add retry logic", "Resolves #9"));
+    }
+
+    #[test]
+    fn is_bug_fix_commit_scans_the_body_for_a_github_auto_appended_issue_reference() {
+        // The shape a squash-merge commonly produces: a subject with no issue reference at
+        // all, and GitHub's auto-appended "Fixes #N" (from the linked PR) only in the body.
+        let subject = "Add retry logic to the upload client (#42)";
+        let body = "* implement retry\n* add tests\n\nFixes #41";
+        assert!(is_bug_fix_commit(subject, body));
+    }
+
+    #[test]
+    fn is_bug_fix_commit_does_not_match_fix_as_part_of_a_longer_word() {
+        assert!(!is_bug_fix_commit(
+            "Fixture setup for integration tests",
+            ""
+        ));
+        assert!(!is_bug_fix_commit(
+            "refactor: simplify fix detection logic",
+            ""
+        ));
     }
 
     // --- git_log_commits_with_subject / parse_name_only_log_with_subject ---
@@ -529,11 +635,13 @@ mod tests {
                 TaggedCommit {
                     sha: "abc123".to_string(),
                     subject: "fix: bug".to_string(),
+                    body: String::new(),
                     files: vec!["a.rs".to_string(), "b.rs".to_string()],
                 },
                 TaggedCommit {
                     sha: "def456".to_string(),
                     subject: "feat: thing".to_string(),
+                    body: String::new(),
                     files: vec!["c.rs".to_string()],
                 },
             ]
@@ -552,5 +660,37 @@ mod tests {
         assert_eq!(commits[0].files, vec!["b.rs".to_string()]);
         assert_eq!(commits[1].subject, "fix: correct the thing");
         assert!(!commits[0].sha.is_empty());
+    }
+
+    #[test]
+    fn git_log_commits_with_subject_captures_a_multi_line_body() {
+        let repo = TempGitRepo::new("tagged-body-e2e");
+        let status = std::process::Command::new("git")
+            .args([
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Add retry logic to the upload client (#42)",
+                "-m",
+                "* implement retry\n* add tests\n\nFixes #41",
+            ])
+            .current_dir(&repo.dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let commits = git_log_commits_with_subject(&repo.dir, 1000).unwrap();
+        assert_eq!(commits.len(), 1, "got: {commits:?}");
+        assert_eq!(
+            commits[0].subject,
+            "Add retry logic to the upload client (#42)"
+        );
+        assert!(
+            commits[0].body.contains("Fixes #41"),
+            "got body: {:?}",
+            commits[0].body
+        );
+        assert!(is_bug_fix_commit(&commits[0].subject, &commits[0].body));
     }
 }

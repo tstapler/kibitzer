@@ -152,15 +152,6 @@ fn hac_partitions(n: usize, sim: &[Vec<f64>]) -> Vec<Vec<Vec<usize>>> {
     history
 }
 
-/// A simplified, documented stand-in for Fokaefs et al.'s Entity Placement metric: the
-/// fraction of methods whose total similarity to their *own* cluster is at least as high
-/// as their total similarity to every other individual cluster. `1.0` means every method
-/// is unambiguously best-placed where the clustering put it; lower scores mean some
-/// methods are about as similar to a different candidate group as to their own — a weak
-/// split. The paper's actual EP metric additionally weighs *coupling introduced* (calls
-/// that would cross the new class boundary) using call-graph data this module doesn't
-/// have cheap access to per candidate cut; that refinement is future work, not attempted
-/// here.
 /// Average similarity of method `m` to every other member of `cluster` (excluding `m`
 /// itself if present — `m` is never a member of an "other" cluster it's being compared
 /// against, so the exclusion is a no-op there). `0.0` for a cluster with no other members
@@ -190,6 +181,15 @@ fn is_well_placed(m: usize, own_idx: usize, clusters: &[Vec<usize>], sim: &[Vec<
     own_sim >= best_other
 }
 
+/// A simplified, documented stand-in for Fokaefs et al.'s Entity Placement metric: the
+/// fraction of methods whose average similarity to their *own* cluster ([`mean_similarity_to`])
+/// is at least as high as their average similarity to every other individual cluster
+/// ([`is_well_placed`]). `1.0` means every method is unambiguously best-placed where the
+/// clustering put it; lower scores mean some methods are about as similar to a different
+/// candidate group as to their own — a weak split. The paper's actual EP metric
+/// additionally weighs *coupling introduced* (calls that would cross the new class
+/// boundary) using call-graph data this module doesn't have cheap access to per candidate
+/// cut; that refinement is future work, not attempted here.
 fn entity_placement_score(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> f64 {
     let n: usize = clusters.iter().map(Vec::len).sum();
     if n == 0 {
@@ -204,18 +204,12 @@ fn entity_placement_score(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> f64 {
     well_placed as f64 / n as f64
 }
 
-/// Finds the best candidate split for one type's clustered methods: scans every partition
-/// with `2..=n-1` clusters (excludes `k=1`, no split, and `k=n`, one class per method —
-/// neither is useful Extract Class advice), scores each by [`entity_placement_score`], and
-/// returns the highest-scoring one, provided it clears [`MIN_ENTITY_PLACEMENT_SCORE`].
-/// Ties prefer the earliest-scanned (highest `k`, i.e. more granular) partition — an
-/// arbitrary but deterministic tie-break, not a claim that finer splits are better.
 /// Mean similarity within `clusters`' groups vs. mean similarity across them. A method
 /// with uniform similarity to every other method (e.g. every method reads/writes the same
 /// single field) has no real cluster structure at all — every entity is equally
 /// "well-placed" wherever the clustering happens to cut, so [`entity_placement_score`]
 /// alone can't tell a genuine split from an arbitrary one on perfectly uniform data. This
-/// exists to gate that: `best_candidate_split` only considers a partition where intra-group
+/// exists to gate that: `candidate_splits` only considers a partition where intra-group
 /// similarity is *strictly* higher than inter-group similarity — a uniform-similarity type
 /// (intra == inter) never clears it, so it correctly produces no candidate.
 /// Sums `sim[a][b]` over every `a` in `cluster` and `b` in `other`, plus the pair count —
@@ -256,14 +250,23 @@ fn separates_meaningfully(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> bool {
     mean(intra) > mean(inter)
 }
 
-fn best_candidate_split(ids: &[&str], sim: &[Vec<f64>]) -> Option<(Vec<Vec<usize>>, f64)> {
+/// Every dendrogram cut tied for the best qualifying [`entity_placement_score`] — issue
+/// #38 specifies this tool return "a closed set of graph-legal moves (no ranking beyond
+/// genuine ties)," so picking a single winner among cuts with genuinely different scores
+/// would itself be an unprincipled ranking; only cuts that are indistinguishable by this
+/// metric are returned together. Scores are exact-equality-comparable here: every
+/// candidate partition for one type shares the same `n` (method count), so
+/// `entity_placement_score`'s `well_placed / n` is the ratio of two integers with a fixed
+/// denominator — two partitions tie iff they have the exact same `well_placed` count,
+/// which produces bit-identical `f64`s.
+fn candidate_splits(ids: &[&str], sim: &[Vec<f64>]) -> Vec<(Vec<Vec<usize>>, f64)> {
     let n = ids.len();
     if n < 3 {
-        return None;
+        return Vec::new();
     }
     let partitions = hac_partitions(n, sim);
     // partitions[i] has n-i clusters; we want cluster counts in [2, n-1], i.e. i in [1, n-2].
-    (1..=n.saturating_sub(2))
+    let qualifying: Vec<(Vec<Vec<usize>>, f64)> = (1..=n.saturating_sub(2))
         .map(|i| {
             let clusters = &partitions[i];
             (clusters.clone(), entity_placement_score(clusters, sim))
@@ -271,40 +274,65 @@ fn best_candidate_split(ids: &[&str], sim: &[Vec<f64>]) -> Option<(Vec<Vec<usize
         .filter(|(clusters, score)| {
             *score >= MIN_ENTITY_PLACEMENT_SCORE && separates_meaningfully(clusters, sim)
         })
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .collect();
+
+    let Some(best) = qualifying
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(None, |acc: Option<f64>, s| {
+            Some(acc.map_or(s, |a| a.max(s)))
+        })
+    else {
+        return Vec::new();
+    };
+    qualifying
+        .into_iter()
+        .filter(|(_, score)| *score == best)
+        .collect()
 }
 
 fn candidates_for_type(
     model: &ArchModel,
     pkg: &PackageNode,
     type_name: &str,
-) -> Option<ExtractClassCandidate> {
+) -> Vec<ExtractClassCandidate> {
     let field_sets = method_field_sets(model, pkg, type_name);
     if field_sets.len() < MIN_METHODS_FOR_CLUSTERING {
-        return None;
+        return Vec::new();
     }
-    let ids: Vec<&str> = field_sets.keys().copied().collect();
+    // Sorted, not left in HashMap iteration order: std's HashMap seeds its hasher randomly
+    // per process, so leaving this unsorted would feed hac_partitions a different initial
+    // index order (and, through best_merge_pair's positional tie-break) a possibly
+    // different clustering result on every run — the same non-determinism
+    // extract_class_candidates already guards against for its own type_names.
+    let mut ids: Vec<&str> = field_sets.keys().copied().collect();
+    ids.sort_unstable();
     let sim = similarity_matrix(&ids, &field_sets);
-    let (clusters, score) = best_candidate_split(&ids, &sim)?;
 
-    let groups: Vec<Vec<String>> = clusters
+    candidate_splits(&ids, &sim)
         .into_iter()
-        .map(|cluster| cluster.into_iter().map(|i| ids[i].to_string()).collect())
-        .collect();
-
-    Some(ExtractClassCandidate {
-        package: pkg.path.clone(),
-        type_name: type_name.to_string(),
-        groups,
-        entity_placement_score: score,
-    })
+        .map(|(clusters, score)| {
+            let groups: Vec<Vec<String>> = clusters
+                .into_iter()
+                .map(|cluster| cluster.into_iter().map(|i| ids[i].to_string()).collect())
+                .collect();
+            ExtractClassCandidate {
+                package: pkg.path.clone(),
+                type_name: type_name.to_string(),
+                groups,
+                entity_placement_score: score,
+            }
+        })
+        .collect()
 }
 
-/// All Extract Class candidates across the whole model — one per type that clears
-/// [`MIN_METHODS_FOR_CLUSTERING`] and produces a split scoring at least
-/// [`MIN_ENTITY_PLACEMENT_SCORE`]. Sorted by package then type name for deterministic
+/// All Extract Class candidates across the whole model — for every type that clears
+/// [`MIN_METHODS_FOR_CLUSTERING`], every dendrogram cut tied for the best qualifying score
+/// (see [`candidate_splits`]; usually exactly one, but genuine ties all come back rather
+/// than an arbitrary pick among them). Sorted by package then type name for deterministic
 /// output (`BTreeMap` iteration on `model.packages` already provides the package order;
-/// types within a package are sorted explicitly since `PackageNode::symbols` isn't).
+/// types within a package are sorted explicitly since `PackageNode::symbols` isn't) — tied
+/// candidates for the same type keep `candidate_splits`' own order.
 pub fn extract_class_candidates(model: &ArchModel) -> Vec<ExtractClassCandidate> {
     let mut out = Vec::new();
     for pkg in model.packages.values() {
@@ -317,9 +345,7 @@ pub fn extract_class_candidates(model: &ArchModel) -> Vec<ExtractClassCandidate>
         type_names.sort_unstable();
         type_names.dedup();
         for type_name in type_names {
-            if let Some(candidate) = candidates_for_type(model, pkg, type_name) {
-                out.push(candidate);
-            }
+            out.extend(candidates_for_type(model, pkg, type_name));
         }
     }
     out
@@ -558,5 +584,36 @@ mod tests {
         sim[2][3] = 1.0;
         sim[3][2] = 1.0;
         assert!(separates_meaningfully(&clusters, &sim));
+    }
+
+    // --- candidate_splits (#7: return the closed set of tied cuts, not a single pick) ---
+
+    #[test]
+    fn candidate_splits_returns_every_partition_tied_for_the_best_score() {
+        // Three tight pairs (sim=1.0 each) with uniform 0.4 cross-cluster similarity. Both
+        // the 3-cluster cut ({0,1},{2,3},{4,5}) and the 2-cluster cut ({0,1,2,3},{4,5})
+        // score a perfect 1.0 — every method is at least as similar, on average, to its own
+        // group as to the best alternative under either cut. Per issue #38's "closed set
+        // of graph-legal moves, no ranking beyond genuine ties" design, both must come
+        // back — a single-winner design would arbitrarily drop one.
+        let n = 6;
+        let mut sim = vec![vec![0.4; n]; n];
+        for (i, row) in sim.iter_mut().enumerate() {
+            row[i] = 0.0;
+        }
+        for &(a, b) in &[(0, 1), (2, 3), (4, 5)] {
+            sim[a][b] = 1.0;
+            sim[b][a] = 1.0;
+        }
+        let ids = vec!["m0", "m1", "m2", "m3", "m4", "m5"];
+
+        let splits = candidate_splits(&ids, &sim);
+        let mut cluster_counts: Vec<usize> =
+            splits.iter().map(|(clusters, _)| clusters.len()).collect();
+        cluster_counts.sort_unstable();
+        assert_eq!(cluster_counts, vec![2, 3], "got: {splits:?}");
+        for (_, score) in &splits {
+            assert_eq!(*score, 1.0, "got: {splits:?}");
+        }
     }
 }

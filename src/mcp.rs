@@ -171,6 +171,14 @@ struct ListRefactorCandidatesRequest {
     /// packages are considered. Defaults to the whole repo.
     #[serde(default)]
     scope: Option<String>,
+    /// Whether to include unexported/private Go types and methods when clustering.
+    /// Defaults to false (exported-only), matching every other pruning default in this
+    /// tool family — but unlike `list_architecture_symbols`, an unexported type is the
+    /// *common* case for this tool (most God-Class candidates live in internal packages),
+    /// so leaving this at its default can silently return zero candidates for a repo whose
+    /// real candidates are all unexported; see `possibly_pruned`.
+    #[serde(default)]
+    include_private: bool,
 }
 
 #[derive(Serialize)]
@@ -184,6 +192,11 @@ struct RefactorCandidateEntry {
 
 #[derive(Serialize)]
 struct ListRefactorCandidatesResponse {
+    /// True when `candidates` is empty, `include_private` was false, and the model's
+    /// pruning summary shows private symbols were excluded — distinguishes "no cohesion
+    /// problems here" from "hidden by the exported-only default," same purpose as
+    /// `ListArchitectureSymbolsResponse::possibly_pruned`.
+    possibly_pruned: bool,
     candidates: Vec<RefactorCandidateEntry>,
 }
 
@@ -942,23 +955,33 @@ impl KibitzerServer {
             Err(e) => return json_error(e),
         };
 
-        let model = match self.load_model_off_stack(repo_root, false).await {
+        let model = match self
+            .load_model_off_stack(repo_root, req.include_private)
+            .await
+        {
             Ok(m) => m,
             Err(e) => return json_error(e),
         };
         let scope: Vec<String> = req.scope.iter().cloned().collect();
         let filtered = model.filtered(&scope, ModelLevel::Code);
 
-        let candidates = crate::extract_class::extract_class_candidates(&filtered)
-            .into_iter()
-            .map(|c| RefactorCandidateEntry {
-                package: c.package,
-                type_name: c.type_name,
-                groups: c.groups,
-                entity_placement_score: c.entity_placement_score,
-            })
-            .collect();
-        let response = ListRefactorCandidatesResponse { candidates };
+        let candidates: Vec<RefactorCandidateEntry> =
+            crate::extract_class::extract_class_candidates(&filtered)
+                .into_iter()
+                .map(|c| RefactorCandidateEntry {
+                    package: c.package,
+                    type_name: c.type_name,
+                    groups: c.groups,
+                    entity_placement_score: c.entity_placement_score,
+                })
+                .collect();
+        let possibly_pruned = candidates.is_empty()
+            && !req.include_private
+            && !model.pruning.pruned_symbol_ids.is_empty();
+        let response = ListRefactorCandidatesResponse {
+            possibly_pruned,
+            candidates,
+        };
         serde_json::to_string(&response)
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
@@ -2289,6 +2312,7 @@ mod tests {
         ListRefactorCandidatesRequest {
             path: dir.display().to_string(),
             scope: None,
+            include_private: false,
         }
     }
 
@@ -2314,6 +2338,68 @@ mod tests {
         assert!(
             candidates[0]["entity_placement_score"].as_f64().unwrap() >= 0.75,
             "got: {json}"
+        );
+    }
+
+    /// Same shape as `write_extract_class_fixture`, but the type and its methods are all
+    /// unexported (lowercase) — clustering candidates that exist only in `internal`-style,
+    /// unexported code, the common real-world case this test guards.
+    fn write_unexported_extract_class_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        std::fs::create_dir_all(dir.join("blob")).unwrap();
+        std::fs::write(
+            dir.join("blob/blob.go"),
+            "package blob\n\n\
+             type t struct {\n\tx int\n\ty int\n}\n\n\
+             func (r *t) setX(v int) { r.x = v }\n\
+             func (r t) getX() int { return r.x }\n\
+             func (r *t) setY(v int) { r.y = v }\n\
+             func (r t) getY() int { return r.y }\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_refactor_candidates_flags_possibly_pruned_for_unexported_only_candidates() {
+        let dir = tmp_dir("refactor-candidates-pruned");
+        write_unexported_extract_class_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let default_output = server
+            .list_refactor_candidates(Parameters(refactor_req(&dir)))
+            .await;
+        let private_output = server
+            .list_refactor_candidates(Parameters(ListRefactorCandidatesRequest {
+                path: dir.display().to_string(),
+                scope: None,
+                include_private: true,
+            }))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let default_json: serde_json::Value = serde_json::from_str(&default_output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{default_output}"));
+        assert_eq!(
+            default_json["candidates"].as_array().unwrap().len(),
+            0,
+            "got: {default_json}"
+        );
+        assert_eq!(default_json["possibly_pruned"], true, "got: {default_json}");
+
+        let private_json: serde_json::Value = serde_json::from_str(&private_output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{private_output}"));
+        assert_eq!(
+            private_json["candidates"].as_array().unwrap().len(),
+            1,
+            "got: {private_json}"
+        );
+        assert_eq!(
+            private_json["possibly_pruned"], false,
+            "got: {private_json}"
         );
     }
 

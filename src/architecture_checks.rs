@@ -694,6 +694,15 @@ const LCOM_MIN_METHODS: usize = 4;
 /// first paragraph); doing that combination is out of scope here — it's a separate,
 /// already-proposed checker (issue #38's "God-class flags" item). Treat a finding as
 /// "worth a second look," not proof, same convention as `DipConcreteCouplingChecker`.
+///
+/// A second, narrower known ceiling: the zero-signal skip in [`lcom4_components`] operates
+/// per *type*, not per method — a type with real cohesion elsewhere plus one legitimate
+/// zero-signal helper (e.g. a `String()` that only reads other methods' return values, no
+/// field access) still counts that helper as its own isolated component, inflating LCOM4
+/// by one. Excluding individual zero-signal methods from the graph (rather than gating the
+/// whole type) would fix this, but changes what `LCOM_MIN_METHODS` should count against
+/// (all methods, or only those with signal) — a real design question, not a small change,
+/// so deferred rather than rushed.
 pub struct LcomChecker;
 
 impl ArchModelChecker for LcomChecker {
@@ -737,21 +746,6 @@ fn methods_by_type(pkg: &crate::arch_model::PackageNode) -> BTreeMap<&str, Vec<&
     map
 }
 
-fn union_find_root(parent: &mut [usize], x: usize) -> usize {
-    if parent[x] != x {
-        parent[x] = union_find_root(parent, parent[x]);
-    }
-    parent[x]
-}
-
-fn union_find_join(parent: &mut [usize], a: usize, b: usize) {
-    let ra = union_find_root(parent, a);
-    let rb = union_find_root(parent, b);
-    if ra != rb {
-        parent[ra] = rb;
-    }
-}
-
 /// Counts LCOM4's connected components over `method_ids` (all belonging to one type,
 /// `type_prefix` being that type's owner-qualifying `"{package}::{type}."` id prefix):
 /// unions any pair of methods sharing a field access, then any pair joined by a resolved
@@ -787,7 +781,7 @@ fn union_shared_field_accesses(
     }
     for members in methods_by_field.values() {
         for pair in members.windows(2) {
-            union_find_join(parent, pair[0], pair[1]);
+            crate::union_find::union(parent, pair[0], pair[1]);
         }
     }
     !methods_by_field.is_empty()
@@ -811,7 +805,7 @@ fn union_same_type_calls(
         }
         if let (Some(&a), Some(&b)) = (index.get(edge.from.as_str()), index.get(edge.to.as_str())) {
             found = true;
-            union_find_join(parent, a, b);
+            crate::union_find::union(parent, a, b);
         }
     }
     found
@@ -848,7 +842,7 @@ fn lcom4_components(
 
     Some(
         (0..method_ids.len())
-            .map(|i| union_find_root(&mut parent, i))
+            .map(|i| crate::union_find::root(&mut parent, i))
             .collect::<std::collections::HashSet<_>>()
             .len(),
     )

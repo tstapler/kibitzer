@@ -43,6 +43,7 @@ mod symbol_extract;
 mod task_stop;
 #[cfg(test)]
 mod test_support;
+mod union_find;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -219,6 +220,9 @@ enum ArchitectureAction {
         /// How many of the most recent non-merge commits to scan for bug fixes.
         #[arg(long, default_value_t = 1000)]
         limit: usize,
+        /// How many top clusters to report, same convention as `change-coupling --top`.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
     },
 }
 
@@ -413,8 +417,8 @@ fn main() -> Result<ExitCode> {
             ArchitectureAction::ChangeCoupling { path, limit, top } => {
                 run_change_coupling(&path, limit, top)
             }
-            ArchitectureAction::RootCauseClusters { path, limit } => {
-                run_root_cause_clusters(&path, limit)
+            ArchitectureAction::RootCauseClusters { path, limit, top } => {
+                run_root_cause_clusters(&path, limit, top)
             }
         },
         Command::Plugin { action } => match action {
@@ -583,8 +587,8 @@ fn run_change_coupling(path: &Path, limit: usize, top: usize) -> Result<ExitCode
 /// `kibitzer architecture root-cause-clusters`: prints each cluster's evidence packet (see
 /// `root_cause_clusters.rs`). Same "report, don't gate" convention as `run_change_coupling`
 /// — always `ExitCode::SUCCESS` when the analysis itself succeeds.
-fn run_root_cause_clusters(path: &Path, limit: usize) -> Result<ExitCode> {
-    let clusters = root_cause_clusters::analyze(path, limit)
+fn run_root_cause_clusters(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
+    let clusters = root_cause_clusters::analyze(path, limit, top)
         .with_context(|| format!("analyzing root-cause clusters for {}", path.display()))?;
 
     if clusters.is_empty() {
@@ -857,7 +861,7 @@ mod architecture_cli_tests {
             git(&["commit", "-q", "-m", &format!("fix: bug number {i}")]);
         }
 
-        let exit = run_root_cause_clusters(&repo.dir, 1000).unwrap();
+        let exit = run_root_cause_clusters(&repo.dir, 1000, 20).unwrap();
         assert_eq!(exit, ExitCode::SUCCESS);
     }
 
