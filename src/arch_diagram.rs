@@ -249,6 +249,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         }
     }
@@ -334,6 +335,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
 

@@ -352,6 +352,88 @@ fn collect_go_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
     }
 }
 
+/// One `import_spec`, kept alongside its explicit alias (if any) — needed to resolve a
+/// `pkg.Type`-qualified local's package back to a real import path (see
+/// `arch_model`'s `file_import_aliases`), which requires knowing whether the alias was
+/// written explicitly or must fall back to the imported package's own declared name.
+pub(crate) struct GoImportSpec {
+    pub path: String,
+    pub alias: Option<String>,
+}
+
+/// A Go file's own declared package name (the identifier in its `package_clause`, e.g.
+/// `v1` for `package v1`) plus its import list. The declared name is needed because
+/// Go's *implicit* import alias (no `import foo "some/path"` rename) is the imported
+/// package's own declared name, which is often but not always its import path's last
+/// segment (`k8s.io/apimachinery/pkg/apis/meta/v1` declares `package v1`, which happens
+/// to match; a package whose directory name and `package` clause disagree would not).
+pub(crate) struct GoFileImports {
+    pub package_name: Option<String>,
+    pub imports: Vec<GoImportSpec>,
+}
+
+/// Extracts `GoFileImports` from an already-parsed Go file. Dot imports (`import .
+/// "pkg"`) and blank imports (`import _ "pkg"`) are skipped entirely, not just left
+/// alias-less: a dot import merges the package's exported identifiers into this file's
+/// own unqualified scope (a different, much rarer resolution shape this v1 doesn't
+/// follow), and a blank import's package can never be referenced by any identifier in
+/// this file at all — both are discouraged idioms in idiomatic Go, so left unhandled
+/// rather than guessed at, same status as `walk_field_accesses`'s receiver-shadowing
+/// ceiling.
+pub(crate) fn extract_go_file_imports(tree: &tree_sitter::Tree, source: &str) -> GoFileImports {
+    let src = source.as_bytes();
+    let root = tree.root_node();
+    let package_name = {
+        let mut cursor = root.walk();
+        root.children(&mut cursor)
+            .find(|c| c.kind() == "package_clause")
+            .and_then(|pc| pc.named_child(0))
+            .and_then(|id| id.utf8_text(src).ok())
+            .map(str::to_string)
+    };
+    let mut imports = Vec::new();
+    collect_go_import_specs(root, src, &mut imports);
+    GoFileImports {
+        package_name,
+        imports,
+    }
+}
+
+fn collect_go_import_specs(node: Node, src: &[u8], out: &mut Vec<GoImportSpec>) {
+    if node.kind() == "import_spec" {
+        // Leaf node for this grammar (an `import_spec`'s only children are `name`/
+        // `path`, never a nested `import_spec`) — no need to recurse further once
+        // handled, whether or not it yields an entry.
+        if let Some(spec) = go_import_spec(node, src) {
+            out.push(spec);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_go_import_specs(child, src, out);
+    }
+}
+
+/// `None` for a dot (`import . "pkg"`) or blank (`import _ "pkg"`) import — see
+/// `extract_go_file_imports`'s doc comment for why those are skipped rather than
+/// aliased — or for a spec missing its `path` child (shouldn't happen for valid Go, but
+/// this is a `.has_error()`-checked tree only at `arch_model::build_model`'s call site,
+/// not universally).
+fn go_import_spec(node: Node, src: &[u8]) -> Option<GoImportSpec> {
+    let path_node = node.child_by_field_name("path")?;
+    let path_text = path_node.utf8_text(src).ok()?;
+    let alias = match node.child_by_field_name("name") {
+        None => None,
+        Some(n) if n.kind() == "package_identifier" => Some(n.utf8_text(src).ok()?.to_string()),
+        Some(_) => return None,
+    };
+    Some(GoImportSpec {
+        path: path_text.trim_matches('"').to_string(),
+        alias,
+    })
+}
+
 fn go_lang_config() -> QualifiedImportLangConfig {
     QualifiedImportLangConfig {
         package_decl_kind: "package_clause",
@@ -2592,5 +2674,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn parse_go(src: &str) -> tree_sitter::Tree {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&tree_sitter_go::LANGUAGE.into()).unwrap();
+        p.parse(src, None).unwrap()
+    }
+
+    #[test]
+    fn extract_go_file_imports_captures_package_name_and_plain_imports() {
+        let src =
+            "package v1\n\nimport (\n\t\"fmt\"\n\t\"k8s.io/apimachinery/pkg/apis/meta/v1\"\n)\n";
+        let tree = parse_go(src);
+        let result = extract_go_file_imports(&tree, src);
+        assert_eq!(result.package_name.as_deref(), Some("v1"));
+        assert_eq!(result.imports.len(), 2);
+        assert_eq!(result.imports[0].path, "fmt");
+        assert!(result.imports[0].alias.is_none());
+        assert_eq!(
+            result.imports[1].path,
+            "k8s.io/apimachinery/pkg/apis/meta/v1"
+        );
+        assert!(result.imports[1].alias.is_none());
+    }
+
+    #[test]
+    fn extract_go_file_imports_captures_an_explicit_alias() {
+        let src = "package foo\n\nimport metav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n\nfunc F() {}\n";
+        let tree = parse_go(src);
+        let result = extract_go_file_imports(&tree, src);
+        assert_eq!(result.imports.len(), 1);
+        assert_eq!(result.imports[0].alias.as_deref(), Some("metav1"));
+    }
+
+    #[test]
+    fn extract_go_file_imports_skips_dot_and_blank_imports() {
+        let src = "package foo\n\nimport (\n\t. \"dotpkg\"\n\t_ \"blankpkg\"\n\t\"fmt\"\n)\n";
+        let tree = parse_go(src);
+        let result = extract_go_file_imports(&tree, src);
+        assert_eq!(
+            result.imports.len(),
+            1,
+            "dot and blank imports must be skipped, not aliased"
+        );
+        assert_eq!(result.imports[0].path, "fmt");
     }
 }

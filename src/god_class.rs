@@ -7,8 +7,10 @@
 //! (ATFD) *or* look internally fragmented (TCC) for perfectly ordinary reasons, but all
 //! three at once is a much stronger God Class signal (PMD's `GodClassRule`, iPlasma).
 //!
-//! Go-only, same-package-only for v1 — see [`GodClassChecker`]'s doc comment for the
-//! full scope/ceiling list, especially ATFD's syntactic-type-only detection.
+//! Go-only for v1 — see [`GodClassChecker`]'s doc comment for the full scope/ceiling
+//! list, especially ATFD's syntactic-type-only detection. ATFD's `pkg.Foo`-qualified
+//! locals resolve cross-package via `ArchModel::file_import_aliases`; same-package
+//! resolution needed no such step in the first place.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -52,11 +54,15 @@ const GOD_CLASS_MIN_METHODS: usize = 4;
 ///   the declaration site. **Known ceiling, not fixed for v1**: this is not real type
 ///   inference. It cannot see through a variable whose type comes from a function's
 ///   return value, an interface's dynamic type, or a generic instantiation — only a
-///   syntactically visible type name at the point a local is introduced. It's also
-///   **same-package-only**: `pkg.Foo`-qualified types are skipped rather than resolving
-///   the import alias to another package's `PackageNode` and cross-referencing its
-///   fields — a real capability, but real cross-package resolution work, deferred rather
-///   than guessed at (same principle as `field_access_supports`'s language scoping).
+///   syntactically visible type name at the point a local is introduced. A `pkg.Foo`-
+///   qualified local's field accesses now count too, resolved to `"{target_package}::
+///   {name}"` via that file's `ArchModel::file_import_aliases` entry (`resolve_qualified_
+///   type`) — dropped, not fabricated under raw alias text, when the alias didn't resolve
+///   (an external/stdlib import, or a dot/blank import `file_import_aliases` never
+///   populates an entry for). No cross-package *field validity* check exists either way —
+///   same-package ATFD never validated a selector's field name against the target's real
+///   fields either (see `walk_selectors_on_typed_locals`), only the package/type identity
+///   changed here.
 /// - **TCC** (Tight Class Cohesion, Bieman & Kang): the fraction of method pairs that
 ///   directly share at least one field access, reusing `ArchModel::field_accesses` —
 ///   the same data `LcomChecker` uses, just aggregated as a ratio of connected pairs
@@ -141,7 +147,8 @@ fn god_class_findings_for_package(pkg: &PackageNode, model: &ArchModel) -> Vec<A
                 return None;
             }
             let wmc = total_wmc(&ids, &symbols_by_id, &mut files);
-            let atfd = distinct_foreign_field_accesses(&ids, &symbols_by_id, type_name, &mut files);
+            let atfd =
+                distinct_foreign_field_accesses(&ids, &symbols_by_id, type_name, &mut files, model);
             let tcc = tight_class_cohesion(&ids, model);
 
             if wmc <= WMC_THRESHOLD || atfd <= ATFD_THRESHOLD || tcc >= TCC_THRESHOLD {
@@ -256,12 +263,17 @@ fn tight_class_cohesion(ids: &[&str], model: &ArchModel) -> f64 {
 /// Distinct `(foreign_type, field_name)` pairs accessed, across all of `ids`' method
 /// bodies, through a syntactically-typed local that isn't this type's own receiver — see
 /// [`GodClassChecker`]'s doc comment for what "syntactically-typed" and "foreign" mean
-/// here (no real type inference, same-package types only).
+/// here (no real type inference). A qualified (`pkg.Foo`) local resolves to its real
+/// cross-package target via `model.file_import_aliases` (per `resolve_qualified_type`)
+/// when that file's imports resolved one; otherwise it's dropped, same as before
+/// cross-package resolution existed — never counted under its raw, ambiguous
+/// `"alias.Foo"` text.
 fn distinct_foreign_field_accesses(
     ids: &[&str],
     symbols_by_id: &HashMap<&str, &SymbolNode>,
     own_type: &str,
     files: &mut FileCache,
+    model: &ArchModel,
 ) -> usize {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for id in ids {
@@ -274,7 +286,8 @@ fn distinct_foreign_field_accesses(
         let Some(node) = find_method_node(tree.root_node(), sym.line, &sym.name, source) else {
             continue;
         };
-        collect_foreign_field_accesses(node, source, own_type, &mut seen);
+        let file_aliases = model.file_import_aliases.get(&sym.file);
+        collect_foreign_field_accesses(node, source, own_type, file_aliases, &mut seen);
     }
     seen.len()
 }
@@ -345,23 +358,75 @@ fn walk_typed_locals(node: Node, source: &str, out: &mut HashMap<String, String>
     }
 }
 
-/// The bare, local-package type name for a type expression, or `None` when the shape
-/// isn't one this checker resolves without real type inference: `type_identifier`
-/// (`Foo`) and `pointer_type` wrapping one (`*Foo`) resolve; `qualified_type`
-/// (`pkg.Foo`, a different package) deliberately does not — see this module's doc
-/// comment's ATFD ceiling.
+/// The type name for a type expression, or `None` when the shape isn't one this checker
+/// resolves without real type inference: `type_identifier` (`Foo`) and `pointer_type`
+/// wrapping one (`*Foo`) resolve to a bare, local-package name; `qualified_type`
+/// (`pkg.Foo`, a different package) resolves too, but to the raw `"pkg.Foo"` text
+/// verbatim rather than a bare name — callers that need the real target package
+/// (`resolve_qualified_type`) split on the first `.`, which is safe because a Go type
+/// identifier can never itself contain one. A local whose type comes from anything else
+/// (a function's return value, an interface's dynamic type, a generic instantiation)
+/// still resolves to `None` — that ceiling is unaffected by cross-package resolution.
 pub(crate) fn simple_type_name(ty: Node, source: &str) -> Option<String> {
     match ty.kind() {
         "type_identifier" => Some(node_text(ty, source).to_string()),
         "pointer_type" => ty.named_child(0).and_then(|c| simple_type_name(c, source)),
+        "qualified_type" => Some(node_text(ty, source).to_string()),
         _ => None,
     }
+}
+
+/// Resolves a `simple_type_name` result to `"{target_package}::{bare_name}"` when it's a
+/// `pkg.Foo`-qualified name whose `pkg` alias resolves in `file_aliases` (that file's
+/// `ArchModel::file_import_aliases` entry) — `None` for a same-package bare name (no `.`)
+/// or a qualified name whose alias didn't resolve (an external/stdlib import, or a `.`
+/// that isn't actually a package qualifier — Go's grammar guarantees it is, for a real
+/// `qualified_type` node, so this is defensive rather than expected). Split rather than
+/// resolved eagerly in `simple_type_name` itself, since only some callers (ATFD, ISP
+/// consumer detection) need the target package — same-type-name comparisons (`local_type
+/// != own_type`) work fine on the raw text either way.
+pub(crate) fn resolve_qualified_type(
+    type_name: &str,
+    file_aliases: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    let (alias, name) = type_name.split_once('.')?;
+    let target_package = file_aliases?.get(alias)?;
+    Some(format!("{target_package}::{name}"))
+}
+
+/// `local_type`'s foreign-type identity for ATFD purposes, or `None` when it isn't
+/// foreign: a same-package bare name equal to `own_type` is the receiver's own type, not
+/// foreign data; a qualified (`pkg.Foo`) name resolves via `resolve_qualified_type` (see
+/// its own doc comment for why an unresolved qualified name — an external/stdlib import —
+/// is dropped rather than kept under its raw, ambiguous text).
+fn foreign_type_of(
+    local_type: &str,
+    own_type: &str,
+    file_aliases: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    if local_type.contains('.') {
+        resolve_qualified_type(local_type, file_aliases)
+    } else if local_type != own_type {
+        Some(local_type.to_string())
+    } else {
+        None
+    }
+}
+
+/// Threaded context for `walk_selectors_on_typed_locals`'s recursive walk — bundled
+/// rather than passed as separate parameters once cross-package resolution added a
+/// fourth thing every recursive call needs to carry unchanged.
+struct ForeignAccessCtx<'a> {
+    own_type: &'a str,
+    typed_locals: &'a HashMap<String, String>,
+    file_aliases: Option<&'a HashMap<String, String>>,
 }
 
 fn collect_foreign_field_accesses(
     method: Node,
     source: &str,
     own_type: &str,
+    file_aliases: Option<&HashMap<String, String>>,
     out: &mut HashSet<(String, String)>,
 ) {
     let mut typed_locals = HashMap::new();
@@ -369,29 +434,33 @@ fn collect_foreign_field_accesses(
     if typed_locals.is_empty() {
         return;
     }
-    walk_selectors_on_typed_locals(method, source, own_type, &typed_locals, out);
+    let ctx = ForeignAccessCtx {
+        own_type,
+        typed_locals: &typed_locals,
+        file_aliases,
+    };
+    walk_selectors_on_typed_locals(method, source, &ctx, out);
 }
 
 fn walk_selectors_on_typed_locals(
     node: Node,
     source: &str,
-    own_type: &str,
-    typed_locals: &HashMap<String, String>,
+    ctx: &ForeignAccessCtx,
     out: &mut HashSet<(String, String)>,
 ) {
     if node.kind() == "selector_expression"
         && !is_call_target(node)
         && let Some(operand) = node.child_by_field_name("operand")
         && operand.kind() == "identifier"
-        && let Some(local_type) = typed_locals.get(node_text(operand, source))
-        && local_type != own_type
+        && let Some(local_type) = ctx.typed_locals.get(node_text(operand, source))
+        && let Some(foreign_type) = foreign_type_of(local_type, ctx.own_type, ctx.file_aliases)
         && let Some(field) = node.child_by_field_name("field")
     {
-        out.insert((local_type.clone(), node_text(field, source).to_string()));
+        out.insert((foreign_type, node_text(field, source).to_string()));
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_selectors_on_typed_locals(child, source, own_type, typed_locals, out);
+        walk_selectors_on_typed_locals(child, source, ctx, out);
     }
 }
 
@@ -497,6 +566,7 @@ mod tests {
                 field_access("m2", "T", "x", "pkg"),
                 field_access("m3", "T", "x", "pkg"),
             ],
+            file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 1.0);
@@ -515,6 +585,7 @@ mod tests {
                 field_access("m2", "T", "y", "pkg"),
                 field_access("m3", "T", "z", "pkg"),
             ],
+            file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 0.0);
@@ -539,6 +610,22 @@ mod tests {
         assert_eq!(total_wmc(&["a", "b"], &map, &mut files), 5);
     }
 
+    fn model_with_aliases(aliases: BTreeMap<PathBuf, HashMap<String, String>>) -> ArchModel {
+        ArchModel {
+            repo_root: PathBuf::new(),
+            packages: BTreeMap::new(),
+            import_edges: vec![],
+            call_edges: vec![],
+            field_accesses: vec![],
+            file_import_aliases: aliases,
+            pruning: crate::arch_model::PruningSummary::default(),
+        }
+    }
+
+    fn empty_test_model() -> ArchModel {
+        model_with_aliases(BTreeMap::new())
+    }
+
     #[test]
     fn atfd_counts_distinct_foreign_fields_through_a_typed_parameter() {
         let dir = crate::test_support::unique_temp_dir("god-class");
@@ -552,7 +639,7 @@ mod tests {
         map.insert("m", &sym);
         let mut files = FileCache::new();
         assert_eq!(
-            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files),
+            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files, &empty_test_model()),
             1,
             "same (Other, Y) pair accessed twice must count once"
         );
@@ -571,7 +658,7 @@ mod tests {
         map.insert("m", &sym);
         let mut files = FileCache::new();
         assert_eq!(
-            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files),
+            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files, &empty_test_model()),
             0
         );
     }
@@ -589,13 +676,16 @@ mod tests {
         map.insert("m", &sym);
         let mut files = FileCache::new();
         assert_eq!(
-            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files),
+            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files, &empty_test_model()),
             0
         );
     }
 
     #[test]
-    fn atfd_ignores_a_cross_package_qualified_type() {
+    fn atfd_drops_a_cross_package_qualified_type_with_no_resolvable_alias() {
+        // No `file_import_aliases` entry for this file at all (as if the import were
+        // stdlib/external, or simply unmodeled) — must drop the access rather than
+        // fabricate a foreign-type identity from the raw, ambiguous `"other.Other"` text.
         let dir = crate::test_support::unique_temp_dir("god-class");
         let file = write_go_file(
             &dir,
@@ -607,9 +697,39 @@ mod tests {
         map.insert("m", &sym);
         let mut files = FileCache::new();
         assert_eq!(
-            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files),
+            distinct_foreign_field_accesses(&["m"], &map, "T", &mut files, &empty_test_model()),
             0,
-            "cross-package qualified types are a documented v1 ceiling, not resolved"
+            "an unresolvable qualified type must not be counted under its raw alias text"
+        );
+    }
+
+    #[test]
+    fn atfd_resolves_a_cross_package_qualified_type_via_the_files_import_alias() {
+        let dir = crate::test_support::unique_temp_dir("god-class");
+        let file = write_go_file(
+            &dir,
+            "t.go",
+            "package pkg\n\ntype T struct{}\n\nfunc (t T) M(o other.Other) {\n\t_ = o.Y\n}\n",
+        );
+        let sym = method_symbol("pkg", "T", "M", &file, 5);
+        let mut map: HashMap<&str, &SymbolNode> = HashMap::new();
+        map.insert("m", &sym);
+        let mut files = FileCache::new();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            file.clone(),
+            HashMap::from([("other".to_string(), "some/other".to_string())]),
+        );
+        assert_eq!(
+            distinct_foreign_field_accesses(
+                &["m"],
+                &map,
+                "T",
+                &mut files,
+                &model_with_aliases(aliases)
+            ),
+            1,
+            "a resolvable cross-package qualified type must now count toward ATFD"
         );
     }
 }

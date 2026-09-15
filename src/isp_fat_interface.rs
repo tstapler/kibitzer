@@ -4,27 +4,30 @@
 //! interface with many methods is a design smell when its consumers only ever need small,
 //! non-overlapping subsets — clients get coupled to methods they never call.
 //!
-//! Design: for each package-local interface with enough declared methods, find every
-//! syntactically-typed local (parameter, or `var`/`:=`-declared local — reusing
-//! `god_class::collect_typed_locals`) whose type resolves to that interface, and record
-//! which of the interface's methods each such "consumer" call site actually invokes. An
-//! interface where every observed consumer uses only a small slice of its full method set
-//! is the ISP signal — no single consumer needs the whole interface.
+//! Design: for every interface across the whole model with enough declared methods, scan
+//! every function/method body across every package for a syntactically-typed local
+//! (parameter, or `var`/`:=`-declared local — reusing `god_class::collect_typed_locals`)
+//! whose type resolves to that interface — same-package by bare name, or cross-package by
+//! resolving a `pkg.Type`-qualified local through that file's `ArchModel::
+//! file_import_aliases` entry (`god_class::resolve_qualified_type`) — and record which of
+//! the interface's methods each such "consumer" call site actually invokes. An interface
+//! where every observed consumer uses only a small slice of its full method set is the ISP
+//! signal — no single consumer needs the whole interface.
 //!
-//! Go-only, same-package-only, declared-methods-only (embedded interfaces' promoted
-//! methods aren't walked into — same "embedding introduces promoted members this v1
-//! extraction doesn't follow" ceiling `go_struct_fields` already documents for struct
-//! field embedding).
+//! Go-only, declared-methods-only (embedded interfaces' promoted methods aren't walked
+//! into — same "embedding introduces promoted members this v1 extraction doesn't follow"
+//! ceiling `go_struct_fields` already documents for struct field embedding).
 
 use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode};
+use crate::arch_model::{ArchModel, SymbolKind, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 use crate::god_class::{
     FileCache, collect_typed_locals, find_method_node, is_call_target, node_text,
+    resolve_qualified_type,
 };
 
 /// An interface needs at least this many declared methods before a "no consumer uses all
@@ -38,29 +41,31 @@ const ISP_MIN_INTERFACE_METHODS: usize = 5;
 /// it, splitting the interface wouldn't actually decouple that consumer from anything.
 const ISP_MAX_USAGE_FRACTION: f64 = 0.5;
 
-/// Minimum number of *distinct* same-package consumers observed before "the heaviest one
-/// uses only M of N methods" is worth reporting at all. Confirmed as a real gap
-/// backtesting against `kubernetes/kubernetes`: consumers here are same-package-only (see
-/// this checker's doc comment), which undercounts a widely-shared, cross-package-exported
-/// interface badly — `metav1.Object` showed only 5 same-package consumers even though
-/// `grep -rl 'metav1\.Object\b'` across the whole repo finds 100 files referencing it, and
-/// several other findings had exactly 1 observed consumer, which is not a pattern, it's a
-/// single data point. Requiring several observed consumers before flagging doesn't fix the
-/// same-package undercounting itself (that's the documented "known ceiling, not fixed for
-/// v1" above), but it does stop the checker from asserting a design smell off evidence too
-/// thin to support it. No stronger literature citation than "a sample of one proves
-/// nothing," same status as `ISP_MIN_INTERFACE_METHODS`/`GOD_CLASS_MIN_METHODS`.
+/// Minimum number of *distinct* consumers observed before "the heaviest one uses only M
+/// of N methods" is worth reporting at all. Confirmed as a real gap backtesting against
+/// `kubernetes/kubernetes` while this checker was still same-package-only: several
+/// findings had exactly 1 observed consumer, which is not a pattern, it's a single data
+/// point. Cross-package resolution (`ArchModel::file_import_aliases`) narrows the
+/// remaining undercounting a lot, but doesn't eliminate it (a consumer that receives the
+/// interface via a struct field, a slice, or a function return rather than a directly
+/// syntactically-typed local is still invisible — see [`IspFatInterfaceChecker`]'s doc
+/// comment), so this gate stays: requiring several observed consumers before flagging
+/// stops the checker from asserting a design smell off evidence too thin to support it.
+/// No stronger literature citation than "a sample of one proves nothing," same status as
+/// `ISP_MIN_INTERFACE_METHODS`/`GOD_CLASS_MIN_METHODS`.
 const ISP_MIN_CONSUMERS: usize = 3;
 
 /// ISP fat-interface detector. See this module's doc comment for the full design and its
-/// scope (Go-only, same-package-only, declared-methods-only).
+/// scope (Go-only, declared-methods-only).
 ///
 /// **Known ceiling, not fixed for v1**: consumers are found via the same
 /// syntactically-typed-local technique `god_class.rs` uses for ATFD — a parameter or
-/// `var`/`:=`-declared local whose type is written out explicitly. A consumer that
-/// receives the interface some other way (a struct field of interface type, a slice/map
-/// of the interface, a value returned from a function and used inline without ever being
-/// bound to a locally-typed variable) is invisible to this detector. An interface with
+/// `var`/`:=`-declared local whose type is written out explicitly, resolved cross-package
+/// via `ArchModel::file_import_aliases` when it's a `pkg.Type`-qualified name. A consumer
+/// that receives the interface some other way (a struct field of interface type, a
+/// slice/map of the interface, a value returned from a function and used inline without
+/// ever being bound to a locally-typed variable, or a dot-import `file_import_aliases`
+/// never populates an entry for) is still invisible to this detector. An interface with
 /// zero observed consumers is skipped entirely (no evidence, not "zero usage" — the same
 /// "unknown vs. zero" distinction `LcomChecker`'s zero-signal handling draws), so this
 /// checker's silence is not proof an interface is well-used, only that it found nothing
@@ -73,69 +78,118 @@ impl ArchModelChecker for IspFatInterfaceChecker {
     }
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
-        model
-            .packages
-            .values()
-            .flat_map(isp_findings_for_package)
-            .collect()
+        isp_findings_for_model(model)
     }
 }
 
-fn isp_findings_for_package(pkg: &PackageNode) -> Vec<ArchFinding> {
+/// One interface candidate, keyed by its `SymbolNode::id` (already `"{package}::{name}"`
+/// — the same scheme `god_class::resolve_qualified_type` produces for a resolved
+/// cross-package reference, so a consumer's resolved key and an interface's own id are
+/// directly comparable without a separate lookup table).
+struct InterfaceCandidate {
+    pkg_path: String,
+    name: String,
+    methods: HashSet<String>,
+}
+
+fn isp_findings_for_model(model: &ArchModel) -> Vec<ArchFinding> {
     let mut files = FileCache::new();
-    let interfaces: HashMap<&str, &SymbolNode> = pkg
-        .symbols
-        .iter()
-        .filter(|s| s.kind == SymbolKind::Interface)
-        .map(|s| (s.name.as_str(), s))
-        .collect();
+
+    let interfaces = collect_interface_candidates(model, &mut files);
     if interfaces.is_empty() {
         return Vec::new();
     }
+    let usage = collect_interface_usage(model, &mut files, &interfaces);
+    build_findings(&interfaces, &usage)
+}
 
-    let mut declared_methods: HashMap<&str, HashSet<String>> = HashMap::new();
-    for (&name, sym) in &interfaces {
-        if let Some(methods) = interface_declared_methods(sym, &mut files) {
-            declared_methods.insert(name, methods);
-        }
-    }
-
-    // interface_name -> one entry per caller observed using it, each the count of that
-    // interface's methods that one caller invoked through a locally-typed variable.
-    let mut usage: HashMap<&str, Vec<usize>> = HashMap::new();
-    for sym in &pkg.symbols {
-        if sym.kind != SymbolKind::Function && sym.kind != SymbolKind::Method {
-            continue;
-        }
-        let Some((source, tree)) = files.get(&sym.file) else {
-            continue;
-        };
-        let Some(node) = find_method_node(tree.root_node(), sym.line, &sym.name, source) else {
-            continue;
-        };
-        let mut typed_locals = HashMap::new();
-        collect_typed_locals(node, source, &mut typed_locals);
-        for interface_name in declared_methods.keys() {
-            let used =
-                methods_called_through_locals_of_type(node, source, interface_name, &typed_locals);
-            if !used.is_empty() {
-                usage.entry(interface_name).or_default().push(used.len());
-            }
-        }
-    }
-
-    declared_methods
-        .into_iter()
-        .filter_map(|(interface_name, methods)| {
+/// Every interface across the whole model with at least `ISP_MIN_INTERFACE_METHODS`
+/// directly-declared methods, keyed by `SymbolNode::id`.
+fn collect_interface_candidates(
+    model: &ArchModel,
+    files: &mut FileCache,
+) -> HashMap<String, InterfaceCandidate> {
+    let mut interfaces = HashMap::new();
+    for pkg in model.packages.values() {
+        for sym in pkg
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+        {
+            let Some(methods) = interface_declared_methods(sym, files) else {
+                continue;
+            };
             if methods.len() < ISP_MIN_INTERFACE_METHODS {
-                return None;
+                continue;
             }
-            let usages = usage.get(interface_name)?;
+            interfaces.insert(
+                sym.id.clone(),
+                InterfaceCandidate {
+                    pkg_path: pkg.path.clone(),
+                    name: sym.name.clone(),
+                    methods,
+                },
+            );
+        }
+    }
+    interfaces
+}
+
+/// Interface id -> one entry per caller observed using it, each the count of that
+/// interface's methods one caller invoked through a locally-typed variable. Scans every
+/// function/method across every package (not just an interface's own) since a consumer
+/// can now resolve cross-package.
+fn collect_interface_usage<'a>(
+    model: &ArchModel,
+    files: &mut FileCache,
+    interfaces: &'a HashMap<String, InterfaceCandidate>,
+) -> HashMap<&'a str, Vec<usize>> {
+    let mut usage: HashMap<&str, Vec<usize>> = HashMap::new();
+    for pkg in model.packages.values() {
+        for sym in &pkg.symbols {
+            if sym.kind != SymbolKind::Function && sym.kind != SymbolKind::Method {
+                continue;
+            }
+            let Some((source, tree)) = files.get(&sym.file) else {
+                continue;
+            };
+            let Some(node) = find_method_node(tree.root_node(), sym.line, &sym.name, source) else {
+                continue;
+            };
+            let mut typed_locals = HashMap::new();
+            collect_typed_locals(node, source, &mut typed_locals);
+            if typed_locals.is_empty() {
+                continue;
+            }
+            let ctx = InterfaceUsageCtx {
+                consumer_pkg: &pkg.path,
+                file_aliases: model.file_import_aliases.get(&sym.file),
+                typed_locals: &typed_locals,
+                interfaces,
+            };
+            let mut used_by_interface: HashMap<&str, HashSet<String>> = HashMap::new();
+            walk_calls_resolving_interfaces(node, source, &ctx, &mut used_by_interface);
+            for (interface_id, methods) in used_by_interface {
+                usage.entry(interface_id).or_default().push(methods.len());
+            }
+        }
+    }
+    usage
+}
+
+fn build_findings(
+    interfaces: &HashMap<String, InterfaceCandidate>,
+    usage: &HashMap<&str, Vec<usize>>,
+) -> Vec<ArchFinding> {
+    interfaces
+        .iter()
+        .filter_map(|(interface_id, candidate)| {
+            let usages = usage.get(interface_id.as_str())?;
             if usages.len() < ISP_MIN_CONSUMERS {
                 return None;
             }
             let max_used = *usages.iter().max()?;
-            let fraction = max_used as f64 / methods.len() as f64;
+            let fraction = max_used as f64 / candidate.methods.len() as f64;
             if fraction > ISP_MAX_USAGE_FRACTION {
                 return None;
             }
@@ -143,14 +197,15 @@ fn isp_findings_for_package(pkg: &PackageNode) -> Vec<ArchFinding> {
                 file: None,
                 line: None,
                 message: format!(
-                    "[isp-fat-interface] {}::{interface_name} declares {} methods; of {} \
-                     observed same-package consumers, the heaviest used only {max_used} — \
-                     likely means no consumer needs the whole interface, though this only \
-                     sees consumers in the same package (see the checker's own documented \
-                     ceiling); worth a second look, not proof — consider splitting it by \
-                     usage",
-                    pkg.path,
-                    methods.len(),
+                    "[isp-fat-interface] {}::{} declares {} methods; of {} observed \
+                     consumers, the heaviest used only {max_used} — likely means no \
+                     consumer needs the whole interface, though a consumer reached other \
+                     than through a directly-typed local is still invisible to this check \
+                     (see the checker's own documented ceiling); worth a second look, not \
+                     proof — consider splitting it by usage",
+                    candidate.pkg_path,
+                    candidate.name,
+                    candidate.methods.len(),
                     usages.len()
                 ),
                 severity_override: None,
@@ -159,42 +214,66 @@ fn isp_findings_for_package(pkg: &PackageNode) -> Vec<ArchFinding> {
         .collect()
 }
 
-/// Set of method names actually invoked, within `caller`'s body, on any local whose type
-/// (per `typed_locals`) is `interface_name` — reuses the same call-target exclusion
-/// (`is_call_target`) god_class's ATFD walker uses, but the opposite way around: ATFD
-/// excludes calls to keep only field accesses, this keeps only calls.
-fn methods_called_through_locals_of_type(
-    caller: Node,
-    source: &str,
-    interface_name: &str,
-    typed_locals: &HashMap<String, String>,
-) -> HashSet<String> {
-    let mut out = HashSet::new();
-    walk_calls_through_locals(caller, source, interface_name, typed_locals, &mut out);
-    out
+/// Resolves `local_type` (as stored by `god_class::collect_typed_locals` — a bare name or
+/// a `pkg.Name` qualified one) to the `SymbolNode::id`-shaped key an interface candidate
+/// is registered under: `"{consumer_pkg}::{local_type}"` for a bare name (the local's
+/// declaring package is its own, same-package interface), or `god_class::
+/// resolve_qualified_type`'s cross-package resolution for a qualified one.
+fn resolve_interface_key(
+    local_type: &str,
+    consumer_pkg: &str,
+    file_aliases: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    if local_type.contains('.') {
+        resolve_qualified_type(local_type, file_aliases)
+    } else {
+        Some(format!("{consumer_pkg}::{local_type}"))
+    }
 }
 
-fn walk_calls_through_locals(
+/// Threaded context for `walk_calls_resolving_interfaces`'s recursive walk — bundled
+/// rather than passed as separate parameters, same rationale as `god_class`'s
+/// `ForeignAccessCtx`. Two lifetimes, not one: `'s` covers the short-lived per-call
+/// borrows (`typed_locals` is rebuilt fresh for every consumer method walked), while `'i`
+/// covers `interfaces`, which outlives the whole scan and is what `out`'s keys borrow
+/// from — collapsing both into one lifetime would force `typed_locals` to live as long as
+/// `interfaces`, which it can't.
+struct InterfaceUsageCtx<'s, 'i> {
+    consumer_pkg: &'s str,
+    file_aliases: Option<&'s HashMap<String, String>>,
+    typed_locals: &'s HashMap<String, String>,
+    interfaces: &'i HashMap<String, InterfaceCandidate>,
+}
+
+/// Single walk collecting, per interface actually called through a locally-typed
+/// variable in `node`'s body, the set of method names invoked on it — one pass resolves
+/// every local's type once rather than re-walking the whole body once per known
+/// interface (which would be O(interfaces × consumer methods) across a whole-model scan).
+/// Reuses the same call-target exclusion (`is_call_target`) `god_class`'s ATFD walker
+/// uses, but the opposite way around: ATFD excludes calls to keep only field accesses,
+/// this keeps only calls.
+fn walk_calls_resolving_interfaces<'i>(
     node: Node,
     source: &str,
-    interface_name: &str,
-    typed_locals: &HashMap<String, String>,
-    out: &mut HashSet<String>,
+    ctx: &InterfaceUsageCtx<'_, 'i>,
+    out: &mut HashMap<&'i str, HashSet<String>>,
 ) {
     if node.kind() == "selector_expression"
         && is_call_target(node)
         && let Some(operand) = node.child_by_field_name("operand")
         && operand.kind() == "identifier"
-        && typed_locals
-            .get(node_text(operand, source))
-            .is_some_and(|t| t == interface_name)
+        && let Some(local_type) = ctx.typed_locals.get(node_text(operand, source))
+        && let Some(key) = resolve_interface_key(local_type, ctx.consumer_pkg, ctx.file_aliases)
+        && let Some((interface_id, _)) = ctx.interfaces.get_key_value(&key)
         && let Some(field) = node.child_by_field_name("field")
     {
-        out.insert(node_text(field, source).to_string());
+        out.entry(interface_id.as_str())
+            .or_default()
+            .insert(node_text(field, source).to_string());
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_calls_through_locals(child, source, interface_name, typed_locals, out);
+        walk_calls_resolving_interfaces(child, source, ctx, out);
     }
 }
 
@@ -248,13 +327,40 @@ fn find_interface_node<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch_model::PruningSummary;
+    use crate::arch_model::{PackageNode, PruningSummary};
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     fn write_go_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// Wraps a single `PackageNode` in a minimal `ArchModel` (no cross-package import
+    /// aliases) — the shape every pre-existing single-package test in this module needs
+    /// now that `isp_findings_for_model` scans the whole model, not one package.
+    fn model_of(pkg: PackageNode) -> ArchModel {
+        model_of_packages(vec![pkg], BTreeMap::new())
+    }
+
+    fn model_of_packages(
+        pkgs: Vec<PackageNode>,
+        file_import_aliases: BTreeMap<PathBuf, HashMap<String, String>>,
+    ) -> ArchModel {
+        let mut packages = BTreeMap::new();
+        for pkg in pkgs {
+            packages.insert(pkg.path.clone(), pkg);
+        }
+        ArchModel {
+            repo_root: PathBuf::new(),
+            packages,
+            import_edges: vec![],
+            call_edges: vec![],
+            field_accesses: vec![],
+            file_import_aliases,
+            pruning: PruningSummary::default(),
+        }
     }
 
     fn interface_symbol(pkg: &str, name: &str, file: &Path, line: usize) -> SymbolNode {
@@ -329,15 +435,11 @@ mod tests {
             ],
             vec![file],
         );
-        let findings = isp_findings_for_package(&pkg);
+        let findings = isp_findings_for_model(&model_of(pkg));
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert!(findings[0].message.contains("declares 6 methods"));
         assert!(findings[0].message.contains("heaviest used only 2"));
-        assert!(
-            findings[0]
-                .message
-                .contains("3 observed same-package consumers")
-        );
+        assert!(findings[0].message.contains("3 observed consumers"));
     }
 
     #[test]
@@ -364,7 +466,7 @@ mod tests {
             vec![file],
         );
         assert!(
-            isp_findings_for_package(&pkg).is_empty(),
+            isp_findings_for_model(&model_of(pkg)).is_empty(),
             "2 observed consumers is below ISP_MIN_CONSUMERS"
         );
     }
@@ -392,7 +494,7 @@ mod tests {
             vec![file],
         );
         assert!(
-            isp_findings_for_package(&pkg).is_empty(),
+            isp_findings_for_model(&model_of(pkg)).is_empty(),
             "3 consumers clears ISP_MIN_CONSUMERS, but the heaviest uses 4/6 (over the \
              fraction threshold) - this must fail on the fraction check, not the count \
              gate, to actually exercise what this test is named for"
@@ -413,7 +515,7 @@ mod tests {
             vec![file],
         );
         assert!(
-            isp_findings_for_package(&pkg).is_empty(),
+            isp_findings_for_model(&model_of(pkg)).is_empty(),
             "no evidence must not be treated as a violation"
         );
     }
@@ -434,7 +536,7 @@ mod tests {
             ],
             vec![file],
         );
-        assert!(isp_findings_for_package(&pkg).is_empty());
+        assert!(isp_findings_for_model(&model_of(pkg)).is_empty());
     }
 
     #[test]
@@ -449,7 +551,103 @@ mod tests {
             )],
             vec![],
         );
-        assert!(isp_findings_for_package(&pkg).is_empty());
+        assert!(isp_findings_for_model(&model_of(pkg)).is_empty());
+    }
+
+    #[test]
+    fn resolves_a_cross_package_consumer_via_import_alias() {
+        // Interface and consumer live in different packages; the consumer's file has no
+        // explicit alias, so this also exercises the implicit-alias-via-declared-package-
+        // name path. Three separate consumer functions, each reusing an explicit alias
+        // set up per-file below, to clear ISP_MIN_CONSUMERS without needing three
+        // separate packages.
+        let iface_dir = crate::test_support::unique_temp_dir("isp-cross-pkg-iface");
+        let iface_file = write_go_file(
+            &iface_dir,
+            "store.go",
+            "package store\n\ntype Store interface {\n\tA()\n\tB()\n\tC()\n\tD()\n\tE()\n\tF()\n}\n",
+        );
+        let consumer_dir = crate::test_support::unique_temp_dir("isp-cross-pkg-consumer");
+        let consumer_file = write_go_file(
+            &consumer_dir,
+            "use.go",
+            "package consumer\n\n\
+             func UseAB(s store.Store) {\n\ts.A()\n\ts.B()\n}\n\n\
+             func UseC(s store.Store) {\n\ts.C()\n}\n\n\
+             func UseD(s store.Store) {\n\ts.D()\n}\n",
+        );
+
+        let iface_pkg = package(
+            "store",
+            vec![interface_symbol("store", "Store", &iface_file, 3)],
+            vec![iface_file],
+        );
+        let consumer_pkg = package(
+            "consumer",
+            vec![
+                function_symbol("consumer", "UseAB", &consumer_file, 3),
+                function_symbol("consumer", "UseC", &consumer_file, 8),
+                function_symbol("consumer", "UseD", &consumer_file, 12),
+            ],
+            vec![consumer_file.clone()],
+        );
+
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            consumer_file,
+            HashMap::from([("store".to_string(), "store".to_string())]),
+        );
+        let model = model_of_packages(vec![iface_pkg, consumer_pkg], aliases);
+
+        let findings = isp_findings_for_model(&model);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("store::Store"));
+        assert!(findings[0].message.contains("declares 6 methods"));
+        assert!(findings[0].message.contains("heaviest used only 2"));
+        assert!(findings[0].message.contains("3 observed consumers"));
+    }
+
+    #[test]
+    fn does_not_resolve_a_cross_package_consumer_with_no_import_alias_entry() {
+        // Same shape as the passing cross-package test, but with no
+        // `file_import_aliases` entry for the consumer file at all — must not fabricate
+        // a resolution from the raw "store.Store" text.
+        let iface_dir = crate::test_support::unique_temp_dir("isp-cross-pkg-iface-noalias");
+        let iface_file = write_go_file(
+            &iface_dir,
+            "store.go",
+            "package store\n\ntype Store interface {\n\tA()\n\tB()\n\tC()\n\tD()\n\tE()\n\tF()\n}\n",
+        );
+        let consumer_dir = crate::test_support::unique_temp_dir("isp-cross-pkg-consumer-noalias");
+        let consumer_file = write_go_file(
+            &consumer_dir,
+            "use.go",
+            "package consumer\n\n\
+             func UseAB(s store.Store) {\n\ts.A()\n\ts.B()\n}\n\n\
+             func UseC(s store.Store) {\n\ts.C()\n}\n\n\
+             func UseD(s store.Store) {\n\ts.D()\n}\n",
+        );
+
+        let iface_pkg = package(
+            "store",
+            vec![interface_symbol("store", "Store", &iface_file, 3)],
+            vec![iface_file],
+        );
+        let consumer_pkg = package(
+            "consumer",
+            vec![
+                function_symbol("consumer", "UseAB", &consumer_file, 3),
+                function_symbol("consumer", "UseC", &consumer_file, 8),
+                function_symbol("consumer", "UseD", &consumer_file, 12),
+            ],
+            vec![consumer_file],
+        );
+
+        let model = model_of_packages(vec![iface_pkg, consumer_pkg], BTreeMap::new());
+        assert!(
+            isp_findings_for_model(&model).is_empty(),
+            "no alias info for the consumer file means no resolvable consumer at all"
+        );
     }
 
     #[allow(dead_code)]

@@ -188,6 +188,16 @@ pub struct ArchModel {
     pub import_edges: Vec<ImportEdge>,
     pub call_edges: Vec<CallEdge>,
     pub field_accesses: Vec<FieldAccessEdge>,
+    /// Per-file `alias -> target package path` map, Go-only, for resolving a
+    /// `pkg.Type`-qualified local's package back to a real `packages` key —
+    /// `god_class`'s ATFD and `isp_fat_interface`'s consumer detection both need this to
+    /// see past a syntactically-typed local whose type is written out with a package
+    /// qualifier, rather than treating every qualified type as unresolvable (their
+    /// previous, same-package-only ceiling). Only ever contains aliases that resolved to
+    /// a package this scan actually modeled — same "graph membership guard" convention
+    /// `import_graph::build_qualified_name_language` already uses for `ImportEdge`s, so
+    /// an external/stdlib import never appears here as a resolvable target.
+    pub file_import_aliases: BTreeMap<PathBuf, HashMap<String, String>>,
     pub pruning: PruningSummary,
 }
 
@@ -321,6 +331,13 @@ pub fn build_model(
     let mut raw_field_access_sites: Vec<RawFieldAccessSite> = Vec::new();
     let mut struct_fields: HashMap<(String, String), std::collections::HashSet<String>> =
         HashMap::new();
+    // Go-only, see `ArchModel::file_import_aliases`'s doc comment. Collected per-file
+    // during this same walk (the tree is already parsed) and resolved into
+    // `file_import_aliases` once `packages` is complete, since an implicit alias needs
+    // the target package's own declared name, which might come from a file later in
+    // this loop than the one importing it.
+    let mut package_short_names: HashMap<String, String> = HashMap::new();
+    let mut raw_file_imports: Vec<(PathBuf, Vec<crate::import_graph::GoImportSpec>)> = Vec::new();
 
     for (path, source) in files {
         let Some(language) = language_for_path(path) else {
@@ -349,6 +366,18 @@ pub fn build_model(
                 symbols: Vec::new(),
             });
         package.files.push(path.clone());
+
+        if language == crate::checker::Language::Go {
+            let go_imports = crate::import_graph::extract_go_file_imports(&tree, source);
+            if let Some(name) = go_imports.package_name {
+                package_short_names
+                    .entry(package_path.clone())
+                    .or_insert(name);
+            }
+            if !go_imports.imports.is_empty() {
+                raw_file_imports.push((path.clone(), go_imports.imports));
+            }
+        }
 
         let symbols = extract_symbols_for_file(language, source, &tree, &package_path);
         for symbol in symbols {
@@ -388,6 +417,8 @@ pub fn build_model(
 
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
     let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites);
+    let file_import_aliases =
+        resolve_file_import_aliases(&packages, &package_short_names, raw_file_imports);
 
     Ok(ArchModel {
         repo_root: repo_root.to_path_buf(),
@@ -395,6 +426,7 @@ pub fn build_model(
         import_edges: import_graph.edges.clone(),
         call_edges,
         field_accesses,
+        file_import_aliases,
         pruning: PruningSummary {
             include_private: prune.include_private,
             excluded_dirs: vec![],
@@ -554,6 +586,45 @@ fn resolve_field_access_edges(
         .collect()
 }
 
+/// Resolves each file's raw Go import list into `alias -> target package path`, per
+/// `ArchModel::file_import_aliases`'s doc comment. An import with an explicit alias
+/// (`import metav1 "..."`) uses it directly; otherwise the alias is the target
+/// package's own declared name (`package_short_names`, gathered from that package's
+/// `package_clause` during the same walk) — falling back to the import path's last
+/// segment only when no file for that package was in this scan (can't happen for a
+/// package this same repo scan modeled, but a defensive fallback rather than a panic).
+/// An import that doesn't resolve to a `packages` key at all (stdlib, an external
+/// module) is dropped — same graph-membership guard `import_graph` already applies to
+/// `ImportEdge`s.
+fn resolve_file_import_aliases(
+    packages: &BTreeMap<String, PackageNode>,
+    package_short_names: &HashMap<String, String>,
+    raw_file_imports: Vec<(PathBuf, Vec<crate::import_graph::GoImportSpec>)>,
+) -> BTreeMap<PathBuf, HashMap<String, String>> {
+    let mut result = BTreeMap::new();
+    for (file, imports) in raw_file_imports {
+        let mut aliases: HashMap<String, String> = HashMap::new();
+        for import in imports {
+            if !packages.contains_key(&import.path) {
+                continue;
+            }
+            let alias = import
+                .alias
+                .or_else(|| package_short_names.get(&import.path).cloned())
+                .unwrap_or_else(|| last_path_segment(&import.path));
+            aliases.insert(alias, import.path);
+        }
+        if !aliases.is_empty() {
+            result.insert(file, aliases);
+        }
+    }
+    result
+}
+
+fn last_path_segment(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
 impl ArchModel {
     /// Exact-key lookup — a package's path, unlike a glob scope, is matched verbatim.
     pub fn package(&self, path: &str) -> Option<&PackageNode> {
@@ -608,6 +679,7 @@ impl ArchModel {
             import_edges: self.import_edges.clone(),
             call_edges: self.call_edges.clone(),
             field_accesses: self.field_accesses.clone(),
+            file_import_aliases: self.file_import_aliases.clone(),
             pruning: self.pruning.clone(),
         }
     }
@@ -898,6 +970,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         }
     }
@@ -914,6 +987,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
 
@@ -1254,6 +1328,96 @@ mod tests {
     }
 
     #[test]
+    fn build_model_resolves_a_qualified_local_s_package_via_implicit_alias() {
+        // No explicit `import x "other"` rename — the alias must fall back to `other`'s
+        // own declared package name, which this test deliberately gives a directory
+        // matching its package name so `ImportGraph::default()`'s directory-based
+        // fallback key ("other") lines up with the import literal ("other") too.
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![
+            (
+                PathBuf::from("/repo/other/types.go"),
+                "package other\n\ntype Object interface {\n\tFoo()\n}\n".to_string(),
+            ),
+            (
+                PathBuf::from("/repo/pkg/consumer.go"),
+                "package pkg\n\nimport \"other\"\n\nfunc F(o other.Object) {\n\to.Foo()\n}\n"
+                    .to_string(),
+            ),
+        ];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        let aliases = model
+            .file_import_aliases
+            .get(Path::new("/repo/pkg/consumer.go"))
+            .expect("consumer.go has a resolved import alias");
+        assert_eq!(aliases.get("other").map(String::as_str), Some("other"));
+    }
+
+    #[test]
+    fn build_model_resolves_a_qualified_local_s_package_via_explicit_alias() {
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![
+            (
+                PathBuf::from("/repo/other/types.go"),
+                "package v1\n\ntype Object interface {\n\tFoo()\n}\n".to_string(),
+            ),
+            (
+                PathBuf::from("/repo/pkg/consumer.go"),
+                "package pkg\n\nimport metav1 \"other\"\n\nfunc F(o metav1.Object) {\n\to.Foo()\n}\n"
+                    .to_string(),
+            ),
+        ];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        let aliases = model
+            .file_import_aliases
+            .get(Path::new("/repo/pkg/consumer.go"))
+            .expect("consumer.go has a resolved import alias");
+        assert_eq!(
+            aliases.get("metav1").map(String::as_str),
+            Some("other"),
+            "explicit alias wins over other's own declared package name (v1)"
+        );
+    }
+
+    #[test]
+    fn build_model_does_not_resolve_an_import_outside_this_scan() {
+        // `fmt` isn't a package this scan modeled (no file declares it) — the
+        // graph-membership guard must drop it rather than inventing a resolvable target.
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![(
+            PathBuf::from("/repo/pkg/a.go"),
+            "package pkg\n\nimport \"fmt\"\n\nfunc F() {\n\tfmt.Println(\"hi\")\n}\n".to_string(),
+        )];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        assert!(
+            model.file_import_aliases.is_empty(),
+            "got: {:?}",
+            model.file_import_aliases
+        );
+    }
+
+    #[test]
     fn build_model_skips_files_with_no_language_mapping() {
         let repo_root = PathBuf::from("/repo");
         let files = vec![
@@ -1550,6 +1714,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
 
@@ -1590,6 +1755,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
 
@@ -1623,6 +1789,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
 
@@ -1656,6 +1823,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
 

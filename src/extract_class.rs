@@ -378,6 +378,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses,
+            file_import_aliases: BTreeMap::new(),
             pruning: PruningSummary {
                 include_private: false,
                 excluded_dirs: vec![],
