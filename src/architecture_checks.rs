@@ -517,6 +517,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(DipConcreteCouplingChecker),
         Box::new(LcomChecker),
         Box::new(crate::god_class::GodClassChecker),
+        Box::new(crate::isp_fat_interface::IspFatInterfaceChecker),
     ]
 }
 

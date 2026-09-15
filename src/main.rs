@@ -30,6 +30,7 @@ mod hook;
 mod hook_log;
 mod import_graph;
 mod install;
+mod isp_fat_interface;
 mod jaccard;
 mod lsp;
 mod markdown_link_integrity;

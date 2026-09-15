@@ -106,18 +106,18 @@ impl ArchModelChecker for GodClassChecker {
 /// tree paired with the new file's source string, producing byte-index-out-of-bounds
 /// panics as soon as a later file was shorter than the first one parsed. A fresh
 /// `GrammarCache::new()` per file avoids the cross-file reuse entirely.
-struct FileCache {
+pub(crate) struct FileCache {
     cache: HashMap<PathBuf, Option<(String, Tree)>>,
 }
 
 impl FileCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cache: HashMap::new(),
         }
     }
 
-    fn get(&mut self, file: &Path) -> Option<&(String, Tree)> {
+    pub(crate) fn get(&mut self, file: &Path) -> Option<&(String, Tree)> {
         self.cache
             .entry(file.to_path_buf())
             .or_insert_with(|| {
@@ -189,12 +189,20 @@ fn total_wmc(
         .sum()
 }
 
-/// Finds the `method_declaration` node whose declared name and 1-indexed start line
-/// match `line`/`name` — `SymbolNode` records a declaration site, not a `Node` handle
-/// (it outlives the `Tree` it came from), so re-locating it after a fresh parse is the
-/// only way back to real AST structure for per-method analysis.
-fn find_method_node<'a>(node: Node<'a>, line: usize, name: &str, source: &str) -> Option<Node<'a>> {
-    if node.kind() == "method_declaration"
+/// Finds the `method_declaration` or `function_declaration` node whose declared name and
+/// 1-indexed start line match `line`/`name` — `SymbolNode` records a declaration site,
+/// not a `Node` handle (it outlives the `Tree` it came from), so re-locating it after a
+/// fresh parse is the only way back to real AST structure for per-symbol analysis.
+/// Matches both kinds since callers need both: `god_class.rs`'s own WMC/ATFD only ever
+/// look up `Method` symbols, but `isp_fat_interface.rs` looks up interface *consumers*,
+/// which are just as often free functions (`func UseThing(t Thing)`) as methods.
+pub(crate) fn find_method_node<'a>(
+    node: Node<'a>,
+    line: usize,
+    name: &str,
+    source: &str,
+) -> Option<Node<'a>> {
+    if matches!(node.kind(), "method_declaration" | "function_declaration")
         && node.start_position().row + 1 == line
         && node
             .child_by_field_name("name")
@@ -207,7 +215,7 @@ fn find_method_node<'a>(node: Node<'a>, line: usize, name: &str, source: &str) -
         .find_map(|child| find_method_node(child, line, name, source))
 }
 
-fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
+pub(crate) fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
     &source[node.start_byte()..node.end_byte()]
 }
 
@@ -274,7 +282,7 @@ fn distinct_foreign_field_accesses(
 /// One syntactically-typed local's type name, as introduced by a parameter, a `var
 /// x T`, or a `x := T{}`-shaped composite literal — see `simple_type_name` for which
 /// type-expression shapes are recognized.
-fn collect_typed_locals(method: Node, source: &str, out: &mut HashMap<String, String>) {
+pub(crate) fn collect_typed_locals(method: Node, source: &str, out: &mut HashMap<String, String>) {
     // The method's own (non-receiver) parameters.
     if let Some(params) = method.child_by_field_name("parameters") {
         let mut cursor = params.walk();
@@ -342,7 +350,7 @@ fn walk_typed_locals(node: Node, source: &str, out: &mut HashMap<String, String>
 /// (`Foo`) and `pointer_type` wrapping one (`*Foo`) resolve; `qualified_type`
 /// (`pkg.Foo`, a different package) deliberately does not — see this module's doc
 /// comment's ATFD ceiling.
-fn simple_type_name(ty: Node, source: &str) -> Option<String> {
+pub(crate) fn simple_type_name(ty: Node, source: &str) -> Option<String> {
     match ty.kind() {
         "type_identifier" => Some(node_text(ty, source).to_string()),
         "pointer_type" => ty.named_child(0).and_then(|c| simple_type_name(c, source)),
@@ -391,7 +399,7 @@ fn walk_selectors_on_typed_locals(
 /// `symbol_extract::selector_is_call_target` applies to receiver field accesses — ATFD
 /// (Lanza & Marinescu's original definition) is about foreign *attribute* access, not
 /// foreign method calls.
-fn is_call_target(selector: Node) -> bool {
+pub(crate) fn is_call_target(selector: Node) -> bool {
     selector.parent().is_some_and(|p| {
         p.kind() == "call_expression"
             && p.child_by_field_name("function").is_some_and(|f| {
@@ -405,33 +413,6 @@ mod tests {
     use super::*;
     use crate::arch_model::{AccessKind, FieldAccessEdge, SymbolKind};
     use std::collections::BTreeMap;
-
-    /// Unique per-test scratch dir — `GodClassChecker`'s WMC/ATFD computation reads real
-    /// files off disk (see `FileCache`), same "no `tempfile` dependency, hand-roll it"
-    /// precedent as `architecture_checks::tests::TempDir`.
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "kibitzer-god-class-test-{}-{name}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     fn write_go_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
@@ -476,16 +457,16 @@ mod tests {
         // long file first, then a short one, and confirming the short one's own content
         // comes back (not a byte-index panic, not the long file's leftover content) is
         // the direct regression check.
-        let dir = TempDir::new("file-cache");
+        let dir = crate::test_support::unique_temp_dir("god-class-file-cache");
         let long = write_go_file(
-            &dir.path,
+            &dir,
             "long.go",
             &format!(
                 "package pkg\n\nfunc Long() {{\n{}\n}}\n",
                 "\t_ = 1\n".repeat(200)
             ),
         );
-        let short = write_go_file(&dir.path, "short.go", "package pkg\n\nfunc Short() {}\n");
+        let short = write_go_file(&dir, "short.go", "package pkg\n\nfunc Short() {}\n");
 
         let mut files = FileCache::new();
         {
@@ -495,12 +476,12 @@ mod tests {
 
         let (short_source, short_tree) = files.get(&short).expect("short.go parses");
         assert_eq!(short_source, "package pkg\n\nfunc Short() {}\n");
-        let name = find_method_node(short_tree.root_node(), 3, "Short", short_source);
-        // `Short` is a free function, not a method, so `find_method_node` correctly
-        // finds nothing — the real assertion is that reaching this line didn't panic
-        // indexing `short_source` with a node from the (much longer) cached `long.go`
-        // tree.
-        assert!(name.is_none());
+        let node = find_method_node(short_tree.root_node(), 3, "Short", short_source)
+            .expect("Short is found in short.go's own (correctly re-parsed) tree");
+        // The real assertion is that this matched a node inside `short_source`'s own
+        // byte range, not a leftover node from the (much longer) cached `long.go` tree —
+        // indexing past `short_source`'s end is exactly the panic this regression covers.
+        assert!(node.end_byte() <= short_source.len());
     }
 
     #[test]
@@ -541,9 +522,9 @@ mod tests {
 
     #[test]
     fn wmc_sums_cyclomatic_complexity_across_methods() {
-        let dir = TempDir::new("god-class");
+        let dir = crate::test_support::unique_temp_dir("god-class");
         let file = write_go_file(
-            &dir.path,
+            &dir,
             "t.go",
             "package pkg\n\ntype T struct{}\n\nfunc (t T) A() {\n\tif true {\n\t}\n}\n\nfunc (t T) B() {\n\tif true {\n\t} else if false {\n\t}\n}\n",
         );
@@ -560,9 +541,9 @@ mod tests {
 
     #[test]
     fn atfd_counts_distinct_foreign_fields_through_a_typed_parameter() {
-        let dir = TempDir::new("god-class");
+        let dir = crate::test_support::unique_temp_dir("god-class");
         let file = write_go_file(
-            &dir.path,
+            &dir,
             "t.go",
             "package pkg\n\ntype T struct{}\n\ntype Other struct{ Y int }\n\nfunc (t T) M(o *Other) {\n\t_ = o.Y\n\t_ = o.Y\n}\n",
         );
@@ -579,9 +560,9 @@ mod tests {
 
     #[test]
     fn atfd_ignores_access_through_the_receivers_own_type() {
-        let dir = TempDir::new("god-class");
+        let dir = crate::test_support::unique_temp_dir("god-class");
         let file = write_go_file(
-            &dir.path,
+            &dir,
             "t.go",
             "package pkg\n\ntype T struct{ X int }\n\nfunc (t T) M(other T) {\n\t_ = other.X\n}\n",
         );
@@ -597,9 +578,9 @@ mod tests {
 
     #[test]
     fn atfd_ignores_a_foreign_method_call_not_a_field_access() {
-        let dir = TempDir::new("god-class");
+        let dir = crate::test_support::unique_temp_dir("god-class");
         let file = write_go_file(
-            &dir.path,
+            &dir,
             "t.go",
             "package pkg\n\ntype T struct{}\n\ntype Other struct{}\n\nfunc (o Other) Helper() int { return 0 }\n\nfunc (t T) M(o *Other) {\n\t_ = o.Helper()\n}\n",
         );
@@ -615,9 +596,9 @@ mod tests {
 
     #[test]
     fn atfd_ignores_a_cross_package_qualified_type() {
-        let dir = TempDir::new("god-class");
+        let dir = crate::test_support::unique_temp_dir("god-class");
         let file = write_go_file(
-            &dir.path,
+            &dir,
             "t.go",
             "package pkg\n\ntype T struct{}\n\nfunc (t T) M(o other.Other) {\n\t_ = o.Y\n}\n",
         );
