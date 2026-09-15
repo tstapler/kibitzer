@@ -5,8 +5,47 @@ over stdio (via [`tower-lsp`](https://docs.rs/tower-lsp)), so any LSP-capable ed
 can get kibitzer's checks as inline diagnostics instead of running `kibitzer hook`
 or `kibitzer run` out of band.
 
-Editor-specific setup (VS Code, Neovim, etc.) isn't covered here — see
-[issue #12](https://github.com/tstapler/kibitzer/issues/12).
+## Editor setup
+
+`kibitzer lsp` isn't in `nvim-lspconfig`'s registry and doesn't ship a VS Code
+extension, so both editors need a small amount of generic-LSP-client config.
+Scope that config to the filetypes your `.claude/inspect.json` actually
+checks (see its `scope` glob field, e.g. `"scope": ["**/*.md"]`) — kibitzer
+runs whatever checks match a file regardless of what triggered it, so a
+mismatched filetype list just means wasted round-trips, not wrong output.
+
+### Neovim (0.8+, no plugin required)
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "go", "markdown" }, -- match your inspect.json scope
+  callback = function(args)
+    vim.lsp.start({
+      name = "kibitzer",
+      cmd = { "kibitzer", "lsp" },
+      root_dir = vim.fs.dirname(vim.fs.find({ ".claude", ".git" }, { upward = true })[1]),
+    })
+  end,
+})
+```
+
+`root_dir` just needs to land inside the repo — `kibitzer lsp` resolves the
+actual `.claude/inspect.json` itself, per-file, via `config::find_config`
+walking up from each opened document.
+
+### VS Code
+
+Install a generic LSP client extension — e.g.
+[`glspc`](https://marketplace.visualstudio.com/items?itemName=zsol.vscode-glspc)
+— then point it at the binary in your workspace `settings.json`:
+
+```json
+{
+  "glspc.server.command": "kibitzer",
+  "glspc.server.commandArguments": ["lsp"],
+  "glspc.server.languageId": ["go", "markdown"]
+}
+```
 
 ## What it does
 
