@@ -667,17 +667,12 @@ fn dip_finding(
     })
 }
 
-/// Minimum method count before a type is evaluated for LCOM4 — a type with fewer methods
-/// is too small for "should be split into N classes" to be actionable, even if its
+/// Minimum method count — after excluding state-independent methods, see
+/// [`methods_with_own_signal`] — before a type is evaluated for LCOM4. A type with fewer
+/// methods is too small for "should be split into N classes" to be actionable, even if its
 /// components technically number more than one (e.g. two independent one-line getters).
 /// No stronger literature citation than "too small to be worth splitting," same status as
 /// `MAX_FAN_OUT`/`STABLE_MAX` above.
-///
-/// Known ceiling: this gates per *type*, not per method, so a type with real cohesion
-/// elsewhere plus one legitimate zero-signal helper (e.g. a `String()` that only reads
-/// other methods' return values) still counts that helper as its own isolated component,
-/// inflating LCOM4 by one — deferred rather than rushed, since fixing it changes what this
-/// constant should count against (all methods, or only those with signal).
 const LCOM_MIN_METHODS: usize = 4;
 
 /// SRP proxy: LCOM4 — the number of connected components in the graph where a type's own
@@ -733,6 +728,47 @@ fn methods_by_type(pkg: &crate::arch_model::PackageNode) -> BTreeMap<&str, Vec<&
     map
 }
 
+/// Filters `method_ids` (all belonging to one type) down to those with at least one
+/// connectivity signal of their own — a field access, or a resolved call to/from another
+/// method of the same type (`type_prefix`). A method with neither (a blank/`_`-receiver
+/// marker-interface stub, or any named-but-unused receiver with the same property) touches
+/// no state kibitzer can observe: excluding it from the LCOM4 graph, rather than counting
+/// it as its own forced singleton component, is the standard treatment for pure/utility
+/// methods in the cohesion-metric literature. The alternative — only excluding literally
+/// blank (`_`) receivers — was rejected because a named-but-unused receiver has the exact
+/// same "touches nothing" property; singling out the syntax rather than the behavior would
+/// just move the false positive to `func (t T) OpenAPISchemaType() string { return "..." }`.
+///
+/// Confirmed as a real false positive backtesting against `kubernetes/kubernetes`:
+/// `k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1.JSON` (one field, `Raw
+/// []byte`) was flagged `LCOM4=3` — its four real methods (`MarshalJSON`/`UnmarshalJSON`/
+/// `MarshalCBOR`/`UnmarshalCBOR`) all touch `Raw` and correctly cluster into one component,
+/// but two `OpenAPISchemaType()`/`OpenAPISchemaFormat()` marker-interface stubs (blank `_`
+/// receiver, no field access, no calls) each counted as their own "unrelated
+/// responsibility." That pattern — `String()`, `DeepCopyObject()`, marker-interface
+/// stubs — is pervasive in real Go code, especially test/mock files satisfying an
+/// interface by design.
+fn methods_with_own_signal<'a>(
+    method_ids: &[&'a str],
+    model: &crate::arch_model::ArchModel,
+    type_prefix: &str,
+) -> Vec<&'a str> {
+    method_ids
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let has_field = model.field_accesses.iter().any(|a| a.from == id);
+            let has_call = model.call_edges.iter().any(|e| {
+                e.resolved
+                    && e.from.starts_with(type_prefix)
+                    && e.to.starts_with(type_prefix)
+                    && (e.from == id || e.to == id)
+            });
+            has_field || has_call
+        })
+        .collect()
+}
+
 /// Unions every pair of methods (by index into `parent`) sharing a field access. Returns
 /// whether kibitzer observed *any* field access for this type at all — `false` means zero
 /// accesses total, not just zero shared ones (see `lcom4_components`'s doc comment).
@@ -782,6 +818,10 @@ fn union_same_type_calls(
     found
 }
 
+/// `method_ids` is expected to already be filtered by [`methods_with_own_signal`] — a
+/// method with no connectivity signal of its own is excluded before it ever reaches here,
+/// rather than being counted as a forced singleton component.
+///
 /// `None` when this type has no connectivity signal at all — e.g. every `Method`'s
 /// receiver's underlying Go type isn't a struct (`type Set[T comparable] map[T]struct{}`),
 /// so `field_accesses` has zero entries and the type would otherwise misread as "maximally
@@ -826,10 +866,13 @@ fn lcom_findings_for_package(
 ) -> Vec<ArchFinding> {
     methods_by_type(pkg)
         .into_iter()
-        .filter(|(_, ids)| ids.len() >= LCOM_MIN_METHODS)
         .filter_map(|(type_name, ids)| {
             let type_prefix = format!("{}::{type_name}.", pkg.path);
-            let components = lcom4_components(&ids, model, &type_prefix)?;
+            let evaluated = methods_with_own_signal(&ids, model, &type_prefix);
+            if evaluated.len() < LCOM_MIN_METHODS {
+                return None;
+            }
+            let components = lcom4_components(&evaluated, model, &type_prefix)?;
             if components <= 1 {
                 return None;
             }
@@ -842,7 +885,7 @@ fn lcom_findings_for_package(
                      them) — likely bundles {components} unrelated responsibilities; consider \
                      Extract Class",
                     pkg.path,
-                    ids.len()
+                    evaluated.len()
                 ),
                 severity_override: None,
             })
@@ -2084,6 +2127,85 @@ mod tests {
             LcomChecker
                 .check(&model, &ArchitectureConfig::default())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn lcom_excludes_a_marker_interface_stub_with_no_field_access_or_calls() {
+        // Regression for a real false positive backtesting against kubernetes/kubernetes:
+        // apiextensions/v1.JSON (one field, four real marshal methods that all correctly
+        // cluster into one component) was flagged LCOM4=3 solely because two blank-`_`-
+        // receiver OpenAPISchema*() marker-interface stubs each counted as their own
+        // forced singleton component. A method with no field access and no same-type call
+        // must be excluded from the graph entirely, not treated as evidence of a second
+        // responsibility.
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+                lcom_method("pkg", "T", "Marker"),
+            ],
+        );
+        // A/B/C/D all touch the same field X — one cohesive cluster. Marker touches
+        // nothing and calls nothing (the OpenAPISchemaType()-style stub shape).
+        let field_accesses = ["A", "B", "C", "D"]
+            .iter()
+            .map(|m| {
+                lcom_field_access(
+                    &format!("pkg::T.{m}"),
+                    "pkg::T.X",
+                    crate::arch_model::AccessKind::Read,
+                )
+            })
+            .collect();
+        let model = model_with_edges(vec![pkg], vec![], field_accesses);
+
+        assert!(
+            LcomChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty(),
+            "a state-independent marker method must not count as a forced singleton component"
+        );
+    }
+
+    #[test]
+    fn lcom_still_flags_a_genuine_split_alongside_an_excluded_marker_stub() {
+        // Companion to the regression above: excluding a signal-free marker method must not
+        // also hide a real disconnection among the methods that do have signal.
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+                lcom_method("pkg", "T", "Marker"),
+            ],
+        );
+        // A/B share field X; C/D share field Y — two disconnected real clusters, plus the
+        // signal-free Marker method (excluded, not a third component).
+        let field_accesses = vec![
+            lcom_field_access("pkg::T.A", "pkg::T.X", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.B", "pkg::T.X", crate::arch_model::AccessKind::Write),
+            lcom_field_access("pkg::T.C", "pkg::T.Y", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.D", "pkg::T.Y", crate::arch_model::AccessKind::Write),
+        ];
+        let model = model_with_edges(vec![pkg], vec![], field_accesses);
+
+        let findings = LcomChecker.check(&model, &ArchitectureConfig::default());
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(
+            findings[0].message.contains("LCOM4=2"),
+            "got: {}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains("across 4 methods"),
+            "Marker should not be counted in the evaluated total: {}",
+            findings[0].message
         );
     }
 }
