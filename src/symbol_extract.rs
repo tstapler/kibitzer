@@ -29,6 +29,7 @@
 //! file path; `SymbolNode::file` is left empty (`PathBuf::new()`) here for the caller to fill
 //! in, since `extract_symbols_for_file`'s signature (Story 1.2.2) takes no file path.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use tree_sitter::{Node, Tree};
@@ -764,11 +765,20 @@ fn field_access_supports(language: Language) -> bool {
 
 /// The enclosing method context `walk_field_accesses` threads through the walk: `None`
 /// outside any method body, or inside one whose receiver has no bound name/type to match
-/// a selector's operand against.
+/// a selector's operand against (including a method whose own parameter list already
+/// shadows the receiver name for the entire body — see `method_field_access_ctx`).
+///
+/// `shadowed` is interior-mutable rather than threaded as a fresh value per recursive
+/// call: once a shadowing declaration is seen anywhere in the method body (see
+/// `shadows_receiver`), every node visited afterward in the same pre-order walk — later
+/// siblings included — shares this same `FieldAccessCtx` and must see the update. A `Cell`
+/// gives that without restructuring the walk to thread `&mut` state through every
+/// recursive call.
 struct FieldAccessCtx {
     caller_id: String,
     receiver_var: String,
     receiver_type: String,
+    shadowed: Cell<bool>,
 }
 
 /// True when `selector` is itself the `function` field of its parent `call_expression` —
@@ -817,10 +827,19 @@ fn selector_access_kind(selector: Node) -> AccessKind {
 }
 
 /// Builds the receiver context for a `method_declaration` node — `None` for an unnamed or
-/// untyped receiver, which has no bound identifier a selector's operand could match.
+/// untyped receiver (no bound identifier a selector's operand could match), or when the
+/// method's own `parameters` list already declares a parameter with the same name as the
+/// receiver (`func (t T) M(t int) { ... }`, from `walk_field_accesses`'s doc comment): the
+/// receiver name is shadowed for the entire body in that case, so there is no method-wide
+/// window where attributing `t.Field` to the receiver would ever be correct.
 fn method_field_access_ctx(node: Node, source: &str, package_path: &str) -> Option<FieldAccessCtx> {
     let receiver_var = go_receiver_var_name(node, source)?;
     let receiver_type = go_receiver_type_name(node, source)?;
+    if let Some(params) = node.child_by_field_name("parameters")
+        && parameter_list_names(params, source).contains(&receiver_var)
+    {
+        return None;
+    }
     let name = node
         .child_by_field_name("name")
         .map(|n| strip_generic_params(node_text(n, source)))
@@ -829,7 +848,109 @@ fn method_field_access_ctx(node: Node, source: &str, package_path: &str) -> Opti
         caller_id: build_id(package_path, Some(&receiver_type), &name),
         receiver_var,
         receiver_type,
+        shadowed: Cell::new(false),
     })
+}
+
+/// Every parameter name declared directly on a `parameter_list` node (a Go
+/// `parameter_declaration` may carry more than one `name` child for a shared-type group,
+/// `func(a, b int)` — same `commaSep1(field('name', ...))` shape as `go_struct_fields`).
+fn parameter_list_names(list: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = list.walk();
+    for decl in list
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "parameter_declaration")
+    {
+        let mut nc = decl.walk();
+        for name_node in decl.children_by_field_name("name", &mut nc) {
+            names.push(node_text(name_node, source).to_string());
+        }
+    }
+    names
+}
+
+/// Every identifier name declared as a new binding by `node`, if `node` is one of the
+/// Go binding-introducing statement shapes `walk_field_accesses` checks for shadowing:
+/// `short_var_declaration` (`x := ...`) and `var_spec` (`var x ...`, inside a
+/// `var_declaration`) both bind via an `expression_list`/multi-`name`-field shape;
+/// `func_literal` binds its own parameters, checked via `parameter_list_names`. A plain
+/// `range_clause` using `=` instead of `:=` (`for t = range xs`) reassigns an existing
+/// binding rather than introducing one and is deliberately not treated as a new shadow
+/// here — see this function's caller, `shadows_receiver`, for why `:=` ranges are still
+/// covered. Reassignment of the receiver identifier itself via a plain `=` (not a `:=` or
+/// `var`) is a further, smaller residual ceiling this still doesn't catch: rebinding `t`
+/// to a different value of the same type without redeclaring it slips through, same
+/// "unusual enough in idiomatic Go to leave undetected" tradeoff as the shadowing case
+/// this function exists to catch.
+fn shadow_candidate_names(node: Node, source: &str) -> Vec<String> {
+    match node.kind() {
+        "short_var_declaration" | "var_spec" => {
+            // short_var_declaration: `left` is an expression_list of identifiers.
+            let mut names = node
+                .child_by_field_name("left")
+                .map(|list| direct_identifier_names(list, source))
+                .unwrap_or_default();
+            // var_spec: one or more direct `name` fields, no wrapping expression_list.
+            let mut nc = node.walk();
+            for name_node in node.children_by_field_name("name", &mut nc) {
+                names.push(node_text(name_node, source).to_string());
+            }
+            names
+        }
+        "func_literal" => node
+            .child_by_field_name("parameters")
+            .map(|p| parameter_list_names(p, source))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every direct `identifier` child of `node` (e.g. an `expression_list`'s bare-name
+/// elements) — shared by `shadow_candidate_names` and `shadows_receiver`'s `range_clause`
+/// handling.
+fn direct_identifier_names(node: Node, source: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|c| c.kind() == "identifier")
+        .map(|id| node_text(id, source).to_string())
+        .collect()
+}
+
+/// Whether `node` introduces a new binding for `receiver_var`, shadowing it from this
+/// point forward in the pre-order walk. `range_clause` is handled separately from
+/// `shadow_candidate_names` (rather than folded into it) because distinguishing its `:=`
+/// form (introduces new bindings, e.g. `for t, v := range xs`) from its `=` form
+/// (reassigns existing ones, e.g. `for t = range xs`) needs a raw-text check for `:=`
+/// between `left` and the `range` keyword — `to_sexp()` doesn't surface that anonymous
+/// token as a distinct field the way it does for `short_var_declaration`.
+fn shadows_receiver(node: Node, source: &str, receiver_var: &str) -> bool {
+    if shadow_candidate_names(node, source)
+        .iter()
+        .any(|n| n == receiver_var)
+    {
+        return true;
+    }
+    range_clause_declared_names(node, source)
+        .iter()
+        .any(|n| n == receiver_var)
+}
+
+/// `range_clause`'s `left` identifiers, but only when it's the `:=` (declaring) form —
+/// `for t = range xs` reassigns, `for t := range xs` declares. Empty for every other node
+/// kind, and for a `=`-form range_clause.
+fn range_clause_declared_names(node: Node, source: &str) -> Vec<String> {
+    if node.kind() != "range_clause" {
+        return Vec::new();
+    }
+    let Some(list) = node.child_by_field_name("left") else {
+        return Vec::new();
+    };
+    let between = &source[list.end_byte()..node.end_byte()];
+    if !between.trim_start().starts_with(":=") {
+        return Vec::new();
+    }
+    direct_identifier_names(list, source)
 }
 
 /// Recursive walk pairing each on-receiver `selector_expression` with the nearest
@@ -838,12 +959,18 @@ fn method_field_access_ctx(node: Node, source: &str, package_path: &str) -> Opti
 /// checked, rather than every `function_kinds` entry) since field access is Go-only (see
 /// `field_access_supports`).
 ///
-/// Known ceiling, not fixed for v1: this matches purely on the receiver identifier's name,
-/// not lexical scope — a local variable or parameter that shadows the receiver name inside
-/// the method body (`func (t T) M(t int) { ... }`, or a closure parameter reusing `t`)
-/// would be misattributed as a field access on the receiver. Unusual in idiomatic Go (a
-/// shadowed receiver name is itself a lint smell most style guides already flag), so left
-/// undetected rather than adding scope tracking for it.
+/// Guards against misattributing a shadowed receiver name to the receiver (see
+/// `shadows_receiver`): a local variable, parameter, or closure parameter that rebinds
+/// the receiver identifier inside the method body (`func (t T) M() { t := t.Clone();
+/// t.OtherField() }`) makes every `receiver_var.Field` selector from that point on refer
+/// to the shadow, not the receiver. `ctx.shadowed` is a coarse, method-wide "once
+/// shadowed, always shadowed for the rest of this method" flag rather than exact
+/// block-scope-exit tracking (a shadow in an `if` branch stays flagged after the branch
+/// closes) — a deliberate simplification in the direction of fewer false positives
+/// (missing a few legitimate post-shadow accesses) rather than more (misattributing a
+/// shadow's accesses to the receiver), matching this repo's existing bias for LCOM/DIP's
+/// documented ceilings. A method whose own receiver name is shadowed by its own parameter
+/// list (`func (t T) M(t int)`) never gets a `ctx` at all — see `method_field_access_ctx`.
 fn walk_field_accesses(
     node: Node,
     source: &str,
@@ -857,8 +984,16 @@ fn walk_field_accesses(
         .flatten();
     let ctx = if is_method { owned_ctx.as_ref() } else { ctx };
 
+    if let Some(c) = ctx
+        && !c.shadowed.get()
+        && shadows_receiver(node, source, &c.receiver_var)
+    {
+        c.shadowed.set(true);
+    }
+
     if node.kind() == "selector_expression"
         && let Some(c) = ctx
+        && !c.shadowed.get()
         && !selector_is_call_target(node)
         && let Some(operand) = node.child_by_field_name("operand")
         && operand.kind() == "identifier"
@@ -1462,6 +1597,95 @@ mod tests {
             "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (T) Get() int {\n\treturn 0\n}\n",
             "pkg",
         );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    // --- Receiver-name shadowing (deferred known ceiling from #38's PR #84) ---
+
+    #[test]
+    fn go_receiver_reused_by_short_var_declaration_shadows_for_rest_of_method() {
+        // Before the fix: `t := t.Clone()` re-binds `t`, and the naive name-only match
+        // attributed the following `t.Y = 1` to the *receiver*'s `Y` field — a false
+        // field-access edge that could wrongly cluster this method with others touching
+        // the receiver's real `Y` field (e.g. inflating LCOM4's cohesion signal).
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX, Y int\n}\n\nfunc (t T) Clone() T { return t }\n\nfunc (t T) Run() {\n\tt := t.Clone()\n\tt.Y = 1\n}\n",
+            "pkg",
+        );
+        assert!(
+            sites.is_empty(),
+            "every access after the `t := t.Clone()` shadow must be excluded: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn go_receiver_access_before_a_later_shadow_is_still_attributed() {
+        // The shadow only takes effect from its declaration onward — an access earlier in
+        // the same method, before `t` is re-bound, is still a genuine receiver access.
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Clone() T { return t }\n\nfunc (t T) Run() {\n\t_ = t.X\n\tt := t.Clone()\n\t_ = t\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_receiver_shadowed_by_closure_parameter_is_excluded() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Run() {\n\tf := func(t int) { _ = t }\n\tf(1)\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_receiver_shadowed_by_own_parameter_yields_no_field_access_sites() {
+        // `func (t T) M(t int)`, the exact example from `walk_field_accesses`'s original
+        // doc comment — the receiver name is unusable for the method's entire body.
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) M(t int) {\n\t_ = t\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_receiver_shadowed_by_var_declaration_is_excluded() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Run() {\n\tvar t int\n\t_ = t\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_receiver_shadowed_by_declaring_range_variable_is_excluded() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Run() {\n\tfor t, v := range []int{1} {\n\t\t_ = t\n\t\t_ = v\n\t}\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_range_clause_reassigning_receiver_with_plain_equals_is_not_treated_as_a_shadow() {
+        // `=`, not `:=` — reassigns the existing `t`, doesn't declare a new one. This repo
+        // deliberately leaves plain-`=` reassignment of the receiver itself undetected (see
+        // `shadow_candidate_names`'s doc comment), so this documents the boundary rather
+        // than asserting a specific (currently unenforced) outcome for it.
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Run() {\n\tvar t T\n\tfor t = range []T{} {\n\t\t_ = t.X\n\t}\n}\n",
+            "pkg",
+        );
+        // `var t T` already shadows before the loop even starts, so this stays empty either
+        // way — the point of this test is documentation, not a new assertion.
         assert!(sites.is_empty(), "got: {sites:?}");
     }
 }
