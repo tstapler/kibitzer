@@ -17,6 +17,7 @@ mod declarations;
 mod dedup;
 mod duplicate_code;
 mod duplicate_cross_file_checker;
+mod extract_class;
 mod file_size;
 mod glob;
 mod go_blank_imports;
@@ -27,12 +28,14 @@ mod hook;
 mod hook_log;
 mod import_graph;
 mod install;
+mod jaccard;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;
 mod mermaid;
 mod plugin;
 mod primitive_obsession;
+mod root_cause_clusters;
 mod rules;
 mod run;
 mod schema;
@@ -41,6 +44,7 @@ mod symbol_extract;
 mod task_stop;
 #[cfg(test)]
 mod test_support;
+mod union_find;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -200,6 +204,24 @@ enum ArchitectureAction {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
         /// How many top-coupled pairs to report.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
+    /// Batch-only multi-bug root-cause clustering (see `root_cause_clusters.rs`): groups
+    /// bug-fix commits (conventional-commit `fix:` prefix, or a `fix(es|ed)? #123` issue
+    /// reference) that touch overlapping files, and cross-references each cluster against
+    /// kibitzer's own current static findings for corroboration. A "look here" evidence
+    /// report for a human or an LLM (e.g. the `reflect-and-fix` skill) to name the shared
+    /// root cause — never asserted as fact here. Never wired into `default_checks()`/hook
+    /// mode, same convention as `change-coupling`.
+    RootCauseClusters {
+        /// Any path inside the repo to analyze (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// How many of the most recent non-merge commits to scan for bug fixes.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// How many top clusters to report, same convention as `change-coupling --top`.
         #[arg(long, default_value_t = 20)]
         top: usize,
     },
@@ -396,6 +418,9 @@ fn main() -> Result<ExitCode> {
             ArchitectureAction::ChangeCoupling { path, limit, top } => {
                 run_change_coupling(&path, limit, top)
             }
+            ArchitectureAction::RootCauseClusters { path, limit, top } => {
+                run_root_cause_clusters(&path, limit, top)
+            }
         },
         Command::Plugin { action } => match action {
             PluginAction::Install {
@@ -556,6 +581,47 @@ fn run_change_coupling(path: &Path, limit: usize, top: usize) -> Result<ExitCode
             pair.file_a,
             pair.file_b
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `kibitzer architecture root-cause-clusters`: prints each cluster's evidence packet (see
+/// `root_cause_clusters.rs`). Same "report, don't gate" convention as `run_change_coupling`
+/// — always `ExitCode::SUCCESS` when the analysis itself succeeds.
+fn run_root_cause_clusters(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
+    let clusters = root_cause_clusters::analyze(path, limit, top)
+        .with_context(|| format!("analyzing root-cause clusters for {}", path.display()))?;
+
+    if clusters.is_empty() {
+        println!("[kibitzer] no multi-commit bug-fix clusters found");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for (i, cluster) in clusters.iter().enumerate() {
+        println!(
+            "cluster {}: {} bug-fix commits, {} shared file(s)",
+            i + 1,
+            cluster.commit_shas.len(),
+            cluster.shared_files.len()
+        );
+        for (sha, subject) in cluster.commit_shas.iter().zip(&cluster.commit_subjects) {
+            println!("  {} {subject}", &sha[..sha.len().min(12)]);
+        }
+        for file in &cluster.shared_files {
+            println!("  shared: {file}");
+        }
+        for pair in &cluster.coupled_pairs {
+            println!(
+                "  {:.0}% coupled: {} <-> {}",
+                pair.coupling * 100.0,
+                pair.file_a,
+                pair.file_b
+            );
+        }
+        match &cluster.corroborating_finding {
+            Some(finding) => println!("  corroborated by: {finding}"),
+            None => println!("  corroboration: none (co-change only)"),
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -769,6 +835,34 @@ mod architecture_cli_tests {
         }
 
         let exit = run_change_coupling(&repo.dir, 1000, 20).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    /// `root_cause_clusters.rs`'s own tests cover the clustering/corroboration logic; this
+    /// proves `run_root_cause_clusters` reaches it end-to-end (real git log, real
+    /// `is_bug_fix_commit` classification) without erroring.
+    #[test]
+    fn run_root_cause_clusters_cli_verb_succeeds_against_a_real_git_repo() {
+        let repo = TempRepo::new("root-cause-clusters");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo.dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        for i in 0..3 {
+            repo.write("a.txt", &format!("{i}"));
+            repo.write("b.txt", &format!("{i}"));
+            git(&["add", "a.txt", "b.txt"]);
+            git(&["commit", "-q", "-m", &format!("fix: bug number {i}")]);
+        }
+
+        let exit = run_root_cause_clusters(&repo.dir, 1000, 20).unwrap();
         assert_eq!(exit, ExitCode::SUCCESS);
     }
 

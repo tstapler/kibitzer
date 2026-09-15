@@ -248,6 +248,7 @@ mod tests {
             packages,
             import_edges: vec![],
             call_edges: vec![],
+            field_accesses: vec![],
             pruning: empty_pruning(),
         }
     }
@@ -332,6 +333,7 @@ mod tests {
             packages,
             import_edges: vec![],
             call_edges: vec![],
+            field_accesses: vec![],
             pruning: empty_pruning(),
         };
 

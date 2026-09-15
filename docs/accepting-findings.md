@@ -72,9 +72,10 @@ native <name> <file>` — `default_checks()`'s catalog plus anything you've adde
 check's pass/fail comes from its process exit code, not from whether its output text
 is empty, so accepting away one of its output lines can't safely flip that check to
 "passed" the way it can for a native one — out of scope for now. Whole-repo
-architecture checks (`instability`, `layering`, `change-coupling`, etc.) are also out
-of scope; they report at package/component granularity, not a specific line, so this
-directory's `(rule, file, line, content)` key doesn't fit them.
+architecture checks (`instability`, `layering`, `change-coupling`, `lcom`, etc.) are also
+out of scope; they report at package/component (or, for `lcom`, whole-type) granularity,
+not a specific line, so this directory's `(rule, file, line, content)` key doesn't fit
+them.
 
 There's still no inline suppression comment (`// kibitzer:accept ...`) — this directory
 is the mechanism, kept checked-in and reviewable rather than scattered through source,

@@ -220,8 +220,8 @@ issue, no new issue filed · ⛔ not recommended.
 | **Encapsulate Collection** | 🔧 [#46](https://github.com/tstapler/kibitzer/issues/46) | Go getter returns a slice/map field with no defensive copy. | Related to #5's general Go-checks bucket. |
 | **Replace Primitive with Object** (Replace Type Code with Class) | ✅ | Shipped as `primitive-obsession` (Go). | — |
 | **Replace Temp with Query** | ⛔ | Low value without deeper data-flow modeling. | — |
-| **Extract Class** | 🔗 (#38) | God-Class metrics (WMC/ATFD/TCC) + JDeodorant clustering. | Fokaefs et al. 2012; already fully scoped in #38, no separate issue filed. |
-| **Inline Class** | 🔗 (#38) | Same cohesion infra as Extract Class, opposite threshold. | — |
+| **Extract Class** | ✅ | Shipped as the `lcom` architecture checker (LCOM4 SRP proxy) plus `src/extract_class.rs`'s Jaccard/HAC clustering, exposed via the `list_refactor_candidates` MCP tool. | Fokaefs et al. 2012-inspired, not a literal reproduction (see `extract_class.rs`'s doc comment); WMC/ATFD combination not attempted, tracked separately (#38's "God-class flags" item). |
+| **Inline Class** | 🔗 (#38) | Same cohesion infra as Extract Class, opposite threshold — not yet built. | — |
 | **Hide Delegate** | 🔧 [#44](https://github.com/tstapler/kibitzer/issues/44) | Chained method/field-access depth ≥3. | Lieberherr, Holland & Riel 1988 (Law of Demeter). |
 | **Remove Middle Man** | 🧩 [#53](https://github.com/tstapler/kibitzer/issues/53) | Delegation-ratio-per-type over a threshold. | No hard capability dependency. |
 | **Substitute Algorithm** | ⛔ | Judging "clearer" needs domain understanding. | — |
@@ -301,13 +301,13 @@ issue, no new issue filed · ⛔ not recommended.
 
 Counted directly from the table markers above (`grep -oE '\| (✅|🔗|🔧|🧩|⛔)' docs/refactoring-catalog-analysis.md | sort | uniq -c`), not from memory:
 
-- ✅ Covered today, no new work needed beyond an optional message tweak: 3 (Replace Primitive with Object; Extract Function and Replace Nested Conditional with Guard Clauses, both also getting a message-naming issue, #41)
-- 🔗 Covered by an existing issue, no new issue filed: 2 (Extract Class, Inline Class — both already in #38)
+- ✅ Covered today, no new work needed beyond an optional message tweak: 4 (Replace Primitive with Object; Extract Function and Replace Nested Conditional with Guard Clauses, both also getting a message-naming issue, #41; Extract Class, shipped as `lcom`/`extract_class.rs`)
+- 🔗 Covered by an existing issue, no new issue filed: 1 (Inline Class, still in #38)
 - 🔧 New issue, extends the existing engine directly: 5
 - 🧩 New issue, needs a new capability: 26 *(several refactorings share one bundled issue — see the table)*
 - ⛔ Not recommended: 29, plus half of one more (Change Function Declaration's rename portion; its parameter-count portion is the 🔗-covered case above)
 
-3 + 2 + 5 + 26 + 29 = 65, plus the one split row (Change Function Declaration,
+4 + 1 + 5 + 26 + 29 = 65, plus the one split row (Change Function Declaration,
 counted once above as 🔗 and once here as a partial ⛔) = 66 total catalog
 entries, matching the verified count of 66 names on the live catalog page.
 
