@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use tree_sitter::{Node, Tree};
 
-use crate::arch_model::{SymbolKind, SymbolNode};
+use crate::arch_model::{AccessKind, SymbolKind, SymbolNode};
 use crate::checker::Language;
 
 /// Per-`Language` table of node-kind strings driving symbol extraction — the
@@ -638,6 +638,261 @@ pub fn extract_call_sites_for_file(
     sites
 }
 
+// ---------------------------------------------------------------------------------
+// Field access extraction (#39) — a method↔field usage graph, parallel to the
+// method↔method call graph above. Go-only for v1 (see `field_access_supports`).
+// ---------------------------------------------------------------------------------
+
+/// Go receiver parameter's own bound identifier (`recv` in `func (recv *T) M()`), distinct
+/// from `go_receiver_type_name`'s type text. `None` for an unnamed receiver
+/// (`func (T) M()`) — such a method can't contain any `recv.Field` selector at all.
+fn go_receiver_var_name(method: Node, source: &str) -> Option<String> {
+    let receiver = method.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let decl = receiver
+        .children(&mut cursor)
+        .find(|c| c.kind() == "parameter_declaration")?;
+    let name = decl.child_by_field_name("name")?;
+    Some(node_text(name, source).to_string())
+}
+
+/// Appends every `(type_name, field_name)` pair declared directly on a Go struct type
+/// under `type_decl` (a `type_declaration` node, possibly a grouped `type (...)` block —
+/// each `type_spec` child is handled independently, matching
+/// `go_type_declaration_symbols`'s precedent). The grammar's `commaSep1(field('name', ...))`
+/// means one `field_declaration` can carry more than one `name` child for a shared-type
+/// group (`X, Y int`), so every `name`-field child is collected, not just the first. An
+/// embedded field (anonymous — no `name` field at all) is skipped: embedding introduces
+/// promoted fields/methods this v1 extraction doesn't walk into.
+fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String)>) {
+    let mut cursor = type_decl.walk();
+    for spec in type_decl
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "type_spec")
+    {
+        let Some(name_node) = spec.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(struct_ty) = spec.child_by_field_name("type") else {
+            continue;
+        };
+        if struct_ty.kind() != "struct_type" {
+            continue;
+        }
+        let type_name = strip_generic_params(node_text(name_node, source));
+        let mut sc = struct_ty.walk();
+        let Some(field_list) = struct_ty
+            .children(&mut sc)
+            .find(|c| c.kind() == "field_declaration_list")
+        else {
+            continue;
+        };
+        let mut fc = field_list.walk();
+        for decl in field_list
+            .children(&mut fc)
+            .filter(|c| c.kind() == "field_declaration")
+        {
+            let mut nc = decl.walk();
+            for field_name_node in decl.children_by_field_name("name", &mut nc) {
+                out.push((
+                    type_name.clone(),
+                    node_text(field_name_node, source).to_string(),
+                ));
+            }
+        }
+    }
+}
+
+fn walk_struct_fields(
+    node: Node,
+    language: Language,
+    source: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    if language == Language::Go && node.kind() == "type_declaration" {
+        go_struct_fields(node, source, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_struct_fields(child, language, source, out);
+    }
+}
+
+/// Extracts every `(type_name, field_name)` pair declared on a struct in `source` —
+/// Go-only for v1 (see [`field_access_supports`]); other languages return an empty list.
+/// Exists solely to give [`extract_field_access_sites_for_file`] a field-name set to match
+/// a selector's accessed name against.
+pub fn extract_struct_fields_for_file(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+) -> Vec<(String, String)> {
+    if language != Language::Go {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk_struct_fields(tree.root_node(), language, source, &mut out);
+    out
+}
+
+/// One field access site found inside a method body: the enclosing method's owner-
+/// qualified id, the raw receiver-type/field-name text (resolved into a
+/// `FieldAccessEdge`'s synthetic field id by `arch_model::build_model`, which alone has
+/// the whole-package struct-field index needed to confirm `field_name` is really a
+/// declared field, not e.g. a value read off some other selector), and the syntactic
+/// access kind. `file` is left as `PathBuf::new()` here, same convention as
+/// `RawCallSite::file` — the caller fills it in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawFieldAccessSite {
+    pub package_path: String,
+    pub caller_id: String,
+    pub receiver_type: String,
+    pub field_name: String,
+    pub access: AccessKind,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+/// Field-access extraction is Go-only for v1 — Go's fields are always accessed through an
+/// explicit `recv.Field` selector, which this extraction matches by identifier; other
+/// languages (attribute access in Python, class-field access in TS/JS/Java/Kotlin, `self.`
+/// in Rust) would each need their own selector-shape handling, deferred rather than
+/// guessed at.
+fn field_access_supports(language: Language) -> bool {
+    matches!(language, Language::Go)
+}
+
+/// The enclosing method context `walk_field_accesses` threads through the walk: `None`
+/// outside any method body, or inside one whose receiver has no bound name/type to match
+/// a selector's operand against.
+struct FieldAccessCtx {
+    caller_id: String,
+    receiver_var: String,
+    receiver_type: String,
+}
+
+/// True when `selector` is itself the `function` field of its parent `call_expression` —
+/// i.e. `recv.Method()`, a method call already captured by `RawCallSite` extraction, never
+/// also counted as a field access. Compared by byte range rather than `Node` identity
+/// equality, which this tree-sitter version's `Node` doesn't implement.
+fn selector_is_call_target(selector: Node) -> bool {
+    selector.parent().is_some_and(|p| {
+        p.kind() == "call_expression"
+            && p.child_by_field_name("function").is_some_and(|f| {
+                f.start_byte() == selector.start_byte() && f.end_byte() == selector.end_byte()
+            })
+    })
+}
+
+/// Syntactic write-detection for a selector already confirmed to be a field access: the
+/// left side of an `=`/`:=`-style assignment, or the operand of a bare `++`/`--`. Anything
+/// else — including `&recv.Field` handed to something that mutates it indirectly, or a
+/// selector passed as a call argument — reads as `Read`. Documented v1 ceiling, see
+/// `arch_model::AccessKind`'s doc comment.
+fn selector_access_kind(selector: Node) -> AccessKind {
+    let Some(list) = selector.parent() else {
+        return AccessKind::Read;
+    };
+    match list.kind() {
+        "inc_statement" | "dec_statement" => AccessKind::Write,
+        "expression_list" => {
+            let Some(stmt) = list.parent() else {
+                return AccessKind::Read;
+            };
+            let is_left = stmt.child_by_field_name("left").is_some_and(|left| {
+                left.start_byte() == list.start_byte() && left.end_byte() == list.end_byte()
+            });
+            if matches!(
+                stmt.kind(),
+                "assignment_statement" | "short_var_declaration"
+            ) && is_left
+            {
+                AccessKind::Write
+            } else {
+                AccessKind::Read
+            }
+        }
+        _ => AccessKind::Read,
+    }
+}
+
+/// Builds the receiver context for a `method_declaration` node — `None` for an unnamed or
+/// untyped receiver, which has no bound identifier a selector's operand could match.
+fn method_field_access_ctx(node: Node, source: &str, package_path: &str) -> Option<FieldAccessCtx> {
+    let receiver_var = go_receiver_var_name(node, source)?;
+    let receiver_type = go_receiver_type_name(node, source)?;
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| strip_generic_params(node_text(n, source)))
+        .unwrap_or_default();
+    Some(FieldAccessCtx {
+        caller_id: build_id(package_path, Some(&receiver_type), &name),
+        receiver_var,
+        receiver_type,
+    })
+}
+
+/// Recursive walk pairing each on-receiver `selector_expression` with the nearest
+/// enclosing `method_declaration`'s receiver context. Mirrors `walk_calls`'s
+/// caller-context-threading shape, but Go-only (`method_declaration` is the only node kind
+/// checked, rather than every `function_kinds` entry) since field access is Go-only (see
+/// `field_access_supports`).
+fn walk_field_accesses(
+    node: Node,
+    source: &str,
+    package_path: &str,
+    ctx: Option<&FieldAccessCtx>,
+    out: &mut Vec<RawFieldAccessSite>,
+) {
+    let is_method = node.kind() == "method_declaration";
+    let owned_ctx = is_method
+        .then(|| method_field_access_ctx(node, source, package_path))
+        .flatten();
+    let ctx = if is_method { owned_ctx.as_ref() } else { ctx };
+
+    if node.kind() == "selector_expression"
+        && let Some(c) = ctx
+        && !selector_is_call_target(node)
+        && let Some(operand) = node.child_by_field_name("operand")
+        && operand.kind() == "identifier"
+        && node_text(operand, source) == c.receiver_var
+        && let Some(field) = node.child_by_field_name("field")
+    {
+        out.push(RawFieldAccessSite {
+            package_path: package_path.to_string(),
+            caller_id: c.caller_id.clone(),
+            receiver_type: c.receiver_type.clone(),
+            field_name: node_text(field, source).to_string(),
+            access: selector_access_kind(node),
+            file: PathBuf::new(),
+            line: node.start_position().row + 1,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_field_accesses(child, source, package_path, ctx, out);
+    }
+}
+
+/// Walks `tree.root_node()` and returns every field access found inside a Go method body,
+/// paired with the enclosing method's owner-qualified id. Empty for a language
+/// [`field_access_supports`] doesn't cover. No file I/O — `RawFieldAccessSite::file` is
+/// left empty for the caller to fill in, same convention as `extract_call_sites_for_file`.
+pub fn extract_field_access_sites_for_file(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    package_path: &str,
+) -> Vec<RawFieldAccessSite> {
+    if !field_access_supports(language) {
+        return Vec::new();
+    }
+    let mut sites = Vec::new();
+    walk_field_accesses(tree.root_node(), source, package_path, None, &mut sites);
+    sites
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1328,108 @@ mod tests {
         let sites = call_sites(
             Language::Python,
             "def bar():\n    pass\n\ndef foo():\n    bar()\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    // --- extract_struct_fields_for_file / extract_field_access_sites_for_file (#39) ---
+
+    fn struct_fields(language: Language, source: &str) -> Vec<(String, String)> {
+        let cache = GrammarCache::new();
+        let tree = cache.parse(language, source).expect("parses");
+        extract_struct_fields_for_file(language, source, &tree)
+    }
+
+    fn field_access_sites(
+        language: Language,
+        source: &str,
+        package_path: &str,
+    ) -> Vec<RawFieldAccessSite> {
+        let cache = GrammarCache::new();
+        let tree = cache.parse(language, source).expect("parses");
+        extract_field_access_sites_for_file(language, source, &tree, package_path)
+    }
+
+    #[test]
+    fn go_struct_fields_collects_every_declared_field() {
+        let fields = struct_fields(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX, Y int\n\tName string\n}\n",
+        );
+        assert_eq!(
+            fields,
+            vec![
+                ("T".to_string(), "X".to_string()),
+                ("T".to_string(), "Y".to_string()),
+                ("T".to_string(), "Name".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_struct_fields_skips_embedded_anonymous_fields() {
+        let fields = struct_fields(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tOther\n\tName string\n}\n",
+        );
+        assert_eq!(fields, vec![("T".to_string(), "Name".to_string())]);
+    }
+
+    #[test]
+    fn go_field_read_in_method_body_resolves_to_owner_qualified_caller() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Get() int {\n\treturn t.X\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].caller_id, "pkg::T.Get");
+        assert_eq!(sites[0].receiver_type, "T");
+        assert_eq!(sites[0].field_name, "X");
+        assert_eq!(sites[0].access, AccessKind::Read);
+    }
+
+    #[test]
+    fn go_field_assignment_in_method_body_is_a_write() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t *T) Set(v int) {\n\tt.X = v\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].access, AccessKind::Write);
+    }
+
+    #[test]
+    fn go_field_inc_dec_is_a_write() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tN int\n}\n\nfunc (t *T) Bump() {\n\tt.N++\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].access, AccessKind::Write);
+    }
+
+    #[test]
+    fn go_method_call_on_receiver_is_not_also_counted_as_a_field_access() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Helper() {}\n\nfunc (t T) Run() {\n\tt.Helper()\n}\n",
+            "pkg",
+        );
+        assert!(
+            sites.is_empty(),
+            "a call through the receiver shouldn't also register as a field access: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn go_unnamed_receiver_yields_no_field_access_sites() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (T) Get() int {\n\treturn 0\n}\n",
             "pkg",
         );
         assert!(sites.is_empty(), "got: {sites:?}");

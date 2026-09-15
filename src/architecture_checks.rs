@@ -1402,6 +1402,7 @@ mod tests {
             packages: packages.into_iter().map(|p| (p.path.clone(), p)).collect(),
             import_edges,
             call_edges: vec![],
+            field_accesses: vec![],
             pruning: crate::arch_model::PruningSummary {
                 include_private: false,
                 excluded_dirs: vec![],
