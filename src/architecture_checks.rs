@@ -1812,6 +1812,76 @@ mod tests {
         }
     }
 
+    // --- methods_by_type's three exclusion filters (kind, parent, file extension) ---
+
+    #[test]
+    fn methods_by_type_excludes_a_non_method_symbol_even_with_a_parent_set() {
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "Real"),
+                crate::arch_model::SymbolNode {
+                    id: "pkg::T.NotAMethod".to_string(),
+                    name: "NotAMethod".to_string(),
+                    kind: crate::arch_model::SymbolKind::Function,
+                    file: PathBuf::from("pkg/notamethod.go"),
+                    line: 1,
+                    exported: true,
+                    parent: Some("T".to_string()),
+                },
+            ],
+        );
+        let ids = methods_by_type(&pkg);
+        let t_ids = ids.get("T").expect("T has at least one method");
+        assert!(!t_ids.contains(&"pkg::T.NotAMethod"), "got: {t_ids:?}");
+        assert_eq!(t_ids, &vec!["pkg::T.Real"]);
+    }
+
+    #[test]
+    fn methods_by_type_excludes_a_method_with_no_parent() {
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "Real"),
+                crate::arch_model::SymbolNode {
+                    id: "pkg::Orphan".to_string(),
+                    name: "Orphan".to_string(),
+                    kind: crate::arch_model::SymbolKind::Method,
+                    file: PathBuf::from("pkg/orphan.go"),
+                    line: 1,
+                    exported: true,
+                    parent: None,
+                },
+            ],
+        );
+        let ids = methods_by_type(&pkg);
+        assert_eq!(ids.len(), 1, "got: {ids:?}");
+        assert_eq!(ids.get("T"), Some(&vec!["pkg::T.Real"]));
+    }
+
+    #[test]
+    fn methods_by_type_excludes_a_method_from_a_non_go_file() {
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "Real"),
+                crate::arch_model::SymbolNode {
+                    id: "pkg::T.FromRust".to_string(),
+                    name: "FromRust".to_string(),
+                    kind: crate::arch_model::SymbolKind::Method,
+                    file: PathBuf::from("pkg/fromrust.rs"),
+                    line: 1,
+                    exported: true,
+                    parent: Some("T".to_string()),
+                },
+            ],
+        );
+        let ids = methods_by_type(&pkg);
+        let t_ids = ids.get("T").expect("T has at least one method");
+        assert!(!t_ids.contains(&"pkg::T.FromRust"), "got: {t_ids:?}");
+        assert_eq!(t_ids, &vec!["pkg::T.Real"]);
+    }
+
     #[test]
     fn lcom_flags_a_type_whose_methods_split_into_two_disconnected_groups() {
         let pkg = model_package(
@@ -1884,6 +1954,58 @@ mod tests {
                 .check(&model, &ArchitectureConfig::default())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn lcom_skips_a_type_with_exactly_three_disconnected_methods() {
+        // Boundary case for LCOM_MIN_METHODS (4): 3 fully-disconnected methods is one below
+        // the threshold, so this must be skipped even though it would score LCOM4=3.
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+            ],
+        );
+        let field_accesses = vec![
+            lcom_field_access("pkg::T.A", "pkg::T.X", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.B", "pkg::T.Y", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.C", "pkg::T.Z", crate::arch_model::AccessKind::Read),
+        ];
+        let model = model_with_edges(vec![pkg], vec![], field_accesses);
+
+        assert!(
+            LcomChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lcom_flags_a_type_with_exactly_four_disconnected_methods() {
+        // Boundary case for LCOM_MIN_METHODS (4): 4 fully-disconnected methods is exactly at
+        // the threshold, so this must fire (LCOM4=4) — catches a `>` vs `>=` off-by-one.
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+            ],
+        );
+        let field_accesses = vec![
+            lcom_field_access("pkg::T.A", "pkg::T.W", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.B", "pkg::T.X", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.C", "pkg::T.Y", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.D", "pkg::T.Z", crate::arch_model::AccessKind::Read),
+        ];
+        let model = model_with_edges(vec![pkg], vec![], field_accesses);
+
+        let findings = LcomChecker.check(&model, &ArchitectureConfig::default());
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("LCOM4=4"), "got: {findings:?}");
     }
 
     #[test]

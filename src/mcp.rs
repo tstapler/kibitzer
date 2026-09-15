@@ -967,9 +967,9 @@ impl KibitzerServer {
 
         // HAC clustering is CPU-bound (O(n^3) per type), so it must not run inline on the
         // async call stack — same reasoning as `load_model_off_stack`.
-        let candidates: Vec<RefactorCandidateEntry> = match tokio::task::spawn_blocking(
-            move || crate::extract_class::extract_class_candidates(&filtered),
-        )
+        let candidates: Vec<RefactorCandidateEntry> = match tokio::task::spawn_blocking(move || {
+            crate::extract_class::extract_class_candidates(&filtered)
+        })
         .await
         {
             Ok(candidates) => candidates

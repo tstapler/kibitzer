@@ -284,7 +284,8 @@ fn candidates_for_type(
     type_name: &str,
 ) -> Vec<ExtractClassCandidate> {
     let field_sets = method_field_sets(model, pkg, type_name);
-    if field_sets.len() < MIN_METHODS_FOR_CLUSTERING || field_sets.len() > MAX_METHODS_FOR_CLUSTERING
+    if field_sets.len() < MIN_METHODS_FOR_CLUSTERING
+        || field_sets.len() > MAX_METHODS_FOR_CLUSTERING
     {
         return Vec::new();
     }

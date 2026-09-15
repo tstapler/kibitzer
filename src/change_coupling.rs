@@ -660,6 +660,10 @@ mod tests {
         assert_eq!(commits[0].files, vec!["b.rs".to_string()]);
         assert_eq!(commits[1].subject, "fix: correct the thing");
         assert!(!commits[0].sha.is_empty());
+        // The common case: an ordinary commit with no body at all must parse as "", not
+        // e.g. a stray newline left over from splitting %B on the subject.
+        assert_eq!(commits[0].body, "", "got: {commits:?}");
+        assert_eq!(commits[1].body, "", "got: {commits:?}");
     }
 
     #[test]

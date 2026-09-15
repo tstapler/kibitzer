@@ -1433,6 +1433,29 @@ mod tests {
     }
 
     #[test]
+    fn go_field_access_on_a_different_local_variable_is_not_attributed_to_the_receiver() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Run() {\n\tother := T{}\n\tother.X = 1\n}\n",
+            "pkg",
+        );
+        assert!(
+            sites.is_empty(),
+            "access through a non-receiver variable must not count: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn go_field_read_on_the_right_hand_side_of_short_var_declaration_is_not_a_write() {
+        let sites = field_access_sites(
+            Language::Go,
+            "package pkg\n\ntype T struct {\n\tX int\n}\n\nfunc (t T) Get() int {\n\tv := t.X\n\treturn v\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites[0].access, AccessKind::Read);
+    }
+
+    #[test]
     fn go_unnamed_receiver_yields_no_field_access_sites() {
         let sites = field_access_sites(
             Language::Go,

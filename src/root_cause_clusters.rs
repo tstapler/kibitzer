@@ -550,4 +550,99 @@ mod tests {
         assert_eq!(top_one.len(), 1, "got: {top_one:?}");
         assert_eq!(top_one[0].shared_files.len(), 3, "got: {top_one:?}");
     }
+
+    #[test]
+    fn analyze_returns_empty_ok_when_there_are_zero_bug_fix_commits() {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-root-cause-clusters-no-bug-fixes-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("a.go"), "package a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "feat: add a thing"]);
+
+        let result = analyze(&dir, 1000, 20);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(result.unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn tied_clusters_sort_deterministically_by_first_commit_sha() {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-root-cause-clusters-tie-break-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+
+        // Two independent clusters, each with 2 shared files across its two commits — a
+        // genuine tie on shared_files.len() that only the documented sha tie-break can
+        // order.
+        for i in 0..2 {
+            std::fs::write(dir.join("a1.go"), format!("// v{i}\npackage a\n")).unwrap();
+            std::fs::write(dir.join("a2.go"), format!("// v{i}\npackage a\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("fix: cluster a {i}")]);
+        }
+        for i in 0..2 {
+            std::fs::write(dir.join("b1.go"), format!("// v{i}\npackage b\n")).unwrap();
+            std::fs::write(dir.join("b2.go"), format!("// v{i}\npackage b\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("fix: cluster b {i}")]);
+        }
+
+        let first_run = analyze(&dir, 1000, 20).unwrap();
+        let second_run = analyze(&dir, 1000, 20).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(first_run.len(), 2, "got: {first_run:?}");
+        assert_eq!(
+            first_run[0].shared_files.len(),
+            first_run[1].shared_files.len(),
+            "expected a genuine tie: {first_run:?}"
+        );
+        assert!(
+            first_run[0].commit_shas.first() <= first_run[1].commit_shas.first(),
+            "documented tie-break sorts ascending by first commit sha: {first_run:?}"
+        );
+        assert_eq!(
+            first_run, second_run,
+            "tie-break must produce the same order on every run"
+        );
+    }
 }
