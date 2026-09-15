@@ -17,6 +17,7 @@ mod declarations;
 mod dedup;
 mod duplicate_code;
 mod duplicate_cross_file_checker;
+mod extract_class;
 mod file_size;
 mod glob;
 mod go_blank_imports;

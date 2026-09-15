@@ -1,0 +1,440 @@
+//! JDeodorant-style Extract Class candidate generation (#38): build a Jaccard-distance
+//! graph over a type's methods (edge weight = shared field-access overlap, from
+//! `ArchModel::field_accesses`, #39), cluster the methods via average-linkage hierarchical
+//! agglomerative clustering (HAC), then rank candidate cuts of that dendrogram by an
+//! Entity-Placement-inspired cohesion score (Fokaefs et al., *Identification and
+//! application of Extract Class refactorings in object-oriented systems*, JSS 2012).
+//!
+//! This is **not** a literal reproduction of that paper's Entity Placement formula, which
+//! needs data (call-graph edge weights split by whether the caller lives inside or outside
+//! the candidate class) beyond what's cheaply available from field-access data alone —
+//! see [`entity_placement_score`]'s doc comment for the documented simplification used
+//! here instead. Naming the extracted class is explicitly out of scope (a human/LLM step,
+//! per the issue) — this module only proposes *which methods* would split cleanly, never a
+//! name for the result.
+//!
+//! Go-only, same scope as `ArchModel::field_accesses`: a method with zero field accesses
+//! (either because it genuinely touches no field, or because its receiver's underlying
+//! type isn't a struct — see `architecture_checks::LcomChecker`'s doc comment on that
+//! ceiling) is excluded from clustering entirely rather than guessed at.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::arch_model::{ArchModel, PackageNode, SymbolKind};
+
+/// A type needs at least this many methods with field-access data before clustering is
+/// attempted — matches `architecture_checks::LCOM_MIN_METHODS`'s bar (not shared as a
+/// `pub` constant across modules, per this codebase's existing per-file threshold
+/// convention, e.g. `MAX_FAN_OUT`/`STABLE_MAX`). Also the minimum needed for a `[2, n-1]`
+/// candidate-cut range to be non-empty (`n=4` gives cuts at `k=2,3`).
+const MIN_METHODS_FOR_CLUSTERING: usize = 4;
+
+/// Minimum Entity Placement score (see [`entity_placement_score`]) for a candidate split
+/// to be worth surfacing — below this, too many methods are ambiguously placed for the
+/// split to be actionable advice. No stronger literature citation than "clearly the
+/// majority," same status as this codebase's other threshold constants.
+const MIN_ENTITY_PLACEMENT_SCORE: f64 = 0.75;
+
+/// One candidate Extract Class split for a type: the methods with field-access data,
+/// partitioned into two or more groups. Each group is a candidate for its own type; the
+/// remaining methods on the original type (those with no field-access data) aren't
+/// assigned anywhere — an Extract Class refactoring on real code would still need a human
+/// or LLM to decide where they land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractClassCandidate {
+    pub package: String,
+    pub type_name: String,
+    /// Each inner `Vec` is one candidate group's method ids (`SymbolNode::id`), in
+    /// clustering order (not sorted) — at least 2 groups, each with at least 1 method.
+    pub groups: Vec<Vec<String>>,
+    /// `[0.0, 1.0]` — see [`entity_placement_score`]. Higher is a cleaner split.
+    pub entity_placement_score: f64,
+}
+
+/// Every Go method of `type_name` in `pkg` that has at least one field access recorded in
+/// `model.field_accesses`, mapped to the set of field ids it accesses. A method with zero
+/// field accesses is simply absent from the returned map — see this module's doc comment.
+fn method_field_sets<'a>(
+    model: &'a ArchModel,
+    pkg: &'a PackageNode,
+    type_name: &str,
+) -> HashMap<&'a str, HashSet<&'a str>> {
+    let method_ids: HashSet<&str> = pkg
+        .symbols
+        .iter()
+        .filter(|s| {
+            s.kind == SymbolKind::Method
+                && s.parent.as_deref() == Some(type_name)
+                && s.file.extension().is_some_and(|ext| ext == "go")
+        })
+        .map(|s| s.id.as_str())
+        .collect();
+
+    let mut sets: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for access in &model.field_accesses {
+        if method_ids.contains(access.from.as_str()) {
+            sets.entry(access.from.as_str())
+                .or_default()
+                .insert(access.to.as_str());
+        }
+    }
+    sets
+}
+
+fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
+    let union = a.union(b).count();
+    if union == 0 {
+        0.0
+    } else {
+        a.intersection(b).count() as f64 / union as f64
+    }
+}
+
+/// Builds the full pairwise Jaccard-similarity matrix for `ids[0..n]`'s field-access sets
+/// (`field_sets[ids[i]]`), `sim[i][j] == sim[j][i]`, `sim[i][i] == 0.0` (a method is never
+/// compared against itself during clustering).
+fn similarity_matrix(ids: &[&str], field_sets: &HashMap<&str, HashSet<&str>>) -> Vec<Vec<f64>> {
+    let n = ids.len();
+    let mut sim = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let s = jaccard(&field_sets[ids[i]], &field_sets[ids[j]]);
+            sim[i][j] = s;
+            sim[j][i] = s;
+        }
+    }
+    sim
+}
+
+/// Average pairwise similarity between two clusters (lists of method indices) — the
+/// average-linkage criterion HAC merges on at each step.
+fn average_linkage(a: &[usize], b: &[usize], sim: &[Vec<f64>]) -> f64 {
+    let mut total = 0.0;
+    for &i in a {
+        for &j in b {
+            total += sim[i][j];
+        }
+    }
+    total / (a.len() * b.len()) as f64
+}
+
+/// Finds the pair of cluster indices with the highest average-linkage similarity —
+/// `hac_partitions`'s per-merge-step search, split out to keep that function's nesting
+/// shallow. Ties resolve to the lowest `(i, j)` pair scanned first.
+fn best_merge_pair(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> (usize, usize) {
+    let mut best = (0usize, 1usize, f64::MIN);
+    for i in 0..clusters.len() {
+        for j in (i + 1)..clusters.len() {
+            let s = average_linkage(&clusters[i], &clusters[j], sim);
+            if s > best.2 {
+                best = (i, j, s);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
+/// Runs average-linkage HAC over `n` methods and returns every partition produced along
+/// the way, from `n` singleton clusters (index `0`) down to 1 cluster containing
+/// everything (index `n-1`) — i.e. `result[i]` has `n-i` clusters.
+fn hac_partitions(n: usize, sim: &[Vec<f64>]) -> Vec<Vec<Vec<usize>>> {
+    let mut clusters: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+    let mut history = vec![clusters.clone()];
+    while clusters.len() > 1 {
+        let (i, j) = best_merge_pair(&clusters, sim);
+        let mut merged = clusters[i].clone();
+        merged.extend(clusters[j].iter().copied());
+        clusters.remove(j);
+        clusters.remove(i);
+        clusters.push(merged);
+        history.push(clusters.clone());
+    }
+    history
+}
+
+/// A simplified, documented stand-in for Fokaefs et al.'s Entity Placement metric: the
+/// fraction of methods whose total similarity to their *own* cluster is at least as high
+/// as their total similarity to every other individual cluster. `1.0` means every method
+/// is unambiguously best-placed where the clustering put it; lower scores mean some
+/// methods are about as similar to a different candidate group as to their own — a weak
+/// split. The paper's actual EP metric additionally weighs *coupling introduced* (calls
+/// that would cross the new class boundary) using call-graph data this module doesn't
+/// have cheap access to per candidate cut; that refinement is future work, not attempted
+/// here.
+/// Total similarity of method `m` to every other member of `cluster` (excluding `m`
+/// itself).
+fn total_similarity_to(m: usize, cluster: &[usize], sim: &[Vec<f64>]) -> f64 {
+    cluster
+        .iter()
+        .filter(|&&x| x != m)
+        .map(|&x| sim[m][x])
+        .sum()
+}
+
+/// Whether method `m` (a member of `clusters[own_idx]`) is at least as similar to its own
+/// cluster as to every other individual cluster.
+fn is_well_placed(m: usize, own_idx: usize, clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> bool {
+    let own_sim = total_similarity_to(m, &clusters[own_idx], sim);
+    let best_other = clusters
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != own_idx)
+        .map(|(_, other)| other.iter().map(|&x| sim[m][x]).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    own_sim >= best_other
+}
+
+fn entity_placement_score(clusters: &[Vec<usize>], sim: &[Vec<f64>]) -> f64 {
+    let n: usize = clusters.iter().map(Vec::len).sum();
+    if n == 0 {
+        return 0.0;
+    }
+    let well_placed = clusters
+        .iter()
+        .enumerate()
+        .flat_map(|(own_idx, cluster)| cluster.iter().map(move |&m| (m, own_idx)))
+        .filter(|&(m, own_idx)| is_well_placed(m, own_idx, clusters, sim))
+        .count();
+    well_placed as f64 / n as f64
+}
+
+/// Finds the best candidate split for one type's clustered methods: scans every partition
+/// with `2..=n-1` clusters (excludes `k=1`, no split, and `k=n`, one class per method —
+/// neither is useful Extract Class advice), scores each by [`entity_placement_score`], and
+/// returns the highest-scoring one, provided it clears [`MIN_ENTITY_PLACEMENT_SCORE`].
+/// Ties prefer the earliest-scanned (highest `k`, i.e. more granular) partition — an
+/// arbitrary but deterministic tie-break, not a claim that finer splits are better.
+fn best_candidate_split(ids: &[&str], sim: &[Vec<f64>]) -> Option<(Vec<Vec<usize>>, f64)> {
+    let n = ids.len();
+    if n < 3 {
+        return None;
+    }
+    let partitions = hac_partitions(n, sim);
+    // partitions[i] has n-i clusters; we want cluster counts in [2, n-1], i.e. i in [1, n-2].
+    (1..=n.saturating_sub(2))
+        .map(|i| {
+            let clusters = &partitions[i];
+            (clusters.clone(), entity_placement_score(clusters, sim))
+        })
+        .filter(|(_, score)| *score >= MIN_ENTITY_PLACEMENT_SCORE)
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn candidates_for_type(
+    model: &ArchModel,
+    pkg: &PackageNode,
+    type_name: &str,
+) -> Option<ExtractClassCandidate> {
+    let field_sets = method_field_sets(model, pkg, type_name);
+    if field_sets.len() < MIN_METHODS_FOR_CLUSTERING {
+        return None;
+    }
+    let ids: Vec<&str> = field_sets.keys().copied().collect();
+    let sim = similarity_matrix(&ids, &field_sets);
+    let (clusters, score) = best_candidate_split(&ids, &sim)?;
+
+    let groups: Vec<Vec<String>> = clusters
+        .into_iter()
+        .map(|cluster| cluster.into_iter().map(|i| ids[i].to_string()).collect())
+        .collect();
+
+    Some(ExtractClassCandidate {
+        package: pkg.path.clone(),
+        type_name: type_name.to_string(),
+        groups,
+        entity_placement_score: score,
+    })
+}
+
+/// All Extract Class candidates across the whole model — one per type that clears
+/// [`MIN_METHODS_FOR_CLUSTERING`] and produces a split scoring at least
+/// [`MIN_ENTITY_PLACEMENT_SCORE`]. Sorted by package then type name for deterministic
+/// output (`BTreeMap` iteration on `model.packages` already provides the package order;
+/// types within a package are sorted explicitly since `PackageNode::symbols` isn't).
+pub fn extract_class_candidates(model: &ArchModel) -> Vec<ExtractClassCandidate> {
+    let mut out = Vec::new();
+    for pkg in model.packages.values() {
+        let mut type_names: Vec<&str> = pkg
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .filter_map(|s| s.parent.as_deref())
+            .collect();
+        type_names.sort_unstable();
+        type_names.dedup();
+        for type_name in type_names {
+            if let Some(candidate) = candidates_for_type(model, pkg, type_name) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch_model::{FieldAccessEdge, PruningSummary, SymbolNode};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn method(pkg: &str, type_name: &str, name: &str) -> SymbolNode {
+        SymbolNode {
+            id: format!("{pkg}::{type_name}.{name}"),
+            name: name.to_string(),
+            kind: SymbolKind::Method,
+            file: PathBuf::from(format!("{pkg}/{name}.go")),
+            line: 1,
+            exported: true,
+            parent: Some(type_name.to_string()),
+        }
+    }
+
+    fn access(from: &str, to: &str) -> FieldAccessEdge {
+        FieldAccessEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            access: crate::arch_model::AccessKind::Read,
+            file: PathBuf::from("f.go"),
+            line: 1,
+        }
+    }
+
+    fn model_of(pkg: PackageNode, field_accesses: Vec<FieldAccessEdge>) -> ArchModel {
+        let mut packages = BTreeMap::new();
+        packages.insert(pkg.path.clone(), pkg);
+        ArchModel {
+            repo_root: PathBuf::from("/repo"),
+            packages,
+            import_edges: vec![],
+            call_edges: vec![],
+            field_accesses,
+            pruning: PruningSummary {
+                include_private: false,
+                excluded_dirs: vec![],
+                generated_files_skipped: 0,
+                private_symbols_skipped: 0,
+                pruned_symbol_ids: vec![],
+                files_with_parse_errors: vec![],
+                unsupported_language_files: 0,
+                total_files_scanned: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn proposes_a_clean_two_way_split_for_two_unrelated_field_clusters() {
+        let pkg = PackageNode {
+            path: "pkg".to_string(),
+            files: vec![],
+            symbols: vec![
+                method("pkg", "T", "A"),
+                method("pkg", "T", "B"),
+                method("pkg", "T", "C"),
+                method("pkg", "T", "D"),
+            ],
+        };
+        let field_accesses = vec![
+            access("pkg::T.A", "pkg::T.X"),
+            access("pkg::T.B", "pkg::T.X"),
+            access("pkg::T.C", "pkg::T.Y"),
+            access("pkg::T.D", "pkg::T.Y"),
+        ];
+        let model = model_of(pkg, field_accesses);
+
+        let candidates = extract_class_candidates(&model);
+        assert_eq!(candidates.len(), 1, "got: {candidates:?}");
+        let candidate = &candidates[0];
+        assert_eq!(candidate.package, "pkg");
+        assert_eq!(candidate.type_name, "T");
+        assert_eq!(candidate.groups.len(), 2, "got: {:?}", candidate.groups);
+
+        let mut ab = candidate
+            .groups
+            .iter()
+            .find(|g| g.contains(&"pkg::T.A".to_string()))
+            .expect("A's group")
+            .clone();
+        ab.sort();
+        assert_eq!(ab, vec!["pkg::T.A".to_string(), "pkg::T.B".to_string()]);
+        assert!(candidate.entity_placement_score >= MIN_ENTITY_PLACEMENT_SCORE);
+    }
+
+    #[test]
+    fn proposes_no_candidate_for_a_fully_cohesive_type() {
+        let pkg = PackageNode {
+            path: "pkg".to_string(),
+            files: vec![],
+            symbols: vec![
+                method("pkg", "T", "A"),
+                method("pkg", "T", "B"),
+                method("pkg", "T", "C"),
+                method("pkg", "T", "D"),
+            ],
+        };
+        // Every method touches the same single field — no meaningful split exists.
+        let field_accesses = ["A", "B", "C", "D"]
+            .iter()
+            .map(|m| access(&format!("pkg::T.{m}"), "pkg::T.X"))
+            .collect();
+        let model = model_of(pkg, field_accesses);
+
+        assert!(extract_class_candidates(&model).is_empty());
+    }
+
+    #[test]
+    fn skips_types_below_the_minimum_method_threshold() {
+        let pkg = PackageNode {
+            path: "pkg".to_string(),
+            files: vec![],
+            symbols: vec![method("pkg", "T", "A"), method("pkg", "T", "B")],
+        };
+        let field_accesses = vec![
+            access("pkg::T.A", "pkg::T.X"),
+            access("pkg::T.B", "pkg::T.Y"),
+        ];
+        let model = model_of(pkg, field_accesses);
+
+        assert!(extract_class_candidates(&model).is_empty());
+    }
+
+    #[test]
+    fn excludes_methods_with_no_field_access_from_clustering() {
+        let pkg = PackageNode {
+            path: "pkg".to_string(),
+            files: vec![],
+            symbols: vec![
+                method("pkg", "T", "A"),
+                method("pkg", "T", "B"),
+                method("pkg", "T", "C"),
+                method("pkg", "T", "D"),
+                method("pkg", "T", "NoFieldAccess"),
+            ],
+        };
+        let field_accesses = vec![
+            access("pkg::T.A", "pkg::T.X"),
+            access("pkg::T.B", "pkg::T.X"),
+            access("pkg::T.C", "pkg::T.Y"),
+            access("pkg::T.D", "pkg::T.Y"),
+        ];
+        let model = model_of(pkg, field_accesses);
+
+        let candidates = extract_class_candidates(&model);
+        assert_eq!(candidates.len(), 1, "got: {candidates:?}");
+        let all_methods: Vec<&String> = candidates[0].groups.iter().flatten().collect();
+        assert!(!all_methods.contains(&&"pkg::T.NoFieldAccess".to_string()));
+        assert_eq!(all_methods.len(), 4);
+    }
+
+    #[test]
+    fn jaccard_of_two_empty_sets_is_zero() {
+        let empty: HashSet<&str> = HashSet::new();
+        assert_eq!(jaccard(&empty, &empty), 0.0);
+    }
+
+    #[test]
+    fn jaccard_of_identical_sets_is_one() {
+        let a: HashSet<&str> = ["x", "y"].into_iter().collect();
+        assert_eq!(jaccard(&a, &a), 1.0);
+    }
+}

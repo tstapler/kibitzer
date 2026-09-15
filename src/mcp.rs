@@ -163,6 +163,30 @@ fn default_depth() -> usize {
 /// constant so the clamp call site and this doc comment can't drift apart.
 const MAX_CALL_DEPTH: usize = 10;
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ListRefactorCandidatesRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// Optional glob (relative to the repo root, `**` supported) restricting which
+    /// packages are considered. Defaults to the whole repo.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RefactorCandidateEntry {
+    package: String,
+    type_name: String,
+    /// Each inner list is one candidate group's method ids, at least 2 groups.
+    groups: Vec<Vec<String>>,
+    entity_placement_score: f64,
+}
+
+#[derive(Serialize)]
+struct ListRefactorCandidatesResponse {
+    candidates: Vec<RefactorCandidateEntry>,
+}
+
 #[derive(Serialize)]
 struct CallTraversalResponse {
     node: String,
@@ -894,6 +918,49 @@ impl KibitzerServer {
     )]
     async fn list_callees(&self, req: Parameters<CallTraversalRequest>) -> String {
         self.call_traversal(req.0, CallDirection::Callees).await
+    }
+
+    #[tool(
+        description = "Extract Class refactoring candidates: for each type whose methods split \
+                        into 2+ field-access-disjoint groups (a JDeodorant-style Jaccard/HAC \
+                        clustering over ArchModel::field_accesses, ranked by an \
+                        Entity-Placement-inspired score), returns the candidate method groups — \
+                        JSON ({candidates: [{package, type_name, groups, \
+                        entity_placement_score}]}), not prose. A closed set of graph-legal splits \
+                        only — never invents a move the graph didn't already validate; naming the \
+                        extracted class is left to the caller. Go-only (see \
+                        ArchModel::field_accesses)."
+    )]
+    async fn list_refactor_candidates(
+        &self,
+        req: Parameters<ListRefactorCandidatesRequest>,
+    ) -> String {
+        let req = req.0;
+        let path = PathBuf::from(&req.path);
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
+        };
+
+        let model = match self.load_model_off_stack(repo_root, false).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+        let scope: Vec<String> = req.scope.iter().cloned().collect();
+        let filtered = model.filtered(&scope, ModelLevel::Code);
+
+        let candidates = crate::extract_class::extract_class_candidates(&filtered)
+            .into_iter()
+            .map(|c| RefactorCandidateEntry {
+                package: c.package,
+                type_name: c.type_name,
+                groups: c.groups,
+                entity_placement_score: c.entity_placement_score,
+            })
+            .collect();
+        let response = ListRefactorCandidatesResponse { candidates };
+        serde_json::to_string(&response)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
 }
 
@@ -2197,6 +2264,83 @@ mod tests {
     /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
     /// plugin-backed check whose binary is missing, instead of raw shell noise a real
     /// command failure would look like.
+    /// A type whose 4 methods split cleanly into two field-disjoint groups (A/B on `X`,
+    /// C/D on `Y`) — the minimal fixture `extract_class::extract_class_candidates` needs
+    /// to propose a 2-group split.
+    fn write_extract_class_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        std::fs::create_dir_all(dir.join("blob")).unwrap();
+        std::fs::write(
+            dir.join("blob/blob.go"),
+            "package blob\n\n\
+             type T struct {\n\tX int\n\tY int\n}\n\n\
+             func (t *T) SetX(v int) { t.X = v }\n\
+             func (t T) GetX() int { return t.X }\n\
+             func (t *T) SetY(v int) { t.Y = v }\n\
+             func (t T) GetY() int { return t.Y }\n",
+        )
+        .unwrap();
+    }
+
+    fn refactor_req(dir: &std::path::Path) -> ListRefactorCandidatesRequest {
+        ListRefactorCandidatesRequest {
+            path: dir.display().to_string(),
+            scope: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_refactor_candidates_proposes_a_two_group_split() {
+        let dir = tmp_dir("refactor-candidates-split");
+        write_extract_class_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_refactor_candidates(Parameters(refactor_req(&dir)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let candidates = json["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "got: {json}");
+        assert_eq!(candidates[0]["type_name"], "T", "got: {json}");
+        let groups = candidates[0]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "got: {json}");
+        assert!(
+            candidates[0]["entity_placement_score"].as_f64().unwrap() >= 0.75,
+            "got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_refactor_candidates_returns_empty_array_for_zero_matches_not_error() {
+        let dir = tmp_dir("refactor-candidates-empty");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+        std::fs::write(dir.join("f.go"), "package fixture\n\nfunc A() {}\n").unwrap();
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_refactor_candidates(Parameters(refactor_req(&dir)))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        assert_eq!(
+            json["candidates"].as_array().unwrap().len(),
+            0,
+            "got: {json}"
+        );
+    }
+
     mod plugin_missing_rendering_tests {
         use super::*;
         use crate::config::OutputFormat;
