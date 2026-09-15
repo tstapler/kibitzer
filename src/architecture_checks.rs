@@ -1645,6 +1645,7 @@ mod tests {
             import_edges,
             call_edges: vec![],
             field_accesses: vec![],
+            file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }
@@ -1848,6 +1849,7 @@ mod tests {
             import_edges: vec![],
             call_edges,
             field_accesses,
+            file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }

@@ -497,6 +497,7 @@ mod tests {
                 field_access("m2", "T", "x", "pkg"),
                 field_access("m3", "T", "x", "pkg"),
             ],
+            file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 1.0);
@@ -515,6 +516,7 @@ mod tests {
                 field_access("m2", "T", "y", "pkg"),
                 field_access("m3", "T", "z", "pkg"),
             ],
+            file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 0.0);
