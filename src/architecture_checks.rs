@@ -515,6 +515,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
     vec![
         Box::new(InstabilityChecker),
         Box::new(DipConcreteCouplingChecker),
+        Box::new(LcomChecker),
     ]
 }
 
@@ -664,6 +665,223 @@ fn dip_finding(
         ),
         severity_override: None,
     })
+}
+
+/// Minimum method count before a type is evaluated for LCOM4 — a type with fewer methods
+/// is too small for "should be split into N classes" to be actionable, even if its
+/// components technically number more than one (e.g. two independent one-line getters).
+/// No stronger literature citation than "too small to be worth splitting," same status as
+/// `MAX_FAN_OUT`/`STABLE_MAX` above.
+const LCOM_MIN_METHODS: usize = 4;
+
+/// SRP proxy: LCOM4 — the number of connected components in the graph where a type's own
+/// methods are nodes and an edge joins two methods that either share a field access (read
+/// or write, from `ArchModel::field_accesses`, #39) or call each other. `LCOM4 == 1` means
+/// every method participates in one cohesive cluster; `LCOM4 > 1` means the methods split
+/// into that many mutually-disconnected groups — a deterministic proxy for "this type
+/// bundles more than one responsibility" (the literature's God Class/Blob smell — see
+/// PMD's `GodClassRule` and iPlasma's TCC/LCOM thresholds, both of which combine LCOM with
+/// WMC/ATFD rather than trusting it alone; this checker is intentionally the single-metric
+/// slice of that, not the full combination) and a candidate input for Extract Class.
+/// Go-only, same scope as `ArchModel::field_accesses`.
+///
+/// Known ceiling, confirmed backtesting against `k8s.io/apimachinery`: a large struct with
+/// one independent getter/setter pair per field (`ObjectMeta`, `metav1.Time`) reports a
+/// high LCOM4 — every accessor genuinely touches only its own field, so the metric is
+/// technically correct, but the advice ("consider Extract Class") is poor for a plain data
+/// holder. This is the exact well-documented weakness LCOM's own literature cites as the
+/// reason to combine it with WMC/ATFD rather than trust it alone (see this doc comment's
+/// first paragraph); doing that combination is out of scope here — it's a separate,
+/// already-proposed checker (issue #38's "God-class flags" item). Treat a finding as
+/// "worth a second look," not proof, same convention as `DipConcreteCouplingChecker`.
+pub struct LcomChecker;
+
+impl ArchModelChecker for LcomChecker {
+    fn name(&self) -> &str {
+        "lcom"
+    }
+
+    fn check(
+        &self,
+        model: &crate::arch_model::ArchModel,
+        _config: &ArchitectureConfig,
+    ) -> Vec<ArchFinding> {
+        model
+            .packages
+            .values()
+            .flat_map(|pkg| lcom_findings_for_package(pkg, model))
+            .collect()
+    }
+}
+
+/// Groups a package's Go `Method` symbols by owning type name, keyed by the type's bare
+/// name (not owner-qualified — `SymbolNode::parent` already stores it that way).
+/// Non-`.go` methods are excluded entirely, not just left with an empty edge set: LCOM's
+/// connectivity signal (`ArchModel::field_accesses`, and `call_edges` for the languages
+/// `call_graph_supports` covers) doesn't exist at all for other languages, so a type with
+/// zero call/field data would otherwise read as "maximally disconnected" — every method
+/// its own component — when the true answer is "unknown," not "zero cohesion." See
+/// `LcomChecker`'s doc comment.
+fn methods_by_type(pkg: &crate::arch_model::PackageNode) -> BTreeMap<&str, Vec<&str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for sym in &pkg.symbols {
+        if sym.kind == crate::arch_model::SymbolKind::Method
+            && let Some(parent) = &sym.parent
+            && sym.file.extension().is_some_and(|ext| ext == "go")
+        {
+            map.entry(parent.as_str())
+                .or_default()
+                .push(sym.id.as_str());
+        }
+    }
+    map
+}
+
+fn union_find_root(parent: &mut [usize], x: usize) -> usize {
+    if parent[x] != x {
+        parent[x] = union_find_root(parent, parent[x]);
+    }
+    parent[x]
+}
+
+fn union_find_join(parent: &mut [usize], a: usize, b: usize) {
+    let ra = union_find_root(parent, a);
+    let rb = union_find_root(parent, b);
+    if ra != rb {
+        parent[ra] = rb;
+    }
+}
+
+/// Counts LCOM4's connected components over `method_ids` (all belonging to one type,
+/// `type_prefix` being that type's owner-qualifying `"{package}::{type}."` id prefix):
+/// unions any pair of methods sharing a field access, then any pair joined by a resolved
+/// call edge within the same type, and returns the number of distinct roots left.
+/// `None` when this type has no connectivity signal at all — every `Method` symbol whose
+/// receiver's underlying Go type isn't a struct (a named map/slice/etc. type, e.g.
+/// `type Set[T comparable] map[T]struct{}`) never produces a single `recv.Field` selector,
+/// so `field_accesses` has zero entries for it and it would otherwise read as "maximally
+/// disconnected" (every method its own component) purely because kibitzer has no way to
+/// observe its state sharing — not because the methods are actually unrelated. Confirmed
+/// against a real false-positive backtest: `k8s.io/apimachinery/pkg/util/sets.Byte`
+/// (`map[byte]struct{}`, 16 independent methods, zero shared state kibitzer can see) — see
+/// this checker's doc comment. Distinguished from a real struct whose methods simply don't
+/// share any field (a legitimate LCOM4 finding): that case still has *some*
+/// `field_accesses`/same-type `call_edges` entries, just not overlapping ones.
+/// Unions every pair of methods (by index into `parent`) sharing a field access. Returns
+/// whether kibitzer observed *any* field access for this type at all — `false` means zero
+/// accesses total, not just zero shared ones (see `lcom4_components`'s doc comment on why
+/// that distinction matters).
+fn union_shared_field_accesses(
+    index: &HashMap<&str, usize>,
+    model: &crate::arch_model::ArchModel,
+    parent: &mut [usize],
+) -> bool {
+    let mut methods_by_field: HashMap<&str, Vec<usize>> = HashMap::new();
+    for access in &model.field_accesses {
+        if let Some(&i) = index.get(access.from.as_str()) {
+            methods_by_field
+                .entry(access.to.as_str())
+                .or_default()
+                .push(i);
+        }
+    }
+    for members in methods_by_field.values() {
+        for pair in members.windows(2) {
+            union_find_join(parent, pair[0], pair[1]);
+        }
+    }
+    !methods_by_field.is_empty()
+}
+
+/// Unions every pair of methods joined by a resolved call edge within `type_prefix`.
+/// Returns whether any such edge existed at all.
+fn union_same_type_calls(
+    index: &HashMap<&str, usize>,
+    model: &crate::arch_model::ArchModel,
+    type_prefix: &str,
+    parent: &mut [usize],
+) -> bool {
+    let mut found = false;
+    for edge in &model.call_edges {
+        if !edge.resolved
+            || !edge.from.starts_with(type_prefix)
+            || !edge.to.starts_with(type_prefix)
+        {
+            continue;
+        }
+        if let (Some(&a), Some(&b)) = (index.get(edge.from.as_str()), index.get(edge.to.as_str())) {
+            found = true;
+            union_find_join(parent, a, b);
+        }
+    }
+    found
+}
+
+/// `None` when this type has no connectivity signal at all — every `Method` symbol whose
+/// receiver's underlying Go type isn't a struct (a named map/slice/etc. type, e.g.
+/// `type Set[T comparable] map[T]struct{}`) never produces a single `recv.Field` selector,
+/// so `field_accesses` has zero entries for it and it would otherwise read as "maximally
+/// disconnected" (every method its own component) purely because kibitzer has no way to
+/// observe its state sharing — not because the methods are actually unrelated. Confirmed
+/// against a real false-positive backtest: `k8s.io/apimachinery/pkg/util/sets.Byte`
+/// (`map[byte]struct{}`, 16 independent methods, zero shared state kibitzer can see).
+/// Distinguished from a real struct whose methods simply don't share any field (a
+/// legitimate LCOM4 finding): that case still has *some* `field_accesses`/same-type
+/// `call_edges` entries, just not overlapping ones.
+fn lcom4_components(
+    method_ids: &[&str],
+    model: &crate::arch_model::ArchModel,
+    type_prefix: &str,
+) -> Option<usize> {
+    let index: HashMap<&str, usize> = method_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    let mut parent: Vec<usize> = (0..method_ids.len()).collect();
+
+    let has_field_signal = union_shared_field_accesses(&index, model, &mut parent);
+    let has_call_signal = union_same_type_calls(&index, model, type_prefix, &mut parent);
+    if !has_field_signal && !has_call_signal {
+        return None;
+    }
+
+    Some(
+        (0..method_ids.len())
+            .map(|i| union_find_root(&mut parent, i))
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+    )
+}
+
+fn lcom_findings_for_package(
+    pkg: &crate::arch_model::PackageNode,
+    model: &crate::arch_model::ArchModel,
+) -> Vec<ArchFinding> {
+    methods_by_type(pkg)
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= LCOM_MIN_METHODS)
+        .filter_map(|(type_name, ids)| {
+            let type_prefix = format!("{}::{type_name}.", pkg.path);
+            let components = lcom4_components(&ids, model, &type_prefix)?;
+            if components <= 1 {
+                return None;
+            }
+            Some(ArchFinding {
+                file: None,
+                line: None,
+                message: format!(
+                    "[lcom] {}::{type_name} has LCOM4={components} across {} methods: they split \
+                     into {components} disconnected groups (no shared field access or call between \
+                     them) — likely bundles {components} unrelated responsibilities; consider \
+                     Extract Class",
+                    pkg.path,
+                    ids.len()
+                ),
+                severity_override: None,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1561,6 +1779,221 @@ mod tests {
 
         assert!(
             DipConcreteCouplingChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    // --- LcomChecker (#38) ---
+
+    fn lcom_method(pkg: &str, type_name: &str, method_name: &str) -> crate::arch_model::SymbolNode {
+        crate::arch_model::SymbolNode {
+            id: format!("{pkg}::{type_name}.{method_name}"),
+            name: method_name.to_string(),
+            kind: crate::arch_model::SymbolKind::Method,
+            file: PathBuf::from(format!("{pkg}/{method_name}.go")),
+            line: 1,
+            exported: true,
+            parent: Some(type_name.to_string()),
+        }
+    }
+
+    fn lcom_field_access(
+        from: &str,
+        to: &str,
+        access: crate::arch_model::AccessKind,
+    ) -> crate::arch_model::FieldAccessEdge {
+        crate::arch_model::FieldAccessEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            access,
+            file: PathBuf::from("f.go"),
+            line: 1,
+        }
+    }
+
+    fn lcom_call_edge(from: &str, to: &str) -> crate::arch_model::CallEdge {
+        crate::arch_model::CallEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            resolved: true,
+            file: PathBuf::from("f.go"),
+            line: 1,
+        }
+    }
+
+    fn model_with_edges(
+        packages: Vec<crate::arch_model::PackageNode>,
+        call_edges: Vec<crate::arch_model::CallEdge>,
+        field_accesses: Vec<crate::arch_model::FieldAccessEdge>,
+    ) -> crate::arch_model::ArchModel {
+        crate::arch_model::ArchModel {
+            repo_root: PathBuf::from("/repo"),
+            packages: packages.into_iter().map(|p| (p.path.clone(), p)).collect(),
+            import_edges: vec![],
+            call_edges,
+            field_accesses,
+            pruning: crate::arch_model::PruningSummary {
+                include_private: false,
+                excluded_dirs: vec![],
+                generated_files_skipped: 0,
+                private_symbols_skipped: 0,
+                pruned_symbol_ids: vec![],
+                files_with_parse_errors: vec![],
+                unsupported_language_files: 0,
+                total_files_scanned: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn lcom_flags_a_type_whose_methods_split_into_two_disconnected_groups() {
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+            ],
+        );
+        // A/B share field X; C/D share field Y — two disconnected clusters.
+        let field_accesses = vec![
+            lcom_field_access("pkg::T.A", "pkg::T.X", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.B", "pkg::T.X", crate::arch_model::AccessKind::Write),
+            lcom_field_access("pkg::T.C", "pkg::T.Y", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.D", "pkg::T.Y", crate::arch_model::AccessKind::Write),
+        ];
+        let model = model_with_edges(vec![pkg], vec![], field_accesses);
+
+        let findings = LcomChecker.check(&model, &ArchitectureConfig::default());
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("[lcom]"));
+        assert!(findings[0].message.contains("LCOM4=2"));
+    }
+
+    #[test]
+    fn lcom_does_not_flag_a_cohesive_type() {
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+            ],
+        );
+        // Every method touches the same field X — one cohesive cluster.
+        let field_accesses = ["A", "B", "C", "D"]
+            .iter()
+            .map(|m| {
+                lcom_field_access(
+                    &format!("pkg::T.{m}"),
+                    "pkg::T.X",
+                    crate::arch_model::AccessKind::Read,
+                )
+            })
+            .collect();
+        let model = model_with_edges(vec![pkg], vec![], field_accesses);
+
+        assert!(
+            LcomChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lcom_skips_types_below_the_minimum_method_threshold() {
+        // Only 2 methods, fully disconnected — would be LCOM4=2, but too small a type for
+        // that to be actionable advice.
+        let pkg = model_package(
+            "pkg",
+            vec![lcom_method("pkg", "T", "A"), lcom_method("pkg", "T", "B")],
+        );
+        let model = model_with_edges(vec![pkg], vec![], vec![]);
+
+        assert!(
+            LcomChecker
+                .check(&model, &ArchitectureConfig::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lcom_counts_a_same_type_call_edge_as_cohesion() {
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+            ],
+        );
+        // No shared field access, but A calls B and C calls D — still two clusters, not
+        // four isolated methods, since call edges also count toward cohesion.
+        let call_edges = vec![
+            lcom_call_edge("pkg::T.A", "pkg::T.B"),
+            lcom_call_edge("pkg::T.C", "pkg::T.D"),
+        ];
+        let model = model_with_edges(vec![pkg], call_edges, vec![]);
+
+        let findings = LcomChecker.check(&model, &ArchitectureConfig::default());
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("LCOM4=2"));
+    }
+
+    #[test]
+    fn lcom_ignores_call_edges_to_a_different_type() {
+        // A method's calls to a different type must never count toward its own type's
+        // cohesion — the type-prefix filter in `lcom4_components` is load-bearing. Real
+        // in-type field-access signal (A/B share X, C/D share Y) gives a baseline of 2
+        // components; a cross-type call from A must not merge that with anything else.
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "T", "A"),
+                lcom_method("pkg", "T", "B"),
+                lcom_method("pkg", "T", "C"),
+                lcom_method("pkg", "T", "D"),
+            ],
+        );
+        let field_accesses = vec![
+            lcom_field_access("pkg::T.A", "pkg::T.X", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.B", "pkg::T.X", crate::arch_model::AccessKind::Write),
+            lcom_field_access("pkg::T.C", "pkg::T.Y", crate::arch_model::AccessKind::Read),
+            lcom_field_access("pkg::T.D", "pkg::T.Y", crate::arch_model::AccessKind::Write),
+        ];
+        let call_edges = vec![lcom_call_edge("pkg::T.A", "pkg::Other.Helper")];
+        let model = model_with_edges(vec![pkg], call_edges, field_accesses);
+
+        let findings = LcomChecker.check(&model, &ArchitectureConfig::default());
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("LCOM4=2"));
+    }
+
+    #[test]
+    fn lcom_skips_a_type_with_zero_field_or_call_signal_at_all() {
+        // Regression for a real false positive found backtesting against
+        // k8s.io/apimachinery/pkg/util/sets: `type Byte map[byte]struct{}` has 16
+        // independent methods that never produce a `recv.Field` selector (the receiver
+        // itself is the map) — zero field_accesses and zero same-type call_edges, not
+        // "16 disconnected components." Must be skipped entirely, not flagged as maximally
+        // incohesive.
+        let pkg = model_package(
+            "pkg",
+            vec![
+                lcom_method("pkg", "Byte", "Insert"),
+                lcom_method("pkg", "Byte", "Delete"),
+                lcom_method("pkg", "Byte", "Has"),
+                lcom_method("pkg", "Byte", "List"),
+            ],
+        );
+        let model = model_with_edges(vec![pkg], vec![], vec![]);
+
+        assert!(
+            LcomChecker
                 .check(&model, &ArchitectureConfig::default())
                 .is_empty()
         );
