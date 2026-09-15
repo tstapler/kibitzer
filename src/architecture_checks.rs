@@ -516,6 +516,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(InstabilityChecker),
         Box::new(DipConcreteCouplingChecker),
         Box::new(LcomChecker),
+        Box::new(crate::god_class::GodClassChecker),
     ]
 }
 
@@ -713,7 +714,7 @@ impl ArchModelChecker for LcomChecker {
 /// zero call/field data would otherwise read as "maximally disconnected" — every method
 /// its own component — when the true answer is "unknown," not "zero cohesion." See
 /// `LcomChecker`'s doc comment.
-fn methods_by_type(pkg: &crate::arch_model::PackageNode) -> BTreeMap<&str, Vec<&str>> {
+pub(crate) fn methods_by_type(pkg: &crate::arch_model::PackageNode) -> BTreeMap<&str, Vec<&str>> {
     let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for sym in &pkg.symbols {
         if sym.kind == crate::arch_model::SymbolKind::Method
@@ -1643,16 +1644,7 @@ mod tests {
             import_edges,
             call_edges: vec![],
             field_accesses: vec![],
-            pruning: crate::arch_model::PruningSummary {
-                include_private: false,
-                excluded_dirs: vec![],
-                generated_files_skipped: 0,
-                private_symbols_skipped: 0,
-                pruned_symbol_ids: vec![],
-                files_with_parse_errors: vec![],
-                unsupported_language_files: 0,
-                total_files_scanned: 0,
-            },
+            pruning: crate::arch_model::PruningSummary::default(),
         }
     }
 
@@ -1855,16 +1847,7 @@ mod tests {
             import_edges: vec![],
             call_edges,
             field_accesses,
-            pruning: crate::arch_model::PruningSummary {
-                include_private: false,
-                excluded_dirs: vec![],
-                generated_files_skipped: 0,
-                private_symbols_skipped: 0,
-                pruned_symbol_ids: vec![],
-                files_with_parse_errors: vec![],
-                unsupported_language_files: 0,
-                total_files_scanned: 0,
-            },
+            pruning: crate::arch_model::PruningSummary::default(),
         }
     }
 
