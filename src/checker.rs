@@ -13,6 +13,7 @@ use crate::file_size::FileSizeChecker;
 use crate::go_blank_imports::BlankImportsChecker;
 use crate::go_error_context::ErrorContextChecker;
 use crate::go_ignored_error::IgnoredErrorChecker;
+use crate::go_type_switch_density::TypeSwitchDensityChecker;
 use crate::markdown_link_integrity::MarkdownLinkIntegrityChecker;
 use crate::primitive_obsession::PrimitiveObsessionChecker;
 use crate::rules::SyntaxRulesChecker;
@@ -155,6 +156,7 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(CrossFileDuplicateChecker),
         Box::new(BlankImportsChecker),
         Box::new(IgnoredErrorChecker),
+        Box::new(TypeSwitchDensityChecker),
         Box::new(ErrorContextChecker),
         Box::new(FileSizeChecker::new(Language::Go)),
         Box::new(FileSizeChecker::new(Language::TypeScript)),

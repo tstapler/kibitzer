@@ -24,6 +24,7 @@ mod go_blank_imports;
 mod go_call_resolution;
 mod go_error_context;
 mod go_ignored_error;
+mod go_type_switch_density;
 mod hook;
 mod hook_log;
 mod import_graph;
