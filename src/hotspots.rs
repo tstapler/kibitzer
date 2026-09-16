@@ -7,9 +7,10 @@
 //! prioritization report, not a pass/fail check. v1 scope is Go-only, matching
 //! `primitive_obsession.rs`'s rollout precedent (see #15).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::checker::{GrammarCache, Language};
 
@@ -27,52 +28,93 @@ pub struct Hotspot {
     pub score: u64,
 }
 
-/// Runs the hotspot report over `repo_root`'s last `limit` non-merge commits (clamped to
+/// `git log --name-only`'s file paths are always relative to the repository's real
+/// top-level directory, regardless of `git`'s working directory — unlike
+/// `change_coupling.rs`'s callers, which only ever print those paths as strings,
+/// `analyze` below needs to actually open each file, so it must resolve the true
+/// top-level once and join against *that*, not against `path` itself. Without this, a
+/// `--path` pointing at a subdirectory silently resolves every file to a nonexistent
+/// location and the report comes back empty instead of scoped to that subdirectory.
+fn git_toplevel(path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .context("failed to run git rev-parse --show-toplevel")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse --show-toplevel exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+/// Runs the hotspot report over `path`'s last `limit` non-merge commits (clamped to
 /// [`MAX_LIMIT`]), scoring every currently-existing `.go` file touched in that window by
-/// `revisions × complexity` and returning the top `top_n`, highest score first. A file's
-/// complexity is the sum of cyclomatic complexity across its function/method
-/// declarations (see `complexity::total_complexity`). Generated files
-/// (`file_size::is_generated`) and files no longer present on disk (deleted or renamed
-/// since) are skipped — churn history for a file that isn't there to fix isn't
-/// actionable.
-pub fn analyze(repo_root: &Path, limit: usize, top_n: usize) -> Result<Vec<Hotspot>> {
-    let commits = crate::change_coupling::git_log_commits(repo_root, limit.min(MAX_LIMIT))?;
+/// `revisions × complexity` and returning the top `top_n`, highest score first. `path`
+/// may be the repo root or any subdirectory inside it — results are always scoped to
+/// files under `path`, since the real repo top-level (see [`git_toplevel`]) is resolved
+/// separately from the directory results are filtered to. A file's complexity is the sum
+/// of cyclomatic complexity across its function/method declarations (see
+/// `complexity::total_complexity`). Generated files (`file_size::is_generated`) and files
+/// no longer present on disk (deleted or renamed since) are skipped — churn history for a
+/// file that isn't there to fix isn't actionable.
+pub fn analyze(path: &Path, limit: usize, top_n: usize) -> Result<Vec<Hotspot>> {
+    let toplevel = git_toplevel(path)?;
+    let commits = crate::change_coupling::git_log_commits(path, limit.min(MAX_LIMIT))?;
     let revisions = crate::change_coupling::file_revisions(&commits);
 
-    let mut hotspots = Vec::new();
-    for (file, revs) in revisions {
-        if !file.ends_with(".go") {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(repo_root.join(&file)) else {
-            continue;
-        };
-        if crate::file_size::is_generated(&source) {
-            continue;
-        }
-        // A fresh `GrammarCache` per file: its cache key is `Language` alone, so reusing
-        // one instance across files of the same language would silently return the
-        // previous file's parse tree (see `GrammarCache::parse`'s doc comment).
-        let grammar = GrammarCache::new();
-        let Ok(tree) = grammar.parse(Language::Go, &source) else {
-            continue;
-        };
-        let complexity = crate::complexity::total_complexity(tree.root_node(), source.as_bytes());
-        if complexity == 0 {
-            continue;
-        }
-        let score = u64::from(revs) * complexity as u64;
-        hotspots.push(Hotspot {
-            file,
-            revisions: revs,
-            complexity,
-            score,
-        });
-    }
+    // Scope to files under `path`: canonicalize both sides so a relative `path` (or one
+    // containing `.`/`..`) still compares correctly against `toplevel`, which
+    // `git rev-parse` always returns as an absolute, fully-resolved path.
+    let scope = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    let mut hotspots: Vec<Hotspot> = revisions
+        .into_iter()
+        .filter_map(|(file, revs)| score_file(&toplevel, &scope, file, revs))
+        .collect();
 
     hotspots.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.file.cmp(&b.file)));
     hotspots.truncate(top_n);
     Ok(hotspots)
+}
+
+/// Scores one churned `file` (repo-root-relative, as `git log` emits it), or `None` if
+/// it's not a `.go` file, falls outside `scope`, no longer exists on disk, is generated,
+/// or fails to parse — see [`analyze`]'s doc comment for why each of those is skipped
+/// rather than erroring.
+fn score_file(toplevel: &Path, scope: &Path, file: String, revs: u32) -> Option<Hotspot> {
+    if !file.ends_with(".go") {
+        return None;
+    }
+    let full_path = toplevel.join(&file);
+    if !full_path.starts_with(scope) {
+        return None;
+    }
+    let source = std::fs::read_to_string(&full_path).ok()?;
+    if crate::file_size::is_generated(&source) {
+        return None;
+    }
+    // A fresh `GrammarCache` per file: its cache key is `Language` alone, so reusing one
+    // instance across files of the same language would silently return the previous
+    // file's parse tree (see `GrammarCache::parse`'s doc comment).
+    let grammar = GrammarCache::new();
+    let tree = grammar.parse(Language::Go, &source).ok()?;
+    let complexity = crate::complexity::total_complexity(tree.root_node(), source.as_bytes());
+    if complexity == 0 {
+        return None;
+    }
+    let score = u64::from(revs) * complexity as u64;
+    Some(Hotspot {
+        file,
+        revisions: revs,
+        complexity,
+        score,
+    })
 }
 
 #[cfg(test)]
@@ -188,5 +230,25 @@ mod tests {
 
         let hotspots = analyze(&repo.dir, 1000, 1).unwrap();
         assert_eq!(hotspots.len(), 1);
+    }
+
+    /// Regression test: `git log --name-only`'s paths are always relative to the repo's
+    /// real top-level, not to whatever directory `analyze` was pointed at. An earlier
+    /// version joined those paths directly against the passed-in `path`, which silently
+    /// resolved every file to a nonexistent location — and produced an empty report
+    /// instead of an error or correct subdirectory scoping — whenever `path` was a
+    /// subdirectory rather than the repo root.
+    #[test]
+    fn scopes_correctly_when_path_is_a_subdirectory() {
+        let repo = TempGitRepo::new("subdir-scope");
+        repo.write_and_commit("sub/a.go", COMPLEX_GO, "add sub/a.go");
+        repo.write_and_commit("other/b.go", COMPLEX_GO, "add other/b.go");
+
+        let scoped = analyze(&repo.dir.join("sub"), 1000, 20).unwrap();
+        let files: Vec<&str> = scoped.iter().map(|h| h.file.as_str()).collect();
+        assert_eq!(files, vec!["sub/a.go"]);
+
+        let unscoped = analyze(&repo.dir, 1000, 20).unwrap();
+        assert_eq!(unscoped.len(), 2);
     }
 }
