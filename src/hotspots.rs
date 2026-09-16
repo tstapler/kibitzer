@@ -68,10 +68,14 @@ pub fn analyze(path: &Path, limit: usize, top_n: usize) -> Result<Vec<Hotspot>> 
     let commits = crate::change_coupling::git_log_commits(path, limit.min(MAX_LIMIT))?;
     let revisions = crate::change_coupling::file_revisions(&commits);
 
-    // Scope to files under `path`: canonicalize both sides so a relative `path` (or one
-    // containing `.`/`..`) still compares correctly against `toplevel`, which
-    // `git rev-parse` always returns as an absolute, fully-resolved path.
-    let scope = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Scope to files under `path`, resolved (not just joined) so a tracked symlink or a
+    // `..`-containing tracked path can't escape it — see `score_file`'s doc comment.
+    // Errors rather than silently returning an empty report on failure (unlike
+    // `score_file`'s per-file skips): a `path` that itself fails to canonicalize means
+    // every subsequent scope check would incorrectly reject everything.
+    let scope = path
+        .canonicalize()
+        .with_context(|| format!("resolving {} to an absolute path", path.display()))?;
 
     let mut hotspots: Vec<Hotspot> = revisions
         .into_iter()
@@ -87,11 +91,19 @@ pub fn analyze(path: &Path, limit: usize, top_n: usize) -> Result<Vec<Hotspot>> 
 /// it's not a `.go` file, falls outside `scope`, no longer exists on disk, is generated,
 /// or fails to parse — see [`analyze`]'s doc comment for why each of those is skipped
 /// rather than erroring.
+///
+/// `full_path` is canonicalized (not just joined) before the `scope` check, and the
+/// check runs against that canonicalized result rather than the raw join: `toplevel.join`
+/// alone doesn't resolve `..` components or follow symlinks, so a plain
+/// `starts_with(scope)` on the un-resolved path can't detect a tracked file that's
+/// actually a symlink pointing outside the repo (or, in principle, a maliciously crafted
+/// tree entry with `..` in its name) — `canonicalize` resolves both before the string
+/// comparison ever runs, so `read_to_string` below can never reach outside `scope`.
 fn score_file(toplevel: &Path, scope: &Path, file: String, revs: u32) -> Option<Hotspot> {
     if !file.ends_with(".go") {
         return None;
     }
-    let full_path = toplevel.join(&file);
+    let full_path = toplevel.join(&file).canonicalize().ok()?;
     if !full_path.starts_with(scope) {
         return None;
     }
@@ -202,14 +214,58 @@ mod tests {
     }
 
     #[test]
-    fn skips_non_go_files_and_files_deleted_since() {
-        let repo = TempGitRepo::new("skip");
+    fn skips_non_go_files() {
+        let repo = TempGitRepo::new("skip-non-go");
         repo.write_and_commit("README.md", "# hi\n", "add readme");
+        repo.write_and_commit("keep.go", SIMPLE_GO, "add keep");
+
+        let hotspots = analyze(&repo.dir, 1000, 20).unwrap();
+        let files: Vec<&str> = hotspots.iter().map(|h| h.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["keep.go"],
+            "README.md must not appear regardless of whether keep.go is also excluded"
+        );
+    }
+
+    #[test]
+    fn skips_files_deleted_since() {
+        let repo = TempGitRepo::new("skip-deleted");
         repo.write_and_commit("gone.go", SIMPLE_GO, "add gone");
         repo.remove_and_commit("gone.go");
 
         let hotspots = analyze(&repo.dir, 1000, 20).unwrap();
         assert!(hotspots.is_empty());
+    }
+
+    /// `total_complexity` sums cyclomatic complexity across a file's functions — a file
+    /// with no function/method declarations at all (a pure `types.go`/interface-only
+    /// file, common in real Go code) sums to zero and is excluded rather than reported
+    /// with a score of zero. Locks that in as an intentional decision (a zero score
+    /// carries no "look here" signal for this report) rather than an untested side
+    /// effect.
+    #[test]
+    fn excludes_a_go_file_with_no_function_declarations() {
+        let repo = TempGitRepo::new("no-funcs");
+        repo.write_and_commit(
+            "types.go",
+            "package foo\n\ntype Widget struct {\n\tName string\n}\n",
+            "add types",
+        );
+
+        let hotspots = analyze(&repo.dir, 1000, 20).unwrap();
+        assert!(hotspots.is_empty());
+    }
+
+    #[test]
+    fn errors_on_a_path_outside_any_git_repo() {
+        let dir = crate::test_support::unique_temp_dir("hotspots-not-a-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = analyze(&dir, 1000, 20);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -250,5 +306,32 @@ mod tests {
 
         let unscoped = analyze(&repo.dir, 1000, 20).unwrap();
         assert_eq!(unscoped.len(), 2);
+    }
+
+    /// Security regression test: a tracked symlink pointing outside the repo must not be
+    /// followed to read content outside `scope`. Before `score_file` canonicalized
+    /// `full_path`, `starts_with(scope)` passed for the symlink's own in-repo path even
+    /// though `read_to_string` then followed it anywhere on disk. Unix-only:
+    /// `std::os::unix::fs::symlink` has no Windows equivalent.
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_a_tracked_symlink_outside_the_repo() {
+        let outside = crate::test_support::unique_temp_dir("hotspots-outside-secret");
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("leaked.go");
+        std::fs::write(&secret, COMPLEX_GO).unwrap();
+
+        let repo = TempGitRepo::new("symlink-escape");
+        std::os::unix::fs::symlink(&secret, repo.dir.join("evil.go")).unwrap();
+        TempGitRepo::run(&repo.dir, &["add", "evil.go"]);
+        TempGitRepo::run(&repo.dir, &["commit", "-q", "-m", "add symlink"]);
+
+        let hotspots = analyze(&repo.dir, 1000, 20).unwrap();
+
+        let _ = std::fs::remove_dir_all(&outside);
+        assert!(
+            hotspots.is_empty(),
+            "a symlink pointing outside the repo must never be scored: {hotspots:?}"
+        );
     }
 }
