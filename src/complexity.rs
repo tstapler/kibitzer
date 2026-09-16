@@ -90,6 +90,29 @@ fn aggregate_findings(complex: &[(usize, usize)]) -> Vec<Finding> {
         .collect()
 }
 
+/// Sum of cyclomatic complexity across every Go function/method declaration in `root` —
+/// `hotspots.rs`'s complexity proxy for its churn × complexity hotspot score (see #15).
+/// Distinct from [`complex_functions`]: no [`CYCLOMATIC_COMPLEXITY_THRESHOLD`] filter (a
+/// hotspot score wants the file's total branching, not just its over-threshold
+/// functions), and always [`SubtestHandling::IncludeAll`] — hotspot ranking doesn't need
+/// `_test.go`'s subtest carve-out's extra precision.
+pub(crate) fn total_complexity(root: Node, source: &[u8]) -> usize {
+    let function_kinds = crate::rules::lang_config(Language::Go).function_kinds;
+    let mut total = 0;
+    collect_total_complexity(root, function_kinds, source, &mut total);
+    total
+}
+
+fn collect_total_complexity(node: Node, function_kinds: &[&str], source: &[u8], total: &mut usize) {
+    if function_kinds.contains(&node.kind()) {
+        *total += cyclomatic_complexity(node, source, SubtestHandling::IncludeAll);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_total_complexity(child, function_kinds, source, total);
+    }
+}
+
 /// `(declaration line, complexity)` for every Go function/method in `root` whose
 /// cyclomatic complexity exceeds [`CYCLOMATIC_COMPLEXITY_THRESHOLD`], in source order.
 /// `is_test_file` gates the `t.Run`/`b.Run`/`m.Run` subtest exclusion (see
