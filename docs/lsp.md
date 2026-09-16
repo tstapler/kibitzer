@@ -50,23 +50,22 @@ beyond `cmd` and `filetypes`.
 
 VS Code has no built-in generic LSP client, so pointing it at an arbitrary stdio
 server requires a small extension shim. Use a generic-LSP-client extension —
-e.g. [`generic-lsp`](https://marketplace.visualstudio.com/items?itemName=llllvvuu.vscode-generic-lsp)
-or similar — configured with:
+e.g. [Generic LSP Client](https://marketplace.visualstudio.com/items?itemName=llllvvuu.llllvvuu-glspc)
+(`llllvvuu.llllvvuu-glspc`) — configured with:
 
 ```json
 {
-  "genericLsp.servers": [
-    {
-      "languageId": ["go", "rust", "python"],
-      "command": "kibitzer",
-      "args": ["lsp"]
-    }
-  ]
+  "glspc.serverCommand": "kibitzer",
+  "glspc.serverCommandArguments": ["lsp"],
+  "glspc.languageId": "go"
 }
 ```
 
-kibitzer doesn't ship its own VS Code extension initially; this is the
-supported path until (if ever) a dedicated one exists.
+That extension registers one language server for one `languageId` per
+installed copy — see its README for building extra copies if you need
+kibitzer attached to multiple filetypes at once. kibitzer doesn't ship its
+own VS Code extension initially; this is the supported path until (if ever)
+a dedicated one exists.
 
 ### Scoping to relevant filetypes
 
