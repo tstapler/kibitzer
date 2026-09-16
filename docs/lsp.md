@@ -5,8 +5,79 @@ over stdio (via [`tower-lsp`](https://docs.rs/tower-lsp)), so any LSP-capable ed
 can get kibitzer's checks as inline diagnostics instead of running `kibitzer hook`
 or `kibitzer run` out of band.
 
-Editor-specific setup (VS Code, Neovim, etc.) isn't covered here — see
-[issue #12](https://github.com/tstapler/kibitzer/issues/12).
+## Editor setup
+
+`kibitzer lsp` isn't tied to one editor — it's a generic stdio LSP server, so any
+client that can spawn an arbitrary command works. There's no dedicated kibitzer
+extension for either editor below; both use their existing generic/custom LSP
+client support.
+
+### Neovim
+
+With [`nvim-lspconfig`](https://github.com/neovim/nvim-lspconfig), register kibitzer
+as a custom server (it isn't one of lspconfig's built-in server definitions) via
+`vim.lsp.config` + `vim.lsp.enable` (Neovim 0.11+):
+
+```lua
+vim.lsp.config.kibitzer = {
+  cmd = { "kibitzer", "lsp" },
+  filetypes = { "go", "rust", "python", "lua", "markdown" }, -- match your repo's checks
+  root_markers = { ".claude/inspect.json", ".git" },
+}
+vim.lsp.enable("kibitzer")
+```
+
+On older Neovim, use `vim.lsp.start` from an `FileType` autocmd instead:
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "go", "rust", "python", "lua", "markdown" },
+  callback = function()
+    vim.lsp.start({
+      name = "kibitzer",
+      cmd = { "kibitzer", "lsp" },
+      root_dir = vim.fs.dirname(vim.fs.find({ ".claude/inspect.json", ".git" }, { upward = true })[1]),
+    })
+  end,
+})
+```
+
+kibitzer publishes diagnostics and answers `textDocument/documentSymbol` /
+`workspace/symbol` like any other server — no special lspconfig glue needed
+beyond `cmd` and `filetypes`.
+
+### VS Code
+
+VS Code has no built-in generic LSP client, so pointing it at an arbitrary stdio
+server requires a small extension shim. Use a generic-LSP-client extension —
+e.g. [`generic-lsp`](https://marketplace.visualstudio.com/items?itemName=llllvvuu.vscode-generic-lsp)
+or similar — configured with:
+
+```json
+{
+  "genericLsp.servers": [
+    {
+      "languageId": ["go", "rust", "python"],
+      "command": "kibitzer",
+      "args": ["lsp"]
+    }
+  ]
+}
+```
+
+kibitzer doesn't ship its own VS Code extension initially; this is the
+supported path until (if ever) a dedicated one exists.
+
+### Scoping to relevant filetypes
+
+Whichever client you use, the `filetypes`/`languageId` list is a client-side
+optimization (only start/attach the server for files you care about) — it's
+independent of `.claude/inspect.json`'s own `scope` globs (see
+[`docs/suppressing-checks.md`](suppressing-checks.md)), which control which
+*checks* run against a given file once kibitzer is already attached. Mismatch
+between the two isn't harmful, just redundant: e.g. attaching kibitzer to every
+filetype when `inspect.json` scopes a check to `**/*.go` still works, since
+scoped-out files simply produce no diagnostics.
 
 ## What it does
 
