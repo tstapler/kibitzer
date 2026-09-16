@@ -18,6 +18,7 @@ mod dedup;
 mod duplicate_code;
 mod duplicate_cross_file_checker;
 mod extract_class;
+mod false_positive;
 mod file_size;
 mod glob;
 mod go_blank_imports;
@@ -33,6 +34,10 @@ mod import_graph;
 mod install;
 mod isp_fat_interface;
 mod jaccard;
+mod java_error_context;
+mod java_ignored_error;
+mod java_lost_exception_cause;
+mod java_swallowed_interrupt;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;
@@ -280,6 +285,26 @@ enum CheckCommand {
         #[arg(long)]
         only_new: bool,
     },
+    /// Review or drain the local queue of suspected-false-positive reports filed via the
+    /// `report_false_positive` MCP tool (see `docs/reporting-false-positives.md`).
+    FalsePositives {
+        #[command(subcommand)]
+        action: FalsePositivesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FalsePositivesAction {
+    /// Print every queued report, formatted ready to paste under a
+    /// `docs/<check>-false-positives.md`'s `## Log` heading, grouped by check name.
+    List {
+        /// Only list reports for this check name.
+        #[arg(long)]
+        check: Option<String>,
+    },
+    /// Delete the queue file — do this only after its entries have been triaged into the
+    /// right `docs/<check>-false-positives.md` file(s).
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -419,6 +444,44 @@ fn main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
             }
+            CheckCommand::FalsePositives { action } => match action {
+                FalsePositivesAction::List { check } => {
+                    let path = false_positive::default_queue_path();
+                    let mut reports = false_positive::read_reports(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    if let Some(check) = &check {
+                        reports.retain(|r| &r.check_name == check);
+                    }
+                    if reports.is_empty() {
+                        println!("[kibitzer] no queued false-positive reports at {}", path.display());
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    reports.sort_by(|a, b| a.check_name.cmp(&b.check_name).then(a.date.cmp(&b.date)));
+                    let mut current_check: Option<&str> = None;
+                    for report in &reports {
+                        if current_check != Some(report.check_name.as_str()) {
+                            println!(
+                                "## docs/{}-false-positives.md\n",
+                                report.check_name
+                            );
+                            current_check = Some(report.check_name.as_str());
+                        }
+                        println!("{}", false_positive::format_markdown_entry(report));
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                FalsePositivesAction::Clear => {
+                    let path = false_positive::default_queue_path();
+                    if path.exists() {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
+                        println!("[kibitzer] cleared {}", path.display());
+                    } else {
+                        println!("[kibitzer] no queue file at {}", path.display());
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            },
         },
         Command::Status => status::run_status(),
         Command::Install { global, dry_run } => install::run_install(global, dry_run),

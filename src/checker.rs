@@ -14,6 +14,10 @@ use crate::go_blank_imports::BlankImportsChecker;
 use crate::go_error_context::ErrorContextChecker;
 use crate::go_ignored_error::IgnoredErrorChecker;
 use crate::go_type_switch_density::TypeSwitchDensityChecker;
+use crate::java_error_context::ErrorContextChecker as JavaErrorContextChecker;
+use crate::java_ignored_error::IgnoredErrorChecker as JavaIgnoredErrorChecker;
+use crate::java_lost_exception_cause::LostExceptionCauseChecker;
+use crate::java_swallowed_interrupt::SwallowedInterruptChecker;
 use crate::markdown_link_integrity::MarkdownLinkIntegrityChecker;
 use crate::primitive_obsession::PrimitiveObsessionChecker;
 use crate::rules::SyntaxRulesChecker;
@@ -158,6 +162,10 @@ pub fn registry() -> Vec<Box<dyn Checker>> {
         Box::new(IgnoredErrorChecker),
         Box::new(TypeSwitchDensityChecker),
         Box::new(ErrorContextChecker),
+        Box::new(JavaIgnoredErrorChecker),
+        Box::new(JavaErrorContextChecker),
+        Box::new(SwallowedInterruptChecker),
+        Box::new(LostExceptionCauseChecker),
         Box::new(FileSizeChecker::new(Language::Go)),
         Box::new(FileSizeChecker::new(Language::TypeScript)),
         Box::new(FileSizeChecker::new(Language::Tsx)),

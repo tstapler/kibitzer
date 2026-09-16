@@ -619,6 +619,30 @@ pub fn default_checks() -> Vec<Check> {
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
         native_check("go-type-switch-density", Severity::Advisory, &["**/*.go"]),
+        // Excludes `**/test/**`: a 2026-09-11 backtest against `apache/cassandra`
+        // (docs/backtest-repos.md) found 86% of raw hits (147/170) were in test
+        // code, almost entirely JUnit's manual `try { ...; fail(); } catch (X e)
+        // {}` "expect this to throw" idiom — a real, common pattern this
+        // structural checker can't distinguish from a genuinely swallowed
+        // exception without much more context than an empty-catch check should
+        // carry. Non-test code was comparatively low-noise (23 hits, see
+        // java_ignored_error.rs's JUSTIFIED_NAMES for the other precision fix).
+        native_check(
+            "java-ignored-error",
+            Severity::Advisory,
+            &["**/*.java", "!**/test/**"],
+        ),
+        native_check("java-error-context", Severity::Advisory, &["**/*.java"]),
+        native_check(
+            "java-swallowed-interrupt",
+            Severity::Advisory,
+            &["**/*.java"],
+        ),
+        native_check(
+            "java-lost-exception-cause",
+            Severity::Advisory,
+            &["**/*.java"],
+        ),
         native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
         whole_repo_check("go-package-size", "package-size"),
         native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
