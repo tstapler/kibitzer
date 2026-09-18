@@ -95,6 +95,13 @@ fn has_justifying_comment(body: Node) -> bool {
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
+    crate::tree_walk::walk_preorder(node, &mut |n| {
+        check_catch_clause(n, src, findings);
+        true
+    });
+}
+
+fn check_catch_clause(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
     if node.kind() == "catch_clause"
         && catches_interrupted_exception(node, src)
         && let Some(body) = node.child_by_field_name("body")
@@ -108,10 +115,6 @@ fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
                       interrupt/cancellation signal (SonarQube S2142)"
                 .to_string(),
         });
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, src, findings);
     }
 }
 

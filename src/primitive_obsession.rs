@@ -63,13 +63,12 @@ fn check_source(src: &str) -> Result<Vec<Finding>> {
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "parameter_list" && !is_named_return_list(node) {
-        check_parameter_list(node, src, findings);
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, src, findings);
-    }
+    crate::tree_walk::walk_preorder(node, &mut |n| {
+        if n.kind() == "parameter_list" && !is_named_return_list(n) {
+            check_parameter_list(n, src, findings);
+        }
+        true
+    });
 }
 
 /// True when `node` is the `result` field of its parent signature node.

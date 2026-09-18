@@ -75,31 +75,36 @@ fn has_justified_name(catch_clause: Node, src: &[u8]) -> bool {
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "catch_clause"
-        && let Some(body) = node.child_by_field_name("body")
-    {
-        let mut cursor = body.walk();
-        let mut statement_count = 0usize;
-        let mut has_comment = false;
-        for child in body.named_children(&mut cursor) {
-            if is_comment(child) {
-                has_comment = true;
-            } else {
-                statement_count += 1;
-            }
-        }
-        if statement_count == 0 && !has_comment && !has_justified_name(node, src) {
-            findings.push(Finding {
-                line: node.start_position().row + 1,
-                message: "empty catch block silently swallows the exception — handle it, log \
-                          it, or add a comment explaining why it's safe to ignore"
-                    .to_string(),
-            });
+    crate::tree_walk::walk_preorder(node, &mut |n| {
+        check_catch_clause(n, src, findings);
+        true
+    });
+}
+
+fn check_catch_clause(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
+    if node.kind() != "catch_clause" {
+        return;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    let mut statement_count = 0usize;
+    let mut has_comment = false;
+    for child in body.named_children(&mut cursor) {
+        if is_comment(child) {
+            has_comment = true;
+        } else {
+            statement_count += 1;
         }
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, src, findings);
+    if statement_count == 0 && !has_comment && !has_justified_name(node, src) {
+        findings.push(Finding {
+            line: node.start_position().row + 1,
+            message: "empty catch block silently swallows the exception — handle it, log \
+                      it, or add a comment explaining why it's safe to ignore"
+                .to_string(),
+        });
     }
 }
 

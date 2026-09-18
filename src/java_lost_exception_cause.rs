@@ -117,24 +117,45 @@ fn preserves_cause(object_creation: Node, src: &[u8], caught_name: &str) -> bool
 /// Walks the tree tracking `enclosing_catch_name`: the nearest enclosing catch clause's
 /// bound exception variable, shadowed on entering a nested `catch_clause`'s own body
 /// (so a `throw new X(...)` is only checked against the catch it's actually lexically
-/// inside).
+/// inside). Delegates ordinary descent to [`crate::tree_walk::walk_preorder`], but a
+/// `catch_clause` prunes the generic walk (`false`) and recurses into its own body
+/// itself with the shadowed name — so the only Rust-stack recursion left is bounded by
+/// *catch-nesting* depth (rarely more than a handful of levels in real code), not by
+/// the full expression-tree depth `walk_preorder` already handles iteratively.
 fn walk<'a>(
     node: Node<'a>,
     src: &'a [u8],
     enclosing_catch_name: Option<&'a str>,
     findings: &mut Vec<Finding>,
 ) {
-    if node.kind() == "catch_clause" {
-        let name = catch_param_name(node, src);
-        if let Some(body) = node.child_by_field_name("body") {
-            let mut cursor = body.walk();
-            for child in body.children(&mut cursor) {
-                walk(child, src, name, findings);
-            }
+    crate::tree_walk::walk_preorder(node, &mut |n| {
+        if n.kind() == "catch_clause" {
+            walk_catch_body(n, src, findings);
+            return false;
         }
-        return;
-    }
 
+        check_throw_statement(n, src, enclosing_catch_name, findings);
+        true
+    });
+}
+
+fn walk_catch_body<'a>(catch_clause: Node<'a>, src: &'a [u8], findings: &mut Vec<Finding>) {
+    let name = catch_param_name(catch_clause, src);
+    let Some(body) = catch_clause.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        walk(child, src, name, findings);
+    }
+}
+
+fn check_throw_statement(
+    node: Node,
+    src: &[u8],
+    enclosing_catch_name: Option<&str>,
+    findings: &mut Vec<Finding>,
+) {
     if node.kind() == "throw_statement"
         && let Some(caught_name) = enclosing_catch_name
         && let Some(expr) = node.named_child(0)
@@ -152,11 +173,6 @@ fn walk<'a>(
                  original stack trace is lost (SonarQube S1166)"
             ),
         });
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, src, enclosing_catch_name, findings);
     }
 }
 

@@ -53,6 +53,7 @@ mod symbol_extract;
 mod task_stop;
 #[cfg(test)]
 mod test_support;
+mod tree_walk;
 mod union_find;
 
 use std::path::{Path, PathBuf};

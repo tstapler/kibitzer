@@ -87,18 +87,17 @@ fn has_wrapping_convention(node: Node, src: &[u8]) -> bool {
 }
 
 fn collect_bare_rethrows(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "catch_clause" && is_bare_rethrow(node, src) {
-        findings.push(Finding {
-            line: node.start_position().row + 1,
-            message: "rethrows the caught exception unwrapped despite this file's \
-                      `throw new X(\"...\", e)` convention — consider wrapping with context here too"
-                .to_string(),
-        });
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_bare_rethrows(child, src, findings);
-    }
+    crate::tree_walk::walk_preorder(node, &mut |n| {
+        if n.kind() == "catch_clause" && is_bare_rethrow(n, src) {
+            findings.push(Finding {
+                line: n.start_position().row + 1,
+                message: "rethrows the caught exception unwrapped despite this file's \
+                          `throw new X(\"...\", e)` convention — consider wrapping with context here too"
+                    .to_string(),
+            });
+        }
+        true
+    });
 }
 
 /// Matches exactly `catch (X <name>) { throw <name>; }` — a catch body whose only
