@@ -45,6 +45,10 @@ impl Checker for PrimitiveObsessionChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(PrimitiveObsessionChecker)])
+}
+
 /// Detects two shapes of same-typed-parameter piles in Go function signatures:
 ///   (a) a single `parameter_declaration` naming ≥2 identifiers of one primitive
 ///       type, e.g. `func f(a, b string)`

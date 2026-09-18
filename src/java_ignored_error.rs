@@ -50,6 +50,10 @@ impl Checker for IgnoredErrorChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(IgnoredErrorChecker)])
+}
+
 fn is_comment(node: Node) -> bool {
     matches!(node.kind(), "line_comment" | "block_comment")
 }
@@ -104,18 +108,7 @@ mod tests {
     use super::*;
 
     fn check_source(src: &str) -> Result<Vec<Finding>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .context("loading tree-sitter-java grammar")?;
-        let tree = parser
-            .parse(src, None)
-            .context("parsing Java source with tree-sitter")?;
-        let ctx = CheckContext {
-            source: src,
-            tree: Some(&tree),
-        };
-        IgnoredErrorChecker.check(Path::new("<source>"), &ctx)
+        crate::test_support::check_java_source(&IgnoredErrorChecker, src)
     }
 
     #[test]

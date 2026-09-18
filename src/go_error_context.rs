@@ -64,6 +64,10 @@ impl Checker for ErrorContextChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(ErrorContextChecker)])
+}
+
 /// Counts calls to `fmt.Errorf(...)` anywhere in the file that carry a `%w` verb in
 /// their format string — each is independent signal that this codebase wraps errors
 /// on purpose.

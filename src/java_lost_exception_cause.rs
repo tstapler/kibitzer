@@ -160,23 +160,16 @@ fn walk<'a>(
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(LostExceptionCauseChecker)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn check_source(src: &str) -> Result<Vec<Finding>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .context("loading tree-sitter-java grammar")?;
-        let tree = parser
-            .parse(src, None)
-            .context("parsing Java source with tree-sitter")?;
-        let ctx = CheckContext {
-            source: src,
-            tree: Some(&tree),
-        };
-        LostExceptionCauseChecker.check(Path::new("<source>"), &ctx)
+        crate::test_support::check_java_source(&LostExceptionCauseChecker, src)
     }
 
     #[test]

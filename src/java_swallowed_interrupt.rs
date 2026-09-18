@@ -115,23 +115,16 @@ fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(SwallowedInterruptChecker)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn check_source(src: &str) -> Result<Vec<Finding>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .context("loading tree-sitter-java grammar")?;
-        let tree = parser
-            .parse(src, None)
-            .context("parsing Java source with tree-sitter")?;
-        let ctx = CheckContext {
-            source: src,
-            tree: Some(&tree),
-        };
-        SwallowedInterruptChecker.check(Path::new("<source>"), &ctx)
+        crate::test_support::check_java_source(&SwallowedInterruptChecker, src)
     }
 
     #[test]

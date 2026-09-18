@@ -5,23 +5,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
-use crate::comment_quality::CommentQualityChecker;
-use crate::complexity::FileComplexityChecker;
-use crate::duplicate_code::DuplicateCodeChecker;
-use crate::duplicate_cross_file_checker::CrossFileDuplicateChecker;
-use crate::file_size::FileSizeChecker;
-use crate::go_blank_imports::BlankImportsChecker;
-use crate::go_error_context::ErrorContextChecker;
-use crate::go_ignored_error::IgnoredErrorChecker;
-use crate::go_type_switch_density::TypeSwitchDensityChecker;
-use crate::java_error_context::ErrorContextChecker as JavaErrorContextChecker;
-use crate::java_ignored_error::IgnoredErrorChecker as JavaIgnoredErrorChecker;
-use crate::java_lost_exception_cause::LostExceptionCauseChecker;
-use crate::java_swallowed_interrupt::SwallowedInterruptChecker;
-use crate::markdown_link_integrity::MarkdownLinkIntegrityChecker;
-use crate::primitive_obsession::PrimitiveObsessionChecker;
-use crate::rules::SyntaxRulesChecker;
-
 /// A finding a [`Checker`] reports against a specific line of a file. Formatted by
 /// callers as `{file}:{line}: {message}` — the convention `check.rs`'s diff-scoping
 /// parser depends on, so don't change this shape without updating that parser too.
@@ -56,7 +39,7 @@ pub enum Language {
 impl Language {
     /// Every variant — see this enum's own doc comment for why this list exists and
     /// what forgetting to update it costs.
-    const ALL: &'static [Language] = &[
+    pub(crate) const ALL: &'static [Language] = &[
         Language::Go,
         Language::TypeScript,
         Language::Tsx,
@@ -149,48 +132,40 @@ pub trait Checker {
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>>;
 }
 
-/// All natively implemented checkers, keyed by [`Checker::name`]. Adding a new native
-/// check means adding its module and one entry here — no other file needs to change.
+/// One native checker's self-registration into [`registry`]. A checker's own module
+/// submits one of these (`inventory::submit! { crate::checker::CheckerFactory(|| ...) }`,
+/// placed next to its `impl Checker` block) instead of this file importing the checker
+/// type and listing it in a central `vec![...]`.
+///
+/// This replaced a hand-maintained `Vec` literal here that required every new native
+/// checker's PR to edit this file (an import plus a `Box::new(...)` line) in addition to
+/// declaring its module in `main.rs` and, for default-on checkers, adding an entry to
+/// `config::default_checks()`. Two unrelated checker-adding branches landing around the
+/// same time reliably produce merge conflicts on this file's import list and `vec![...]`
+/// — see `git log --oneline -- src/checker.rs` for a prior instance
+/// (`0374e2c`, "Fix unresolved merge conflict markers left in main.rs by 6182a4e") and
+/// this session's own 3-file conflict (this file, `main.rs`, `config.rs`) rebasing the
+/// Java exception-handling checkers onto `099d9d7` ("Additional gaps from #38's original
+/// proposal", #85), which added `go-type-switch-density` via the exact same 3-file
+/// pattern concurrently (2026-09-18). Distributed registration via `inventory` (see
+/// https://docs.rs/inventory) means adding a checker never touches this file again —
+/// each checker's own file is the only place its registration lives. `main.rs`'s `mod`
+/// declaration is still required (Rust has no auto-discovery of source files) and was
+/// left as-is. `config::default_checks()` still needs its own entry for a checker to
+/// run by default — that's an explicit, curated severity/scope decision per checker,
+/// not mechanical registration, so it stays hand-maintained, but it's now split into
+/// one function per checker family (see that function's doc comment) so unrelated
+/// families no longer collide the way this session's conflict did.
+pub struct CheckerFactory(pub fn() -> Vec<Box<dyn Checker>>);
+inventory::collect!(CheckerFactory);
+
+/// All natively implemented checkers, keyed by [`Checker::name`]. Collected from every
+/// `inventory::submit! { CheckerFactory(...) }` block across the crate — see
+/// [`CheckerFactory`] for why registration works this way.
 pub fn registry() -> Vec<Box<dyn Checker>> {
-    vec![
-        Box::new(PrimitiveObsessionChecker),
-        Box::new(FileComplexityChecker),
-        Box::new(MarkdownLinkIntegrityChecker),
-        Box::new(DuplicateCodeChecker),
-        Box::new(CrossFileDuplicateChecker),
-        Box::new(BlankImportsChecker),
-        Box::new(IgnoredErrorChecker),
-        Box::new(TypeSwitchDensityChecker),
-        Box::new(ErrorContextChecker),
-        Box::new(JavaIgnoredErrorChecker),
-        Box::new(JavaErrorContextChecker),
-        Box::new(SwallowedInterruptChecker),
-        Box::new(LostExceptionCauseChecker),
-        Box::new(FileSizeChecker::new(Language::Go)),
-        Box::new(FileSizeChecker::new(Language::TypeScript)),
-        Box::new(FileSizeChecker::new(Language::Tsx)),
-        Box::new(FileSizeChecker::new(Language::JavaScript)),
-        Box::new(FileSizeChecker::new(Language::Python)),
-        Box::new(FileSizeChecker::new(Language::Java)),
-        Box::new(FileSizeChecker::new(Language::Kotlin)),
-        Box::new(FileSizeChecker::new(Language::Rust)),
-        Box::new(SyntaxRulesChecker::new(Language::Go)),
-        Box::new(SyntaxRulesChecker::new(Language::TypeScript)),
-        Box::new(SyntaxRulesChecker::new(Language::Tsx)),
-        Box::new(SyntaxRulesChecker::new(Language::JavaScript)),
-        Box::new(SyntaxRulesChecker::new(Language::Python)),
-        Box::new(SyntaxRulesChecker::new(Language::Java)),
-        Box::new(SyntaxRulesChecker::new(Language::Kotlin)),
-        Box::new(SyntaxRulesChecker::new(Language::Rust)),
-        Box::new(CommentQualityChecker::new(Language::Go)),
-        Box::new(CommentQualityChecker::new(Language::TypeScript)),
-        Box::new(CommentQualityChecker::new(Language::Tsx)),
-        Box::new(CommentQualityChecker::new(Language::JavaScript)),
-        Box::new(CommentQualityChecker::new(Language::Python)),
-        Box::new(CommentQualityChecker::new(Language::Java)),
-        Box::new(CommentQualityChecker::new(Language::Kotlin)),
-        Box::new(CommentQualityChecker::new(Language::Rust)),
-    ]
+    inventory::iter::<CheckerFactory>()
+        .flat_map(|factory| (factory.0)())
+        .collect()
 }
 
 pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {

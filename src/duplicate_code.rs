@@ -64,6 +64,10 @@ impl Checker for DuplicateCodeChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(DuplicateCodeChecker)])
+}
+
 /// Slides a `MIN_BLOCK_LINES`-line window over `source`'s trimmed lines, grouping
 /// windows by identical text to find every start position each distinct block occurs
 /// at. Windows spanning a blank line, or too short on total content, are skipped so

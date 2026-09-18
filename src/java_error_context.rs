@@ -54,6 +54,10 @@ impl Checker for ErrorContextChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(ErrorContextChecker)])
+}
+
 /// True if `throw new X(...)` is called anywhere in the file with both a string
 /// literal and an identifier among its constructor arguments — the signal that this
 /// codebase wraps a caught exception with a message on purpose.
@@ -137,18 +141,7 @@ mod tests {
     use super::*;
 
     fn check_source(src: &str) -> Result<Vec<Finding>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .context("loading tree-sitter-java grammar")?;
-        let tree = parser
-            .parse(src, None)
-            .context("parsing Java source with tree-sitter")?;
-        let ctx = CheckContext {
-            source: src,
-            tree: Some(&tree),
-        };
-        ErrorContextChecker.check(Path::new("<source>"), &ctx)
+        crate::test_support::check_java_source(&ErrorContextChecker, src)
     }
 
     const WRAPPING_CONVENTION: &str =

@@ -43,6 +43,33 @@ pub(crate) fn check_go_source(checker: &dyn Checker, src: &str) -> Result<Vec<Fi
     checker.check(Path::new("<source>"), &ctx)
 }
 
+/// Parses `src` as Java with tree-sitter — the `parse_go`/`rules.rs::check_source` half
+/// of this pair, for `rules.rs`'s own Java test helper whose tail diverges into
+/// `walk_declarations` instead of a `Checker::check` call.
+pub(crate) fn parse_java(src: &str) -> Result<Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .context("loading tree-sitter-java grammar")?;
+    parser
+        .parse(src, None)
+        .context("parsing Java source with tree-sitter")
+}
+
+/// Parses `src` as Java and runs `checker` against it — the Java counterpart of
+/// [`check_go_source`], extracted for the same reason: a corpus backtest sweep flagged
+/// the un-collapsed version as a byte-identical repeated block across
+/// `java_error_context.rs`, `java_ignored_error.rs`, `java_lost_exception_cause.rs`, and
+/// `java_swallowed_interrupt.rs`.
+pub(crate) fn check_java_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    let tree = parse_java(src)?;
+    let ctx = CheckContext {
+        source: src,
+        tree: Some(&tree),
+    };
+    checker.check(Path::new("<source>"), &ctx)
+}
+
 /// The compiled `kibitzer` binary's path. Cargo only sets `CARGO_BIN_EXE_<name>` for
 /// integration tests/benches (this crate has no `tests/` directory — everything is inline
 /// `#[cfg(test)]`, per `validation.md`'s Test Stack section), so it's not available here.

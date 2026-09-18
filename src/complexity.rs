@@ -65,6 +65,10 @@ impl Checker for FileComplexityChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(FileComplexityChecker)])
+}
+
 /// One finding per complex function, all sharing the same aggregate message — not a
 /// single finding anchored at just one of them. `PostToolUse`'s diff-scoping filters
 /// findings to whichever lines an edit actually touched, so anchoring at only e.g. the

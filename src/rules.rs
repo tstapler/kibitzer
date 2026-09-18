@@ -989,6 +989,15 @@ fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
     max_depth
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| {
+        Language::ALL
+            .iter()
+            .map(|&lang| Box::new(SyntaxRulesChecker::new(lang)) as Box<dyn Checker>)
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1734,18 +1743,15 @@ mod tests {
 
     #[test]
     fn checker_names_are_distinct_per_language() {
-        let names: Vec<&str> = [
-            Language::Go,
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Python,
-            Language::Java,
-            Language::Kotlin,
-        ]
-        .iter()
-        .map(|&lang| lang_config(lang).name)
-        .collect();
+        // Derives from `Language::ALL` rather than its own hand-rolled list: this test
+        // used to omit `Rust`, silently leaving `syntax-rules-rust`'s name unchecked —
+        // the same class of "forgot to update a hand-rolled language list" gap
+        // `Language::extensions`'s doc comment documents finding elsewhere in this
+        // codebase (a real missed-Rust bug in `arch_model.rs`).
+        let names: Vec<&str> = Language::ALL
+            .iter()
+            .map(|&lang| lang_config(lang).name)
+            .collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -1908,14 +1914,7 @@ mod tests {
     }
 
     fn check_java_source(src: &str) -> Result<Vec<Finding>> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .context("loading tree-sitter-java grammar")?;
-        let tree = parser
-            .parse(src, None)
-            .context("parsing Java source with tree-sitter")?;
-
+        let tree = crate::test_support::parse_java(src)?;
         let cfg = lang_config(Language::Java);
         let mut findings = Vec::new();
         walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);

@@ -63,6 +63,10 @@ impl Checker for TypeSwitchDensityChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(TypeSwitchDensityChecker)])
+}
+
 fn collect_dense_type_switches(node: Node, src: &[u8], out: &mut Vec<Finding>) {
     if node.kind() == "type_switch_statement" {
         let case_count = type_case_count(node);
