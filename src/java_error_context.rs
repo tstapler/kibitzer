@@ -82,8 +82,7 @@ fn has_wrapping_convention(node: Node) -> bool {
         }
     }
     let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| has_wrapping_convention(child))
+    node.children(&mut cursor).any(has_wrapping_convention)
 }
 
 fn collect_bare_rethrows(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
