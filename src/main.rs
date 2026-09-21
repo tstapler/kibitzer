@@ -454,17 +454,18 @@ fn main() -> Result<ExitCode> {
                         reports.retain(|r| &r.check_name == check);
                     }
                     if reports.is_empty() {
-                        println!("[kibitzer] no queued false-positive reports at {}", path.display());
+                        println!(
+                            "[kibitzer] no queued false-positive reports at {}",
+                            path.display()
+                        );
                         return Ok(ExitCode::SUCCESS);
                     }
-                    reports.sort_by(|a, b| a.check_name.cmp(&b.check_name).then(a.date.cmp(&b.date)));
+                    reports
+                        .sort_by(|a, b| a.check_name.cmp(&b.check_name).then(a.date.cmp(&b.date)));
                     let mut current_check: Option<&str> = None;
                     for report in &reports {
                         if current_check != Some(report.check_name.as_str()) {
-                            println!(
-                                "## docs/{}-false-positives.md\n",
-                                report.check_name
-                            );
+                            println!("## docs/{}-false-positives.md\n", report.check_name);
                             current_check = Some(report.check_name.as_str());
                         }
                         println!("{}", false_positive::format_markdown_entry(report));

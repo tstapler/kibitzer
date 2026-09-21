@@ -1495,13 +1495,13 @@ mod diff_scoping_tests {
     #[test]
     fn substitute_command_fills_changed_lines() {
         let cmd = substitute_command(
-            "kibitzer check primitive-obsession {file} --lines={changed_lines}",
+            "kibitzer check native primitive-obsession {file} --lines={changed_lines}",
             &file(),
             Some(&[(12, 15), (40, 40)]),
         );
         assert_eq!(
             cmd,
-            "kibitzer check primitive-obsession src/foo.go --lines=12-15,40-40"
+            "kibitzer check native primitive-obsession src/foo.go --lines=12-15,40-40"
         );
     }
 
