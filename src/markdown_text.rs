@@ -30,9 +30,15 @@ pub struct Paragraph {
 /// each one. List items are excluded because a parallel bulleted enumeration (independent
 /// facts stated in the same grammatical form on purpose) is not the kind of prose defect
 /// these checkers look for — see the originating issue's false-positive guardrail.
+///
+/// Parses with `ENABLE_TABLES`: without it, a GFM table has no blank-line separation
+/// pulldown-cmark recognizes, so the whole table parses as one giant `Tag::Paragraph`
+/// (found backtesting vscode-docs: a troubleshooting table reported as one 30-"sentence"
+/// paragraph). With it, table content arrives as `Tag::Table`/`TableCell` events instead,
+/// which `in_paragraph`'s gate below already excludes.
 pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
     let line_starts = line_start_offsets(body);
-    let parser = Parser::new_ext(body, Options::empty());
+    let parser = Parser::new_ext(body, Options::ENABLE_TABLES);
 
     let mut list_depth = 0usize;
     let mut in_paragraph = false;
@@ -64,5 +70,24 @@ pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_table_is_not_treated_as_one_giant_paragraph() {
+        let body = "| Problem | Cause |\n\
+                     | --- | --- |\n\
+                     | One. Two. Three. | Four. Five. Six. |\n\
+                     | Seven. Eight. Nine. | Ten. Eleven. Twelve. |\n";
+        let mut paragraphs = Vec::new();
+        for_each_paragraph(body, |p| paragraphs.push(p.text));
+        assert!(
+            paragraphs.is_empty(),
+            "table cells should never surface as paragraphs, got: {paragraphs:?}"
+        );
     }
 }
