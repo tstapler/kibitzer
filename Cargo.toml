@@ -50,6 +50,11 @@ inventory = "0.3.24"
 [dev-dependencies]
 kibitzer-stub-plugin = { path = "crates/kibitzer-stub-plugin" }
 
+# build.rs generates the typed `<Lang>Kind` enums in src/node_kind.rs from the vendored
+# node-types.json files under codegen/node-types/ — see build.rs's own doc comment.
+[build-dependencies]
+serde_json = "1"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

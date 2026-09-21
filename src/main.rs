@@ -43,6 +43,7 @@ mod markdown_link_integrity;
 mod markdown_text;
 mod mcp;
 mod mermaid;
+mod node_kind;
 mod paragraph_breaks;
 mod plugin;
 mod primitive_obsession;
