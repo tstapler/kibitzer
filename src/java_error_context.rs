@@ -44,7 +44,7 @@ impl Checker for ErrorContextChecker {
         let src = ctx.source.as_bytes();
         let root = tree.root_node();
 
-        if !has_wrapping_convention(root, src) {
+        if !has_wrapping_convention(root) {
             return Ok(Vec::new());
         }
 
@@ -61,7 +61,7 @@ inventory::submit! {
 /// True if `throw new X(...)` is called anywhere in the file with both a string
 /// literal and an identifier among its constructor arguments — the signal that this
 /// codebase wraps a caught exception with a message on purpose.
-fn has_wrapping_convention(node: Node, src: &[u8]) -> bool {
+fn has_wrapping_convention(node: Node) -> bool {
     if node.kind() == "throw_statement"
         && let Some(expr) = node.named_child(0)
         && expr.kind() == "object_creation_expression"
@@ -83,7 +83,7 @@ fn has_wrapping_convention(node: Node, src: &[u8]) -> bool {
     }
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .any(|child| has_wrapping_convention(child, src))
+        .any(|child| has_wrapping_convention(child))
 }
 
 fn collect_bare_rethrows(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
