@@ -61,8 +61,9 @@ fn parse_name_only_log(output: &str) -> Vec<Vec<String>> {
 /// Runs `git log --name-only --no-merges -n <limit>` in `repo_root` and returns the
 /// per-commit file lists. Each commit is delimited with a `\u{1}` marker (a byte that never
 /// appears in a file path) so commits with zero changed files don't get silently merged
-/// into their neighbor.
-fn git_log_commits(repo_root: &Path, limit: usize) -> Result<Vec<Vec<String>>> {
+/// into their neighbor. `pub(crate)` so `hotspots.rs` can reuse the same git-log plumbing
+/// for its churn count instead of re-implementing this parsing.
+pub(crate) fn git_log_commits(repo_root: &Path, limit: usize) -> Result<Vec<Vec<String>>> {
     let output = Command::new("git")
         .args([
             "log",
@@ -318,6 +319,28 @@ fn tally_revisions_and_shared_commits(commits: &[Vec<String>]) -> RevisionAndSha
         }
     }
     (revisions, shared)
+}
+
+/// Per-file revision counts across `commits`, applying the same mass-refactor noise
+/// filter as [`tally_revisions_and_shared_commits`] ([`MAX_FILES_PER_COMMIT`]) so a single
+/// huge rename/vendor-update commit doesn't inflate every touched file's churn count.
+/// A standalone pass rather than reusing `tally_revisions_and_shared_commits` and
+/// discarding its pairwise `shared` map: that map costs O(files²) per commit to build,
+/// pure overhead for `hotspots.rs`'s single-file churn score.
+pub(crate) fn file_revisions(commits: &[Vec<String>]) -> BTreeMap<String, u32> {
+    let mut revisions: BTreeMap<String, u32> = BTreeMap::new();
+    for commit in commits {
+        if commit.is_empty() || commit.len() > MAX_FILES_PER_COMMIT {
+            continue;
+        }
+        let mut files: Vec<&str> = commit.iter().map(String::as_str).collect();
+        files.sort_unstable();
+        files.dedup();
+        for f in files {
+            *revisions.entry(f.to_string()).or_default() += 1;
+        }
+    }
+    revisions
 }
 
 /// Second pass: turns the raw tallies into [`CoupledPair`]s, dropping anything below

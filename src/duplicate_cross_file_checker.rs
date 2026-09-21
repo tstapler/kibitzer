@@ -44,6 +44,10 @@ impl Checker for CrossFileDuplicateChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(CrossFileDuplicateChecker)])
+}
+
 /// Shared scope for any file with no discoverable `.git` ancestor — grouping these
 /// together (rather than, say, each file's own directory) matters because the whole
 /// point of this checker is catching duplication *across* directories/packages; scoping

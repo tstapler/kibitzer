@@ -45,6 +45,10 @@ impl Checker for PrimitiveObsessionChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(PrimitiveObsessionChecker)])
+}
+
 /// Detects two shapes of same-typed-parameter piles in Go function signatures:
 ///   (a) a single `parameter_declaration` naming ≥2 identifiers of one primitive
 ///       type, e.g. `func f(a, b string)`
@@ -59,13 +63,12 @@ fn check_source(src: &str) -> Result<Vec<Finding>> {
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "parameter_list" && !is_named_return_list(node) {
-        check_parameter_list(node, src, findings);
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, src, findings);
-    }
+    crate::tree_walk::walk_preorder(node, &mut |n| {
+        if n.kind() == "parameter_list" && !is_named_return_list(n) {
+            check_parameter_list(n, src, findings);
+        }
+        true
+    });
 }
 
 /// True when `node` is the `result` field of its parent signature node.

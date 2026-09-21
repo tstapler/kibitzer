@@ -126,6 +126,15 @@ impl Checker for FileSizeChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| {
+        Language::ALL
+            .iter()
+            .map(|&lang| Box::new(FileSizeChecker::new(lang)) as Box<dyn Checker>)
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,21 +220,11 @@ mod tests {
 
     #[test]
     fn every_language_gets_a_distinct_checker_name() {
-        let langs = [
-            Language::Go,
-            Language::TypeScript,
-            Language::Tsx,
-            Language::JavaScript,
-            Language::Python,
-            Language::Java,
-            Language::Kotlin,
-            Language::Rust,
-        ];
-        let checkers: Vec<FileSizeChecker> = langs
+        let checkers: Vec<FileSizeChecker> = Language::ALL
             .iter()
             .map(|&lang| FileSizeChecker::new(lang))
             .collect();
         let names: std::collections::HashSet<&str> = checkers.iter().map(|c| c.name()).collect();
-        assert_eq!(names.len(), langs.len());
+        assert_eq!(names.len(), Language::ALL.len());
     }
 }

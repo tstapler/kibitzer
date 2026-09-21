@@ -71,6 +71,10 @@ impl Checker for MarkdownLinkIntegrityChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(MarkdownLinkIntegrityChecker)])
+}
+
 pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     let line_starts = line_start_offsets(body);
 

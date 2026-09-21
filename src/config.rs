@@ -577,7 +577,28 @@ fn whole_repo_check(name: &str, architecture_checker: &str) -> Check {
 /// overlays these via `merge_checks`: `disabled` turns a default off by name, and a
 /// `checks` entry reusing a default's `name` replaces it outright. See
 /// docs/suppressing-checks.md.
+///
+/// Split into one function per checker family (below) rather than a single flat
+/// `vec![...]`: two unrelated checker-adding PRs each appending near the end of one
+/// big literal is exactly what produced a real merge conflict here between the Java
+/// exception-handling checkers and `099d9d7` ("Additional gaps from #38's original
+/// proposal", #85, which added `go-type-switch-density`) landing concurrently
+/// (2026-09-18) — see `checker::CheckerFactory`'s doc comment for the matching
+/// `checker.rs`/`main.rs` half of that conflict. Grouping by family doesn't eliminate
+/// conflicts between two PRs adding to the *same* family, but it does mean unrelated
+/// families (a new Go checker vs. a new file-size language) no longer collide.
 pub fn default_checks() -> Vec<Check> {
+    core_checks()
+        .into_iter()
+        .chain(go_exception_checks())
+        .chain(java_exception_checks())
+        .chain(file_size_checks())
+        .chain(syntax_rules_checks())
+        .chain(comment_quality_checks())
+        .collect()
+}
+
+fn core_checks() -> Vec<Check> {
     vec![
         Check {
             message: Some("broken markdown link/anchor".to_string()),
@@ -615,10 +636,49 @@ pub fn default_checks() -> Vec<Check> {
                 "**/*.rs",
             ],
         ),
+    ]
+}
+
+fn go_exception_checks() -> Vec<Check> {
+    vec![
         native_check("go-blank-imports", Severity::Advisory, &["**/*.go"]),
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
         native_check("go-type-switch-density", Severity::Advisory, &["**/*.go"]),
+    ]
+}
+
+fn java_exception_checks() -> Vec<Check> {
+    vec![
+        // Excludes `**/test/**`: a 2026-09-11 backtest against `apache/cassandra`
+        // (docs/backtest-repos.md) found 86% of raw hits (147/170) were in test
+        // code, almost entirely JUnit's manual `try { ...; fail(); } catch (X e)
+        // {}` "expect this to throw" idiom — a real, common pattern this
+        // structural checker can't distinguish from a genuinely swallowed
+        // exception without much more context than an empty-catch check should
+        // carry. Non-test code was comparatively low-noise (23 hits, see
+        // java_ignored_error.rs's JUSTIFIED_NAMES for the other precision fix).
+        native_check(
+            "java-ignored-error",
+            Severity::Advisory,
+            &["**/*.java", "!**/test/**"],
+        ),
+        native_check("java-error-context", Severity::Advisory, &["**/*.java"]),
+        native_check(
+            "java-swallowed-interrupt",
+            Severity::Advisory,
+            &["**/*.java"],
+        ),
+        native_check(
+            "java-lost-exception-cause",
+            Severity::Advisory,
+            &["**/*.java"],
+        ),
+    ]
+}
+
+fn file_size_checks() -> Vec<Check> {
+    vec![
         native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
         whole_repo_check("go-package-size", "package-size"),
         native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
@@ -636,6 +696,11 @@ pub fn default_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("rust-file-size", Severity::Advisory, &["**/*.rs"]),
+    ]
+}
+
+fn syntax_rules_checks() -> Vec<Check> {
+    vec![
         Check {
             checker: Some("syntax-rules".to_string()),
             ..native_check("syntax-rules-go", Severity::Advisory, &["**/*.go"])
@@ -655,6 +720,11 @@ pub fn default_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("syntax-rules-rust", Severity::Advisory, &["**/*.rs"]),
+    ]
+}
+
+fn comment_quality_checks() -> Vec<Check> {
+    vec![
         native_check("comment-quality-go", Severity::Advisory, &["**/*.go"]),
         native_check(
             "comment-quality-typescript",

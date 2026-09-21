@@ -844,6 +844,15 @@ fn leading_comment_rows(leading_nodes: &[Node]) -> BTreeSet<usize> {
     rows
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| {
+        Language::ALL
+            .iter()
+            .map(|&lang| Box::new(CommentQualityChecker::new(lang)) as Box<dyn Checker>)
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

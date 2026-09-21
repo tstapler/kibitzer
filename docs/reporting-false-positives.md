@@ -22,30 +22,45 @@ misfire — see `docs/accepting-findings.md` instead.
 
 ## How to file one
 
-Each checker has (or should have) a `docs/<checker-name>-false-positives.md`
-log — e.g. `docs/go-primitive-obsession-false-positives.md`,
-`docs/markdown-link-integrity-false-positives.md`. To report a new one:
+Prefer the `report_false_positive` MCP tool (`src/mcp.rs`) over hand-editing
+a doc — it's exposed on the same `kibitzer mcp` server as `list_checks`/
+`run_checks`, so any session already talking to kibitzer can call it
+directly with `check_name`, `file`, `what_changed`, `why_false_positive`,
+and (if known) `mechanism`, `repo`, `session`. Because kibitzer runs as an
+installed binary with no fixed relationship to this source checkout, the
+report is queued locally
+(`~/.local/share/kibitzer/false-positive-reports.jsonl` by default, or
+`$XDG_DATA_HOME/kibitzer/false-positive-reports.jsonl`) rather than written
+straight into the doc.
 
-1. Find (or create) `docs/<checker-name>-false-positives.md` for the check
-   that fired.
-2. Append an entry under its `## Log` section (create that heading if the
-   file is new) following this shape:
+A maintainer periodically drains the queue with
+`kibitzer check false-positives list` (optionally `--check <name>` to scope
+it), which prints each entry pre-formatted for its
+`docs/<checker-name>-false-positives.md` — e.g.
+`docs/go-primitive-obsession-false-positives.md`,
+`docs/markdown-link-integrity-false-positives.md`. Paste the printed
+entries under each file's `## Log` section (create that heading if the file
+is new), then run `kibitzer check false-positives clear` to empty the queue.
 
-   ```markdown
-   ### <date> — <repo/session> — <one-line summary>
+If the MCP tool isn't reachable, append directly to
+`docs/<checker-name>-false-positives.md` under its `## Log` section instead,
+following the same shape a queued entry renders as:
 
-   - **Repo**: `<owner>/<repo>` (session `<session-name>`, if known), file
-     `<path>`.
-   - **What changed**: what the edit actually did.
-   - **Why it's a false positive**: why the finding doesn't apply to this
-     edit.
-   - **Mechanism** (if known): the specific source-level reason the check
-     fired anyway — cite the function/file (e.g.
-     `src/hook.rs::compute_changed_lines`). If you haven't traced it to a
-     mechanism, say so explicitly rather than guessing.
-   ```
+```markdown
+### <date> — <repo/session> — <one-line summary>
 
-3. Use the actual current date, not a placeholder.
+- **Repo**: `<owner>/<repo>` (session `<session-name>`, if known), file
+  `<path>`.
+- **What changed**: what the edit actually did.
+- **Why it's a false positive**: why the finding doesn't apply to this
+  edit.
+- **Mechanism** (if known): the specific source-level reason the check
+  fired anyway — cite the function/file (e.g.
+  `src/hook.rs::compute_changed_lines`). If you haven't traced it to a
+  mechanism, say so explicitly rather than guessing.
+```
+
+Use the actual current date, not a placeholder.
 
 Do not edit or delete existing entries you didn't investigate — append only.
 A maintainer triages the log periodically and turns confirmed, high-signal

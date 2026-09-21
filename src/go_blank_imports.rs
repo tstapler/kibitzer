@@ -57,6 +57,10 @@ impl Checker for BlankImportsChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(BlankImportsChecker)])
+}
+
 fn collect_comment_rows(node: Node, rows: &mut std::collections::HashSet<usize>) {
     if node.kind() == "comment" {
         rows.insert(node.start_position().row);

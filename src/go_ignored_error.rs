@@ -56,6 +56,10 @@ impl Checker for IgnoredErrorChecker {
     }
 }
 
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(IgnoredErrorChecker)])
+}
+
 struct ResolvedModule {
     root: std::path::PathBuf,
     path: String,

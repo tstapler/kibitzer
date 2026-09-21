@@ -132,6 +132,30 @@ struct ListArchitectureSymbolsResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct ReportFalsePositiveRequest {
+    /// The check name that fired, as shown in `list_checks`/`run_checks` output (e.g.
+    /// "go-ignored-error", "markdown-link-integrity").
+    check_name: String,
+    /// Path to the file the check fired on.
+    file: String,
+    /// What the edit actually did.
+    what_changed: String,
+    /// Why the finding doesn't apply to this edit — not just disagreement with a
+    /// genuine hit. See docs/reporting-false-positives.md for the distinction.
+    why_false_positive: String,
+    /// The specific source-level reason the check fired anyway, if traced (e.g.
+    /// "src/hook.rs::compute_changed_lines"). Omit rather than guessing.
+    #[serde(default)]
+    mechanism: Option<String>,
+    /// "<owner>/<repo>" this fired in, if known.
+    #[serde(default)]
+    repo: Option<String>,
+    /// The current session name/id, if known.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct GetArchitectureNodeRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
     path: String,
@@ -468,6 +492,41 @@ impl KibitzerServer {
                 )
             }
             Err(e) => format!("error reading config: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "File a suspected false-positive report for a kibitzer check: a check that \
+                        fired on an edit which, on inspection, didn't actually introduce (or \
+                        doesn't actually contain) the problem the check claims. Do not use this \
+                        for a check you simply disagree with on a genuine hit. Queues the report \
+                        locally (~/.local/share/kibitzer/false-positive-reports.jsonl by default) \
+                        for later triage into docs/<check_name>-false-positives.md — see \
+                        docs/reporting-false-positives.md. Use `kibitzer check false-positives \
+                        list` to review the queue."
+    )]
+    async fn report_false_positive(&self, req: Parameters<ReportFalsePositiveRequest>) -> String {
+        let report = crate::false_positive::FalsePositiveReport {
+            date: crate::false_positive::today_date_string(),
+            check_name: req.0.check_name,
+            file: req.0.file,
+            what_changed: req.0.what_changed,
+            why_false_positive: req.0.why_false_positive,
+            mechanism: req.0.mechanism,
+            repo: req.0.repo,
+            session: req.0.session,
+        };
+        let path = crate::false_positive::default_queue_path();
+        match crate::false_positive::append_report(&path, &report) {
+            Ok(()) => format!(
+                "queued false-positive report for `{}` at {}. Run `kibitzer check \
+                 false-positives list` to review queued reports before triaging them into \
+                 docs/{}-false-positives.md.",
+                report.check_name,
+                path.display(),
+                report.check_name,
+            ),
+            Err(e) => format!("error queuing false-positive report: {e}"),
         }
     }
 
@@ -1040,7 +1099,9 @@ impl ServerHandler for KibitzerServer {
                  model instead of a whole-repo report, use list_architecture_symbols (a \
                  paginated, filtered symbol slice), get_architecture_node (one package or \
                  symbol by exact reference), or list_callers/list_callees (function-level \
-                 call-graph traversal, Go/TS/JS only) — all four return JSON, not prose."
+                 call-graph traversal, Go/TS/JS only) — all four return JSON, not prose. If a \
+                 check fires on an edit that didn't actually introduce the problem it claims, \
+                 call report_false_positive instead of just noting it in the transcript."
                     .to_string(),
             ),
             ..Default::default()

@@ -18,6 +18,7 @@ mod dedup;
 mod duplicate_code;
 mod duplicate_cross_file_checker;
 mod extract_class;
+mod false_positive;
 mod file_size;
 mod glob;
 mod go_blank_imports;
@@ -28,10 +29,15 @@ mod go_type_switch_density;
 mod god_class;
 mod hook;
 mod hook_log;
+mod hotspots;
 mod import_graph;
 mod install;
 mod isp_fat_interface;
 mod jaccard;
+mod java_error_context;
+mod java_ignored_error;
+mod java_lost_exception_cause;
+mod java_swallowed_interrupt;
 mod lsp;
 mod markdown_link_integrity;
 mod mcp;
@@ -47,6 +53,7 @@ mod symbol_extract;
 mod task_stop;
 #[cfg(test)]
 mod test_support;
+mod tree_walk;
 mod union_find;
 
 use std::path::{Path, PathBuf};
@@ -228,6 +235,23 @@ enum ArchitectureAction {
         #[arg(long, default_value_t = 20)]
         top: usize,
     },
+    /// Batch-only git-churn × complexity hotspot report (see `hotspots.rs`): scores every
+    /// Go file touched in the scanned window by revisions × complexity, the technique
+    /// behind CodeScene. A "look here" prioritization report — which files are both
+    /// complex and frequently changed, i.e. where incidents concentrate — never a
+    /// pass/fail check. Never wired into `default_checks()`/hook mode, same convention as
+    /// `change-coupling`/`root-cause-clusters`. v1 is Go-only (see #15).
+    Hotspots {
+        /// Any path inside the repo to analyze (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// How many of the most recent non-merge commits to scan.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// How many top-scoring files to report, same convention as `change-coupling --top`.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +286,26 @@ enum CheckCommand {
         #[arg(long)]
         only_new: bool,
     },
+    /// Review or drain the local queue of suspected-false-positive reports filed via the
+    /// `report_false_positive` MCP tool (see `docs/reporting-false-positives.md`).
+    FalsePositives {
+        #[command(subcommand)]
+        action: FalsePositivesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FalsePositivesAction {
+    /// Print every queued report, formatted ready to paste under a
+    /// `docs/<check>-false-positives.md`'s `## Log` heading, grouped by check name.
+    List {
+        /// Only list reports for this check name.
+        #[arg(long)]
+        check: Option<String>,
+    },
+    /// Delete the queue file — do this only after its entries have been triaged into the
+    /// right `docs/<check>-false-positives.md` file(s).
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -401,6 +445,44 @@ fn main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
             }
+            CheckCommand::FalsePositives { action } => match action {
+                FalsePositivesAction::List { check } => {
+                    let path = false_positive::default_queue_path();
+                    let mut reports = false_positive::read_reports(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    if let Some(check) = &check {
+                        reports.retain(|r| &r.check_name == check);
+                    }
+                    if reports.is_empty() {
+                        println!("[kibitzer] no queued false-positive reports at {}", path.display());
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    reports.sort_by(|a, b| a.check_name.cmp(&b.check_name).then(a.date.cmp(&b.date)));
+                    let mut current_check: Option<&str> = None;
+                    for report in &reports {
+                        if current_check != Some(report.check_name.as_str()) {
+                            println!(
+                                "## docs/{}-false-positives.md\n",
+                                report.check_name
+                            );
+                            current_check = Some(report.check_name.as_str());
+                        }
+                        println!("{}", false_positive::format_markdown_entry(report));
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                FalsePositivesAction::Clear => {
+                    let path = false_positive::default_queue_path();
+                    if path.exists() {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
+                        println!("[kibitzer] cleared {}", path.display());
+                    } else {
+                        println!("[kibitzer] no queue file at {}", path.display());
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            },
         },
         Command::Status => status::run_status(),
         Command::Install { global, dry_run } => install::run_install(global, dry_run),
@@ -424,6 +506,7 @@ fn main() -> Result<ExitCode> {
             ArchitectureAction::RootCauseClusters { path, limit, top } => {
                 run_root_cause_clusters(&path, limit, top)
             }
+            ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
         },
         Command::Plugin { action } => match action {
             PluginAction::Install {
@@ -625,6 +708,28 @@ fn run_root_cause_clusters(path: &Path, limit: usize, top: usize) -> Result<Exit
             Some(finding) => println!("  corroborated by: {finding}"),
             None => println!("  corroboration: none (co-change only)"),
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `kibitzer architecture hotspots`: reports the git-churn × complexity hotspot score
+/// (see `hotspots.rs`) over `path`'s git history. Same "report, don't gate" convention
+/// as `run_change_coupling`/`run_root_cause_clusters` — always `ExitCode::SUCCESS` when
+/// the analysis itself succeeds.
+fn run_hotspots(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
+    let hotspots = hotspots::analyze(path, limit, top)
+        .with_context(|| format!("analyzing hotspots for {}", path.display()))?;
+
+    if hotspots.is_empty() {
+        println!("[kibitzer] no Go files with git history found in the scanned window");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for hotspot in &hotspots {
+        println!(
+            "score {}: {} ({} revisions x complexity {})",
+            hotspot.score, hotspot.file, hotspot.revisions, hotspot.complexity
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -866,6 +971,30 @@ mod architecture_cli_tests {
         }
 
         let exit = run_root_cause_clusters(&repo.dir, 1000, 20).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    /// `hotspots.rs`'s own tests cover the scoring/ranking logic; this proves
+    /// `run_hotspots` (the CLI-verb wrapper) reaches it end-to-end without erroring.
+    #[test]
+    fn run_hotspots_cli_verb_succeeds_against_a_real_git_repo() {
+        let repo = TempRepo::new("hotspots");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo.dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        repo.write("a.go", "package main\n\nfunc a() {\n\tprintln(\"hi\")\n}\n");
+        git(&["add", "a.go"]);
+        git(&["commit", "-q", "-m", "add a.go"]);
+
+        let exit = run_hotspots(&repo.dir, 1000, 20).unwrap();
         assert_eq!(exit, ExitCode::SUCCESS);
     }
 

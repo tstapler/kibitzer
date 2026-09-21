@@ -35,6 +35,7 @@ tower-lsp = "0.20.0"
 tree-sitter-rust = "0.24"
 sha2 = "0.11"
 ureq = "3"
+inventory = "0.3.24"
 
 # NOTE: this does NOT expose CARGO_BIN_EXE_kibitzer-stub-plugin to tests/*.rs — that
 # requires an "artifact dependency" (`artifact = "bin"`), which needs `-Z bindeps` and is
