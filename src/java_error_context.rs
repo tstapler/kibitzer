@@ -143,8 +143,7 @@ mod tests {
         crate::test_support::check_java_source(&ErrorContextChecker, src)
     }
 
-    const WRAPPING_CONVENTION: &str =
-        "void wrap() { try { doThing(); } catch (IOException e) { throw new RuntimeException(\"wrap failed\", e); } }";
+    const WRAPPING_CONVENTION: &str = "void wrap() { try { doThing(); } catch (IOException e) { throw new RuntimeException(\"wrap failed\", e); } }";
 
     #[test]
     fn flags_bare_rethrow_when_wrapping_convention_exists() {

@@ -93,9 +93,8 @@ mod tests {
             }
         }
 
-        let tree = parse_go(
-            "package main\nfunc f(a, b string) { if a == b { g(a) } else { h(b) } }\n",
-        );
+        let tree =
+            parse_go("package main\nfunc f(a, b string) { if a == b { g(a) } else { h(b) } }\n");
         let mut naive = 0;
         naive_count(tree.root_node(), &mut naive);
 

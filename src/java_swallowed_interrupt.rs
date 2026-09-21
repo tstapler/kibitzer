@@ -197,10 +197,9 @@ mod tests {
 
     #[test]
     fn does_not_flag_unrelated_exception_type() {
-        let findings = check_source(
-            "class Foo { void bar() { try { a(); } catch (IOException e) { } } }",
-        )
-        .unwrap();
+        let findings =
+            check_source("class Foo { void bar() { try { a(); } catch (IOException e) { } } }")
+                .unwrap();
         assert!(findings.is_empty());
     }
 
