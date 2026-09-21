@@ -5,6 +5,7 @@ use anyhow::Result;
 use pulldown_cmark::{BrokenLinkCallback, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::markdown_text::{line_for_offset, line_start_offsets};
 
 /// Checks a markdown document for three shapes of link/anchor breakage:
 ///   - a reference-style use (`[label][ref-id]`) with no matching `[ref-id]: target`
@@ -398,19 +399,6 @@ fn normalize_label(label: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
-}
-
-fn line_start_offsets(src: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
-    starts
-}
-
-fn line_for_offset(line_starts: &[usize], offset: usize) -> usize {
-    match line_starts.binary_search(&offset) {
-        Ok(i) => i + 1,
-        Err(i) => i,
-    }
 }
 
 /// Rendered heading text for every heading in a document, extracted the same way

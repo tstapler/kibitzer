@@ -604,6 +604,12 @@ fn core_checks() -> Vec<Check> {
             message: Some("broken markdown link/anchor".to_string()),
             ..native_check("markdown-link-integrity", Severity::Blocking, &["**/*.md"])
         },
+        native_check(
+            "repetitive-sentence-structure",
+            Severity::Advisory,
+            &["**/*.md"],
+        ),
+        native_check("missing-paragraph-break", Severity::Advisory, &["**/*.md"]),
         native_check("primitive-obsession", Severity::Advisory, &["**/*.go"]),
         native_check("file-complexity", Severity::Advisory, &["**/*.go"]),
         native_check(
