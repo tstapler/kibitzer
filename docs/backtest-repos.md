@@ -19,6 +19,13 @@ into `~/code/github.com/<owner>/<repo>` per the repo-placement convention in
 | `BurntSushi/ripgrep`     | Rust             | Small, famously clean, idiomatic Rust codebase — a useful low-noise counterpoint to `servo`'s size. |
 | `denoland/deno`          | Rust + TypeScript | Covers both a large Rust codebase and its own TS standard library/runtime code in one repo. |
 | `microsoft/vscode`       | TypeScript       | Canonical large-scale, well-regarded TypeScript application codebase — the JS/TS pick requested 2026-09-07. |
+| `kubernetes/website`     | Markdown (prose) | The k8s docs site source — large, heavily-edited real-world prose corpus (`content/en/docs/`); added 2026-09-21 for backtesting `repetitive-sentence-structure`/`missing-paragraph-break` (issue #92). |
+| `gitlabhq/gitlabhq`      | Markdown (prose) | Enormous, actively-maintained `doc/` tree — the single largest pure-prose corpus in this list. |
+| `docker/docs`            | Markdown (prose) | Docker's docs site source, all markdown. |
+| `mdn/content`            | Markdown (prose) | MDN Web Docs, 14,000+ pages — very consistent editorial style, a low-noise prose counterpoint the way `ripgrep` is for Rust. |
+| `microsoft/vscode-docs`  | Markdown (prose) | VS Code's public docs. |
+| `rust-lang/book`         | Markdown (prose) | The Rust Book — well-edited, idiomatic technical prose; another low-noise counterpoint. |
+| `rust-lang/rustc-dev-guide` | Markdown (prose) | Smaller, clean technical prose corpus. |
 
 `stapler-squad` is not cloned by the script — it's already present locally (e.g.
 `~/Programming/stapler-squad`, or a `~/.stapler-squad/workspaces/*/worktrees/*` worktree

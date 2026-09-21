@@ -14,6 +14,13 @@ REPOS=(
   "BurntSushi/ripgrep"
   "denoland/deno"
   "microsoft/vscode"
+  "kubernetes/website"
+  "gitlabhq/gitlabhq"
+  "docker/docs"
+  "mdn/content"
+  "microsoft/vscode-docs"
+  "rust-lang/book"
+  "rust-lang/rustc-dev-guide"
 )
 
 for repo in "${REPOS[@]}"; do
