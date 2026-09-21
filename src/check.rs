@@ -314,11 +314,8 @@ fn run_check_with_timeout(
     let mut message = check.message.clone();
 
     if !passed && severity == Severity::Blocking {
-        let baseline = if command.contains("{file}") {
-            check_against_git_head(check, repo_root, file_path, changed_lines)
-        } else {
-            check_against_git_head_repo(check, repo_root)
-        };
+        let baseline =
+            command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines);
         if let Some(false) = baseline {
             severity = Severity::Advisory;
             message = Some(format!(
@@ -889,6 +886,47 @@ fn scope_output_to_changed_lines(
 /// same extension at the same instant — a shared path let one thread's baseline read/write
 /// race with another's, corrupting both checks' results.
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Command-check counterpart to the per-file-vs-repo-wide branch [`run_check_with_timeout`]
+/// used to take inline: a whole-repo command (no `{file}` placeholder) baselines against a
+/// snapshot of the whole tree; anything else baselines against just this file.
+fn command_baseline_against_git_head(
+    check: &Check,
+    command: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Option<bool> {
+    if command.contains("{file}") {
+        check_against_git_head(check, repo_root, file_path, changed_lines)
+    } else {
+        check_against_git_head_repo(check, repo_root)
+    }
+}
+
+/// Whether `check` already failed against `file_path`'s content at git HEAD, regardless of
+/// `check.severity` — dispatches to the native or command-based baseline path depending on
+/// how `check` is implemented. Unlike the `Severity::Blocking`-gated call sites in
+/// [`run_check_with_timeout`]/[`run_native_check`], this is exposed for callers (namely
+/// `task_stop`'s unscoped Stop-hook recheck) that want to know whether *any* finding —
+/// including an Advisory one — predates the current edits, so a whole-file recheck doesn't
+/// resurface a pre-existing violation as if it were newly introduced.
+///
+/// `None` means "can't tell" (untracked file, no HEAD commit, not a git repo, or — for an
+/// `architecture_checker`-based check, which has no per-file HEAD content to compare
+/// against — not applicable at all); callers should treat that as "don't suppress."
+pub(crate) fn check_predates_git_head(
+    check: &Check,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Option<bool> {
+    if let Some(checker_name) = &check.checker {
+        return check_native_against_git_head(checker_name, repo_root, file_path, changed_lines);
+    }
+    let command = check.command.as_deref()?;
+    command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+}
 
 /// Re-run `check` against the file's `git show HEAD:<relpath>` content to determine
 /// whether a current failure predates this session's edits. `changed_lines`, when present,

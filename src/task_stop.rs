@@ -188,24 +188,7 @@ fn run_stop_hook_with_offsets_path(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut lines_out: Vec<String> = Vec::new();
-    for file in &files {
-        if !file.is_file() {
-            // Deleted (or never existed — a path from a failed tool call) later in the
-            // same task; nothing on disk to check, and checking it would just report a
-            // spurious "couldn't read file" finding.
-            continue;
-        }
-        let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None)?;
-        for result in results.iter().filter(|r| !r.passed) {
-            lines_out.push(format!(
-                "{}: {}: {}",
-                file.display(),
-                result.check_name,
-                result.describe()
-            ));
-        }
-    }
+    let lines_out = stop_hook_findings_for_files(cwd, &files)?;
 
     if lines_out.is_empty() {
         return Ok(ExitCode::SUCCESS);
@@ -227,6 +210,63 @@ fn run_stop_hook_with_offsets_path(
     });
     println!("{payload}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Re-checks every file in `files` (unscoped) and formats each surviving finding as
+/// `{file}: {check_name}: {description}` — split out from [`run_stop_hook_with_offsets_path`]
+/// so a test can exercise the recheck-and-filter behavior directly against a real repo
+/// fixture without going through the transcript/offset-tracking machinery.
+fn stop_hook_findings_for_files(cwd: &Path, files: &BTreeSet<PathBuf>) -> Result<Vec<String>> {
+    // Loaded once so `predates_git_head` can look up each failing result's own `Check`
+    // (native/command, scope, etc.) by name — `run_checks_smart` only hands back the
+    // resulting `CheckResult`s, not the config that produced them.
+    let (config, repo_root) = crate::config::find_effective_config(cwd)?;
+
+    let mut lines_out: Vec<String> = Vec::new();
+    for file in files {
+        if !file.is_file() {
+            // Deleted (or never existed — a path from a failed tool call) later in the
+            // same task; nothing on disk to check, and checking it would just report a
+            // spurious "couldn't read file" finding.
+            continue;
+        }
+        let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None)?;
+        for result in results.iter().filter(|r| !r.passed) {
+            if predates_git_head(&config, &repo_root, file, result) {
+                continue;
+            }
+            lines_out.push(format!(
+                "{}: {}: {}",
+                file.display(),
+                result.check_name,
+                result.describe()
+            ));
+        }
+    }
+    Ok(lines_out)
+}
+
+/// Whether `result` (a failing check against `file`) already failed the same way at git
+/// HEAD — i.e. it predates this task's edits rather than being introduced by them. Unlike
+/// [`crate::check::run_check`]'s own baseline downgrade (which only applies to
+/// `Severity::Blocking`, since an Advisory finding never blocks anyway), this Stop-hook
+/// summary is meant to report only what changed *this task*: an Advisory finding this
+/// checker already had for the whole rest of the file before we touched it is exactly the
+/// noise a whole-file, unscoped recheck would otherwise resurface. `None` (can't tell —
+/// untracked file, no HEAD, check config not found) is treated as "don't suppress."
+fn predates_git_head(
+    config: &crate::config::Config,
+    repo_root: &Path,
+    file: &Path,
+    result: &crate::check::CheckResult,
+) -> bool {
+    let Some(check) = config.checks.iter().find(|c| c.name == result.check_name) else {
+        return false;
+    };
+    matches!(
+        crate::check::check_predates_git_head(check, repo_root, file, None),
+        Some(false)
+    )
 }
 
 #[cfg(test)]
@@ -387,5 +427,69 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&transcript).ok();
         std::fs::remove_file(&offsets).ok();
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn stop_hook_suppresses_an_advisory_finding_that_predates_this_task() {
+        let dir = tmp_path("baseline-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+
+        let target = dir.join("doc.md");
+        // Already-repetitive on the very first commit — this predates any edit this
+        // "task" makes, so the Stop hook should never surface it.
+        std::fs::write(&target, "This is bad. This is worse. This is worst.\n").unwrap();
+        git(&dir, &["add", "doc.md"]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let files = BTreeSet::from([target.clone()]);
+        let lines = stop_hook_findings_for_files(&dir, &files).unwrap();
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("repetitive-sentence-structure")),
+            "pre-existing finding should be suppressed, got: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_hook_reports_an_advisory_finding_newly_introduced_this_task() {
+        let dir = tmp_path("newfinding-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+
+        let target = dir.join("doc.md");
+        std::fs::write(&target, "Clean prose with varied openers.\n").unwrap();
+        git(&dir, &["add", "doc.md"]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        // Not committed — simulates this task's own edit introducing the violation.
+        std::fs::write(&target, "This is bad. This is worse. This is worst.\n").unwrap();
+
+        let files = BTreeSet::from([target.clone()]);
+        let lines = stop_hook_findings_for_files(&dir, &files).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("repetitive-sentence-structure")),
+            "newly introduced finding should still be reported, got: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
