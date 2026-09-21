@@ -2,7 +2,7 @@
 
 Tracks confirmed false-positive firings of the `go-primitive-obsession` kibitzer
 check (`src/primitive_obsession.rs`, wired up per-project via `.claude/inspect.json`'s
-`go-primitive-obsession` entry running `kibitzer check primitive-obsession {file}` on
+`go-primitive-obsession` entry running `kibitzer check native primitive-obsession {file}` on
 every `Edit|Write` to a `**/*.go` file). Check new occurrences against this list before
 re-investigating a firing from scratch.
 
@@ -15,7 +15,7 @@ an edit actually touched:
   `tool_input.file_path`, and calls `run_checks_smart` — it never inspects the tool's
   diff/patch content, just the path.
 - `check::run_check` (`src/check.rs`) shells out to the configured command
-  (`kibitzer check primitive-obsession {file}`) with the file path substituted in.
+  (`kibitzer check native primitive-obsession {file}`) with the file path substituted in.
 - `main.rs`'s `CheckCommand::PrimitiveObsession` handler calls
   `primitive_obsession::check_file(&file)`, which does `std::fs::read_to_string(path)`
   and tree-sitter-parses the **entire current file on disk**, then walks every
