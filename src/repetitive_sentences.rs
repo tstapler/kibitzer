@@ -5,7 +5,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::markdown_text::for_each_paragraph;
+use crate::markdown_text::{for_each_paragraph, split_sentences};
 
 /// Sentence-opener words common enough that three in a row reads as monotonous
 /// (JMU Writing Center / Purdue OWL "sentence variety" guidance). Anything else is
@@ -16,7 +16,6 @@ const OPENERS: &[&str] = &[
     "a", "an",
 ];
 
-static SENTENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^.!?]+[.!?]+").unwrap());
 static FIRST_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z']+").unwrap());
 
 /// Flags 3+ consecutive sentences in one flowing-prose paragraph that open with the same
@@ -70,8 +69,8 @@ fn check_paragraph(line: usize, text: &str) -> Option<Finding> {
     let mut run_opener: Option<&str> = None;
     let mut run_len = 0usize;
 
-    for sentence in SENTENCE_RE.find_iter(text) {
-        let opener = sentence_opener(sentence.as_str().trim());
+    for sentence in split_sentences(text) {
+        let opener = sentence_opener(sentence.trim());
         match (opener, run_opener) {
             (Some(o), Some(prev)) if o == prev => {
                 run_len += 1;

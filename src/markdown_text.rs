@@ -26,6 +26,51 @@ pub struct Paragraph {
     pub text: String,
 }
 
+/// Splits `text` into sentence-like chunks on `.`/`!`/`?`, except a `.` sitting between
+/// two digits (`v1.13`, `10.5`) — treated as a decimal/version number, not a sentence
+/// boundary. Found necessary backtesting against kubernetes/website: naive splitting on
+/// every `.` turned "etcd client is included in Kubernetes v1.13. Previously..." into a
+/// fake extra "13." sentence, inflating a paragraph's reported sentence count and
+/// shifting where a topic-shift word appeared to land. Not a real sentence tokenizer (no
+/// abbreviation list, no quote/parenthetical handling) — good enough for the mechanical
+/// structural checks that use it.
+pub fn split_sentences(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !matches!(bytes[i], b'.' | b'!' | b'?') {
+            i += 1;
+            continue;
+        }
+        let is_decimal_point = bytes[i] == b'.'
+            && i > 0
+            && bytes[i - 1].is_ascii_digit()
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_digit();
+        if is_decimal_point {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        while end < bytes.len() && matches!(bytes[end], b'.' | b'!' | b'?') {
+            end += 1;
+        }
+        push_if_not_blank(&mut sentences, &text[start..end]);
+        start = end;
+        i = end;
+    }
+    push_if_not_blank(&mut sentences, &text[start..]);
+    sentences
+}
+
+fn push_if_not_blank<'a>(sentences: &mut Vec<&'a str>, candidate: &'a str) {
+    if !candidate.trim().is_empty() {
+        sentences.push(candidate);
+    }
+}
+
 /// Walks `body`'s markdown paragraphs outside any list, invoking `on_paragraph` for
 /// each one. List items are excluded because a parallel bulleted enumeration (independent
 /// facts stated in the same grammatical form on purpose) is not the kind of prose defect
@@ -76,6 +121,21 @@ pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_number_dot_is_not_a_sentence_boundary() {
+        let sentences = split_sentences("The client shipped in v1.13. It works well.");
+        assert_eq!(
+            sentences,
+            vec!["The client shipped in v1.13.", " It works well."]
+        );
+    }
+
+    #[test]
+    fn trailing_punctuation_run_is_kept_together() {
+        let sentences = split_sentences("Wait, really?! Yes.");
+        assert_eq!(sentences, vec!["Wait, really?!", " Yes."]);
+    }
 
     #[test]
     fn a_table_is_not_treated_as_one_giant_paragraph() {

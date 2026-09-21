@@ -1,11 +1,9 @@
 use std::path::Path;
 
 use anyhow::Result;
-use regex::Regex;
-use std::sync::LazyLock;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::markdown_text::for_each_paragraph;
+use crate::markdown_text::{for_each_paragraph, split_sentences};
 
 /// A sentence starting with one of these (case-insensitive) reads as a topic shift —
 /// Purdue OWL's "On Paragraphs" guidance (start a new paragraph on a topic shift or when
@@ -25,8 +23,6 @@ const SHIFT_WORDS: &[&str] = &[
 /// topic shift is worth flagging at all — short paragraphs with a "However" mid-sentence
 /// are usually fine as one paragraph.
 const LONG_PARAGRAPH_SENTENCES: usize = 6;
-
-static SENTENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^.!?]+[.!?]+").unwrap());
 
 /// A cheap structural proxy for "this paragraph should probably be split in two":
 /// flags a long paragraph (more sentences than [`LONG_PARAGRAPH_SENTENCES`]) that
@@ -74,10 +70,7 @@ pub fn check_source(body: &str) -> Vec<Finding> {
 }
 
 fn check_paragraph(line: usize, text: &str) -> Option<Finding> {
-    let sentences: Vec<&str> = SENTENCE_RE
-        .find_iter(text)
-        .map(|m| m.as_str().trim())
-        .collect();
+    let sentences: Vec<&str> = split_sentences(text).into_iter().map(str::trim).collect();
     if sentences.len() <= LONG_PARAGRAPH_SENTENCES {
         return None;
     }
@@ -128,6 +121,16 @@ mod tests {
     #[test]
     fn ignores_shift_word_in_first_sentence() {
         let body = "However this opens. Two. Three. Four. Five. Six. Seven.\n";
+        assert!(check_source(body).is_empty());
+    }
+
+    #[test]
+    fn version_numbers_do_not_inflate_the_sentence_count() {
+        // 4 real sentences — the naive `.`-split this replaced would have split "v1.10",
+        // "v1.11", and "v1.12" into 3 extra fake sentences, pushing this paragraph over
+        // LONG_PARAGRAPH_SENTENCES and misreporting its length.
+        let body = "The client shipped in v1.10, v1.11, and v1.12. The team maintains it. \
+                     However, it still gets bug fixes. This remains true today.\n";
         assert!(check_source(body).is_empty());
     }
 }
