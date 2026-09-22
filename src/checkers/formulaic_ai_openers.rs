@@ -6,7 +6,7 @@ use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::markdown_text::split_sentences;
 
 /// Formulaic transition phrases a paragraph's first sentence starts with — the same
-/// "mechanical proxy for a writing tell" idea as [`crate::repetitive_sentences::OPENERS`],
+/// "mechanical proxy for a writing tell" idea as [`crate::checkers::repetitive_sentences::OPENERS`],
 /// but targeting known AI-writing openers specifically (borrowed from analyzing
 /// github.com/puneethkotha/humanizer-workbench's heuristics for LLM-generated prose).
 ///
@@ -28,7 +28,7 @@ const AI_OPENERS: &[&str] = &[
 ];
 
 /// Flags a paragraph whose *first* sentence opens with a formulaic AI-writing transition
-/// phrase. Unlike [`crate::repetitive_sentences::RepetitiveSentencesChecker`], a single
+/// phrase. Unlike [`crate::checkers::repetitive_sentences::RepetitiveSentencesChecker`], a single
 /// occurrence is enough to flag — there's no run-of-3+ threshold here.
 ///
 /// Intentionally NOT wired into `config::default_checks()`; opt in via

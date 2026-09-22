@@ -1,5 +1,4 @@
 mod accepted_findings;
-mod ai_vocabulary_density;
 mod arch_diagram;
 mod arch_export;
 mod arch_model;
@@ -9,29 +8,16 @@ mod cache;
 mod change_coupling;
 mod check;
 mod checker;
-mod comment_quality;
-mod complexity;
+mod checkers;
 mod config;
 mod daemon;
 mod declaration_checks;
 mod declarations;
 mod dedup;
-mod duplicate_code;
-mod duplicate_cross_file_checker;
-mod em_dash_overuse;
 mod extract_class;
 mod false_positive;
-mod file_size;
-mod filler_phrase_density;
-mod formulaic_ai_openers;
 mod glob;
-mod go_blank_imports;
-mod go_bulk_fetch_linear_scan;
 mod go_call_resolution;
-mod go_error_context;
-mod go_ignored_error;
-mod go_table_driven_test;
-mod go_type_switch_density;
 mod god_class;
 mod hook;
 mod hook_log;
@@ -40,25 +26,15 @@ mod import_graph;
 mod install;
 mod isp_fat_interface;
 mod jaccard;
-mod java_error_context;
-mod java_ignored_error;
-mod java_lost_exception_cause;
-mod java_swallowed_interrupt;
 mod lsp;
-mod markdown_link_integrity;
 mod markdown_text;
 mod mcp;
 mod mermaid;
 mod node_kind;
-mod paragraph_breaks;
 mod plugin;
-mod primitive_obsession;
-mod repetitive_sentences;
 mod root_cause_clusters;
-mod rules;
 mod run;
 mod schema;
-mod sentence_length_uniformity;
 mod status;
 mod symbol_extract;
 mod task_stop;
@@ -747,11 +723,11 @@ fn run_hotspots(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
 }
 
 /// Covers every language `duplicate-code` (single-file) covers — see
-/// `duplicate_code::DuplicateCodeChecker::file_globs()` — so a block copy-pasted
+/// `checkers::duplicate_code::DuplicateCodeChecker::file_globs()` — so a block copy-pasted
 /// across files is caught regardless of language.
 fn run_duplicates_cli(dir: &Path) -> Result<ExitCode> {
     let files = collect_files_for_duplicate_scan(dir)?;
-    let duplicates = duplicate_code::find_cross_file_duplicates(&files);
+    let duplicates = checkers::duplicate_code::find_cross_file_duplicates(&files);
     if duplicates.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -765,11 +741,12 @@ fn run_duplicates_cli(dir: &Path) -> Result<ExitCode> {
 fn collect_files_for_duplicate_scan(dir: &Path) -> Result<Vec<(PathBuf, String)>> {
     use checker::Checker as _;
 
-    let extensions: std::collections::HashSet<&str> = duplicate_code::DuplicateCodeChecker
-        .file_globs()
-        .iter()
-        .filter_map(|glob| glob.rsplit('.').next())
-        .collect();
+    let extensions: std::collections::HashSet<&str> =
+        checkers::duplicate_code::DuplicateCodeChecker
+            .file_globs()
+            .iter()
+            .filter_map(|glob| glob.rsplit('.').next())
+            .collect();
 
     let all_files =
         check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
@@ -788,7 +765,7 @@ fn collect_files_for_duplicate_scan(dir: &Path) -> Result<Vec<(PathBuf, String)>
     Ok(files)
 }
 
-fn print_cross_file_duplicates(duplicates: &[duplicate_code::CrossFileDuplicate]) {
+fn print_cross_file_duplicates(duplicates: &[checkers::duplicate_code::CrossFileDuplicate]) {
     for dup in duplicates {
         let locations: Vec<String> = dup
             .occurrences

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::rules;
+use crate::checkers::rules;
 
 /// `over-commented` fires when a declaration's attached comment lines are at least this
 /// multiple of its body's code-line count. A well-justified "why" comment can easily run

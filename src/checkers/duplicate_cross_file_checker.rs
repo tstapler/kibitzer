@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::duplicate_code::{
+use crate::checkers::duplicate_code::{
     DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_windows,
 };
 

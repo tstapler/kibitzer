@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::duplicate_code::MIN_OCCURRENCES;
+use crate::checkers::duplicate_code::MIN_OCCURRENCES;
 
 /// Literal-value node kinds treated as wildcards when comparing two test bodies — the
 /// "inputs/expected values" issue #31 describes near-identical table-driven-test
@@ -57,7 +57,7 @@ impl Checker for TableDrivenTestChecker {
         // into a table" isn't actionable on code nobody hand-edits — the same rationale
         // duplicate_code.rs's is_generated guard was added for (see
         // docs/duplicate-code-false-positives.md's 2026-09-12 entry).
-        if crate::file_size::is_generated(ctx.source) {
+        if crate::checkers::file_size::is_generated(ctx.source) {
             return Ok(Vec::new());
         }
         let tree = ctx

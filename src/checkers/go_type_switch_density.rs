@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::file_size::is_generated;
+use crate::checkers::file_size::is_generated;
 
 /// Minimum number of `case` clauses on a single `switch x.(type)` before it's flagged —
 /// #38's "OCP proxy: type-switch density" item. No stronger literature citation than

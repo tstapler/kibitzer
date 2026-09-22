@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::file_size::is_generated;
+use crate::checkers::file_size::is_generated;
 
 /// Flags `if err != nil { return err }` — a bare passthrough that discards the call
 /// site's context — but only in files that already demonstrate an `fmt.Errorf(...,
