@@ -26,6 +26,7 @@ mod go_bulk_fetch_linear_scan;
 mod go_call_resolution;
 mod go_error_context;
 mod go_ignored_error;
+mod go_table_driven_test;
 mod go_type_switch_density;
 mod god_class;
 mod hook;

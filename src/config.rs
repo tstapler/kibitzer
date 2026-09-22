@@ -656,6 +656,11 @@ fn go_exception_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.go"],
         ),
+        native_check(
+            "go-table-driven-test-candidate",
+            Severity::Advisory,
+            &["**/*_test.go"],
+        ),
     ]
 }
 
