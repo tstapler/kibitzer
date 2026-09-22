@@ -5,6 +5,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::go_call_resolution::{self, GoModule};
+use crate::node_kind::GoKind;
 
 /// Flags Go short variable declarations that discard the *last* value of a
 /// multi-value call via `_` (e.g. `result, _ := f()`) — by Go convention the last
@@ -85,13 +86,13 @@ fn safe_to_suppress(call: Node, tree: &Tree, src: &[u8], module: Option<&Resolve
     let Some(function) = call.child_by_field_name("function") else {
         return false;
     };
-    if function.kind() != "selector_expression" {
+    if GoKind::of(function) != GoKind::SelectorExpression {
         return false;
     }
     let Some(operand) = function.child_by_field_name("operand") else {
         return false;
     };
-    if operand.kind() != "identifier" {
+    if GoKind::of(operand) != GoKind::Identifier {
         return false;
     }
     let Some(field) = function.child_by_field_name("field") else {
@@ -116,14 +117,14 @@ fn walk(
     module: Option<&ResolvedModule>,
     findings: &mut Vec<Finding>,
 ) {
-    if node.kind() == "short_var_declaration"
+    if GoKind::of(node) == GoKind::ShortVarDeclaration
         && let Some(call) = go_call_resolution::single_rhs_call_expression(node)
         && let Some(left) = node.child_by_field_name("left")
     {
         let mut cursor = left.walk();
         let names: Vec<Node> = left
             .children(&mut cursor)
-            .filter(|n| n.kind() == "identifier")
+            .filter(|n| GoKind::of(*n) == GoKind::Identifier)
             .collect();
         if names.len() >= 2
             && let Some(last) = names.last()
