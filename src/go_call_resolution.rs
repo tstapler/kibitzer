@@ -2,6 +2,20 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Tree};
 
+/// The RHS `call_expression` when `node` (a `short_var_declaration`) has a single-call
+/// right side — the shape a multi-value call unpacked via `:=` takes (e.g. `all, err :=
+/// s.ListAllX()`), as opposed to a comma-ok type assertion or map index that shares the
+/// same two-identifier LHS shape.
+pub(crate) fn single_rhs_call_expression(node: Node) -> Option<Node> {
+    let right = node.child_by_field_name("right")?;
+    let mut cursor = right.walk();
+    let mut exprs = right.named_children(&mut cursor);
+    match (exprs.next(), exprs.next()) {
+        (Some(only), None) if only.kind() == "call_expression" => Some(only),
+        _ => None,
+    }
+}
+
 /// Resolves a same-module, package-qualified Go function call (`pkg.Func(...)`) to its
 /// real declaration on disk and reports whether its last return type is literally
 /// `error` — used by `go_ignored_error.rs` to avoid flagging a discarded non-error last

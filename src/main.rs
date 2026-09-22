@@ -22,6 +22,7 @@ mod false_positive;
 mod file_size;
 mod glob;
 mod go_blank_imports;
+mod go_bulk_fetch_linear_scan;
 mod go_call_resolution;
 mod go_error_context;
 mod go_ignored_error;
