@@ -1481,6 +1481,15 @@ mod tests {
     }
 
     #[test]
+    fn catalog_cites_fowler_for_long_function_and_deep_nesting() {
+        let long_function = CATALOG.iter().find(|r| r.id == "long-function").unwrap();
+        assert!(long_function.description.contains("Extract Function"));
+
+        let deep_nesting = CATALOG.iter().find(|r| r.id == "deep-nesting").unwrap();
+        assert!(deep_nesting.description.contains("Guard Clauses"));
+    }
+
+    #[test]
     fn flags_bool_param_branched_on_directly() {
         let findings = check_source(
             "package main\nfunc f(verbose bool) {\n\tif verbose {\n\t\tprintln(\"v\")\n\t}\n}\n",
