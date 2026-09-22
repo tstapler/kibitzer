@@ -88,6 +88,50 @@ message, since it doesn't depend on kibitzer's message format staying the same")
 evidence that message-text changes are an accepted category of change in this codebase, not a
 compatibility surface.
 
+## 6. `markdown-link-integrity` scope — markdown files only, does not apply
+
+[`src/markdown_link_integrity.rs:67`](src/markdown_link_integrity.rs#L67) implements `Checker`'s
+`glob_patterns()` as `&["**/*.md"]`, and [`language()`](src/markdown_link_integrity.rs#L61)
+returns `None` (language-agnostic, but file-pattern-gated). The checker runner
+(`src/checker.rs`) dispatches per-checker by matching a file against its `glob_patterns()`
+before invoking it, so `.rs` files never reach this checker regardless of what string literals
+they contain. The two new URLs, embedded inside Rust `format!` string literals in `src/rules.rs`,
+are structurally invisible to `markdown-link-integrity` — it never parses `.rs` source, only
+`.md` documents. No risk of this check firing on, or gatekeeping, the new URLs.
+
+(Requirement 3's "already confirmed 200 OK... before ship" step is a plain `curl -sI`/`WebFetch`,
+not this checker — see §1 above, which already covers live-URL verification.)
+
+## 7. clippy / rustfmt / CI build risk — none found
+
+- **`cargo fmt --all --check`** ([`.github/workflows/ci.yml:28`](.github/workflows/ci.yml#L28))
+  is in the CI gate. Checked whether appending ~55–70 chars of URL text to the two `format!`
+  string literals could produce a diff `cargo fmt` would want to make (which would fail this
+  check): the *existing*, currently-shipping literal at
+  [`src/rules.rs:827`](src/rules.rs#L827) (`"[long-function] body spans {body_lines} lines (over
+  {LONG_FUNCTION_LINES}) — consider splitting it up"`) is already 123 characters on its own line
+  (`awk 'NR==827{print length($0)}' src/rules.rs` → `123`), well past rustfmt's default 100-char
+  `max_width`, and CI passes on `master` today with this line as-is. rustfmt does not split or wrap the contents of a string literal — it only reflows
+  surrounding code (call/argument layout) — so an overlong string-literal line is not something
+  `cargo fmt --check` flags. Making the literals longer by appending catalog text carries the
+  same non-risk as the current code. Running `cargo fmt` locally after the edit (as normal
+  practice) is still the right verification step, but no failure is expected.
+- **`cargo clippy --workspace --all-targets -- -D warnings`**
+  ([`.github/workflows/ci.yml:30`](.github/workflows/ci.yml#L30)) treats every clippy warning as
+  a build failure. No clippy lint targets plain string-literal *content* (URL text, punctuation,
+  or length) inside a non-doc `format!` call — lints like `clippy::needless_raw_string_hashes` or
+  `clippy::doc_markdown` apply to raw-string syntax or `///` doc comments respectively, neither of
+  which is in play here (this is an ordinary `"..."` literal inside a runtime `format!`, not a doc
+  comment). No applicable lint found. No `clippy.toml` exists in the repo (checked: absent), so
+  there's no project-specific lint config that could add one.
+- **Em dash / non-ASCII encoding**: the existing messages already contain a literal em dash
+  (`—`, U+2014) in both target lines (`"...(over {LONG_FUNCTION_LINES}) — consider..."`,
+  `"...(over {MAX_NESTING_DEPTH}) — consider..."`) and the file is plain UTF-8 like every other
+  `.rs` file in the repo — Rust source files are UTF-8 by spec, so no new encoding risk from
+  reusing the same character or adding ASCII URL/parenthesis text alongside it.
+- No `rustfmt.toml` or `.rustfmt.toml` exists in the repo (checked: absent), so rustfmt runs on
+  its all-default config — consistent with the `max_width`-ignores-string-literals behavior above.
+
 ## Summary of risk
 
 Low risk overall. The only real work items surfaced:

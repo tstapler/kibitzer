@@ -35,13 +35,13 @@ pub const CATALOG: &[RuleMeta] = &[
     RuleMeta {
         id: "long-function",
         category: "complexity",
-        description: "Function/method body spans more than 40 lines.",
+        description: "Function/method body spans more than 40 lines — Fowler's Extract Function.",
         default_severity: Severity::Advisory,
     },
     RuleMeta {
         id: "deep-nesting",
         category: "complexity",
-        description: "Function/method body nests if/for/switch/select/func_literal more than 4 levels deep.",
+        description: "Function/method body nests if/for/switch/select/func_literal more than 4 levels deep — Fowler's Replace Nested Conditional with Guard Clauses.",
         default_severity: Severity::Advisory,
     },
     RuleMeta {
@@ -824,7 +824,7 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mu
             findings.push(Finding {
                 line,
                 message: format!(
-                    "[long-function] body spans {body_lines} lines (over {LONG_FUNCTION_LINES}) — consider splitting it up"
+                    "[long-function] body spans {body_lines} lines (over {LONG_FUNCTION_LINES}) — consider Fowler's Extract Function (https://refactoring.com/catalog/extractFunction.html)"
                 ),
             });
         }
@@ -834,7 +834,7 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mu
             findings.push(Finding {
                 line,
                 message: format!(
-                    "[deep-nesting] body nests {depth} levels deep (over {MAX_NESTING_DEPTH}) — consider extracting a function or inverting a condition"
+                    "[deep-nesting] body nests {depth} levels deep (over {MAX_NESTING_DEPTH}) — consider Fowler's Replace Nested Conditional with Guard Clauses (https://refactoring.com/catalog/replaceNestedConditionalWithGuardClauses.html)"
                 ),
             });
         }
@@ -1242,6 +1242,21 @@ mod tests {
     }
 
     #[test]
+    fn long_function_message_cites_extract_function() {
+        let mut src = String::from("package main\nfunc f() {\n");
+        for _ in 0..45 {
+            src.push_str("\tprintln(\"line\")\n");
+        }
+        src.push_str("}\n");
+        let findings = check_source(&src).unwrap();
+        assert!(findings.iter().any(|f| {
+            f.message.contains("Extract Function")
+                && f.message
+                    .contains("https://refactoring.com/catalog/extractFunction.html")
+        }));
+    }
+
+    #[test]
     fn allows_shallow_nesting() {
         let findings = check_source(
             "package main\nfunc f(x int) {\n\tif x > 0 {\n\t\tprintln(\"pos\")\n\t}\n}\n",
@@ -1275,6 +1290,28 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[deep-nesting]"))
         );
+    }
+
+    #[test]
+    fn deep_nesting_message_cites_guard_clauses() {
+        let src = "package main\n\
+             func f(x int) {\n\
+             \tif x > 0 {\n\
+             \t\tfor i := 0; i < x; i++ {\n\
+             \t\t\tswitch i {\n\
+             \t\t\tcase 0:\n\
+             \t\t\t\tif i == 0 {\n\
+             \t\t\t\t\tprintln(\"deep\")\n\
+             \t\t\t\t}\n\
+             \t\t\t}\n\
+             \t\t}\n\
+             \t}\n\
+             }\n";
+        let findings = check_source(src).unwrap();
+        assert!(findings.iter().any(|f| f.message.contains("Guard Clauses")
+            && f.message.contains(
+                "https://refactoring.com/catalog/replaceNestedConditionalWithGuardClauses.html"
+            )));
     }
 
     #[test]

@@ -3,32 +3,40 @@
 **Date**: 2026-09-22
 
 ## Happy Path Scenario
-Given a Go function whose body exceeds 40 lines and nests conditionals more than 4 levels deep, when `kibitzer` runs the `long-function`/`deep-nesting` checks against it, then the resulting finding messages name the corresponding Fowler *Refactoring* catalog entry ("Extract Function" / "Replace Nested Conditional with Guard Clauses") and link its `refactoring.com/catalog/...` URL, while thresholds, trigger conditions, and `line`/severity stay exactly as before.
+Given a Go function body that exceeds `LONG_FUNCTION_LINES` (40 lines), when `check_source`
+runs `check_declaration` over it, then the resulting `[long-function]` `Finding.message`
+contains both "Extract Function" and
+`https://refactoring.com/catalog/extractFunction.html` — telling the user which Fowler
+refactoring to apply without them already knowing the catalog.
 
 ## Requirement → Test Mapping
 
 | Requirement | Test File | Test Name | Type | Scenario |
 |-------------|-----------|-----------|------|----------|
-| AC-1: `long-function` message names "Extract Function" and links `extractFunction.html` | src/rules.rs (`mod tests`, alongside `flags_long_function` at line 1230) | `long_function_message_cites_extract_function` | Unit | Reuse the 45-line-body Go source from `flags_long_function`; assert the matched finding's `message` contains both `"Extract Function"` and `"https://refactoring.com/catalog/extractFunction.html"`. |
-| AC-2: `deep-nesting` message names "Replace Nested Conditional with Guard Clauses" and links `replaceNestedConditionalWithGuardClauses.html` | src/rules.rs (`mod tests`, alongside `flags_deep_nesting` at line 1258) | `deep_nesting_message_cites_guard_clauses` | Unit | Reuse the 5-level-nested Go source from `flags_deep_nesting`; assert the matched finding's `message` contains both `"Replace Nested Conditional with Guard Clauses"` and `"https://refactoring.com/catalog/replaceNestedConditionalWithGuardClauses.html"`. |
-| AC-3: both URLs return a successful (non-404/non-error) response | N/A (manual, not automated) | N/A | Manual | `curl -sI https://refactoring.com/catalog/extractFunction.html` and `curl -sI https://refactoring.com/catalog/replaceNestedConditionalWithGuardClauses.html`, run immediately before ship (plan Story 1.1.4); confirm `HTTP/2 200` (or other 2xx/3xx) on both. Not an automated test — a live network dependency in `cargo test` is undesirable and the content is static, so a point-in-time manual check per the plan is sufficient. |
-| AC-4: no detection-logic changes — thresholds, trigger conditions, finding `line`/severity unchanged | src/rules.rs (`mod tests`, existing) | *(no new test — covered by existing tests)* | Unit (existing) | `allows_short_function`, `allows_shallow_nesting` (negative/boundary cases) and every existing positive case (`flags_long_function`, `flags_deep_nesting`, `rules_fire_independently_on_one_function`, etc.) already assert on trigger conditions and firing behavior around `LONG_FUNCTION_LINES`/`MAX_NESTING_DEPTH`. Since the plan only appends text inside the two `format!` strings (`src/rules.rs:826-828`, `:836-838`) and does not touch the constants or the `if` conditions that gate them, these pre-existing tests re-passing unchanged is the evidence for AC-4 — no new test adds coverage here. |
-| AC-5: all 29 existing `.contains("[long-function]")` / `.contains("[deep-nesting]")` call sites still pass | N/A (verification step, not a new test) | N/A | Unit (existing, run as a gate) | `cargo test rules::` (plan Story 1.1.3). A substring `.contains(...)` on the rule-id prefix (`"[long-function]"`, `"[deep-nesting]"`) is unaffected by appending more text after it, so this is a regression gate on the existing suite rather than something a new test could cover better. |
-| AC-6 (optional, open question): `CATALOG` descriptions for `long-function`/`deep-nesting` get the same treatment | src/rules.rs (`mod tests`) | *(no test required — out of scope unless implemented)* | N/A | `CATALOG` (`src/rules.rs:34-46`) is documentation metadata (`#[allow(dead_code)]`, not read by checker logic — see doc comment at `src/rules.rs:31-32`) with no existing test asserting on its `description` strings. If Epic 1.2 is implemented, a one-line manual read-back of `CATALOG[0].description`/`CATALOG[1].description` is sufficient; if skipped, no coverage gap since AC-6 is explicitly an open question, not a firm requirement. |
+| AC#1 — `long-function` message names "Extract Function" and links the catalog URL | `src/rules.rs` (`mod tests`) | `long_function_message_cites_extract_function` | Unit (happy path) | 45-line Go function body (reuses `flags_long_function`'s fixture, `src/rules.rs:1230-1242`) → `Finding.message` contains `"Extract Function"` and `"https://refactoring.com/catalog/extractFunction.html"` |
+| AC#1 — message does *not* regress when body is under the threshold | `src/rules.rs` (`mod tests`) | `allows_short_function` (existing, unmodified) | Unit (error/negative path) | Short function body → `findings.is_empty()`, so no citation text can appear — confirms the citation addition didn't loosen the trigger condition |
+| AC#2 — `deep-nesting` message names "Replace Nested Conditional with Guard Clauses" and links the catalog URL | `src/rules.rs` (`mod tests`) | `deep_nesting_message_cites_guard_clauses` | Unit (happy path) | 5-level-nested Go function body (reuses `flags_deep_nesting`'s fixture, `src/rules.rs:1257-1278`) → `Finding.message` contains `"Guard Clauses"` and `"https://refactoring.com/catalog/replaceNestedConditionalWithGuardClauses.html"` |
+| AC#2 — message does not regress for shallow nesting | `src/rules.rs` (`mod tests`) | `allows_shallow_nesting` (existing, unmodified) | Unit (error/negative path) | Shallowly nested function → no `[deep-nesting]` finding at all, so no citation text can leak in incorrectly |
+| AC#3 — both catalog URLs return 2xx | N/A (manual/shell, not a `cargo test`) | `curl -sI` against both URLs (Task 1.2.1a) | Integration (external call) | `curl -sI https://refactoring.com/catalog/extractFunction.html` and `curl -sI https://refactoring.com/catalog/replaceNestedConditionalWithGuardClauses.html` — status line is `HTTP/1.1 2xx`, run once immediately before opening the PR per `research/build-vs-buy.md` §2 (no automated linkcheck; `markdown-link-integrity` deliberately treats `http(s)://` targets as always-valid, `src/markdown_link_integrity.rs:357`) |
+| AC#4 — `LONG_FUNCTION_LINES`, `MAX_NESTING_DEPTH`, trigger conditions, `Finding.line`/severity stay byte-identical | N/A (diff inspection, not a runtime test) | `git diff src/rules.rs` reviewed by hand/PR reviewer | N/A — structural invariant, not testable via `cargo test` | Diff touches only the string-literal contents inside the two `format!(...)` calls (`src/rules.rs:826-828`, `:836-838`); constants at `:11`/`:15` and the `Finding { line, .. }` construction are unchanged |
+| AC#5 — all 29 existing test call sites pass unmodified | `src/rules.rs` (`mod tests`, all existing tests) | `cargo test rules::` (full existing suite, no edits to assertions) | Unit regression (happy path, run as a batch) | Existing tests assert `.message.contains("[long-function]")` / `.contains("[deep-nesting]")` — substring match on the bracketed prefix, unaffected by appended trailing text |
+| AC#6 — two new unit tests exist, compile, and pass | `src/rules.rs` (`mod tests`) | `long_function_message_cites_extract_function`, `deep_nesting_message_cites_guard_clauses` | Unit (happy path) | `cargo test rules::long_function_message_cites_extract_function rules::deep_nesting_message_cites_guard_clauses` — both exist and pass |
+| AC#7 (committed in scope, see plan.md Story 1.1.3) — `CATALOG` descriptions for `long-function`/`deep-nesting` name the refactoring, matching the `flag-argument`/`unreachable-code` style | N/A — no dedicated test; `CATALOG` is `#[allow(dead_code)]` self-documentation, not machine-read (per plan.md's Pattern Decisions table) | N/A | N/A | Verified by reading `CATALOG[0].description` / `CATALOG[1].description` (`src/rules.rs:38`, `:44`) against the pattern at `:56`/`:62` — a compile-time string literal, not exercised by any runtime path |
 
 ## UX Acceptance Tests
-N/A — no user-facing surface (CLI/library finding-message change).
+N/A — no user-facing UI surface. This change edits two `Finding.message` string literals and
+(optionally) two `RuleMeta.description` string literals consumed as CLI/JSON output text; there
+is no `design/ux.md` for this project and none is needed at this scope.
 
 ## Test Stack
-- **Unit**: cargo test (Rust built-in test framework)
-- **Integration**: N/A
-- **E2E / UX**: N/A
+- **Unit**: cargo test's built-in `#[test]` + `assert!`/`assert_eq!`, matching src/rules.rs's existing `mod tests` convention. New tests follow the existing snake_case naming style seen in `flags_long_function`, `flags_deep_nesting`, `allows_shallow_nesting` — no camelCase-derived `methodName_should_X_When_Y` scheme is used, since it doesn't match this codebase's convention.
+- **Integration**: N/A — no data store, no internal service call. The one external call (catalog URL liveness) is verified manually with `curl -sI`, not via an automated integration test (see AC#3 row and `research/build-vs-buy.md` §2 for why: this repo deliberately excludes `http(s)://` targets from its own `markdown-link-integrity` check to avoid flaky, network-dependent CI).
+- **E2E / UX**: N/A — no user-facing UI surface.
 
 ## Coverage Targets and How to Measure
+
 | Stack | Coverage command | Target |
 |---|---|---|
-| Rust | `cargo test rules::` | All existing + 2 new assertions pass |
-
-- All public service methods: N/A for this change
-- All external integrations: the two refactoring.com URLs — verified via manual `curl -sI` per AC #3, not an automated test (network dependency in CI is undesirable for a static-content link check)
-- UX acceptance criteria: N/A
+| Rust | `cargo test rules::` | All 29 existing + 2 new = 31 tests in `rules::tests` pass |
+| Rust (full gate, per plan.md Task 1.2.1a) | `cargo test && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` | All three exit 0 |
+| External URLs (manual, not `cargo test`) | `curl -sI <url>` for both catalog URLs, re-run immediately before shipping | Both status lines are `HTTP/1.1 2xx` |
