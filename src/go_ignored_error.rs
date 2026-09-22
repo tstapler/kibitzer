@@ -72,22 +72,6 @@ fn resolve_module(file: &Path) -> Option<ResolvedModule> {
     Some(ResolvedModule { root, path })
 }
 
-/// Returns the RHS `call_expression` when a `short_var_declaration`'s `right`
-/// expression list is a single call. By Go convention the "last value is the
-/// error" heuristic only makes sense for a multi-value function/method call — a
-/// comma-ok type assertion (`v[1].(string)`) or map index (`m[k]`) produces the
-/// same two-identifier LHS shape but its trailing value is a plain bool, not an
-/// error, so those RHS node kinds must not be flagged.
-fn rhs_call_expression(node: Node) -> Option<Node> {
-    let right = node.child_by_field_name("right")?;
-    let mut cursor = right.walk();
-    let mut exprs = right.named_children(&mut cursor);
-    match (exprs.next(), exprs.next()) {
-        (Some(only), None) if only.kind() == "call_expression" => Some(only),
-        _ => None,
-    }
-}
-
 /// When `call`'s callee is `pkg_alias.func_name` (a package-qualified free function,
 /// not a method call on a local variable), attempts to resolve it to a real
 /// declaration under `module` and reports whether the discard is safe to suppress
@@ -133,7 +117,7 @@ fn walk(
     findings: &mut Vec<Finding>,
 ) {
     if node.kind() == "short_var_declaration"
-        && let Some(call) = rhs_call_expression(node)
+        && let Some(call) = go_call_resolution::single_rhs_call_expression(node)
         && let Some(left) = node.child_by_field_name("left")
     {
         let mut cursor = left.walk();
