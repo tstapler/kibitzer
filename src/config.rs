@@ -611,11 +611,6 @@ fn core_checks() -> Vec<Check> {
         ),
         native_check("missing-paragraph-break", Severity::Advisory, &["**/*.md"]),
         native_check("primitive-obsession", Severity::Advisory, &["**/*.go"]),
-        native_check(
-            "go-bulk-fetch-linear-scan",
-            Severity::Advisory,
-            &["**/*.go"],
-        ),
         native_check("file-complexity", Severity::Advisory, &["**/*.go"]),
         native_check(
             "duplicate-code",
@@ -656,6 +651,11 @@ fn go_exception_checks() -> Vec<Check> {
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
         native_check("go-type-switch-density", Severity::Advisory, &["**/*.go"]),
+        native_check(
+            "go-bulk-fetch-linear-scan",
+            Severity::Advisory,
+            &["**/*.go"],
+        ),
     ]
 }
 

@@ -7,11 +7,8 @@ use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::go_call_resolution;
 
 /// Name prefixes conventionally used for a bulk-fetch-everything call (`ListAllX`,
-/// `GetAllFoo`, `FindAllBar`) — see issue #30 for the profiled real-world hotspot this
-/// checker was written against: a `FindInstanceDataByID`
-/// helper called `ListInstanceData()` (a full ORM scan) once per session inside a
-/// reconciliation loop, then linear-scanned the result for one ID match, instead of an
-/// indexed `WHERE` query — ~25% of the process's live CPU in a pprof profile.
+/// `GetAllFoo`, `FindAllBar`) — flags the "fetch everything, then find one row" shape
+/// from issue #30's profiled hotspot.
 const BULK_FETCH_PREFIXES: &[&str] = &["List", "GetAll", "FindAll"];
 
 /// Flags a Go function that bulk-fetches a collection (`List*`/`GetAll*`/`FindAll*`)
@@ -78,21 +75,68 @@ fn check_function<'a>(func: Node<'a>, src: &'a [u8], findings: &mut Vec<Finding>
     if bulk_vars.is_empty() {
         return;
     }
+    if let Some(finding) = scan_for_lookup(body, src, &bulk_vars, &param_names, None) {
+        // One finding per function, not per matching loop: a second offending loop in
+        // the same function is real but redundant noise — the first is enough to send
+        // someone to look at the function.
+        findings.push(finding);
+    }
+}
 
-    let mut reported = false;
-    crate::tree_walk::walk_preorder(body, &mut |n| {
-        if reported {
-            return false;
+/// The innermost enclosing bulk-fetch range loop a node is scanned under, if any: the
+/// `for_statement` itself (for the finding's line) plus its ranged/item variable names.
+type LoopContext<'a> = (Node<'a>, &'a str, &'a str);
+
+/// Recursively scans `node` for the first `for`-loop that ranges over a known
+/// bulk-fetch var and whose body contains a matching lookup `if`, returning on the
+/// first hit in the same document order the old preorder-walk design used. A single
+/// pass carrying `active` (the innermost enclosing bulk-fetch loop, if any) down through
+/// the recursion — rather than, for each `for_statement` found, independently re-walking
+/// that loop's whole body subtree — avoids the O(depth²) revisiting a chain of `k`
+/// directly-nested bulk-fetch loops would otherwise cause (each of the `k` nested
+/// bodies getting fully walked once for itself and again as part of every enclosing
+/// loop's own body walk).
+fn scan_for_lookup<'a>(
+    node: Node<'a>,
+    src: &'a [u8],
+    bulk_vars: &[&str],
+    param_names: &[&str],
+    active: Option<LoopContext<'a>>,
+) -> Option<Finding> {
+    if node.kind() == "for_statement"
+        && let Some((ranged_name, item_name)) = range_over_bulk_var(node, src, bulk_vars)
+    {
+        let loop_body = node.child_by_field_name("body")?;
+        return scan_for_lookup(
+            loop_body,
+            src,
+            bulk_vars,
+            param_names,
+            Some((node, ranged_name, item_name)),
+        );
+    }
+
+    if node.kind() == "if_statement"
+        && let Some((for_stmt, ranged_name, item_name)) = active
+        && matches_lookup_pattern(node, src, item_name, param_names)
+    {
+        return Some(Finding {
+            line: for_stmt.start_position().row + 1,
+            message: format!(
+                "ranges over `{ranged_name}` (bound from a bulk List/GetAll/FindAll fetch) \
+                 and returns on the first element matching a parameter — an indexed/keyed \
+                 lookup usually replaces fetching everything to find one row"
+            ),
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(finding) = scan_for_lookup(child, src, bulk_vars, param_names, active) {
+            return Some(finding);
         }
-        if n.kind() == "for_statement"
-            && let Some(finding) = check_for_statement(n, src, &bulk_vars, &param_names)
-        {
-            findings.push(finding);
-            reported = true;
-            return false;
-        }
-        true
-    });
+    }
+    None
 }
 
 /// Non-blank parameter names declared on `params` (a function/method's own
@@ -170,30 +214,6 @@ fn is_bulk_fetch_name(name: &str) -> bool {
     })
 }
 
-/// If `for_stmt` ranges over one of `bulk_vars` and its body contains an
-/// `item.Field == param`-shaped (order-insensitive) equality check inside an `if` that
-/// returns, builds the finding for it.
-fn check_for_statement(
-    for_stmt: Node,
-    src: &[u8],
-    bulk_vars: &[&str],
-    param_names: &[&str],
-) -> Option<Finding> {
-    let (ranged_name, item_name) = range_over_bulk_var(for_stmt, src, bulk_vars)?;
-    let loop_body = for_stmt.child_by_field_name("body")?;
-    if !loop_body_has_lookup_match(loop_body, src, item_name, param_names) {
-        return None;
-    }
-    Some(Finding {
-        line: for_stmt.start_position().row + 1,
-        message: format!(
-            "ranges over `{ranged_name}` (bound from a bulk List/GetAll/FindAll fetch) and \
-             returns on the first element matching a parameter — an indexed/keyed lookup \
-             usually replaces fetching everything to find one row"
-        ),
-    })
-}
-
 /// When `for_stmt` is `for _, <item> := range <ranged>` and `<ranged>` is one of
 /// `bulk_vars`, returns `(ranged, item)` — `None` for any other for-loop shape (a plain
 /// C-style loop, or a range over something other than a known bulk-fetch var).
@@ -228,28 +248,10 @@ fn range_over_bulk_var<'a>(
     Some((ranged_name, item_name))
 }
 
-/// True when `loop_body` contains an `if item.Field == param { return ... }`-shaped
-/// (order-insensitive) match anywhere inside it.
-fn loop_body_has_lookup_match(
-    loop_body: Node,
-    src: &[u8],
-    item_name: &str,
-    param_names: &[&str],
-) -> bool {
-    let mut found = false;
-    crate::tree_walk::walk_preorder(loop_body, &mut |n| {
-        if found {
-            return false;
-        }
-        if n.kind() == "if_statement" && matches_lookup_pattern(n, src, item_name, param_names) {
-            found = true;
-            return false;
-        }
-        true
-    });
-    found
-}
-
+/// True for an `if item.Field == param { return ... }`-shaped (order-insensitive)
+/// match, checked directly against `if_stmt` itself — `scan_for_lookup`'s own recursive
+/// descent is what finds every `if_statement` in a bulk-fetch loop's body, so this only
+/// needs to judge one at a time, not search a subtree itself.
 fn matches_lookup_pattern(
     if_stmt: Node,
     src: &[u8],
@@ -319,192 +321,5 @@ fn is_param_ref(n: Node, src: &[u8], param_names: &[&str]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flags_the_profiled_stapler_squad_shape() {
-        // The exact shape from issue #30: bulk List* fetch, range, compare an element
-        // field against a parameter, return on match.
-        let findings = check_source(
-            "package main\n\
-             func (s *Store) FindInstanceDataByID(id string) (*Data, error) {\n\
-             \tall, err := s.ListInstanceData()\n\
-             \tif err != nil {\n\
-             \t\treturn nil, err\n\
-             \t}\n\
-             \tfor _, item := range all {\n\
-             \t\tif item.ID == id {\n\
-             \t\t\treturn &item, nil\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("`all`"));
-    }
-
-    #[test]
-    fn flags_comparison_order_swapped() {
-        let findings = check_source(
-            "package main\n\
-             func FindX(id string) (*T, error) {\n\
-             \tall, err := ListAllX()\n\
-             \tif err != nil { return nil, err }\n\
-             \tfor _, item := range all {\n\
-             \t\tif id == item.ID {\n\
-             \t\t\treturn &item, nil\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert_eq!(findings.len(), 1);
-    }
-
-    #[test]
-    fn flags_get_all_and_find_all_prefixes() {
-        for prefix in ["GetAllFoo", "FindAllBar"] {
-            let findings = check_source(&format!(
-                "package main\n\
-                 func FindX(id string) (*T, error) {{\n\
-                 \tall, err := {prefix}()\n\
-                 \tif err != nil {{ return nil, err }}\n\
-                 \tfor _, item := range all {{\n\
-                 \t\tif item.ID == id {{\n\
-                 \t\t\treturn &item, nil\n\
-                 \t\t}}\n\
-                 \t}}\n\
-                 \treturn nil, ErrNotFound\n\
-                 }}\n"
-            ))
-            .unwrap();
-            assert_eq!(findings.len(), 1, "prefix {prefix} should flag");
-        }
-    }
-
-    #[test]
-    fn ignores_non_bulk_fetch_name() {
-        // "Listener" starts with "List" but the next char isn't uppercase-boundary —
-        // and more importantly this isn't a List/GetAll/FindAll-shaped name at all.
-        let findings = check_source(
-            "package main\n\
-             func FindX(id string) (*T, error) {\n\
-             \tall, err := loadCandidates()\n\
-             \tif err != nil { return nil, err }\n\
-             \tfor _, item := range all {\n\
-             \t\tif item.ID == id {\n\
-             \t\t\treturn &item, nil\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn ignores_comparison_against_non_parameter() {
-        // Compares against a local, not one of the function's own parameters — not
-        // the single-key lookup shape this check targets.
-        let findings = check_source(
-            "package main\n\
-             func FindX(id string) (*T, error) {\n\
-             \tall, err := ListAllX()\n\
-             \tif err != nil { return nil, err }\n\
-             \twant := \"fixed\"\n\
-             \tfor _, item := range all {\n\
-             \t\tif item.ID == want {\n\
-             \t\t\treturn &item, nil\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn ignores_loop_with_no_early_return() {
-        // A range that accumulates/aggregates over every element (no per-match early
-        // return) isn't the "find one row" shape this check targets.
-        let findings = check_source(
-            "package main\n\
-             func SumX(id string) int {\n\
-             \tall, _ := ListAllX()\n\
-             \ttotal := 0\n\
-             \tfor _, item := range all {\n\
-             \t\tif item.ID == id {\n\
-             \t\t\ttotal += item.Amount\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn total\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn ignores_inequality_comparison() {
-        let findings = check_source(
-            "package main\n\
-             func FindX(id string) (*T, error) {\n\
-             \tall, err := ListAllX()\n\
-             \tif err != nil { return nil, err }\n\
-             \tfor _, item := range all {\n\
-             \t\tif item.ID != id {\n\
-             \t\t\tcontinue\n\
-             \t\t}\n\
-             \t\treturn &item, nil\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn ignores_range_over_unrelated_slice() {
-        let findings = check_source(
-            "package main\n\
-             func FindX(id string, others []T) (*T, error) {\n\
-             \t_, err := ListAllX()\n\
-             \tif err != nil { return nil, err }\n\
-             \tfor _, item := range others {\n\
-             \t\tif item.ID == id {\n\
-             \t\t\treturn &item, nil\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn ignores_function_with_no_parameters() {
-        let findings = check_source(
-            "package main\n\
-             func FindDefault() (*T, error) {\n\
-             \tall, err := ListAllX()\n\
-             \tif err != nil { return nil, err }\n\
-             \tfor _, item := range all {\n\
-             \t\tif item.ID == \"default\" {\n\
-             \t\t\treturn &item, nil\n\
-             \t\t}\n\
-             \t}\n\
-             \treturn nil, ErrNotFound\n\
-             }\n",
-        )
-        .unwrap();
-        assert!(findings.is_empty());
-    }
-}
+#[path = "go_bulk_fetch_linear_scan_tests.rs"]
+mod tests;
