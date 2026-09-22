@@ -17,19 +17,20 @@ const LITERAL_KINDS: &[&str] = &[
     "rune_literal",
     "interpreted_string_literal",
     "raw_string_literal",
+    "true",
+    "false",
+    "nil",
 ];
 
 /// Minimum normalized-token count a test body must reach to be considered. A near-empty
 /// body (`t.Skip()`) repeated verbatim is boilerplate, not a table-driven-test signal.
 const MIN_NORMALIZED_TOKENS: usize = 8;
 
-/// Flags 3+ `func TestXxx(t *testing.T)` functions in the same file whose bodies are
-/// identical once literal values are normalized away — the classic copy-pasted
-/// table-driven-test candidate (see the Go Wiki
-/// <https://go.dev/wiki/TableDrivenTests>). Comparing whole normalized bodies, not
-/// `duplicate-code`'s line-window overlap, is what keeps this from flagging tests that
-/// only coincidentally share a setup prefix (e.g. `t.Run` subtest boilerplate) but
-/// diverge afterward — those normalize to different strings and never group together.
+/// Flags 3+ `func TestXxx(t *testing.T)` functions whose bodies are identical once
+/// literal values are normalized away — a copy-pasted table-driven-test candidate (see
+/// the [Go Wiki](https://go.dev/wiki/TableDrivenTests)). Comparing whole normalized
+/// bodies, not `duplicate-code`'s line-window overlap, is what keeps this from flagging
+/// tests that share a setup prefix but diverge afterward.
 pub struct TableDrivenTestChecker;
 
 impl Checker for TableDrivenTestChecker {
@@ -51,6 +52,14 @@ impl Checker for TableDrivenTestChecker {
     }
 
     fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        // Generated test scaffolding (protobuf conformance suites, codegen'd table
+        // tests) mechanically repeats near-identical TestXxx functions; "consolidate
+        // into a table" isn't actionable on code nobody hand-edits — the same rationale
+        // duplicate_code.rs's is_generated guard was added for (see
+        // docs/duplicate-code-false-positives.md's 2026-09-12 entry).
+        if crate::file_size::is_generated(ctx.source) {
+            return Ok(Vec::new());
+        }
         let tree = ctx
             .tree
             .context("go-table-driven-test-candidate checker requires a parsed tree")?;
@@ -123,12 +132,14 @@ fn test_function_signature<'a>(decl: Node<'a>, src: &'a [u8]) -> Option<(&'a str
     ))
 }
 
-/// Go's `go test` convention: `Test` followed immediately by an uppercase letter (or
-/// nothing) — the same "prefix + capitalized rest" shape
-/// `go_bulk_fetch_linear_scan.rs`'s `is_bulk_fetch_name` uses for its own name-prefix
-/// check.
+/// `go test`'s own `isTest` rule (`cmd/go/internal/load/test.go`): `Test` followed by
+/// nothing, or by a rune that isn't a lowercase letter — so `Test`, `Test2`, and
+/// `Test_Foo` all count, but `Testable` doesn't. Matching on "not lowercase" rather than
+/// "is uppercase" is what makes `Test2`/`Test_Foo` count; an ASCII-uppercase-only check
+/// (this function's first cut) missed both and under-counted real test functions.
 fn is_go_test_name(name: &str) -> bool {
-    name == "Test" || (name.starts_with("Test") && name.as_bytes()[4].is_ascii_uppercase())
+    name.strip_prefix("Test")
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_lowercase()))
 }
 
 /// True if `params` (a function's own `parameter_list`) declares exactly one parameter,
@@ -164,20 +175,17 @@ fn is_testing_t_pointer(ty: Node, src: &[u8]) -> bool {
 }
 
 /// Leaf tokens of `body` in document order, with each literal-value node (see
-/// [`LITERAL_KINDS`]) collapsed to a single placeholder token and comments dropped —
-/// identifiers, keywords, and operators are kept verbatim, so two bodies normalize
-/// equal only when they call the same things in the same shape and differ solely in
-/// literal values.
-///
-/// A literal node stops the walk from descending into it (e.g. an
-/// `interpreted_string_literal` wraps its quotes and an `interpreted_string_literal_content`
-/// child rather than being a leaf itself) — otherwise its content would be emitted as an
-/// ordinary token instead of collapsed away.
+/// [`LITERAL_KINDS`]) collapsed to one placeholder token and comments dropped —
+/// identifiers/keywords/operators are kept verbatim, so two bodies normalize equal only
+/// when they differ solely in literal values.
 fn normalize_body_tokens<'a>(body: Node<'a>, src: &'a [u8]) -> Vec<&'a str> {
     let mut tokens = Vec::new();
     crate::tree_walk::walk_preorder(body, &mut |n| {
         if LITERAL_KINDS.contains(&n.kind()) {
             tokens.push("<lit>");
+            // A literal node isn't a leaf (e.g. `interpreted_string_literal` wraps its
+            // quotes and content), so don't descend into it — that content would
+            // otherwise be emitted as an ordinary token instead of collapsed away.
             return false;
         }
         if n.kind() != "comment"
@@ -308,6 +316,102 @@ mod tests {
                     \t})\n\
                     }\n";
         assert!(check_source(src).is_empty());
+    }
+
+    #[test]
+    fn recognizes_test_names_go_itself_would_run() {
+        // go test's own isTest rule: Test followed by nothing, or by any rune that
+        // isn't a lowercase letter — Test2/Test_Foo count, Testable doesn't.
+        assert!(is_go_test_name("Test"));
+        assert!(is_go_test_name("Test2"));
+        assert!(is_go_test_name("Test_Foo"));
+        assert!(is_go_test_name("TestFoo"));
+        assert!(!is_go_test_name("Testable"));
+        assert!(!is_go_test_name("doWork"));
+    }
+
+    #[test]
+    fn flags_tests_named_with_a_digit_or_underscore_suffix() {
+        // Regression for the ASCII-uppercase-only bug: Test2/Test3 are valid go test
+        // names go itself would run, but the original is_go_test_name missed them.
+        let src = format!(
+            "package main\n\n{}\n{}\n{}",
+            test_fn("Test2", "a", "A"),
+            test_fn("Test_Foo", "b", "B"),
+            test_fn("Test3", "c", "C"),
+        );
+        assert_eq!(check_source(&src).len(), 1);
+    }
+
+    #[test]
+    fn ignores_comment_text_differences_when_grouping() {
+        let comment_variant = |name: &str, comment: &str, arg: &str, want: &str| {
+            format!(
+                "func {name}(t *testing.T) {{\n\
+                 \t// {comment}\n\
+                 \tresult := doSomething(\"{arg}\")\n\
+                 \tif result != \"{want}\" {{\n\
+                 \t\tt.Fatalf(\"got %q, want %q\", result, \"{want}\")\n\
+                 \t}}\n\
+                 }}\n"
+            )
+        };
+        let src = format!(
+            "package main\n\n{}\n{}\n{}",
+            comment_variant("TestFoo", "case a", "a", "A"),
+            comment_variant("TestBar", "a totally different comment", "b", "B"),
+            comment_variant("TestBaz", "yet another one", "c", "C"),
+        );
+        assert_eq!(check_source(&src).len(), 1);
+    }
+
+    #[test]
+    fn flags_tests_differing_only_in_a_boolean_literal() {
+        // Regression: true/false weren't in LITERAL_KINDS, so a group differing only by
+        // a bool argument split instead of matching.
+        let bool_variant = |name: &str, arg: &str| {
+            format!(
+                "func {name}(t *testing.T) {{\n\
+                 \tresult := isValid({arg})\n\
+                 \tif !result {{\n\
+                 \t\tt.Fatalf(\"isValid(%v) = false\", {arg})\n\
+                 \t}}\n\
+                 }}\n"
+            )
+        };
+        let src = format!(
+            "package main\n\n{}\n{}\n{}",
+            bool_variant("TestFoo", "true"),
+            bool_variant("TestBar", "false"),
+            bool_variant("TestBaz", "true"),
+        );
+        assert_eq!(check_source(&src).len(), 1);
+    }
+
+    #[test]
+    fn does_not_flag_a_generated_file() {
+        let src = format!(
+            "// Code generated by mockgen. DO NOT EDIT.\npackage main\n\n{}\n{}\n{}",
+            test_fn("TestFoo", "a", "A"),
+            test_fn("TestBar", "b", "B"),
+            test_fn("TestBaz", "c", "C"),
+        );
+        assert!(check_source(&src).is_empty());
+    }
+
+    #[test]
+    fn does_not_group_testmain_with_testing_t_functions() {
+        // *testing.M is a plausible near-miss for the *testing.T match — TestMain must
+        // stay excluded even when its body shape would otherwise line up.
+        let src = format!(
+            "package main\n\nfunc TestMain(m *testing.M) {{\n\tresult := doSomething(\"z\")\n\tif result != \"Z\" {{\n\t\tpanic(result)\n\t}}\n}}\n\n{}\n{}\n{}",
+            test_fn("TestFoo", "a", "A"),
+            test_fn("TestBar", "b", "B"),
+            test_fn("TestBaz", "c", "C"),
+        );
+        let findings = check_source(&src);
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].message.contains("TestMain"));
     }
 
     #[test]

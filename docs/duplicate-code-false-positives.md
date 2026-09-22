@@ -53,3 +53,8 @@ times, which is itself a signal a shared test helper is missing rather than a fa
 `## Log` entry since these are correct according to the check's stated purpose — flagging here only so the
 mechanism (generated-code scope) isn't confused with this separate, unresolved policy question (whether test
 files should be excluded or literal-abstraction added).
+
+`go-table-driven-test-candidate` (`src/go_table_driven_test.rs`, issue #31) targets the same underlying pattern
+at whole-function granularity instead of `duplicate-code`'s 6-line window, and both can fire on the same group of
+`TestXxx` functions — one advisory per checker for one root cause. This wasn't resolved when that checker landed;
+still open whether `duplicate-code` should stop scanning `_test.go` now that a dedicated checker exists.
