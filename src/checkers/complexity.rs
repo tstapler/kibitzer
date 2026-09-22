@@ -47,7 +47,7 @@ impl Checker for FileComplexityChecker {
     }
 
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        if crate::file_size::is_generated(ctx.source) {
+        if crate::checkers::file_size::is_generated(ctx.source) {
             return Ok(Vec::new());
         }
         let tree = ctx
@@ -101,7 +101,7 @@ fn aggregate_findings(complex: &[(usize, usize)]) -> Vec<Finding> {
 /// functions), and always [`SubtestHandling::IncludeAll`] — hotspot ranking doesn't need
 /// `_test.go`'s subtest carve-out's extra precision.
 pub(crate) fn total_complexity(root: Node, source: &[u8]) -> usize {
-    let function_kinds = crate::rules::lang_config(Language::Go).function_kinds;
+    let function_kinds = crate::checkers::rules::lang_config(Language::Go).function_kinds;
     let mut total = 0;
     collect_total_complexity(root, function_kinds, source, &mut total);
     total
@@ -125,7 +125,7 @@ fn complex_functions(root: Node, source: &[u8], is_test_file: bool) -> Vec<(usiz
     // Reuses `rules.rs`'s already-verified Go `function_kinds` table instead of an
     // independently-declared literal of the same two strings, so the two can't
     // silently drift apart if Go's grammar node names are ever revisited there.
-    let function_kinds = crate::rules::lang_config(Language::Go).function_kinds;
+    let function_kinds = crate::checkers::rules::lang_config(Language::Go).function_kinds;
     let mut out = Vec::new();
     collect_complex_functions(root, function_kinds, source, is_test_file, &mut out);
     out

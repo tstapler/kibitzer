@@ -20,7 +20,7 @@ use tree_sitter::{Node, Tree};
 use crate::arch_model::{ArchModel, PackageNode, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker, methods_by_type};
 use crate::checker::{GrammarCache, Language};
-use crate::complexity::{SubtestHandling, cyclomatic_complexity};
+use crate::checkers::complexity::{SubtestHandling, cyclomatic_complexity};
 use crate::config::ArchitectureConfig;
 
 /// PMD's default God Class thresholds (PMD's `GodClassRule`: `WMC > 47`, `ATFD > 5`,
@@ -44,7 +44,7 @@ const GOD_CLASS_MIN_METHODS: usize = 4;
 /// alone (see this module's doc comment):
 ///
 /// - **WMC** (Weighted Method Count): sum of each method's McCabe cyclomatic complexity
-///   ([`crate::complexity::cyclomatic_complexity`], reused rather than reimplemented).
+///   ([`crate::checkers::complexity::cyclomatic_complexity`], reused rather than reimplemented).
 ///   Requires re-parsing each method's source file — `ArchModel` doesn't retain a parsed
 ///   `Tree` or per-method complexity, only declarations (same "no other source for this
 ///   data" tradeoff `PackageSizeChecker` already makes reading file contents directly).

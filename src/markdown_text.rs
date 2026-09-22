@@ -5,6 +5,8 @@
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
+use crate::checker::Finding;
+
 pub fn line_start_offsets(src: &str) -> Vec<usize> {
     let mut starts = vec![0];
     starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
@@ -116,6 +118,26 @@ pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
             _ => {}
         }
     }
+}
+
+/// Runs `check_paragraph` over every flowing-prose paragraph in `body` (via
+/// [`for_each_paragraph`]) and collects whatever findings it returns. Every native prose
+/// checker in this crate (`repetitive_sentences`, `paragraph_breaks`,
+/// `ai_vocabulary_density`, `filler_phrase_density`, `formulaic_ai_openers`,
+/// `sentence_length_uniformity`, `em_dash_overuse`) had converged on this exact
+/// `check_source` wrapper independently — kibitzer's own `duplicate-code-cross-file`
+/// checker flagged the repetition, so it's a shared helper instead of a seventh copy.
+pub fn check_paragraphs(
+    body: &str,
+    mut check_paragraph: impl FnMut(usize, &str) -> Option<Finding>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for_each_paragraph(body, |p| {
+        if let Some(finding) = check_paragraph(p.line, &p.text) {
+            findings.push(finding);
+        }
+    });
+    findings
 }
 
 #[cfg(test)]

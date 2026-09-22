@@ -595,7 +595,32 @@ pub fn default_checks() -> Vec<Check> {
         .chain(file_size_checks())
         .chain(syntax_rules_checks())
         .chain(comment_quality_checks())
+        .chain(prose_checks())
         .collect()
+}
+
+/// Mechanical markdown-prose checks. `ai-vocabulary-density`, `filler-phrase-density`,
+/// `formulaic-ai-openers`, `sentence-length-uniformity`, and `em-dash-overuse` are
+/// registered (via `inventory::submit!` in their own modules, so `kibitzer check native
+/// <name>`/an explicit `.claude/inspect.json` entry can still reach them) but deliberately
+/// NOT included here: each carries a real risk of flagging legitimate domain/technical
+/// writing, so they're opt-in per repo rather than on by default.
+///
+/// `sentence-length-uniformity` was originally wired in here as purely structural (word
+/// counts only, no word lists) — backtesting against kubernetes/website found it flagging
+/// a deliberately parallel enumeration ("Signers must not... Signers should... Signers
+/// should...") with "vary sentence length," which would have actively broken the
+/// intentional parallelism. Moved to opt-in alongside the others once that counter-example
+/// showed the false-positive risk wasn't actually lower than the word-list-based checks.
+fn prose_checks() -> Vec<Check> {
+    vec![
+        native_check(
+            "repetitive-sentence-structure",
+            Severity::Advisory,
+            &["**/*.md"],
+        ),
+        native_check("missing-paragraph-break", Severity::Advisory, &["**/*.md"]),
+    ]
 }
 
 fn core_checks() -> Vec<Check> {
@@ -604,12 +629,6 @@ fn core_checks() -> Vec<Check> {
             message: Some("broken markdown link/anchor".to_string()),
             ..native_check("markdown-link-integrity", Severity::Blocking, &["**/*.md"])
         },
-        native_check(
-            "repetitive-sentence-structure",
-            Severity::Advisory,
-            &["**/*.md"],
-        ),
-        native_check("missing-paragraph-break", Severity::Advisory, &["**/*.md"]),
         native_check("primitive-obsession", Severity::Advisory, &["**/*.go"]),
         native_check("file-complexity", Severity::Advisory, &["**/*.go"]),
         native_check(

@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::markdown_text::{for_each_paragraph, split_sentences};
+use crate::markdown_text::split_sentences;
 
 /// A sentence starting with one of these (case-insensitive) reads as a topic shift —
 /// Purdue OWL's "On Paragraphs" guidance (start a new paragraph on a topic shift or when
@@ -60,13 +60,7 @@ inventory::submit! {
 }
 
 pub fn check_source(body: &str) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    for_each_paragraph(body, |p| {
-        if let Some(finding) = check_paragraph(p.line, &p.text) {
-            findings.push(finding);
-        }
-    });
-    findings
+    crate::markdown_text::check_paragraphs(body, check_paragraph)
 }
 
 fn check_paragraph(line: usize, text: &str) -> Option<Finding> {

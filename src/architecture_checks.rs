@@ -225,7 +225,7 @@ impl ArchitectureChecker for CouplingChecker {
 }
 
 /// Aggregate Go line count per package beyond which `package-size` suggests splitting it
-/// into sub-packages — set at roughly 4x [`crate::file_size`]'s single-file threshold,
+/// into sub-packages — set at roughly 4x [`crate::checkers::file_size`]'s single-file threshold,
 /// since a package this large is usually several oversized files, not just one.
 const MAX_PACKAGE_LINES: usize = 2000;
 
@@ -242,7 +242,7 @@ impl ArchitectureChecker for PackageSizeChecker {
     /// Unlike those other checkers, this one reads file contents directly: `ImportGraph`
     /// deliberately doesn't carry line counts (kept lean, per its own doc comment), so
     /// there's no other source for this data. Generated files (per
-    /// [`crate::file_size::is_generated`]) are excluded from the sum for the same
+    /// [`crate::checkers::file_size::is_generated`]) are excluded from the sum for the same
     /// reason `go-file-size` skips them outright — machine output isn't a candidate for
     /// a human to split.
     fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
@@ -254,7 +254,7 @@ impl ArchitectureChecker for PackageSizeChecker {
             let Ok(source) = std::fs::read_to_string(file) else {
                 continue;
             };
-            if crate::file_size::is_generated(&source) {
+            if crate::checkers::file_size::is_generated(&source) {
                 continue;
             }
             *totals.entry(pkg.as_str()).or_default() += source.lines().count();

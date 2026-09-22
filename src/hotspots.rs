@@ -108,7 +108,7 @@ fn score_file(toplevel: &Path, scope: &Path, file: String, revs: u32) -> Option<
         return None;
     }
     let source = std::fs::read_to_string(&full_path).ok()?;
-    if crate::file_size::is_generated(&source) {
+    if crate::checkers::file_size::is_generated(&source) {
         return None;
     }
     // A fresh `GrammarCache` per file: its cache key is `Language` alone, so reusing one
@@ -116,7 +116,8 @@ fn score_file(toplevel: &Path, scope: &Path, file: String, revs: u32) -> Option<
     // file's parse tree (see `GrammarCache::parse`'s doc comment).
     let grammar = GrammarCache::new();
     let tree = grammar.parse(Language::Go, &source).ok()?;
-    let complexity = crate::complexity::total_complexity(tree.root_node(), source.as_bytes());
+    let complexity =
+        crate::checkers::complexity::total_complexity(tree.root_node(), source.as_bytes());
     if complexity == 0 {
         return None;
     }

@@ -5,7 +5,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::markdown_text::{for_each_paragraph, split_sentences};
+use crate::markdown_text::split_sentences;
 
 /// Sentence-opener words common enough that three in a row reads as monotonous
 /// (JMU Writing Center / Purdue OWL "sentence variety" guidance). Anything else is
@@ -53,13 +53,7 @@ inventory::submit! {
 }
 
 pub fn check_source(body: &str) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    for_each_paragraph(body, |p| {
-        if let Some(finding) = check_paragraph(p.line, &p.text) {
-            findings.push(finding);
-        }
-    });
-    findings
+    crate::markdown_text::check_paragraphs(body, check_paragraph)
 }
 
 /// One paragraph's worth of flattened text, checked for a 3+ run of sentences sharing

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::file_size::is_generated;
+use crate::checkers::file_size::is_generated;
 
 /// Minimum number of consecutive lines a duplicated block must span before flagging —
 /// short repeats (a closing brace, a single `return nil`) are normal, not copy-paste.
