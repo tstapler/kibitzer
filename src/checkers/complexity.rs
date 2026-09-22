@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::GoKind;
 
 /// A function/method whose cyclomatic complexity exceeds this counts toward
 /// `file-complexity`'s per-file aggregate. McCabe's original paper treats 10 as the
@@ -108,6 +109,8 @@ pub(crate) fn total_complexity(root: Node, source: &[u8]) -> usize {
 }
 
 fn collect_total_complexity(node: Node, function_kinds: &[&str], source: &[u8], total: &mut usize) {
+    // SEAM(typed-node-kind-migration): `function_kinds` is `rules.rs::lang_config`'s
+    // seamed `&'static [&'static str]` field (ADR-001) — left raw, not a gap.
     if function_kinds.contains(&node.kind()) {
         *total += cyclomatic_complexity(node, source, SubtestHandling::IncludeAll);
     }
@@ -138,6 +141,8 @@ fn collect_complex_functions(
     is_test_file: bool,
     out: &mut Vec<(usize, usize)>,
 ) {
+    // SEAM(typed-node-kind-migration): `function_kinds` is `rules.rs::lang_config`'s
+    // seamed `&'static [&'static str]` field (ADR-001) — left raw, not a gap.
     if function_kinds.contains(&node.kind()) {
         let subtests = subtest_handling_for(is_test_file, node, source);
         let complexity = cyclomatic_complexity(node, source, subtests);
@@ -203,15 +208,18 @@ pub(crate) fn cyclomatic_complexity(decl: Node, source: &[u8], subtests: Subtest
 
 fn count_decision_points(node: Node, source: &[u8], subtests: SubtestHandling) -> usize {
     if subtests == SubtestHandling::ExcludeRunSubtests
-        && node.kind() == "func_literal"
+        && GoKind::of(node) == GoKind::FuncLiteral
         && is_run_subtest_closure(node, source)
     {
         return 0;
     }
-    let mut count = match node.kind() {
-        "if_statement" | "for_statement" | "expression_case" | "type_case"
-        | "communication_case" => 1,
-        "binary_expression" => usize::from(is_short_circuit(node)),
+    let mut count = match GoKind::of(node) {
+        GoKind::IfStatement
+        | GoKind::ForStatement
+        | GoKind::ExpressionCase
+        | GoKind::TypeCase
+        | GoKind::CommunicationCase => 1,
+        GoKind::BinaryExpression => usize::from(is_short_circuit(node)),
         _ => 0,
     };
     let mut cursor = node.walk();
@@ -224,6 +232,8 @@ fn count_decision_points(node: Node, source: &[u8], subtests: SubtestHandling) -
 fn is_short_circuit(binary_expression: Node) -> bool {
     binary_expression
         .child_by_field_name("operator")
+        // `&&`/`||` are anonymous tokens ("named": false in go.json) — no `GoKind`
+        // variant exists for them, so this stays a raw string comparison.
         .is_some_and(|op| matches!(op.kind(), "&&" | "||"))
 }
 
@@ -237,17 +247,17 @@ fn is_run_subtest_closure(func_literal: Node, source: &[u8]) -> bool {
     let Some(args) = func_literal.parent() else {
         return false;
     };
-    if args.kind() != "argument_list" {
+    if GoKind::of(args) != GoKind::ArgumentList {
         return false;
     }
     let Some(call) = args.parent() else {
         return false;
     };
-    if call.kind() != "call_expression" {
+    if GoKind::of(call) != GoKind::CallExpression {
         return false;
     }
     call.child_by_field_name("function")
-        .filter(|f| f.kind() == "selector_expression")
+        .filter(|f| GoKind::of(*f) == GoKind::SelectorExpression)
         .and_then(|f| f.child_by_field_name("field"))
         .and_then(|f| f.utf8_text(source).ok())
         == Some("Run")

@@ -1,5 +1,6 @@
 use super::*;
 use crate::checker::GrammarCache;
+use crate::node_kind::GoKind;
 
 fn check_source(src: &str) -> Vec<Finding> {
     check_source_at(Path::new("<source>"), src)
@@ -65,7 +66,7 @@ fn function_line(src: &str, name: &str) -> usize {
     tree.root_node()
         .children(&mut cursor)
         .find(|n| {
-            n.kind() == "function_declaration"
+            GoKind::of(*n) == GoKind::FunctionDeclaration
                 && n.child_by_field_name("name")
                     .and_then(|id| id.utf8_text(src.as_bytes()).ok())
                     == Some(name)
