@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::config::Severity;
+use crate::file_size;
 
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
@@ -16,6 +17,22 @@ const MAX_NESTING_DEPTH: usize = 4;
 /// A function/method parameter list naming more identifiers than this is flagged by
 /// `long-parameter-list`.
 const LONG_PARAM_LIST_COUNT: usize = 5;
+/// The repetition threshold for `replace-magic-literal`. Ships at 2 per AC2, gated by
+/// the mandatory corpus backtest (ADR-001): bumped to 3 in the same PR if the corpus
+/// triage shows the same table-driven-test overcorrection `duplicate-code` hit.
+const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 2;
+/// Near-universal literal values `replace-magic-literal` never flags regardless of
+/// repeat count, compared against a value already normalized by
+/// `normalize_literal_value` (delimiters/prefixes stripped) — so `""` here also matches
+/// Kotlin's `""""""`, Rust's `r""`, Go's empty backtick string, and Python's `r""`/`b""`/
+/// `f""` once normalized, not just a literal `""`/`''` in the raw source text.
+/// `-1`'s per-grammar shape (Task 1.1.1b probe, `to_sexp()`-verified): every one of the 8
+/// grammars here tokenizes a negative numeric literal as a `unary_expression`/
+/// `-`-prefixed wrapper around the positive literal, *not* as a single literal token —
+/// so `"-1"` is not itself ever an `occurrences` map key for these grammars; it's kept
+/// in the allow-list anyway as defense-in-depth for any future grammar/version where it
+/// might be.
+const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
 
 /// Metadata for one rule in the catalog. Thresholds above are fixed for now —
 /// per-rule configurability is a natural follow-up, not required for the initial
@@ -62,7 +79,45 @@ pub const CATALOG: &[RuleMeta] = &[
         description: "A statement follows an unconditional return/break/continue/panic in the same block — Fowler's Remove Dead Code.",
         default_severity: Severity::Advisory,
     },
+    RuleMeta {
+        id: "replace-magic-literal",
+        category: "duplication",
+        description: "A non-trivial numeric or string literal is repeated 2+ times in one file with no bound named constant — Fowler's Replace Magic Literal.",
+        default_severity: Severity::Advisory,
+    },
 ];
+
+/// A named-constant-style binding `binding_finder` found: a declaration whose direct
+/// initializer is a literal, named so `replace-magic-literal`'s exclusion logic can
+/// check whether that name is referenced elsewhere in the file. A named struct (not an
+/// anonymous `(String, Node)` tuple) so a positional mix-up between `name` and
+/// `initializer` is a compile error, not a silent bug.
+pub(crate) struct ConstBinding<'tree> {
+    pub(crate) name: String,
+    pub(crate) initializer: Node<'tree>,
+}
+
+/// One occurrence of a literal value found by `walk_literals`, carrying the literal
+/// node's own `node.kind()` alongside it so `emit_literal_findings` can label a finding
+/// "numeric" vs. "string" from the grammar's own node-kind name (via
+/// `LangRuleConfig::numeric_literal_kinds`) rather than re-deriving it from the raw
+/// text's first character — a quote-character heuristic mislabels Go/Rust raw strings
+/// (no leading `"`) and Python `r`/`b`/`f`-prefixed strings (leading `r`/`b`/`f`, not
+/// `"`).
+pub(crate) struct LiteralOccurrence<'tree> {
+    pub(crate) node: Node<'tree>,
+    pub(crate) kind: &'static str,
+}
+
+/// Accumulator for `walk_literals`'s single pass over the tree: every literal's raw-text
+/// occurrences (grouped for repetition counting) and every qualifying named-constant
+/// binding found (for `resolve_excluded_constants` to check against). Lives only for the
+/// duration of one `check()` call.
+#[derive(Default)]
+pub(crate) struct LiteralCollector<'tree> {
+    pub(crate) occurrences: HashMap<String, Vec<LiteralOccurrence<'tree>>>,
+    pub(crate) bound: Vec<ConstBinding<'tree>>,
+}
 
 /// Per-language node-kind table the AST walk consults instead of hardcoded literals.
 /// Verified against each grammar's real `to_sexp()` output, not guessed by analogy —
@@ -141,6 +196,20 @@ pub(crate) struct LangRuleConfig {
     /// `panic!`/`unreachable!`/`todo!`/`unimplemented!`. `no_panic_detector` for every
     /// other grammar, which has no such built-in.
     panic_detector: fn(Node, &[u8]) -> bool,
+    /// Numeric/string literal node kinds `replace-magic-literal`'s `walk_literals` walks
+    /// for this grammar.
+    literal_kinds: &'static [&'static str],
+    /// The subset of `literal_kinds` that are numeric (vs. string) — used to label a
+    /// `replace-magic-literal` finding "numeric" or "string". Must be a subset of
+    /// `literal_kinds` (checked by `node_kind_literals_are_valid_for_their_grammar`).
+    numeric_literal_kinds: &'static [&'static str],
+    /// Given any node, returns `Some(ConstBinding)` if that node is a named-constant-
+    /// style binding (Go `const`, TS/JS `const` — not `let`, Java `final`, Kotlin `val`,
+    /// Rust `const`/`static` — not `let`, Python SCREAMING_SNAKE_CASE) whose direct
+    /// initializer is a literal; `None` otherwise. A literal bound this way, and
+    /// referenced by name elsewhere in the file, is excluded from
+    /// `replace-magic-literal` (see `resolve_excluded_constants`).
+    binding_finder: for<'a> fn(Node<'a>, &'a [u8]) -> Option<ConstBinding<'a>>,
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -481,224 +550,507 @@ fn rust_panic_detector(stmt: Node, src: &[u8]) -> bool {
     )
 }
 
+/// Go's `const_spec`'s `value` field is always an `expression_list` (even for a single
+/// value, verified via `to_sexp()`) — a multi-name (`const a, b = 1, 2`) or multi-value
+/// spec returns `None` rather than guessing which name pairs with which value
+/// (Unresolved Question 3: an accepted, documented false-negative gap, not fixed here).
+fn go_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    if node.kind() != "const_spec" {
+        return None;
+    }
+    let mut name_cursor = node.walk();
+    let names: Vec<Node> = node
+        .children_by_field_name("name", &mut name_cursor)
+        .filter(|n| n.kind() == "identifier")
+        .collect();
+    if names.len() != 1 {
+        return None;
+    }
+    let value_list = node.child_by_field_name("value")?;
+    let mut vcursor = value_list.walk();
+    let values: Vec<Node> = value_list.named_children(&mut vcursor).collect();
+    if values.len() != 1 {
+        return None;
+    }
+    let initializer = values[0];
+    if !matches!(
+        initializer.kind(),
+        "int_literal"
+            | "float_literal"
+            | "imaginary_literal"
+            | "rune_literal"
+            | "interpreted_string_literal"
+            | "raw_string_literal"
+    ) {
+        return None;
+    }
+    let name = names[0].utf8_text(src).ok()?.to_string();
+    Some(ConstBinding { name, initializer })
+}
+
+/// TS/JS `lexical_declaration` exposes its `const`/`let` keyword via the `kind` field
+/// directly (verified via `node-types.json`) — no raw-child scan needed. Only a
+/// single-declarator statement qualifies (`const a = 1, b = 2` returns `None`, same
+/// accepted gap as Go's multi-value `const_spec`). `let` is deliberately excluded
+/// (ADR-001 / Pattern Decision "JS/TS/Rust binding scope").
+fn ts_js_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    if node.kind() != "lexical_declaration" {
+        return None;
+    }
+    let kind = node.child_by_field_name("kind")?;
+    if kind.kind() != "const" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let declarators: Vec<Node> = node
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "variable_declarator")
+        .collect();
+    if declarators.len() != 1 {
+        return None;
+    }
+    let declarator = declarators[0];
+    let name_node = declarator.child_by_field_name("name")?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    let initializer = declarator.child_by_field_name("value")?;
+    if !matches!(initializer.kind(), "number" | "string") {
+        return None;
+    }
+    let name = name_node.utf8_text(src).ok()?.to_string();
+    Some(ConstBinding { name, initializer })
+}
+
+/// Python has no `const` keyword — a SCREAMING_SNAKE_CASE module/class-level assignment
+/// is the idiomatic convention (ADR-001, Pattern Decision "Python constant heuristic").
+/// Weaker than the other 7 languages' keyword-backed guarantee, deliberately.
+fn py_screaming_snake_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let name = left.utf8_text(src).ok()?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return None;
+    }
+    let initializer = node.child_by_field_name("right")?;
+    if !matches!(initializer.kind(), "integer" | "float" | "string") {
+        return None;
+    }
+    Some(ConstBinding {
+        name: name.to_string(),
+        initializer,
+    })
+}
+
+/// Java's `final` modifier is an anonymous token inside the `modifiers` child — not a
+/// named field, so it's found via a raw (not just named) child scan, per the anonymous-
+/// token caveat `node_kind_literals_are_valid_for_their_grammar` already documents.
+/// Only the first declarator is considered when a `final` statement declares several
+/// (`final int a = 1, b = 2`) — same accepted narrow scope as Go/TS's multi-binding gap.
+fn java_final_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    if node.kind() != "local_variable_declaration" && node.kind() != "field_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let modifiers = node.children(&mut cursor).find(|c| c.kind() == "modifiers")?;
+    let mut mcursor = modifiers.walk();
+    let has_final = modifiers.children(&mut mcursor).any(|c| c.kind() == "final");
+    if !has_final {
+        return None;
+    }
+    let declarator = node.child_by_field_name("declarator")?;
+    let name_node = declarator.child_by_field_name("name")?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    let initializer = declarator.child_by_field_name("value")?;
+    if !matches!(
+        initializer.kind(),
+        "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal"
+            | "decimal_floating_point_literal"
+            | "hex_floating_point_literal"
+            | "string_literal"
+    ) {
+        return None;
+    }
+    let name = name_node.utf8_text(src).ok()?.to_string();
+    Some(ConstBinding { name, initializer })
+}
+
+/// Kotlin's `property_declaration` exposes no field names for its `val`/`var` keyword
+/// or its positional `variable_declaration`/initializer children (same positional shape
+/// as `kotlin_body`/`kotlin_params`) — found via raw-child and kind-based scans.
+fn kotlin_val_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    if node.kind() != "property_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let is_val = node.children(&mut cursor).any(|c| c.kind() == "val");
+    if !is_val {
+        return None;
+    }
+    let mut cursor2 = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor2).collect();
+    let var_decl = children
+        .iter()
+        .find(|c| c.kind() == "variable_declaration")?;
+    let mut vcursor = var_decl.walk();
+    let name_node = var_decl
+        .named_children(&mut vcursor)
+        .find(|c| c.kind() == "identifier")?;
+    let initializer = *children.iter().find(|c| {
+        matches!(
+            c.kind(),
+            "number_literal" | "float_literal" | "string_literal" | "multiline_string_literal"
+        )
+    })?;
+    let name = name_node.utf8_text(src).ok()?.to_string();
+    Some(ConstBinding { name, initializer })
+}
+
+/// Rust's `const_item`/`static_item` have flat `name`/`value` fields (verified via
+/// `node-types.json`) — `let_declaration` is deliberately excluded (ADR-001 / Pattern
+/// Decision "JS/TS/Rust binding scope").
+fn rust_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    if node.kind() != "const_item" && node.kind() != "static_item" {
+        return None;
+    }
+    let name_node = node.child_by_field_name("name")?;
+    let initializer = node.child_by_field_name("value")?;
+    if !matches!(
+        initializer.kind(),
+        "integer_literal" | "float_literal" | "string_literal" | "raw_string_literal"
+    ) {
+        return None;
+    }
+    let name = name_node.utf8_text(src).ok()?.to_string();
+    Some(ConstBinding { name, initializer })
+}
+
 /// Shared with `comment_quality`'s over-commented check, which needs the same
 /// per-language function-kind/body lookup this file already maintains (Kotlin's
 /// positional-only body lookup in particular) rather than duplicating it.
 pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
     match lang {
-        Language::Go => LangRuleConfig {
-            name: "syntax-rules",
-            file_globs: &["**/*.go"],
-            function_kinds: &["function_declaration", "method_declaration"],
-            if_kind: "if_statement",
-            nesting_kinds: &[
-                "for_statement",
-                "expression_switch_statement",
-                "type_switch_statement",
-                "select_statement",
-                "func_literal",
-            ],
-            else_wrapper_kinds: &[],
-            chain_kinds: &[],
-            param_counter: go_param_identifier_count,
-            body_finder: field_body,
-            params_finder: field_params,
-            bool_param_finder: go_bool_params,
-            ternary_kind: None,
-            block_kind: "block",
-            statement_container: go_statement_container,
-            unwrap_statement: identity_stmt,
-            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
-            panic_detector: go_panic_detector,
-        },
-        Language::TypeScript => LangRuleConfig {
-            name: "syntax-rules-typescript",
-            file_globs: &["**/*.ts"],
-            function_kinds: &[
-                "function_declaration",
-                "function_expression",
-                "generator_function_declaration",
-                "method_definition",
-                "arrow_function",
-            ],
-            if_kind: "if_statement",
-            nesting_kinds: &[
-                "for_statement",
-                "for_in_statement",
-                "while_statement",
-                "do_statement",
-                "switch_statement",
-                "arrow_function",
-                "function_expression",
-            ],
-            else_wrapper_kinds: &["else_clause"],
-            chain_kinds: &[],
-            param_counter: js_ts_param_count,
-            body_finder: field_body,
-            params_finder: field_params,
-            bool_param_finder: ts_js_bool_params,
-            ternary_kind: Some("ternary_expression"),
-            block_kind: "statement_block",
-            statement_container: identity_stmt,
-            unwrap_statement: identity_stmt,
-            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
-            panic_detector: no_panic_detector,
-        },
-        Language::Tsx => LangRuleConfig {
-            name: "syntax-rules-tsx",
-            file_globs: &["**/*.tsx"],
-            ..lang_config(Language::TypeScript)
-        },
-        Language::JavaScript => LangRuleConfig {
-            name: "syntax-rules-javascript",
-            file_globs: &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
-            ..lang_config(Language::TypeScript)
-        },
-        Language::Python => LangRuleConfig {
-            name: "syntax-rules-python",
-            file_globs: &["**/*.py"],
-            // Decorators wrap a `function_definition` in a `decorated_definition` node
-            // (with the function as its `definition` field) — no separate entry needed
-            // here since `walk_declarations` recurses into every child regardless of
-            // kind, so the wrapped `function_definition` is still found. `async def`
-            // produces a plain `function_definition` too (verified via to_sexp — no
-            // distinct "async" node kind wraps it).
-            function_kinds: &["function_definition"],
-            if_kind: "if_statement",
-            nesting_kinds: &[
-                "for_statement",
-                "while_statement",
-                "match_statement",
-                "lambda",
-            ],
-            else_wrapper_kinds: &[],
-            // Python's `elif` is a distinct `elif_clause` node (not an `if_statement`
-            // wrapped in an `else_clause` like JS/TS) but carries the same
-            // condition/consequence/alternative fields, so it chains like `if_statement`
-            // itself once recognized here.
-            chain_kinds: &["elif_clause"],
-            param_counter: py_param_count,
-            body_finder: field_body,
-            params_finder: field_params,
-            bool_param_finder: py_bool_params,
-            ternary_kind: None,
-            block_kind: "block",
-            statement_container: identity_stmt,
-            unwrap_statement: identity_stmt,
-            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
-            panic_detector: no_panic_detector,
-        },
-        Language::Java => LangRuleConfig {
-            name: "syntax-rules-java",
-            file_globs: &["**/*.java"],
-            // Constructors (`constructor_declaration`) are deliberately excluded for
-            // now — unverified against the real grammar; can be added later without
-            // disturbing this entry.
-            function_kinds: &["method_declaration", "lambda_expression"],
-            if_kind: "if_statement",
-            nesting_kinds: &[
-                "for_statement",
-                "enhanced_for_statement",
-                "while_statement",
-                "do_statement",
-                "switch_expression",
-                "lambda_expression",
-            ],
-            else_wrapper_kinds: &[],
-            chain_kinds: &[],
-            param_counter: js_ts_param_count,
-            body_finder: field_body,
-            params_finder: field_params,
-            bool_param_finder: java_bool_params,
-            ternary_kind: Some("ternary_expression"),
-            block_kind: "block",
-            statement_container: identity_stmt,
-            unwrap_statement: identity_stmt,
-            terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
-            panic_detector: no_panic_detector,
-        },
-        Language::Kotlin => LangRuleConfig {
-            name: "syntax-rules-kotlin",
-            file_globs: &["**/*.kt", "**/*.kts"],
-            // `function_declaration` covers both top-level functions and class methods
-            // (like Python's `function_definition`). `anonymous_function` is Kotlin's
-            // `fun(x: Int) { ... }` expression form — checked the same way TS/JS check
-            // `arrow_function`/`function_expression` (both a function-kind and a
-            // nesting-kind). Lambda literals (`{ x -> ... }`) are nesting-only, like
-            // Go's `func_literal` — their `lambda_parameters` node shape differs from
-            // `function_value_parameters` and isn't handled by `kotlin_params`.
-            function_kinds: &["function_declaration", "anonymous_function"],
-            // Kotlin's `if_expression` exposes only `condition` as a named field — the
-            // then-branch and else/elif continuation are positional named children.
-            // `walk_if_chain`'s field lookups fall back to positional order when the
-            // field lookup returns `None`, so no separate flag is needed here; the
-            // chained `elif` is itself a nested `if_expression` (covered by `if_kind`
-            // already, not a distinct wrapper kind).
-            if_kind: "if_expression",
-            nesting_kinds: &[
-                "for_statement",
-                "while_statement",
-                "do_while_statement",
-                "when_expression",
-                "lambda_literal",
-                "anonymous_function",
-            ],
-            else_wrapper_kinds: &[],
-            chain_kinds: &[],
-            param_counter: kotlin_param_count,
-            body_finder: kotlin_body,
-            params_finder: kotlin_params,
-            bool_param_finder: kotlin_bool_params,
-            ternary_kind: None,
-            block_kind: "block",
-            statement_container: identity_stmt,
-            unwrap_statement: identity_stmt,
-            // `break`/`continue` omitted — see `terminal_kinds`'s doc comment.
-            terminal_kinds: &["return_expression"],
-            panic_detector: no_panic_detector,
-        },
-        Language::Rust => LangRuleConfig {
-            name: "syntax-rules-rust",
-            file_globs: &["**/*.rs"],
-            // `function_item` covers free functions, inherent/trait `impl` methods, and
-            // default trait-method bodies alike (one node kind for all three, verified
-            // via `to_sexp()`). A trait method *declaration* with no body is the
-            // distinct `function_signature_item` kind, deliberately excluded —
-            // `body_finder` would return `None` for it anyway, same as Go interface
-            // methods never appearing in `function_kinds`. `closure_expression` is
-            // nesting-only (below), not function-like: its parameter list uses a
-            // different node kind (`closure_parameters`, not `parameters`) and isn't
-            // handled by `rust_param_count`.
-            function_kinds: &["function_item"],
-            // Rust's `if` is an expression with proper `condition`/`consequence`/
-            // `alternative` fields (Go-like, no positional fallback needed). A chained
-            // `else if` wraps in an intermediate `else_clause` before the nested
-            // `if_expression` (JS/TS-like).
-            if_kind: "if_expression",
-            nesting_kinds: &[
-                "for_expression",
-                "while_expression",
-                "loop_expression",
-                "match_expression",
-                "closure_expression",
-            ],
-            else_wrapper_kinds: &["else_clause"],
-            chain_kinds: &[],
-            param_counter: rust_param_count,
-            body_finder: field_body,
-            params_finder: field_params,
-            bool_param_finder: rust_bool_params,
-            ternary_kind: None,
-            block_kind: "block",
-            statement_container: identity_stmt,
-            unwrap_statement: rust_unwrap_statement,
-            terminal_kinds: &[
-                "return_expression",
-                "break_expression",
-                "continue_expression",
-            ],
-            panic_detector: rust_panic_detector,
-        },
+        Language::Go => go_lang_config(),
+        Language::TypeScript => typescript_lang_config(),
+        Language::Tsx => tsx_lang_config(),
+        Language::JavaScript => javascript_lang_config(),
+        Language::Python => python_lang_config(),
+        Language::Java => java_lang_config(),
+        Language::Kotlin => kotlin_lang_config(),
+        Language::Rust => rust_lang_config(),
+    }
+}
+
+fn go_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules",
+        file_globs: &["**/*.go"],
+        function_kinds: &["function_declaration", "method_declaration"],
+        if_kind: "if_statement",
+        nesting_kinds: &[
+            "for_statement",
+            "expression_switch_statement",
+            "type_switch_statement",
+            "select_statement",
+            "func_literal",
+        ],
+        else_wrapper_kinds: &[],
+        chain_kinds: &[],
+        param_counter: go_param_identifier_count,
+        body_finder: field_body,
+        params_finder: field_params,
+        bool_param_finder: go_bool_params,
+        ternary_kind: None,
+        block_kind: "block",
+        statement_container: go_statement_container,
+        unwrap_statement: identity_stmt,
+        terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+        panic_detector: go_panic_detector,
+        literal_kinds: &[
+            "int_literal",
+            "float_literal",
+            "imaginary_literal",
+            "rune_literal",
+            "interpreted_string_literal",
+            "raw_string_literal",
+        ],
+        numeric_literal_kinds: &[
+            "int_literal",
+            "float_literal",
+            "imaginary_literal",
+            "rune_literal",
+        ],
+        binding_finder: go_const_binding,
+    }
+}
+
+fn typescript_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-typescript",
+        file_globs: &["**/*.ts"],
+        function_kinds: &[
+            "function_declaration",
+            "function_expression",
+            "generator_function_declaration",
+            "method_definition",
+            "arrow_function",
+        ],
+        if_kind: "if_statement",
+        nesting_kinds: &[
+            "for_statement",
+            "for_in_statement",
+            "while_statement",
+            "do_statement",
+            "switch_statement",
+            "arrow_function",
+            "function_expression",
+        ],
+        else_wrapper_kinds: &["else_clause"],
+        chain_kinds: &[],
+        param_counter: js_ts_param_count,
+        body_finder: field_body,
+        params_finder: field_params,
+        bool_param_finder: ts_js_bool_params,
+        ternary_kind: Some("ternary_expression"),
+        block_kind: "statement_block",
+        statement_container: identity_stmt,
+        unwrap_statement: identity_stmt,
+        terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+        panic_detector: no_panic_detector,
+        literal_kinds: &["number", "string"],
+        numeric_literal_kinds: &["number"],
+        binding_finder: ts_js_const_binding,
+    }
+}
+
+fn tsx_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-tsx",
+        file_globs: &["**/*.tsx"],
+        ..typescript_lang_config()
+    }
+}
+
+fn javascript_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-javascript",
+        file_globs: &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        ..typescript_lang_config()
+    }
+}
+
+fn python_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-python",
+        file_globs: &["**/*.py"],
+        // Decorators wrap a `function_definition` in a `decorated_definition` node
+        // (with the function as its `definition` field) — no separate entry needed
+        // here since `walk_declarations` recurses into every child regardless of
+        // kind, so the wrapped `function_definition` is still found. `async def`
+        // produces a plain `function_definition` too (verified via to_sexp — no
+        // distinct "async" node kind wraps it).
+        function_kinds: &["function_definition"],
+        if_kind: "if_statement",
+        nesting_kinds: &[
+            "for_statement",
+            "while_statement",
+            "match_statement",
+            "lambda",
+        ],
+        else_wrapper_kinds: &[],
+        // Python's `elif` is a distinct `elif_clause` node (not an `if_statement`
+        // wrapped in an `else_clause` like JS/TS) but carries the same
+        // condition/consequence/alternative fields, so it chains like `if_statement`
+        // itself once recognized here.
+        chain_kinds: &["elif_clause"],
+        param_counter: py_param_count,
+        body_finder: field_body,
+        params_finder: field_params,
+        bool_param_finder: py_bool_params,
+        ternary_kind: None,
+        block_kind: "block",
+        statement_container: identity_stmt,
+        unwrap_statement: identity_stmt,
+        terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+        panic_detector: no_panic_detector,
+        // tree-sitter-python 0.23.6: an f-string parses as a distinct `string` node
+        // whose contents include `interpolation` children — same top-level `string`
+        // kind as a plain string literal (verified via `codegen/node-types/python.json`
+        // and `to_sexp()`), so it's already visited by `literal_kinds` without a
+        // separate entry.
+        literal_kinds: &["integer", "float", "string"],
+        numeric_literal_kinds: &["integer", "float"],
+        binding_finder: py_screaming_snake_binding,
+    }
+}
+
+fn java_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-java",
+        file_globs: &["**/*.java"],
+        // Constructors (`constructor_declaration`) are deliberately excluded for
+        // now — unverified against the real grammar; can be added later without
+        // disturbing this entry.
+        function_kinds: &["method_declaration", "lambda_expression"],
+        if_kind: "if_statement",
+        nesting_kinds: &[
+            "for_statement",
+            "enhanced_for_statement",
+            "while_statement",
+            "do_statement",
+            "switch_expression",
+            "lambda_expression",
+        ],
+        else_wrapper_kinds: &[],
+        chain_kinds: &[],
+        param_counter: js_ts_param_count,
+        body_finder: field_body,
+        params_finder: field_params,
+        bool_param_finder: java_bool_params,
+        ternary_kind: Some("ternary_expression"),
+        block_kind: "block",
+        statement_container: identity_stmt,
+        unwrap_statement: identity_stmt,
+        terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
+        panic_detector: no_panic_detector,
+        literal_kinds: &[
+            "decimal_integer_literal",
+            "hex_integer_literal",
+            "octal_integer_literal",
+            "binary_integer_literal",
+            "decimal_floating_point_literal",
+            "hex_floating_point_literal",
+            "string_literal",
+        ],
+        numeric_literal_kinds: &[
+            "decimal_integer_literal",
+            "hex_integer_literal",
+            "octal_integer_literal",
+            "binary_integer_literal",
+            "decimal_floating_point_literal",
+            "hex_floating_point_literal",
+        ],
+        binding_finder: java_final_binding,
+    }
+}
+
+fn kotlin_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-kotlin",
+        file_globs: &["**/*.kt", "**/*.kts"],
+        // `function_declaration` covers both top-level functions and class methods
+        // (like Python's `function_definition`). `anonymous_function` is Kotlin's
+        // `fun(x: Int) { ... }` expression form — checked the same way TS/JS check
+        // `arrow_function`/`function_expression` (both a function-kind and a
+        // nesting-kind). Lambda literals (`{ x -> ... }`) are nesting-only, like
+        // Go's `func_literal` — their `lambda_parameters` node shape differs from
+        // `function_value_parameters` and isn't handled by `kotlin_params`.
+        function_kinds: &["function_declaration", "anonymous_function"],
+        // Kotlin's `if_expression` exposes only `condition` as a named field — the
+        // then-branch and else/elif continuation are positional named children.
+        // `walk_if_chain`'s field lookups fall back to positional order when the
+        // field lookup returns `None`, so no separate flag is needed here; the
+        // chained `elif` is itself a nested `if_expression` (covered by `if_kind`
+        // already, not a distinct wrapper kind).
+        if_kind: "if_expression",
+        nesting_kinds: &[
+            "for_statement",
+            "while_statement",
+            "do_while_statement",
+            "when_expression",
+            "lambda_literal",
+            "anonymous_function",
+        ],
+        else_wrapper_kinds: &[],
+        chain_kinds: &[],
+        param_counter: kotlin_param_count,
+        body_finder: kotlin_body,
+        params_finder: kotlin_params,
+        bool_param_finder: kotlin_bool_params,
+        ternary_kind: None,
+        block_kind: "block",
+        statement_container: identity_stmt,
+        unwrap_statement: identity_stmt,
+        // `break`/`continue` omitted — see `terminal_kinds`'s doc comment.
+        terminal_kinds: &["return_expression"],
+        panic_detector: no_panic_detector,
+        // Verified against `tree-sitter-kotlin-ng` 1.1.0's `node-types.json`: no
+        // separate hex/binary/long/unsigned literal kinds exist — `number_literal`
+        // covers every integer form.
+        literal_kinds: &[
+            "number_literal",
+            "float_literal",
+            "string_literal",
+            "multiline_string_literal",
+        ],
+        numeric_literal_kinds: &["number_literal", "float_literal"],
+        binding_finder: kotlin_val_binding,
+    }
+}
+
+fn rust_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-rust",
+        file_globs: &["**/*.rs"],
+        // `function_item` covers free functions, inherent/trait `impl` methods, and
+        // default trait-method bodies alike (one node kind for all three, verified
+        // via `to_sexp()`). A trait method *declaration* with no body is the
+        // distinct `function_signature_item` kind, deliberately excluded —
+        // `body_finder` would return `None` for it anyway, same as Go interface
+        // methods never appearing in `function_kinds`. `closure_expression` is
+        // nesting-only (below), not function-like: its parameter list uses a
+        // different node kind (`closure_parameters`, not `parameters`) and isn't
+        // handled by `rust_param_count`.
+        function_kinds: &["function_item"],
+        // Rust's `if` is an expression with proper `condition`/`consequence`/
+        // `alternative` fields (Go-like, no positional fallback needed). A chained
+        // `else if` wraps in an intermediate `else_clause` before the nested
+        // `if_expression` (JS/TS-like).
+        if_kind: "if_expression",
+        nesting_kinds: &[
+            "for_expression",
+            "while_expression",
+            "loop_expression",
+            "match_expression",
+            "closure_expression",
+        ],
+        else_wrapper_kinds: &["else_clause"],
+        chain_kinds: &[],
+        param_counter: rust_param_count,
+        body_finder: field_body,
+        params_finder: field_params,
+        bool_param_finder: rust_bool_params,
+        ternary_kind: None,
+        block_kind: "block",
+        statement_container: identity_stmt,
+        unwrap_statement: rust_unwrap_statement,
+        terminal_kinds: &[
+            "return_expression",
+            "break_expression",
+            "continue_expression",
+        ],
+        panic_detector: rust_panic_detector,
+        literal_kinds: &["integer_literal", "float_literal", "string_literal", "raw_string_literal"],
+        numeric_literal_kinds: &["integer_literal", "float_literal"],
+        binding_finder: rust_const_binding,
     }
 }
 
@@ -718,7 +1070,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -738,6 +1090,15 @@ impl Checker for SyntaxRulesChecker {
         let src = ctx.source.as_bytes();
         walk_declarations(tree.root_node(), &cfg, src, &mut findings);
         walk_blocks(tree.root_node(), &cfg, src, &mut findings);
+        // Generated files are dense, mechanical, and by construction full of repeated
+        // literals — more exposed to this rule than any of the other 4 (ADR-001,
+        // pitfalls.md §2/§5). Scoped to just this pass; the other 4 rules are untouched.
+        if !file_size::is_generated(ctx.source) {
+            let mut collector = LiteralCollector::default();
+            walk_literals(tree.root_node(), &cfg, src, &mut collector);
+            let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
+            emit_literal_findings(&collector, &cfg, &excluded, &mut findings);
+        }
         Ok(findings)
     }
 }
@@ -762,6 +1123,177 @@ fn walk_blocks(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_blocks(child, cfg, src, findings);
+    }
+}
+
+/// Collect-pass for `replace-magic-literal`: recurses the whole tree (not just function
+/// bodies — a repeated literal anywhere in the file counts), grouping every
+/// `literal_kinds` node by its raw source text and recording every qualifying
+/// `binding_finder` match. Emits nothing itself — matches the two-pass collect-then-emit
+/// shape architecture.md recommends over folding into `walk_blocks`'s single-pass
+/// emit-immediately design.
+fn walk_literals<'tree>(
+    node: Node<'tree>,
+    cfg: &LangRuleConfig,
+    src: &'tree [u8],
+    collector: &mut LiteralCollector<'tree>,
+) {
+    if cfg.literal_kinds.contains(&node.kind())
+        && let Ok(text) = node.utf8_text(src)
+    {
+        collector
+            .occurrences
+            .entry(text.to_string())
+            .or_default()
+            .push(LiteralOccurrence {
+                node,
+                kind: node.kind(),
+            });
+    }
+    if let Some(binding) = (cfg.binding_finder)(node, src) {
+        collector.bound.push(binding);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_literals(child, cfg, src, collector);
+    }
+}
+
+/// Given every qualifying named-constant binding found by `walk_literals`, returns the
+/// `Node::id()`s of the initializers that qualify for `replace-magic-literal`'s
+/// exclusion: the binding's `name` must be referenced at least once beyond its own
+/// declaration (count >= 2: the declaration itself plus >=1 real use). Same same-file,
+/// non-scope-resolved heuristic as `collect_condition_identifiers` (ADR-001) — a binding
+/// shadowed in a different function scope is an accepted, documented false negative.
+fn resolve_excluded_constants(
+    root: Node,
+    src: &[u8],
+    bound: &[ConstBinding],
+) -> HashSet<usize> {
+    let mut ref_counts = HashMap::new();
+    collect_identifiers(root, src, &mut ref_counts);
+    bound
+        .iter()
+        .filter(|b| ref_counts.get(&b.name).copied().unwrap_or(0) >= 2)
+        .map(|b| b.initializer.id())
+        .collect()
+}
+
+/// Strips the language-specific delimiter/prefix from a raw literal's source text so an
+/// empty-literal comparison against `MAGIC_LITERAL_ALLOWLIST` is structural, not a
+/// fixed-string match — a raw-text allow-list of `"\"\""`/`"''"` never matches Kotlin's
+/// empty `""""""`, Rust's `r""`, Go's empty backtick raw string, or Python's `r`/`b`/`f`-
+/// prefixed empty string.
+fn normalize_literal_value<'a>(raw: &'a str, kind: &str) -> &'a str {
+    // Kotlin's multiline string: strip the triple-quote delimiter on each side.
+    if kind == "multiline_string_literal"
+        && let Some(inner) = raw.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\""))
+    {
+        return inner;
+    }
+    // Go's raw string literal: backtick-delimited, no escape processing, no prefix.
+    if kind == "raw_string_literal"
+        && let Some(inner) = raw.strip_prefix('`').and_then(|s| s.strip_suffix('`'))
+    {
+        return inner;
+    }
+    // Rust's raw string literal: `r"..."`, `r#"..."#`, `r##"..."##`, etc.
+    if kind == "raw_string_literal" {
+        let mut hashes = 0usize;
+        let mut rest = raw.strip_prefix('r').unwrap_or(raw);
+        while let Some(r) = rest.strip_prefix('#') {
+            hashes += 1;
+            rest = r;
+        }
+        let close = format!("\"{}", "#".repeat(hashes));
+        if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix(&close)) {
+            return inner;
+        }
+    }
+    // Python's string-prefix letters (`r`/`b`/`f`/`rb`/`br`/`rf`/`fr`, any case) ahead of
+    // the quote character, then the (single or triple) quote delimiter itself.
+    if kind == "string" {
+        let prefix_len = raw
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .take(2)
+            .count();
+        let (prefix, rest) = raw.split_at(prefix_len);
+        if prefix.chars().all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f'))
+            && let Some(inner) = strip_quote_delimiter(rest)
+        {
+            return inner;
+        }
+    }
+    // Every other basic quoted form: `"..."`/`'...'` (single- or double-quoted).
+    if let Some(inner) = strip_quote_delimiter(raw) {
+        return inner;
+    }
+    raw
+}
+
+/// Strips a matching pair of `"`/`'` (single-char) or `"""` (triple, for a plain,
+/// non-prefixed Python triple-quoted string) delimiters from `s`, if present.
+fn strip_quote_delimiter(s: &str) -> Option<&str> {
+    if let Some(inner) = s.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\"")) {
+        return Some(inner);
+    }
+    if let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Some(inner);
+    }
+    if let Some(inner) = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return Some(inner);
+    }
+    None
+}
+
+fn is_allowlisted_literal(raw: &str, kind: &str) -> bool {
+    MAGIC_LITERAL_ALLOWLIST.contains(&normalize_literal_value(raw, kind))
+}
+
+/// Emit-pass for `replace-magic-literal`: applies the allow-list and the excluded-node-
+/// id set, filters to literal values with >= `MAGIC_LITERAL_MIN_OCCURRENCES` remaining
+/// occurrences, and pushes one `Finding` per qualifying value, anchored at the first
+/// remaining occurrence's line.
+fn emit_literal_findings(
+    collector: &LiteralCollector,
+    cfg: &LangRuleConfig,
+    excluded: &HashSet<usize>,
+    findings: &mut Vec<Finding>,
+) {
+    for (text, occurrences) in &collector.occurrences {
+        let Some(first) = occurrences.first() else {
+            continue;
+        };
+        if is_allowlisted_literal(text, first.kind) {
+            continue;
+        }
+        let mut remaining: Vec<&LiteralOccurrence> = occurrences
+            .iter()
+            .filter(|occ| !excluded.contains(&occ.node.id()))
+            .collect();
+        if remaining.len() < MAGIC_LITERAL_MIN_OCCURRENCES {
+            continue;
+        }
+        remaining.sort_by_key(|occ| occ.node.start_position().row);
+        let label = if cfg.numeric_literal_kinds.contains(&remaining[0].kind) {
+            "numeric"
+        } else {
+            "string"
+        };
+        let line = remaining[0].node.start_position().row + 1;
+        let other_lines: Vec<String> = remaining[1..]
+            .iter()
+            .map(|occ| (occ.node.start_position().row + 1).to_string())
+            .collect();
+        findings.push(Finding {
+            line,
+            message: format!(
+                "[replace-magic-literal] {label} literal {text} appears {} times (also line {}) — consider extracting a named constant",
+                remaining.len(),
+                other_lines.join(", ")
+            ),
+        });
     }
 }
 
@@ -855,10 +1387,10 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mu
         if let Some(body) = (cfg.body_finder)(decl)
             && !bool_params.is_empty()
         {
-            let mut branched_on = HashSet::new();
+            let mut branched_on = HashMap::new();
             collect_condition_identifiers(body, cfg, src, &mut branched_on);
             for name in bool_params {
-                if branched_on.contains(&name) {
+                if branched_on.contains_key(&name) {
                     findings.push(Finding {
                         line,
                         message: format!(
@@ -882,7 +1414,7 @@ fn collect_condition_identifiers(
     node: Node,
     cfg: &LangRuleConfig,
     src: &[u8],
-    out: &mut HashSet<String>,
+    out: &mut HashMap<String, usize>,
 ) {
     if (node.kind() == cfg.if_kind || cfg.ternary_kind == Some(node.kind()))
         && let Some(condition) = node.child_by_field_name("condition")
@@ -895,11 +1427,15 @@ fn collect_condition_identifiers(
     }
 }
 
-fn collect_identifiers(node: Node, src: &[u8], out: &mut HashSet<String>) {
+/// Counts every identifier reference under `node` by name — used both by
+/// `collect_condition_identifiers` (is this name referenced in a branch condition at
+/// all?) and `resolve_excluded_constants` (is this name referenced *beyond* its own
+/// declaration — i.e. is its count >= 2?).
+fn collect_identifiers(node: Node, src: &[u8], out: &mut HashMap<String, usize>) {
     if node.kind() == "identifier"
         && let Ok(text) = node.utf8_text(src)
     {
-        out.insert(text.to_string());
+        *out.entry(text.to_string()).or_insert(0) += 1;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1218,6 +1754,352 @@ mod tests {
             tree_sitter_rust::LANGUAGE.into(),
             &lang_config(Language::Rust),
         );
+    }
+
+    /// Task 1.3.1c: dedicated companion to `node_kind_literals_are_valid_for_their_grammar`
+    /// covering `replace-magic-literal`'s two new per-language fields — kept as its own
+    /// test function (rather than folded into that one) so neither grows past
+    /// `long-function`'s own 40-line threshold, the exact violation Epic 1.0 exists to
+    /// avoid reintroducing.
+    #[test]
+    fn replace_magic_literal_node_kinds_are_valid_for_their_grammar() {
+        fn assert_literal_kinds_valid(ts_lang: tree_sitter::Language, cfg: &LangRuleConfig) {
+            for kind in cfg.literal_kinds {
+                assert_ne!(
+                    ts_lang.id_for_node_kind(kind, true),
+                    0,
+                    "`{kind}` is not a valid named node kind for the `{}` grammar",
+                    cfg.name
+                );
+            }
+            for kind in cfg.numeric_literal_kinds {
+                assert!(
+                    cfg.literal_kinds.contains(kind),
+                    "`{kind}` is in `{}`'s numeric_literal_kinds but missing from literal_kinds",
+                    cfg.name
+                );
+            }
+        }
+
+        let pairs: [(tree_sitter::Language, Language); 8] = [
+            (tree_sitter_go::LANGUAGE.into(), Language::Go),
+            (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                Language::TypeScript,
+            ),
+            (tree_sitter_typescript::LANGUAGE_TSX.into(), Language::Tsx),
+            (
+                tree_sitter_javascript::LANGUAGE.into(),
+                Language::JavaScript,
+            ),
+            (tree_sitter_python::LANGUAGE.into(), Language::Python),
+            (tree_sitter_java::LANGUAGE.into(), Language::Java),
+            (tree_sitter_kotlin_ng::LANGUAGE.into(), Language::Kotlin),
+            (tree_sitter_rust::LANGUAGE.into(), Language::Rust),
+        ];
+        for (ts_lang, lang) in pairs {
+            assert_literal_kinds_valid(ts_lang, &lang_config(lang));
+        }
+    }
+
+    /// Companion to the test above: anonymous binding-keyword tokens each
+    /// `binding_finder` checks directly via a raw-child scan (not through
+    /// `literal_kinds`, which only covers named nodes) — split into its own test
+    /// function for the same `long-function` reason. Go's `const_spec`, Rust's
+    /// `const_item`/`static_item`, and Python's casing heuristic all check named node
+    /// kinds already covered above, so only TS/JS's `const`, Java's `final`, and
+    /// Kotlin's `val` need this separate lookup.
+    #[test]
+    fn replace_magic_literal_binding_tokens_are_valid_for_their_grammar() {
+        fn assert_anonymous_token_valid(ts_lang: tree_sitter::Language, name: &str, token: &str) {
+            assert_ne!(
+                ts_lang.id_for_node_kind(token, false),
+                0,
+                "`{token}` is not a valid anonymous node kind for the `{name}` grammar"
+            );
+        }
+        assert_anonymous_token_valid(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            "const",
+        );
+        assert_anonymous_token_valid(tree_sitter_java::LANGUAGE.into(), "java", "final");
+        assert_anonymous_token_valid(tree_sitter_kotlin_ng::LANGUAGE.into(), "kotlin", "val");
+    }
+
+    /// Full-pipeline helper for `replace-magic-literal`: unlike `check_source`/
+    /// `check_unreachable` above (which call one walk directly), this runs the whole
+    /// `SyntaxRulesChecker::check()` pipeline — declarations + blocks + the literal
+    /// pass — since this rule's only externally observable behavior is through
+    /// `check()` itself (validation.md's Test Stack note).
+    fn check_full(lang: Language, ts_lang: tree_sitter::Language, src: &str) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let ctx = CheckContext {
+            source: src,
+            tree: Some(&tree),
+        };
+        SyntaxRulesChecker::new(lang)
+            .check(Path::new("<source>"), &ctx)
+            .expect("check() should not error")
+    }
+
+    fn magic_literal_findings(
+        lang: Language,
+        ts_lang: tree_sitter::Language,
+        src: &str,
+    ) -> Vec<Finding> {
+        check_full(lang, ts_lang, src)
+            .into_iter()
+            .filter(|f| f.message.contains("[replace-magic-literal]"))
+            .collect()
+    }
+
+    #[test]
+    fn flags_replace_magic_literal() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f() {\n\ta := 86400\n\tb := 86400\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("86400"));
+        assert!(findings[0].message.contains("2 times"));
+    }
+
+    #[test]
+    fn allows_replace_magic_literal_single_occurrence() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f() {\n\ta := 86400\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn allows_replace_magic_literal_allowlisted_values() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f() {\n\ta := 0\n\tb := 0\n\tc := 1\n\td := 1\n\te := -1\n\tg := -1\n\th := \"\"\n\ti := \"\"\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_non_allowlisted_small_value() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f() {\n\ta := 2\n\tb := 2\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_excludes_named_constant() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nconst Timeout = 30\nfunc f() { wait(Timeout) }\nfunc g() { wait(Timeout) }\nfunc h() { sleep(30) }\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_does_not_exclude_destructured_binding() {
+        // Documented gap (Unresolved Question 3): `go_const_binding` only handles a
+        // single-name/single-value `const_spec` — this multi-name/multi-value spec
+        // returns `None`, so this already-correctly-factored pair of constants is
+        // still (incorrectly) flagged as a repeated magic literal.
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nconst a, b = 42, 42\nfunc f() { use(a); use(b) }\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("42"));
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_skips_generated_file() {
+        let body = "func f() {\n\ta := 1234\n\tb := 1234\n}\n";
+        let generated =
+            format!("// Code generated by protoc-gen-go. DO NOT EDIT.\npackage main\n{body}");
+        let hand_written = format!("package main\n{body}");
+
+        assert!(
+            magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &generated)
+                .is_empty()
+        );
+        assert_eq!(
+            magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &hand_written)
+                .len(),
+            1,
+            "sanity check: the same body without the generated-file marker should fire"
+        );
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_allowlist_empty_backtick_string() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f() {\n\ta := ``\n\tb := ``\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_empty_file_produces_no_findings_and_does_not_panic() {
+        let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), "");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_no_literals_produces_no_findings() {
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f(a, b int) int { return a + b }\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn ts_flags_replace_magic_literal() {
+        let findings = magic_literal_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  console.log(42);\n  console.log(42);\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("42"));
+    }
+
+    #[test]
+    fn ts_flags_replace_magic_literal_excludes_const_not_let() {
+        // Locks in ADR-001's deliberate narrowing: only `const` (not `let`) qualifies
+        // for the named-constant exclusion, even though `x` is referenced once beyond
+        // its own declaration.
+        let findings = magic_literal_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  let x = 42;\n  use(x);\n  let y = 42;\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn py_flags_replace_magic_literal() {
+        let findings = magic_literal_findings(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    print(42)\n    print(42)\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn py_flags_replace_magic_literal_excludes_screaming_snake_case() {
+        let findings = magic_literal_findings(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "TIMEOUT = 30\ndef f():\n    wait(TIMEOUT)\ndef g():\n    wait(TIMEOUT)\ndef h():\n    sleep(30)\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn py_flags_replace_magic_literal_allowlist_prefixed_empty_string() {
+        let findings = magic_literal_findings(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    a = r\"\"\n    b = r\"\"\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn java_flags_replace_magic_literal() {
+        let findings = magic_literal_findings(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C {\n  void f() {\n    System.out.println(42);\n    System.out.println(42);\n  }\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn java_flags_replace_magic_literal_excludes_final() {
+        let findings = magic_literal_findings(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C {\n  void f() {\n    final int Timeout = 30;\n    use(Timeout);\n    use(Timeout);\n  }\n  void g() {\n    sleep(30);\n  }\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn kotlin_flags_replace_magic_literal() {
+        let findings = magic_literal_findings(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  println(42)\n  println(42)\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn kotlin_flags_replace_magic_literal_excludes_val() {
+        let findings = magic_literal_findings(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  val Timeout = 30\n  use(Timeout)\n  use(Timeout)\n}\nfun g() {\n  sleep(30)\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn kotlin_flags_replace_magic_literal_allowlist_empty_multiline_string() {
+        let findings = magic_literal_findings(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  val a = \"\"\"\"\"\"\n  val b = \"\"\"\"\"\"\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn rust_flags_replace_magic_literal() {
+        let findings = magic_literal_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    use(42);\n    use(42);\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn rust_flags_replace_magic_literal_excludes_const_not_let() {
+        let findings = magic_literal_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    let x = 42;\n    use(x);\n    let y = 42;\n}\n",
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn rust_flags_replace_magic_literal_allowlist_empty_raw_string() {
+        let findings = magic_literal_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    let a = r\"\";\n    let b = r\"\";\n}\n",
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]
