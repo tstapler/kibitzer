@@ -764,6 +764,7 @@ impl Checker for SyntaxRulesChecker {
     }
 }
 
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn walk_declarations(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
     if cfg.function_kinds.contains(&node.kind()) {
         check_declaration(node, cfg, src, findings);
@@ -777,6 +778,7 @@ fn walk_declarations(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mu
 /// Recurses over the whole tree (not just function bodies — a `unreachable-code` block
 /// can be any `{ ... }`, including one nested inside another already-dead block) looking
 /// for `block_kind` nodes to hand to `check_block_for_unreachable`.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn walk_blocks(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
     if node.kind() == cfg.block_kind {
         check_block_for_unreachable(node, cfg, src, findings);
@@ -793,6 +795,7 @@ fn walk_blocks(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<
 /// Doesn't descend into `switch`/`match`/`when` case bodies — those aren't `block_kind`
 /// nodes in any of the seven grammars here, so this scope is a property of the walk, not
 /// a separate carve-out.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn check_block_for_unreachable(
     block: Node,
     cfg: &LangRuleConfig,
@@ -803,6 +806,7 @@ fn check_block_for_unreachable(
     let mut terminal: Option<(&'static str, usize)> = None;
     let mut cursor = container.walk();
     for stmt in container.named_children(&mut cursor) {
+        // SEAM(typed-node-kind-migration): substring check has no single-variant equivalent — see ADR-001.
         if stmt.kind().contains("comment") {
             continue;
         }
@@ -900,6 +904,7 @@ fn check_declaration(decl: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mu
 /// parameter's own function scope (a nested closure/lambda could shadow the name) —
 /// deliberately: this check is a mechanical, low-false-positive heuristic, not a
 /// scope-resolving analysis, and a shadowed name would just be one more legitimate hit.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn collect_condition_identifiers(
     node: Node,
     cfg: &LangRuleConfig,
@@ -917,6 +922,7 @@ fn collect_condition_identifiers(
     }
 }
 
+// SEAM(typed-node-kind-migration): called generically across all 8 grammars, no single <Lang>Kind applies — see ADR-001.
 fn collect_identifiers(node: Node, src: &[u8], out: &mut HashSet<String>) {
     if node.kind() == "identifier"
         && let Ok(text) = node.utf8_text(src)
@@ -932,6 +938,7 @@ fn collect_identifiers(node: Node, src: &[u8], out: &mut HashSet<String>) {
 /// Depth of `node` itself (as passed in via `current_depth`), taking the max over all
 /// descendants. Each nesting-construct body adds one — except a chained `else if`,
 /// which stays at the current depth rather than adding one (see `walk_if_chain`).
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn max_nesting_depth(node: Node, current_depth: usize, cfg: &LangRuleConfig) -> usize {
     if node.kind() == cfg.if_kind {
         return walk_if_chain(node, current_depth, cfg);
@@ -979,6 +986,7 @@ fn if_branches(if_node: Node<'_>) -> (Option<Node<'_>>, Option<Node<'_>>) {
 /// `else_clause`) before reaching either another `if_statement` (chain continues) or
 /// a plain block (chain ends, walked at the same depth since `else` itself isn't
 /// nesting).
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
     let mut max_depth = depth;
 
