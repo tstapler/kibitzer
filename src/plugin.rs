@@ -679,6 +679,8 @@ pub fn remove_plugin(name: &PluginName, force: bool) -> Result<ExitCode> {
     let plugin_dir = default_plugin_dir().join(name.as_ref());
     match fs::remove_dir_all(&plugin_dir) {
         Ok(()) => {}
+        // std::io::Error::kind(), not tree_sitter::Node::kind() — out of scope for the
+        // typed-node-kind-migration (confirmed by direct read, Story 1.1.1).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", plugin_dir.display())),
     }

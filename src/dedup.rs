@@ -38,6 +38,8 @@ pub fn claim(tool_use_id: &str) -> bool {
         .open(dir.join(tool_use_id))
     {
         Ok(_) => true,
+        // std::io::Error::kind(), not tree_sitter::Node::kind() — out of scope for the
+        // typed-node-kind-migration (confirmed by direct read, Story 1.1.1).
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(_) => true,
     }

@@ -8,10 +8,6 @@
 //! (a synthetic `ERROR`/`MISSING` node, or an anonymous/punctuation token no checker in
 //! this crate currently matches by kind anyway).
 
-// Migration in progress (see the SDD plan for issue-92-adjacent node-kind typing) — not
-// every generated enum/variant has a caller outside this module's own tests yet.
-#![allow(dead_code, unused_imports)]
-
 include!(concat!(env!("OUT_DIR"), "/go_kind.rs"));
 
 pub mod typescript {

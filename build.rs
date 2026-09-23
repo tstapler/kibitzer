@@ -123,6 +123,9 @@ fn write_enum_impl(out: &mut String, enum_name: &str, kinds: &BTreeMap<String, S
     out.push_str("    pub fn of(node: tree_sitter::Node) -> Self {\n");
     out.push_str("        Self::from_kind_str(node.kind())\n");
     out.push_str("    }\n\n");
+    // as_str has no caller yet outside this module's own tests — kept for round-tripping
+    // a Kind back to its grammar string, which some future checker/debug path will want.
+    out.push_str("    #[allow(dead_code)]\n");
     out.push_str("    pub fn as_str(self) -> &'static str {\n");
     out.push_str("        match self {\n");
     for (variant, raw) in kinds {

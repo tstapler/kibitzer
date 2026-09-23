@@ -645,6 +645,10 @@ fn walk_calls(node: Node, ctx: &CallWalkCtx, caller: Option<&str>, out: &mut Vec
         current_caller = Some(sym.id);
     }
 
+    // SEAM(typed-node-kind-migration): `call_expression` is shared Go/TypeScript/Tsx/
+    // JavaScript vocabulary reached from one function body (per `call_graph_supports`)
+    // — see ADR-001. Surfaced during Story 4.1.1's completeness sweep, alongside the
+    // already-seamed `function_kinds.contains` check just above.
     if node.kind() == "call_expression"
         && let Some(caller_id) = &current_caller
         && let Some(callee_text) = callee_text_for(node, ctx.source)

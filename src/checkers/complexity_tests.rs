@@ -123,7 +123,7 @@ fn complexity_of(src: &str) -> usize {
     let decl = tree
         .root_node()
         .children(&mut cursor)
-        .find(|n| n.kind() == "function_declaration")
+        .find(|n| GoKind::of(*n) == GoKind::FunctionDeclaration)
         .unwrap();
     cyclomatic_complexity(decl, src.as_bytes(), SubtestHandling::IncludeAll)
 }
@@ -235,7 +235,7 @@ fn does_not_sum_independent_t_run_subtests_in_a_test_file() {
     let decl = tree
         .root_node()
         .children(&mut cursor)
-        .find(|n| n.kind() == "function_declaration")
+        .find(|n| GoKind::of(*n) == GoKind::FunctionDeclaration)
         .unwrap();
     assert_eq!(
         cyclomatic_complexity(decl, src.as_bytes(), SubtestHandling::ExcludeRunSubtests),
