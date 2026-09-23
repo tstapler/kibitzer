@@ -569,6 +569,7 @@ mod tests {
                 field_access("m2", "T", "x", "pkg"),
                 field_access("m3", "T", "x", "pkg"),
             ],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
@@ -588,6 +589,7 @@ mod tests {
                 field_access("m2", "T", "y", "pkg"),
                 field_access("m3", "T", "z", "pkg"),
             ],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
@@ -620,6 +622,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: aliases,
             pruning: crate::arch_model::PruningSummary::default(),
         }

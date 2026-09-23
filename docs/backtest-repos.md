@@ -14,6 +14,7 @@ into `~/code/github.com/<owner>/<repo>` per the repo-placement convention in
 |--------------------------|------------------|------------|
 | `kubernetes/kubernetes`  | Go               | Largest widely-referenced real-world Go codebase; broad style variance across many contributors. |
 | `apache/cassandra`       | Java             | Large, mature, well-regarded Java codebase (build tooling aside). |
+| `android/nowinandroid`   | Kotlin           | Google's official, actively-maintained modern-Kotlin/Jetpack-Compose sample app — idiomatic sealed-class/interface hierarchies and the no-primary-constructor Android View idiom the type-hierarchy-graph feature's Kotlin extraction depends on getting right. |
 | `tstapler/stapler-squad` | Go               | Tyler's own in-progress monorepo — already checked out locally (see below), not re-cloned by the script. |
 | `servo/servo`            | Rust             | Large browser-engine Rust codebase, heavy real-world generics/trait use. |
 | `BurntSushi/ripgrep`     | Rust             | Small, famously clean, idiomatic Rust codebase — a useful low-noise counterpoint to `servo`'s size. |
@@ -31,8 +32,8 @@ into `~/code/github.com/<owner>/<repo>` per the repo-placement convention in
 `~/Programming/stapler-squad`, or a `~/.stapler-squad/workspaces/*/worktrees/*` worktree
 checkout); point the checker at whichever local checkout is current instead.
 
-No Python or Kotlin exemplar is in this list yet — add one the same way if a checker
-needs backtesting against those languages.
+No Python exemplar is in this list yet — add one the same way if a checker needs
+backtesting against that language.
 
 ## Running a checker against the corpus
 

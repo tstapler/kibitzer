@@ -359,6 +359,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases,
             pruning: PruningSummary::default(),
         }
