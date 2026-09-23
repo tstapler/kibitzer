@@ -10,6 +10,7 @@ CODE_ROOT="${CODE_ROOT:-$HOME/code/github.com}"
 REPOS=(
   "kubernetes/kubernetes"
   "apache/cassandra"
+  "android/nowinandroid"
   "servo/servo"
   "BurntSushi/ripgrep"
   "denoland/deno"

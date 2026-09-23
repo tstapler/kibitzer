@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use tree_sitter::{Node, Tree};
 
-use crate::arch_model::{AccessKind, SymbolKind, SymbolNode};
+use crate::arch_model::{AccessKind, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::checker::Language;
 
 /// Per-`Language` table of node-kind strings driving symbol extraction — the
@@ -1035,6 +1035,498 @@ pub fn extract_field_access_sites_for_file(
     sites
 }
 
+/// One raw `extends`/`implements` site found in source, before resolution against the
+/// rest of the model (mirrors `RawCallSite`/`RawFieldAccessSite`'s "raw" naming — a later
+/// pass turns these into `TypeRelationEdge`s). `kind_hint` is `None` only for source
+/// syntax that can't disambiguate `Extends`/`Implements` on its own (e.g. Go embedded
+/// fields, Kotlin bare-`type` supertype-list entries) — Java always supplies a hint since
+/// its grammar distinguishes `extends`/`implements` syntactically.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawTypeRelationSite {
+    pub type_id: String,
+    pub package_path: String,
+    pub target_text: String,
+    pub kind_hint: Option<TypeRelationKind>,
+    pub file: PathBuf,
+    pub line: usize,
+    /// `true` only for a Go embedded field whose `target_text` is package-qualified
+    /// (`pkg.Type`) — the *only* shape where a `.` in `target_text` is a real
+    /// package-qualifier meant to be routed through `file_import_aliases`. TS/JS's
+    /// `React.Component`-style member-expression supertypes, Java's `pkg.Base`/
+    /// `scoped_type_identifier` targets, and any other language's dotted text are real
+    /// possibilities too, but resolving *those* by stripping the qualifier and doing a
+    /// same-name lookup elsewhere in the model would be a guess, not a resolution — see
+    /// `resolve_type_edge_target`'s doc comment in `arch_model.rs`. Defaults to `false`;
+    /// only `go_embedded_type_relations`/`go_embedded_interface_relations` set it `true`.
+    pub dotted_text_is_go_package_qualifier: bool,
+}
+
+/// Languages `extract_type_relation_sites_for_file` walks. Mirrors `call_graph_supports`/
+/// `field_access_supports`'s per-feature capability-list convention.
+pub fn type_relation_supports(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Go
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Java
+            | Language::Kotlin
+    )
+}
+
+fn walk_type_relations(
+    node: Node,
+    language: Language,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    match language {
+        Language::Go => {
+            if node.kind() == "type_declaration" {
+                go_embedded_type_relations(node, source, package_path, out);
+                go_embedded_interface_relations(node, source, package_path, out);
+            }
+        }
+        Language::Java => match node.kind() {
+            "class_declaration" => java_class_type_relations(node, source, package_path, out),
+            "interface_declaration" => {
+                java_interface_type_relations(node, source, package_path, out)
+            }
+            _ => {}
+        },
+        Language::TypeScript | Language::Tsx => {
+            if node.kind() == "class_declaration" {
+                ts_class_heritage_relations(node, source, package_path, out);
+            }
+        }
+        Language::JavaScript => {
+            if node.kind() == "class_declaration" {
+                js_class_heritage_relation(node, source, package_path, out);
+            }
+        }
+        Language::Kotlin if node.kind() == "class_declaration" => {
+            kotlin_delegation_type_relations(node, source, package_path, out);
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_type_relations(child, language, source, package_path, out);
+    }
+}
+
+/// Walks `tree.root_node()` and returns every `extends`/`implements` site found, per
+/// [`type_relation_supports`]. No file I/O — `RawTypeRelationSite::file` is left empty for
+/// the caller to fill in, same convention as `extract_call_sites_for_file`.
+pub fn extract_type_relation_sites_for_file(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    package_path: &str,
+) -> Vec<RawTypeRelationSite> {
+    let mut out = Vec::new();
+    if !type_relation_supports(language) {
+        return out;
+    }
+    walk_type_relations(tree.root_node(), language, source, package_path, &mut out);
+    out
+}
+
+/// Java `class_declaration` → `extends`/`implements` sites. `superclass` is a NAMED field
+/// (`class_declaration`'s `superclass` field wraps the single supertype reference
+/// directly); `interfaces` is also a named field, but wraps a `super_interfaces` node whose
+/// own single `type_list` child holds one entry per implemented interface — verified
+/// against the grammar's field-based/positional split the epic's task description calls
+/// out (contrast with `java_interface_type_relations`'s positional `extends_interfaces`).
+fn java_class_type_relations(
+    class_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let Some(name_node) = class_decl.child_by_field_name("name") else {
+        return;
+    };
+    let class_name = node_text(name_node, source);
+    let type_id = build_id(package_path, None, &strip_generic_params(class_name));
+    let line = class_decl.start_position().row + 1;
+
+    if let Some(superclass) = class_decl.child_by_field_name("superclass")
+        && let Some(target) = superclass.named_child(0)
+    {
+        out.push(RawTypeRelationSite {
+            type_id: type_id.clone(),
+            package_path: package_path.to_string(),
+            target_text: strip_generic_params(node_text(target, source)),
+            kind_hint: Some(TypeRelationKind::Extends),
+            file: PathBuf::new(),
+            line,
+            dotted_text_is_go_package_qualifier: false,
+        });
+    }
+
+    if let Some(interfaces) = class_decl.child_by_field_name("interfaces")
+        && let Some(type_list) = find_child_by_kind(interfaces, "type_list")
+    {
+        let mut cursor = type_list.walk();
+        for target in type_list.named_children(&mut cursor) {
+            out.push(RawTypeRelationSite {
+                type_id: type_id.clone(),
+                package_path: package_path.to_string(),
+                target_text: strip_generic_params(node_text(target, source)),
+                kind_hint: Some(TypeRelationKind::Implements),
+                file: PathBuf::new(),
+                line,
+                dotted_text_is_go_package_qualifier: false,
+            });
+        }
+    }
+}
+
+/// Java `interface_declaration` → `extends` sites. `extends_interfaces` is a POSITIONAL
+/// child here (no field name) — unlike `class_declaration`'s named `interfaces` field —
+/// and interface-to-interface inheritance uses the `extends` keyword, so every site here
+/// is tagged `Extends`, never `Implements`, even though (like `interfaces` above) it wraps
+/// a `type_list` of possibly multiple targets.
+fn java_interface_type_relations(
+    interface_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let Some(name_node) = interface_decl.child_by_field_name("name") else {
+        return;
+    };
+    let interface_name = node_text(name_node, source);
+    let type_id = build_id(package_path, None, &strip_generic_params(interface_name));
+    let line = interface_decl.start_position().row + 1;
+
+    let Some(extends_interfaces) = find_child_by_kind(interface_decl, "extends_interfaces") else {
+        return;
+    };
+    let Some(type_list) = find_child_by_kind(extends_interfaces, "type_list") else {
+        return;
+    };
+    let mut cursor = type_list.walk();
+    for target in type_list.named_children(&mut cursor) {
+        out.push(RawTypeRelationSite {
+            type_id: type_id.clone(),
+            package_path: package_path.to_string(),
+            target_text: strip_generic_params(node_text(target, source)),
+            kind_hint: Some(TypeRelationKind::Extends),
+            file: PathBuf::new(),
+            line,
+            dotted_text_is_go_package_qualifier: false,
+        });
+    }
+}
+
+/// TS/Tsx `class_declaration` → `extends`/`implements` sites. Both clauses live inside a
+/// `class_heritage` node that is itself a positional (not field-based) child of
+/// `class_declaration` — verified via `to_sexp()`: `(class_declaration name: ... (class_heritage
+/// (extends_clause value: ...) (implements_clause (type_identifier) ...)) body: ...)`.
+/// `extends_clause`'s superclass is its `value` field; `implements_clause` has no
+/// analogous field — each implemented type is a bare positional (named) child, since TS
+/// allows more than one. A generic superclass's type arguments (`Base<T>`) surface as a
+/// sibling `type_arguments` field on `extends_clause`, not inside `value`'s own text, so
+/// `strip_generic_params` here is defensive rather than load-bearing (same caveat as
+/// `strip_generic_params`'s own doc comment) — kept for parity with every other call site
+/// per the Pattern Decisions table.
+fn ts_class_heritage_relations(
+    class_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let Some(name_node) = class_decl.child_by_field_name("name") else {
+        return;
+    };
+    let type_id = build_id(
+        package_path,
+        None,
+        &strip_generic_params(node_text(name_node, source)),
+    );
+    let line = class_decl.start_position().row + 1;
+    let push = |target: Node, kind, out: &mut Vec<RawTypeRelationSite>| {
+        out.push(RawTypeRelationSite {
+            type_id: type_id.clone(),
+            package_path: package_path.to_string(),
+            target_text: strip_generic_params(node_text(target, source)),
+            kind_hint: Some(kind),
+            file: PathBuf::new(),
+            line,
+            dotted_text_is_go_package_qualifier: false,
+        });
+    };
+
+    let Some(heritage) = find_child_by_kind(class_decl, "class_heritage") else {
+        return;
+    };
+
+    if let Some(extends) = find_child_by_kind(heritage, "extends_clause")
+        && let Some(value) = extends.child_by_field_name("value")
+    {
+        push(value, TypeRelationKind::Extends, out);
+    }
+
+    if let Some(implements) = find_child_by_kind(heritage, "implements_clause") {
+        let mut cursor = implements.walk();
+        for ty in implements.named_children(&mut cursor) {
+            push(ty, TypeRelationKind::Implements, out);
+        }
+    }
+}
+
+/// Plain JS `class_declaration` → its (at most one) `extends` site. Deliberately separate
+/// from [`ts_class_heritage_relations`], not a shared helper: plain JS's `class_heritage`
+/// has none of TS's `extends_clause`/`implements_clause` substructure — verified via
+/// `to_sexp()`, `class Dog extends Animal {}` produces `(class_heritage (identifier))`, a
+/// single bare positional child that *is* the superclass expression. A class with no
+/// `class_heritage` child at all (`class Dog {}`) emits nothing. JS has no `implements`
+/// keyword, so this never emits a `TypeRelationKind::Implements` site.
+fn js_class_heritage_relation(
+    class_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let Some(name_node) = class_decl.child_by_field_name("name") else {
+        return;
+    };
+    let Some(heritage) = find_child_by_kind(class_decl, "class_heritage") else {
+        return;
+    };
+    let Some(superclass) = heritage.named_child(0) else {
+        return;
+    };
+    out.push(RawTypeRelationSite {
+        type_id: build_id(
+            package_path,
+            None,
+            &strip_generic_params(node_text(name_node, source)),
+        ),
+        package_path: package_path.to_string(),
+        target_text: strip_generic_params(node_text(superclass, source)),
+        kind_hint: Some(TypeRelationKind::Extends),
+        file: PathBuf::new(),
+        line: class_decl.start_position().row + 1,
+        dotted_text_is_go_package_qualifier: false,
+    });
+}
+
+/// Kotlin `class_declaration` (covers both plain classes and interfaces) →
+/// `delegation_specifiers`, split three ways by shape (verified against
+/// `tree-sitter-kotlin-ng`'s `grammar.js`; all children read positionally, no named
+/// fields): `constructor_invocation` (`Base()`) → unambiguously a class → `Extends`;
+/// `explicit_delegation` (`Iface by impl`) → unambiguously interface delegation →
+/// `Implements`; a bare `type` (`user_type` etc.) → genuinely ambiguous → `kind_hint: None`
+/// — NOT always an interface (Kotlin's "no primary constructor" idiom writes its
+/// superclass bare too, see the `..._no_primary_constructor_superclass_...` test below),
+/// so it's deliberately left unresolved rather than guessed.
+fn kotlin_delegation_type_relations(
+    class_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let Some(name_node) = class_decl.child_by_field_name("name") else {
+        return;
+    };
+    let type_id = build_id(
+        package_path,
+        None,
+        &strip_generic_params(node_text(name_node, source)),
+    );
+    let line = class_decl.start_position().row + 1;
+
+    let Some(specifiers) = find_child_by_kind(class_decl, "delegation_specifiers") else {
+        return;
+    };
+
+    let mut cursor = specifiers.walk();
+    for specifier in specifiers
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "delegation_specifier")
+    {
+        let Some((target, kind_hint)) = kotlin_delegation_specifier_target(specifier) else {
+            continue;
+        };
+        out.push(RawTypeRelationSite {
+            type_id: type_id.clone(),
+            package_path: package_path.to_string(),
+            target_text: strip_generic_params(node_text(target, source)),
+            kind_hint,
+            file: PathBuf::new(),
+            line,
+            dotted_text_is_go_package_qualifier: false,
+        });
+    }
+}
+
+/// Classifies one `delegation_specifier` child's shape and returns the type node to read the
+/// target name from, paired with the `kind_hint` that shape implies. `None` only when the
+/// specifier is malformed (an `annotation`-only child list, or a shape node missing its
+/// expected first named child) — never used to mean "ambiguous", which is
+/// `Some((_, None))`.
+fn kotlin_delegation_specifier_target(specifier: Node) -> Option<(Node, Option<TypeRelationKind>)> {
+    let mut cursor = specifier.walk();
+    let shape = specifier
+        .children(&mut cursor)
+        .find(|c| c.kind() != "annotation")?;
+
+    match shape.kind() {
+        "constructor_invocation" => Some((shape.named_child(0)?, Some(TypeRelationKind::Extends))),
+        "explicit_delegation" => Some((shape.named_child(0)?, Some(TypeRelationKind::Implements))),
+        _ => Some((shape, None)),
+    }
+}
+
+/// Resolves a Go embedded field's `type`-field node to its raw supertype name text,
+/// unwrapping `pointer_type` (one level, same pattern as `go_receiver_type_name`) and
+/// `generic_type` (drops the `type_arguments` child entirely, equivalent to
+/// `strip_generic_params`) before matching the base shape: a bare `type_identifier`
+/// name, or a `qualified_type`'s `package.Name` join. Any other shape (e.g. an
+/// anonymous inline `struct_type`) has no name to report and yields `None`.
+fn go_embedded_type_name(ty: Node, source: &str) -> Option<String> {
+    match ty.kind() {
+        "type_identifier" => Some(node_text(ty, source).to_string()),
+        "qualified_type" => {
+            let package = ty.child_by_field_name("package")?;
+            let name = ty.child_by_field_name("name")?;
+            Some(format!(
+                "{}.{}",
+                node_text(package, source),
+                node_text(name, source)
+            ))
+        }
+        "pointer_type" => go_embedded_type_name(ty.named_child(0)?, source),
+        "generic_type" => go_embedded_type_name(ty.child_by_field_name("type")?, source),
+        _ => None,
+    }
+}
+
+/// Appends one `RawTypeRelationSite` per embedded (anonymous) field declared directly on
+/// a Go struct type under `type_decl` (a `type_declaration` node, possibly a grouped
+/// `type (...)` block — each `type_spec` child is handled independently, matching
+/// `go_struct_fields`'s precedent). Opposite branch from `go_struct_fields`: a
+/// `field_declaration` with no `name` field-child is the embed this extracts (skipped
+/// there); one with a `name` is an ordinary field and is skipped here. `kind_hint` is
+/// always `None` — Go embeds are structurally ambiguous between `extends`/`implements`,
+/// resolved later by symbol-kind lookup, not here.
+fn go_embedded_type_relations(
+    type_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let mut cursor = type_decl.walk();
+    for spec in type_decl
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "type_spec")
+    {
+        let Some(name_node) = spec.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(struct_ty) = spec.child_by_field_name("type") else {
+            continue;
+        };
+        if struct_ty.kind() != "struct_type" {
+            continue;
+        }
+        let type_name = strip_generic_params(node_text(name_node, source));
+        let type_id = build_id(package_path, None, &type_name);
+        let mut sc = struct_ty.walk();
+        let Some(field_list) = struct_ty
+            .children(&mut sc)
+            .find(|c| c.kind() == "field_declaration_list")
+        else {
+            continue;
+        };
+        let mut fc = field_list.walk();
+        for decl in field_list
+            .children(&mut fc)
+            .filter(|c| c.kind() == "field_declaration")
+        {
+            if decl.child_by_field_name("name").is_some() {
+                continue;
+            }
+            let Some(ty) = decl.child_by_field_name("type") else {
+                continue;
+            };
+            let Some(target_text) = go_embedded_type_name(ty, source) else {
+                continue;
+            };
+            out.push(RawTypeRelationSite {
+                type_id: type_id.clone(),
+                package_path: package_path.to_string(),
+                target_text,
+                kind_hint: None,
+                file: PathBuf::new(),
+                line: type_decl.start_position().row + 1,
+                dotted_text_is_go_package_qualifier: true,
+            });
+        }
+    }
+}
+
+/// Appends one `RawTypeRelationSite` per embedded interface declared directly on a Go
+/// `interface_type` under `type_decl` (same grouped-`type (...)` handling as
+/// `go_embedded_type_relations`). Opposite branch from `interface_declared_methods`
+/// (`isp_fat_interface.rs`): a `type_elem` child is the embedded interface this extracts
+/// (skipped there as "real cross-type/cross-package work, deferred"); a `method_elem`
+/// child is an ordinary method signature and is skipped here. Unlike struct embedding
+/// (ambiguous between `Extends`/`Implements`, resolved later by symbol-kind lookup), Go's
+/// grammar only allows embedding an interface inside another interface — there's no
+/// "embed a struct inside an interface" shape — so `kind_hint` is always
+/// `Some(Implements)` here, no ambiguity to defer.
+fn go_embedded_interface_relations(
+    type_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let mut cursor = type_decl.walk();
+    for spec in type_decl
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "type_spec")
+    {
+        let Some(name_node) = spec.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(interface_ty) = spec.child_by_field_name("type") else {
+            continue;
+        };
+        if interface_ty.kind() != "interface_type" {
+            continue;
+        }
+        let type_name = strip_generic_params(node_text(name_node, source));
+        let type_id = build_id(package_path, None, &type_name);
+        let mut ic = interface_ty.walk();
+        for elem in interface_ty
+            .children(&mut ic)
+            .filter(|c| c.kind() == "type_elem")
+        {
+            let Some(ty) = elem.named_child(0) else {
+                continue;
+            };
+            let Some(target_text) = go_embedded_type_name(ty, source) else {
+                continue;
+            };
+            out.push(RawTypeRelationSite {
+                type_id: type_id.clone(),
+                package_path: package_path.to_string(),
+                target_text,
+                kind_hint: Some(TypeRelationKind::Implements),
+                file: PathBuf::new(),
+                line: type_decl.start_position().row + 1,
+                dotted_text_is_go_package_qualifier: true,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1543,16 @@ mod tests {
             .iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("no symbol named {name} in {symbols:?}"))
+    }
+
+    fn type_relation_sites(
+        language: Language,
+        source: &str,
+        package_path: &str,
+    ) -> Vec<RawTypeRelationSite> {
+        let cache = GrammarCache::new();
+        let tree = cache.parse(language, source).expect("parses");
+        extract_type_relation_sites_for_file(language, source, &tree, package_path)
     }
 
     // --- Story 1.2.1: LangSymbolConfig table ---
@@ -1687,5 +2189,352 @@ mod tests {
         // `var t T` already shadows before the loop even starts, so this stays empty either
         // way — the point of this test is documentation, not a new assertion.
         assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    // --- Epic 1.4: Java extends/implements extraction ---
+
+    #[test]
+    fn java_class_type_relations_captures_superclass_and_multiple_interfaces() {
+        let sites = type_relation_sites(
+            Language::Java,
+            "class Dog extends Animal implements Runnable, Named {}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 3, "got: {sites:?}");
+        assert!(sites.iter().all(|s| s.type_id == "pkg::Dog"));
+
+        let extends: Vec<_> = sites
+            .iter()
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Extends))
+            .collect();
+        assert_eq!(extends.len(), 1);
+        assert_eq!(extends[0].target_text, "Animal");
+
+        let implements: Vec<&str> = sites
+            .iter()
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Implements))
+            .map(|s| s.target_text.as_str())
+            .collect();
+        assert_eq!(implements, vec!["Runnable", "Named"]);
+    }
+
+    #[test]
+    fn java_class_type_relations_empty_for_plain_class() {
+        let sites = type_relation_sites(Language::Java, "class Dog {}\n", "pkg");
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn java_interface_type_relations_captures_multiple_extends_targets_as_extends_kind() {
+        let sites =
+            type_relation_sites(Language::Java, "interface Foo extends Bar, Baz {}\n", "pkg");
+        assert_eq!(sites.len(), 2, "got: {sites:?}");
+        assert!(sites.iter().all(|s| s.type_id == "pkg::Foo"));
+        assert!(
+            sites
+                .iter()
+                .all(|s| s.kind_hint == Some(TypeRelationKind::Extends))
+        );
+
+        let targets: Vec<&str> = sites.iter().map(|s| s.target_text.as_str()).collect();
+        assert_eq!(targets, vec!["Bar", "Baz"]);
+    }
+
+    // --- Epic 1.3: TS/Tsx/JS class_heritage extraction ---
+
+    #[test]
+    fn ts_class_heritage_relations_captures_extends_and_multiple_implements() {
+        let sites = type_relation_sites(
+            Language::TypeScript,
+            "class Dog extends Animal implements Runnable, Named {}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 3, "got: {sites:?}");
+        assert!(sites.iter().all(|s| s.type_id == "pkg::Dog"));
+
+        let extends: Vec<_> = sites
+            .iter()
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Extends))
+            .collect();
+        assert_eq!(extends.len(), 1);
+        assert_eq!(extends[0].target_text, "Animal");
+
+        let implements: Vec<&str> = sites
+            .iter()
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Implements))
+            .map(|s| s.target_text.as_str())
+            .collect();
+        assert_eq!(implements, vec!["Runnable", "Named"]);
+    }
+
+    #[test]
+    fn ts_class_heritage_relations_strips_generic_args() {
+        let sites = type_relation_sites(
+            Language::TypeScript,
+            "class Dog<T> extends Base<T> {}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "Base");
+    }
+
+    #[test]
+    fn tsx_class_heritage_relations_matches_typescript() {
+        let source = "class Dog extends Animal {}\n";
+        let ts_sites = type_relation_sites(Language::TypeScript, source, "pkg");
+        let tsx_sites = type_relation_sites(Language::Tsx, source, "pkg");
+
+        assert_eq!(ts_sites.len(), 1);
+        assert_eq!(tsx_sites.len(), 1);
+        assert_eq!(tsx_sites[0].target_text, ts_sites[0].target_text);
+        assert_eq!(tsx_sites[0].kind_hint, ts_sites[0].kind_hint);
+        assert_eq!(tsx_sites[0].kind_hint, Some(TypeRelationKind::Extends));
+    }
+
+    #[test]
+    fn js_class_heritage_relation_captures_extends() {
+        let sites =
+            type_relation_sites(Language::JavaScript, "class Dog extends Animal {}\n", "pkg");
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "Animal");
+        assert_eq!(sites[0].kind_hint, Some(TypeRelationKind::Extends));
+    }
+
+    #[test]
+    fn js_class_heritage_relation_empty_for_no_extends() {
+        let sites = type_relation_sites(Language::JavaScript, "class Dog {}\n", "pkg");
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    // --- go_embedded_type_relations (Epic 1.2) ---
+
+    #[test]
+    fn go_embedded_type_relations_captures_same_package_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Animal struct{}\n\ntype Dog struct {\n\tAnimal\n\tName string\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].type_id, "pkg::Dog");
+        assert_eq!(sites[0].target_text, "Animal");
+        assert_eq!(sites[0].kind_hint, None);
+    }
+
+    #[test]
+    fn go_embedded_type_relations_unwraps_pointer_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Dog struct {\n\t*Animal\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "Animal");
+    }
+
+    #[test]
+    fn go_embedded_type_relations_keeps_qualifier_on_cross_package_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Dog struct {\n\tother.Animal\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "other.Animal");
+    }
+
+    #[test]
+    fn go_embedded_type_relations_strips_generic_args_on_generic_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Dog struct {\n\tBase[int]\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "Base");
+    }
+
+    #[test]
+    fn go_embedded_type_relations_skips_anonymous_inline_struct_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Foo struct {\n\tstruct{ X int }\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_embedded_type_relations_skips_named_field_not_embedded() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Dog struct {\n\tName string\n\tAge int\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    // --- go_embedded_interface_relations ---
+
+    #[test]
+    fn go_embedded_interface_relations_captures_embedded_interface_as_implements() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n\ntype Writer interface {\n\tWrite(p []byte) (n int, err error)\n}\n\ntype ReadWriter interface {\n\tReader\n\tWriter\n}\n",
+            "pkg",
+        );
+        let mut targets: Vec<&str> = sites.iter().map(|s| s.target_text.as_str()).collect();
+        targets.sort_unstable();
+        assert_eq!(targets, vec!["Reader", "Writer"], "got: {sites:?}");
+        assert!(
+            sites
+                .iter()
+                .all(|s| s.kind_hint == Some(TypeRelationKind::Implements)),
+            "got: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn go_embedded_interface_relations_does_not_treat_a_method_signature_as_an_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_embedded_interface_relations_keeps_qualifier_on_cross_package_embedded_interface() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Named interface {\n\tio.Reader\n\tName() string\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "io.Reader");
+        assert_eq!(sites[0].kind_hint, Some(TypeRelationKind::Implements));
+        assert!(sites[0].dotted_text_is_go_package_qualifier);
+    }
+
+    #[test]
+    fn type_relation_supports_returns_true_for_supported_languages_false_for_python_and_rust() {
+        for language in [
+            Language::Go,
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Java,
+            Language::Kotlin,
+        ] {
+            assert!(
+                type_relation_supports(language),
+                "expected {language:?} to be supported"
+            );
+        }
+        for language in [Language::Python, Language::Rust] {
+            assert!(
+                !type_relation_supports(language),
+                "expected {language:?} to be unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_type_relation_sites_for_file_returns_empty_for_unsupported_language() {
+        // Same Go embedding source that `go_embedded_type_relations_captures_same_package_embed`
+        // proves DOES produce a site when walked as Go — parsed here under a language
+        // `type_relation_supports` excludes, to prove the early return in
+        // `extract_type_relation_sites_for_file` short-circuits before any walk happens,
+        // not merely that the walk itself happens to find nothing.
+        let sites = type_relation_sites(
+            Language::Python,
+            "package pkg\n\ntype Animal struct{}\n\ntype Dog struct {\n\tAnimal\n\tName string\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites, Vec::new());
+    }
+
+    // --- kotlin_delegation_type_relations (Epic 1.5) ---
+
+    #[test]
+    fn kotlin_delegation_type_relations_constructor_invocation_is_extends() {
+        let sites = type_relation_sites(
+            Language::Kotlin,
+            "class Dog : Animal(), Runnable {}\n",
+            "pkg",
+        );
+        let animal = sites
+            .iter()
+            .find(|s| s.target_text == "Animal")
+            .unwrap_or_else(|| panic!("no Animal site in {sites:?}"));
+        assert_eq!(animal.kind_hint, Some(TypeRelationKind::Extends));
+        assert_eq!(animal.type_id, "pkg::Dog");
+    }
+
+    #[test]
+    fn kotlin_delegation_type_relations_explicit_delegation_is_implements() {
+        let sites = type_relation_sites(
+            Language::Kotlin,
+            "class Dog(impl: Runnable) : Runnable by impl {}\n",
+            "pkg",
+        );
+        let runnable = sites
+            .iter()
+            .find(|s| s.target_text == "Runnable")
+            .unwrap_or_else(|| panic!("no Runnable site in {sites:?}"));
+        assert_eq!(runnable.kind_hint, Some(TypeRelationKind::Implements));
+    }
+
+    #[test]
+    fn kotlin_delegation_type_relations_bare_type_is_ambiguous() {
+        let sites = type_relation_sites(Language::Kotlin, "class Dog : Runnable {}\n", "pkg");
+        let runnable = sites
+            .iter()
+            .find(|s| s.target_text == "Runnable")
+            .unwrap_or_else(|| panic!("no Runnable site in {sites:?}"));
+        assert_eq!(runnable.kind_hint, None);
+    }
+
+    #[test]
+    fn kotlin_delegation_type_relations_no_primary_constructor_superclass_is_ambiguous_not_implements()
+     {
+        // Kotlin's "class with no primary constructor" idiom: each secondary constructor
+        // delegates via `: super(...)`, and the superclass name is written bare after `:` —
+        // exactly the same syntax a bare interface reference would use. `View` here is
+        // actually a class (real Kotlin/Android code writes this for e.g. custom Views), so
+        // classifying it `Implements` would be a real bug — this is the regression test for
+        // that trap.
+        let sites = type_relation_sites(
+            Language::Kotlin,
+            "class MyView : View {\n    constructor(ctx: Int) : super(ctx)\n}\n",
+            "pkg",
+        );
+        let view = sites
+            .iter()
+            .find(|s| s.target_text == "View")
+            .unwrap_or_else(|| panic!("no View site in {sites:?}"));
+        assert_eq!(view.kind_hint, None);
+    }
+
+    #[test]
+    fn kotlin_delegation_type_relations_splits_mixed_supertype_list() {
+        let sites = type_relation_sites(
+            Language::Kotlin,
+            "class Dog : Animal(), Runnable, Named {}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 3, "got: {sites:?}");
+        assert!(sites.iter().all(|s| s.type_id == "pkg::Dog"));
+
+        let find = |name: &str| {
+            sites
+                .iter()
+                .find(|s| s.target_text == name)
+                .unwrap_or_else(|| panic!("no {name} site in {sites:?}"))
+        };
+        assert_eq!(find("Animal").kind_hint, Some(TypeRelationKind::Extends));
+        assert_eq!(find("Runnable").kind_hint, None);
+        assert_eq!(find("Named").kind_hint, None);
     }
 }

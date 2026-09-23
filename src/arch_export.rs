@@ -307,13 +307,23 @@ mod tests {
     fn run_export_completes_under_5s_on_benchmark_fixture() {
         let dir = tmp_dir("benchmark");
         write_fixture(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        write_fixture(
+            &dir,
+            "shared/base.go",
+            "package shared\n\ntype Base struct{}\n",
+        );
+        write_fixture(
+            &dir,
+            "web/shared/base.ts",
+            "export interface BaseShape { area(): number; }\n",
+        );
         for i in 0..40 {
             let go_src = format!(
-                "package pkg{i}\n\ntype Widget{i} struct{{}}\n\nfunc (w Widget{i}) Do() {{}}\n\nfunc Handle{i}() {{}}\n"
+                "package pkg{i}\n\nimport \"example.com/app/shared\"\n\ntype Widget{i} struct{{\n\tshared.Base\n}}\n\nfunc (w Widget{i}) Do() {{}}\n\nfunc Handle{i}() {{}}\n"
             );
             write_fixture(&dir, &format!("svc{i}/widget.go"), &go_src);
             let ts_src = format!(
-                "export interface Shape{i} {{ area(): number; }}\n\nexport function make{i}(): Shape{i} {{ return null as unknown as Shape{i}; }}\n"
+                "import {{ BaseShape }} from \"../shared/base\";\n\nexport interface Shape{i} extends BaseShape {{ area(): number; }}\n\nexport function make{i}(): Shape{i} {{ return null as unknown as Shape{i}; }}\n"
             );
             write_fixture(&dir, &format!("web/mod{i}/shape.ts"), &ts_src);
         }
