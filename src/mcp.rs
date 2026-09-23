@@ -11,7 +11,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::arch_model::{
-    ArchModel, CallEdge, ModelCache, ModelLevel, SymbolKind, SymbolNode, load_cached_model,
+    ArchModel, CallEdge, ModelCache, ModelLevel, SymbolKind, SymbolNode, TypeRelationEdge,
+    load_cached_model,
 };
 use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
@@ -187,6 +188,10 @@ fn default_depth() -> usize {
 /// constant so the clamp call site and this doc comment can't drift apart.
 const MAX_CALL_DEPTH: usize = 10;
 
+/// Upper bound `type_hierarchy` clamps `TypeHierarchyRequest::depth` to — mirrors
+/// `MAX_CALL_DEPTH`'s reasoning for the type-hierarchy traversal.
+const MAX_TYPE_HIERARCHY_DEPTH: usize = 10;
+
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct ListRefactorCandidatesRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
@@ -233,6 +238,53 @@ struct CallTraversalResponse {
     /// within the graph was already collected.
     truncated: bool,
     edges: Vec<CallEdge>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct TypeHierarchyRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// The `SymbolNode::id` (a `Type` or `Interface`) to traverse from — as returned by
+    /// `list_architecture_symbols` or `get_architecture_node`.
+    node: String,
+    /// How many hops to follow. Defaults to 1 (immediate super-/subtypes only); clamped
+    /// to [1, `MAX_TYPE_HIERARCHY_DEPTH`]. The walk keeps a visited-node set so a cyclic
+    /// hierarchy can't loop forever.
+    #[serde(default = "default_depth")]
+    depth: usize,
+    /// Whether to include unexported/private symbols when loading the model. Defaults to
+    /// false, matching every other pruning default in this tool family.
+    #[serde(default)]
+    include_private: bool,
+    /// Maximum number of edges to return in one page. Defaults to 200; values above 1000
+    /// are clamped down to 1000.
+    #[serde(default = "default_limit")]
+    limit: usize,
+    /// Opaque pagination cursor from a previous response's `next_cursor`. Defaults to
+    /// `None`, which starts from the first match.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TypeHierarchyResponse {
+    node: String,
+    depth: usize,
+    /// True when the walk still had unexpanded nodes left when `depth` ran out —
+    /// increasing `depth` may surface more edges.
+    truncated: bool,
+    total_matched: usize,
+    returned: usize,
+    next_cursor: Option<String>,
+    /// True when `total_matched == 0`, `include_private` was false, and the model's
+    /// pruning summary shows symbols were excluded by that default — same purpose as
+    /// `ListArchitectureSymbolsResponse::possibly_pruned`.
+    possibly_pruned: bool,
+    /// Set only when `node` resolves to a non-`Type`/`Interface` `SymbolNode` — see
+    /// `non_type_node_hint`.
+    node_kind: Option<SymbolKind>,
+    hint: Option<String>,
+    edges: Vec<TypeRelationEdge>,
 }
 
 /// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain
@@ -338,6 +390,165 @@ fn traverse_call_edges(
         frontier = next_frontier;
     }
     (collected, false)
+}
+
+/// Which direction `traverse_type_edges` walks — mirrors `CallDirection`'s reasoning for
+/// the type-hierarchy graph.
+#[derive(Debug, Clone, Copy)]
+enum TypeHierarchyDirection {
+    /// Follows `from -> to`: "what does this type extend/implement?"
+    Supertypes,
+    /// Follows `to -> from`: "what extends/implements this type?"
+    Subtypes,
+}
+
+impl TypeHierarchyDirection {
+    /// `(near, far)`: `near` is the endpoint a frontier node is matched against, `far` is
+    /// the endpoint that continues the walk.
+    fn endpoints(self, edge: &TypeRelationEdge) -> (&str, &str) {
+        match self {
+            TypeHierarchyDirection::Supertypes => (&edge.from, &edge.to),
+            TypeHierarchyDirection::Subtypes => (&edge.to, &edge.from),
+        }
+    }
+
+    /// The registered MCP tool name for this direction — used to build a direction-correct
+    /// `non_type_node_hint` message (a `list_subtypes` caller should be told to retry with
+    /// `list_subtypes`, not a hardcoded `list_supertypes`).
+    fn tool_name(self) -> &'static str {
+        match self {
+            TypeHierarchyDirection::Supertypes => "list_supertypes",
+            TypeHierarchyDirection::Subtypes => "list_subtypes",
+        }
+    }
+}
+
+/// `direction`-relevant near-endpoint -> edges index, built once per `traverse_type_edges`
+/// call instead of rescanning `edges` linearly on every hop — same reasoning as
+/// `CallAdjacency`.
+type TypeAdjacency<'a> = std::collections::HashMap<&'a str, Vec<&'a TypeRelationEdge>>;
+
+fn build_type_adjacency(
+    edges: &[TypeRelationEdge],
+    direction: TypeHierarchyDirection,
+) -> TypeAdjacency<'_> {
+    let mut by_near: TypeAdjacency = std::collections::HashMap::new();
+    for edge in edges {
+        by_near
+            .entry(direction.endpoints(edge).0)
+            .or_default()
+            .push(edge);
+    }
+    by_near
+}
+
+/// One BFS layer: every edge in `by_near` keyed by a node in `frontier` is collected, and
+/// its far endpoint queued for the next layer unless already `visited` — the guard that
+/// stops a cyclic type hierarchy from looping forever.
+fn expand_type_frontier(
+    by_near: &TypeAdjacency,
+    direction: TypeHierarchyDirection,
+    frontier: &[String],
+    visited: &mut std::collections::HashSet<String>,
+    collected: &mut Vec<TypeRelationEdge>,
+) -> Vec<String> {
+    let mut next = Vec::new();
+    for node in frontier {
+        let Some(edges) = by_near.get(node.as_str()) else {
+            continue;
+        };
+        for edge in edges {
+            collected.push((*edge).clone());
+            let far = direction.endpoints(edge).1;
+            if visited.insert(far.to_string()) {
+                next.push(far.to_string());
+            }
+        }
+    }
+    next
+}
+
+/// Bounded BFS over `edges` from `start` (a `SymbolNode::id`), in `direction`. Returns
+/// the collected edges and whether a further hop would actually surface more edges — same
+/// semantics as `traverse_call_edges`' `truncated` return value.
+fn traverse_type_edges(
+    edges: &[TypeRelationEdge],
+    start: &str,
+    depth: usize,
+    direction: TypeHierarchyDirection,
+) -> (Vec<TypeRelationEdge>, bool) {
+    let by_near = build_type_adjacency(edges, direction);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(start.to_string());
+    let mut frontier: Vec<String> = vec![start.to_string()];
+    let mut collected: Vec<TypeRelationEdge> = Vec::new();
+
+    for hop in 0..depth {
+        let next_frontier =
+            expand_type_frontier(&by_near, direction, &frontier, &mut visited, &mut collected);
+        if next_frontier.is_empty() {
+            return (collected, false);
+        }
+        if hop + 1 == depth {
+            let truncated = next_frontier
+                .iter()
+                .any(|n| by_near.contains_key(n.as_str()));
+            return (collected, truncated);
+        }
+        frontier = next_frontier;
+    }
+    (collected, false)
+}
+
+/// Shared skip/take/next_cursor pagination — extracted out of
+/// `list_architecture_symbols` (its original, sole caller) so `type_hierarchy` can reuse
+/// the same page-and-cursor semantics rather than reimplementing them. Returns
+/// `(page, total_matched, next_cursor)`; `next_cursor` is `Some(next_offset)` only when
+/// more items remain past this page.
+fn paginate<T>(items: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, usize, Option<String>) {
+    let total_matched = items.len();
+    let page: Vec<T> = items.into_iter().skip(offset).take(limit).collect();
+    let returned = page.len();
+    let next_offset = offset + returned;
+    let next_cursor = if next_offset < total_matched {
+        Some(next_offset.to_string())
+    } else {
+        None
+    };
+    (page, total_matched, next_cursor)
+}
+
+/// Resolves `node` to a `SymbolNode` the same way `get_architecture_node` does (a linear
+/// scan of `model.packages`), and — only when found AND its kind is neither `Type` nor
+/// `Interface` — returns that kind plus a hint string steering the caller toward
+/// `get_architecture_node`. Returns `None` when `node` doesn't resolve to any symbol at
+/// all, or resolves to a `Type`/`Interface`; both cases fall through to normal
+/// `type_hierarchy` handling (an unknown node yields empty edges, not this hint).
+///
+/// `direction` names the *actual* tool the caller invoked (`list_supertypes` or
+/// `list_subtypes`) in the returned hint, rather than hardcoding one — both tools share
+/// this helper via `type_hierarchy`.
+fn non_type_node_hint(
+    model: &ArchModel,
+    node: &str,
+    direction: TypeHierarchyDirection,
+) -> Option<(SymbolKind, String)> {
+    for pkg in model.packages.values() {
+        if let Some(sym) = pkg.symbols.iter().find(|s| s.id == node) {
+            return match sym.kind {
+                SymbolKind::Type | SymbolKind::Interface => None,
+                other => Some((
+                    other,
+                    format!(
+                        "node exists but is not a Type or Interface; call \
+                         get_architecture_node to check node.kind before calling {}",
+                        direction.tool_name()
+                    ),
+                )),
+            };
+        }
+    }
+    None
 }
 
 fn symbol_kind_matches(kind: SymbolKind, want: &str) -> bool {
@@ -869,16 +1080,8 @@ impl KibitzerServer {
             }
         }
 
-        let total_matched = matches.len();
-        let page: Vec<(String, SymbolNode)> =
-            matches.into_iter().skip(offset).take(limit).collect();
+        let (page, total_matched, next_cursor) = paginate(matches, offset, limit);
         let returned = page.len();
-        let next_offset = offset + returned;
-        let next_cursor = if next_offset < total_matched {
-            Some(next_offset.to_string())
-        } else {
-            None
-        };
 
         let possibly_pruned = total_matched == 0
             && !req.include_private
@@ -993,6 +1196,52 @@ impl KibitzerServer {
     }
 
     #[tool(
+        description = "Backward type-hierarchy traversal: what `node` (a Type/Interface \
+                        SymbolNode id) extends or implements, up to `depth` hops (default 1, \
+                        clamped to 10) — returns JSON \
+                        ({node, depth, truncated, total_matched, returned, next_cursor, \
+                        possibly_pruned, node_kind, hint, edges}), not prose. Each edge's `kind` \
+                        is \"extends\"/\"implements\"/None when the source syntax and resolution \
+                        both leave it ambiguous. `resolved: false` on an edge means its \
+                        supertype/interface is external/vendored/stdlib and this model can't \
+                        resolve it to a symbol id — not an error. Called on a node that exists but \
+                        isn't a Type/Interface, this returns empty edges plus `node_kind`/`hint` \
+                        instead of an error — call get_architecture_node first if unsure of a \
+                        node's kind. Use for hierarchy-shaped refactoring checks: Extract \
+                        Superclass, Collapse Hierarchy, Pull Up/Push Down Method/Field. Go \
+                        caveat: only struct-embedding-expressed supertypes are detected — \
+                        structural (method-set-only) interface satisfaction is NOT detected, so an \
+                        empty result for a Go interface does not mean nothing implements it."
+    )]
+    async fn list_supertypes(&self, req: Parameters<TypeHierarchyRequest>) -> String {
+        self.type_hierarchy(req.0, TypeHierarchyDirection::Supertypes)
+            .await
+    }
+
+    #[tool(
+        description = "Forward type-hierarchy traversal: what extends or implements `node` (a \
+                        Type/Interface SymbolNode id), up to `depth` hops (default 1, clamped to \
+                        10) — returns JSON \
+                        ({node, depth, truncated, total_matched, returned, next_cursor, \
+                        possibly_pruned, node_kind, hint, edges}), not prose. Each edge's `kind` \
+                        is \"extends\"/\"implements\"/None when the source syntax and resolution \
+                        both leave it ambiguous. `resolved: false` on an edge means its \
+                        subtype is external/vendored/stdlib and this model can't resolve it to a \
+                        symbol id — not an error. Called on a node that exists but isn't a \
+                        Type/Interface, this returns empty edges plus `node_kind`/`hint` instead \
+                        of an error — call get_architecture_node first if unsure of a node's \
+                        kind. Use for hierarchy-shaped refactoring checks: Extract Superclass, \
+                        Collapse Hierarchy, Pull Up/Push Down Method/Field. Go caveat: only \
+                        struct-embedding-expressed subtypes are detected — structural \
+                        (method-set-only) interface satisfaction is NOT detected, so an empty \
+                        result for a Go interface does not mean nothing implements it."
+    )]
+    async fn list_subtypes(&self, req: Parameters<TypeHierarchyRequest>) -> String {
+        self.type_hierarchy(req.0, TypeHierarchyDirection::Subtypes)
+            .await
+    }
+
+    #[tool(
         description = "Extract Class refactoring candidates: for each type whose methods split \
                         into 2+ field-access-disjoint groups (a JDeodorant-style Jaccard/HAC \
                         clustering over ArchModel::field_accesses, ranked by an \
@@ -1084,6 +1333,82 @@ impl KibitzerServer {
         serde_json::to_string(&response)
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
+
+    /// Shared body for `list_supertypes`/`list_subtypes` — the two tools differ only in
+    /// which direction they walk `ArchModel::type_edges`.
+    async fn type_hierarchy(
+        &self,
+        req: TypeHierarchyRequest,
+        direction: TypeHierarchyDirection,
+    ) -> String {
+        let path = PathBuf::from(&req.path);
+        let repo_root = match Self::resolve_repo_root(&path) {
+            Ok(root) => root,
+            Err(e) => return json_error(e),
+        };
+        let depth = req.depth.clamp(1, MAX_TYPE_HIERARCHY_DEPTH);
+        let limit = req.limit.clamp(1, 1000);
+
+        // `None` legitimately means "start from page 1"; a non-numeric cursor is corrupt
+        // input and must surface as an error rather than silently reset to page 1 — same
+        // convention as `list_architecture_symbols`.
+        let offset: usize = match req.cursor.as_deref() {
+            None => 0,
+            Some(c) => match c.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return json_error(format!("invalid cursor: {c:?}")),
+            },
+        };
+
+        let model = match self
+            .load_model_off_stack(repo_root, req.include_private)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+
+        if let Some((node_kind, hint)) = non_type_node_hint(&model, &req.node, direction) {
+            let response = TypeHierarchyResponse {
+                node: req.node,
+                depth,
+                truncated: false,
+                total_matched: 0,
+                returned: 0,
+                next_cursor: None,
+                possibly_pruned: false,
+                node_kind: Some(node_kind),
+                hint: Some(hint.to_string()),
+                edges: Vec::new(),
+            };
+            return serde_json::to_string(&response)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
+        }
+
+        let (all_edges, truncated) =
+            traverse_type_edges(&model.type_edges, &req.node, depth, direction);
+        let (edges, total_matched, next_cursor) = paginate(all_edges, offset, limit);
+        let returned = edges.len();
+
+        let possibly_pruned = total_matched == 0
+            && !req.include_private
+            && !model.pruning.pruned_symbol_ids.is_empty();
+
+        let response = TypeHierarchyResponse {
+            node: req.node,
+            depth,
+            truncated,
+            total_matched,
+            returned,
+            next_cursor,
+            possibly_pruned,
+            node_kind: None,
+            hint: None,
+            edges,
+        };
+        serde_json::to_string(&response)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1123,6 +1448,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::arch_model::TypeRelationKind;
 
     #[test]
     fn recommendation_for_covers_all_five_native_architecture_checkers() {
@@ -1182,6 +1508,67 @@ mod tests {
             collected,
             vec![edge("a", "a", true)],
             "the self-edge is collected once, not once per remaining hop"
+        );
+    }
+
+    // --- traverse_type_edges: direct BFS unit tests against hand-built TypeRelationEdge
+    // literals, mirroring the traverse_call_edges tests above (same proven algorithm,
+    // retyped).
+
+    fn type_edge(from: &str, to: &str, kind: TypeRelationKind) -> TypeRelationEdge {
+        TypeRelationEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: Some(kind),
+            resolved: true,
+            file: PathBuf::new(),
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn traverse_type_edges_direct_only_at_depth_one_reports_truncated() {
+        let edges = vec![
+            type_edge("pkg::Dog", "pkg::Animal", TypeRelationKind::Extends),
+            type_edge("pkg::Animal", "pkg::LivingThing", TypeRelationKind::Extends),
+        ];
+        let (collected, truncated) =
+            traverse_type_edges(&edges, "pkg::Dog", 1, TypeHierarchyDirection::Supertypes);
+        assert_eq!(collected, vec![edges[0].clone()]);
+        assert!(truncated, "Animal still extends LivingThing beyond depth 1");
+    }
+
+    #[test]
+    fn traverse_type_edges_full_chain_at_depth_two_not_truncated() {
+        let edges = vec![
+            type_edge("pkg::Dog", "pkg::Animal", TypeRelationKind::Extends),
+            type_edge("pkg::Animal", "pkg::LivingThing", TypeRelationKind::Extends),
+        ];
+        let (collected, truncated) =
+            traverse_type_edges(&edges, "pkg::Dog", 2, TypeHierarchyDirection::Supertypes);
+        assert_eq!(collected, edges);
+        assert!(!truncated, "LivingThing has no further supertypes");
+    }
+
+    #[test]
+    fn traverse_type_edges_diamond_terminates_via_visited_set() {
+        // D extends both B and C, which both extend A — a diamond. If the BFS didn't
+        // dedupe the frontier via the visited set, expanding A's (nonexistent) further
+        // supertypes from two separate paths could loop; asserting this returns at all,
+        // with exactly the 4 declared edges, is the "doesn't hang" proof.
+        let edges = vec![
+            type_edge("B", "A", TypeRelationKind::Extends),
+            type_edge("C", "A", TypeRelationKind::Extends),
+            type_edge("D", "B", TypeRelationKind::Extends),
+            type_edge("D", "C", TypeRelationKind::Extends),
+        ];
+        let (collected, _truncated) =
+            traverse_type_edges(&edges, "D", 5, TypeHierarchyDirection::Supertypes);
+        assert_eq!(collected.len(), 4, "got: {collected:?}");
+        let targets: Vec<&str> = collected.iter().map(|e| e.to.as_str()).collect();
+        assert!(
+            targets.iter().filter(|t| **t == "A").count() == 2,
+            "A reached once via B and once via C, not deduplicated away: {targets:?}"
         );
     }
 
@@ -1960,6 +2347,330 @@ mod tests {
             .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
         assert_eq!(json["edges"].as_array().unwrap().len(), 0, "got: {json}");
         assert_eq!(json["truncated"], false, "got: {json}");
+    }
+
+    // --- Epic 2.1: list_supertypes / list_subtypes ---
+
+    /// Builds a Go repo (module "fixture") with a `hier` package (`Dog` embeds `Animal` —
+    /// one type edge — plus a free function `DoStuff` for the non-Type/Interface `hint`
+    /// case) and a `poly` package (`Multi` embeds 5 separate types, for pagination).
+    fn write_type_hierarchy_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
+
+        std::fs::create_dir_all(dir.join("hier")).unwrap();
+        std::fs::write(
+            dir.join("hier/h.go"),
+            "package hier\n\ntype Animal struct{}\n\ntype Dog struct {\n\tAnimal\n}\n\nfunc DoStuff() {}\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.join("poly")).unwrap();
+        std::fs::write(
+            dir.join("poly/p.go"),
+            "package poly\n\ntype A1 struct{}\ntype A2 struct{}\ntype A3 struct{}\ntype A4 struct{}\ntype A5 struct{}\n\ntype Multi struct {\n\tA1\n\tA2\n\tA3\n\tA4\n\tA5\n}\n",
+        )
+        .unwrap();
+    }
+
+    fn type_req(
+        dir: &std::path::Path,
+        node: &str,
+        depth: usize,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> TypeHierarchyRequest {
+        TypeHierarchyRequest {
+            path: dir.display().to_string(),
+            node: node.to_string(),
+            depth,
+            include_private: false,
+            limit,
+            cursor,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_supertypes_returns_direct_edge_by_default() {
+        let dir = tmp_dir("supertypes-direct-edge");
+        write_type_hierarchy_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_supertypes(Parameters(type_req(
+                &dir,
+                "fixture/hier::Dog",
+                default_depth(),
+                default_limit(),
+                None,
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let edges = json["edges"].as_array().expect("edges array");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e["from"] == "fixture/hier::Dog" && e["to"] == "fixture/hier::Animal"),
+            "got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_subtypes_returns_reverse_direction_of_same_edge() {
+        let dir = tmp_dir("subtypes-reverse-direction");
+        write_type_hierarchy_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_subtypes(Parameters(type_req(
+                &dir,
+                "fixture/hier::Animal",
+                default_depth(),
+                default_limit(),
+                None,
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        let edges = json["edges"].as_array().expect("edges array");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e["from"] == "fixture/hier::Dog" && e["to"] == "fixture/hier::Animal"),
+            "got: {json}"
+        );
+    }
+
+    #[test]
+    fn list_supertypes_tool_description_mentions_depth_and_resolved_semantics() {
+        let router = KibitzerServer::tool_router();
+        let tools = router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "list_supertypes")
+            .expect("list_supertypes is registered");
+        let desc = tool.description.as_ref().expect("has a description");
+        assert!(desc.contains("depth"), "got: {desc}");
+        assert!(desc.contains('1'), "got: {desc}");
+        assert!(desc.contains("10"), "got: {desc}");
+        assert!(
+            desc.contains("external") && desc.contains("vendored") && desc.contains("stdlib"),
+            "got: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_supertypes_returns_empty_array_not_an_error_for_an_unknown_node() {
+        let dir = tmp_dir("supertypes-unknown-node");
+        write_type_hierarchy_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_supertypes(Parameters(type_req(
+                &dir,
+                "fixture/hier::DoesNotExist",
+                default_depth(),
+                default_limit(),
+                None,
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        assert!(json.get("error").is_none(), "unexpected error: {json}");
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0, "got: {json}");
+        assert_eq!(json["truncated"], false, "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_supertypes_reports_node_kind_and_hint_for_a_function_id() {
+        let dir = tmp_dir("supertypes-function-node");
+        write_type_hierarchy_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_supertypes(Parameters(type_req(
+                &dir,
+                "fixture/hier::DoStuff",
+                default_depth(),
+                default_limit(),
+                None,
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|e| panic!("expected JSON: {e}\n{output}"));
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0, "got: {json}");
+        assert_eq!(json["node_kind"], "function", "got: {json}");
+        assert!(json["hint"].is_string(), "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_supertypes_paginates_via_next_cursor() {
+        let dir = tmp_dir("supertypes-pagination");
+        write_type_hierarchy_fixture(&dir);
+        let server = KibitzerServer::new();
+
+        let page1 = server
+            .list_supertypes(Parameters(type_req(
+                &dir,
+                "fixture/poly::Multi",
+                default_depth(),
+                2,
+                None,
+            )))
+            .await;
+        let json1: serde_json::Value = serde_json::from_str(&page1).expect("valid JSON");
+        assert_eq!(json1["total_matched"], 5, "got: {json1}");
+        assert_eq!(json1["returned"], 2, "got: {json1}");
+        assert_eq!(json1["next_cursor"], "2", "got: {json1}");
+
+        let page2 = server
+            .list_supertypes(Parameters(type_req(
+                &dir,
+                "fixture/poly::Multi",
+                default_depth(),
+                2,
+                Some("2".to_string()),
+            )))
+            .await;
+        let json2: serde_json::Value = serde_json::from_str(&page2).expect("valid JSON");
+        assert_eq!(json2["returned"], 2, "got: {json2}");
+        assert_eq!(json2["next_cursor"], "4", "got: {json2}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn list_supertypes_rejects_malformed_cursor() {
+        let dir = tmp_dir("supertypes-bad-cursor");
+        write_type_hierarchy_fixture(&dir);
+
+        let server = KibitzerServer::new();
+        let output = server
+            .list_supertypes(Parameters(type_req(
+                &dir,
+                "fixture/hier::Dog",
+                default_depth(),
+                default_limit(),
+                Some("not-a-number".to_string()),
+            )))
+            .await;
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(
+            json["error"]
+                .as_str()
+                .expect("error is a string")
+                .contains("invalid cursor"),
+            "got: {json}"
+        );
+    }
+
+    #[test]
+    fn paginate_splits_items_by_offset_and_limit_and_reports_next_cursor() {
+        let (page, total_matched, next_cursor) = paginate(vec![1, 2, 3, 4, 5], 0, 2);
+        assert_eq!(page, vec![1, 2]);
+        assert_eq!(total_matched, 5);
+        assert_eq!(next_cursor, Some("2".to_string()));
+
+        let (page, total_matched, next_cursor) = paginate(vec![1, 2, 3, 4, 5], 2, 2);
+        assert_eq!(page, vec![3, 4]);
+        assert_eq!(total_matched, 5);
+        assert_eq!(next_cursor, Some("4".to_string()));
+
+        let (page, total_matched, next_cursor) = paginate(vec![1, 2, 3, 4, 5], 4, 2);
+        assert_eq!(page, vec![5]);
+        assert_eq!(total_matched, 5);
+        assert_eq!(next_cursor, None);
+    }
+
+    #[test]
+    fn non_type_node_hint_returns_kind_and_hint_for_a_function_id_and_none_for_a_type_id() {
+        let symbols = vec![
+            SymbolNode {
+                id: "pkg::DoStuff".to_string(),
+                name: "DoStuff".to_string(),
+                kind: SymbolKind::Function,
+                file: PathBuf::new(),
+                line: 1,
+                exported: true,
+                parent: None,
+            },
+            SymbolNode {
+                id: "pkg::Dog".to_string(),
+                name: "Dog".to_string(),
+                kind: SymbolKind::Type,
+                file: PathBuf::new(),
+                line: 1,
+                exported: true,
+                parent: None,
+            },
+        ];
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            "pkg".to_string(),
+            crate::arch_model::PackageNode {
+                path: "pkg".to_string(),
+                files: Vec::new(),
+                symbols,
+            },
+        );
+        let model = ArchModel {
+            repo_root: PathBuf::new(),
+            packages,
+            import_edges: Vec::new(),
+            call_edges: Vec::new(),
+            field_accesses: Vec::new(),
+            type_edges: Vec::new(),
+            file_import_aliases: BTreeMap::new(),
+            pruning: crate::arch_model::PruningSummary::default(),
+        };
+
+        let function_hint =
+            non_type_node_hint(&model, "pkg::DoStuff", TypeHierarchyDirection::Supertypes);
+        assert_eq!(
+            function_hint,
+            Some((
+                SymbolKind::Function,
+                "node exists but is not a Type or Interface; call get_architecture_node \
+                 to check node.kind before calling list_supertypes"
+                    .to_string(),
+            ))
+        );
+
+        // The hint must name whichever tool the caller actually invoked, not a hardcoded
+        // one — a list_subtypes caller should be told to retry with list_subtypes.
+        let subtypes_hint =
+            non_type_node_hint(&model, "pkg::DoStuff", TypeHierarchyDirection::Subtypes);
+        assert_eq!(
+            subtypes_hint,
+            Some((
+                SymbolKind::Function,
+                "node exists but is not a Type or Interface; call get_architecture_node \
+                 to check node.kind before calling list_subtypes"
+                    .to_string(),
+            ))
+        );
+
+        assert!(
+            non_type_node_hint(&model, "pkg::Dog", TypeHierarchyDirection::Supertypes).is_none(),
+            "a Type id must not get the non-Type/Interface hint"
+        );
     }
 
     fn list_req(

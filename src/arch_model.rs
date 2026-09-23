@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::checker::{GrammarCache, Language};
 use crate::import_graph::{ImportEdge, ImportGraph};
 use crate::symbol_extract::{
-    RawCallSite, RawFieldAccessSite, extract_call_sites_for_file,
+    RawCallSite, RawFieldAccessSite, RawTypeRelationSite, extract_call_sites_for_file,
     extract_field_access_sites_for_file, extract_struct_fields_for_file, extract_symbols_for_file,
+    extract_type_relation_sites_for_file,
 };
 
 /// The kind of a single extracted symbol. Exhaustively matched by every consumer (the
@@ -177,6 +178,54 @@ pub struct FieldAccessEdge {
     pub line: usize,
 }
 
+/// Whether a `TypeRelationEdge` is an inheritance ("is-a") or interface-satisfaction
+/// relationship. `None` on the edge itself (not this enum) covers the rare case where
+/// source syntax doesn't disambiguate and resolution couldn't either — see
+/// `TypeRelationEdge`'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TypeRelationKind {
+    Extends,
+    Implements,
+}
+
+/// One type-hierarchy edge: `from` is the declaring `Type`/`Interface`'s `SymbolNode::id`;
+/// `to` is a `SymbolNode::id` when `resolved`, else the raw supertype/interface text —
+/// never silently dropped, matching `CallEdge`'s convention (an unresolved target is
+/// routinely a legitimate external/vendored/stdlib base, not a typo).
+///
+/// `kind` is `None` only when the source syntax alone can't distinguish `extends` from
+/// `implements` (Go embedded fields; Kotlin's bare-`type` supertype-list entries) *and*
+/// resolution couldn't determine it either (the target's `SymbolKind` would have settled
+/// it, but the target didn't resolve) — this is never guessed.
+///
+/// `None` is common, not a rare corner case — every unresolved external-base Go embed
+/// (`sync.Mutex`, an un-indexed `io.Reader`) and every ambiguous Kotlin bare-`type` entry
+/// produces it. A consumer that cares about the extends/implements distinction MUST treat
+/// `None` as unclassified — never default it to `Extends`/`Implements` (e.g. never
+/// `kind.unwrap_or(Extends)` or a catch-all `_ => Extends` match arm). Doing so would
+/// silently reintroduce exactly the guessing `resolve_in`'s doc comment already forbids.
+///
+/// Note: `(resolved: true, kind: None)` is type-representable but never produced by
+/// `resolve_one_type_edge`'s spec'd logic — any successfully-resolved target always
+/// yields a `SymbolKind` to infer `kind` from, unless `kind_hint` already supplied one.
+///
+/// v1 scope note: Go interface satisfaction is only captured when it's expressed via
+/// explicit struct embedding. Go's *structural* interface satisfaction (a type implements
+/// an interface purely by having a matching method set, no embedding keyword) is out of
+/// scope for this data model and is a fast-follow, not something `type_edges` represents —
+/// see `list_supertypes`/`list_subtypes`'s tool descriptions in `mcp.rs` for the
+/// consumer-facing version of this same caveat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeRelationEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: Option<TypeRelationKind>,
+    pub resolved: bool,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
 /// The shared, repo-scoped architecture model: packages (keyed by path), the import
 /// edges between them, the function/method call edges within them, and the method↔field
 /// access edges within a type. The one model all consumer interfaces (CLI export, MCP
@@ -188,6 +237,9 @@ pub struct ArchModel {
     pub import_edges: Vec<ImportEdge>,
     pub call_edges: Vec<CallEdge>,
     pub field_accesses: Vec<FieldAccessEdge>,
+    /// Type-hierarchy (`extends`/`implements`) edges. Populated by `resolve_type_edges`
+    /// (a later story) — always empty for now.
+    pub type_edges: Vec<TypeRelationEdge>,
     /// Per-file `alias -> target package path` map, Go-only, for resolving a
     /// `pkg.Type`-qualified local's package back to a real `packages` key —
     /// `god_class`'s ATFD and `isp_fat_interface`'s consumer detection both need this to
@@ -303,6 +355,25 @@ fn collect_field_access_sites(
         .collect()
 }
 
+/// `file`'s `extends`/`implements` sites with `file` filled in — the `TypeRelationEdge`
+/// sibling of `collect_call_sites`/`collect_field_access_sites`. Resolution against the
+/// whole-repo `Type`/`Interface` index still happens later, in `resolve_type_edges`.
+fn collect_type_relation_sites(
+    language: Language,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    package_path: &str,
+    file: &Path,
+) -> Vec<RawTypeRelationSite> {
+    extract_type_relation_sites_for_file(language, source, tree, package_path)
+        .into_iter()
+        .map(|site| RawTypeRelationSite {
+            file: file.to_path_buf(),
+            ..site
+        })
+        .collect()
+}
+
 /// Groups `files` by `package_key_for_file`, skipping files with no recognized `Language`
 /// (counted in `PruningSummary.unsupported_language_files` rather than silently dropped).
 /// For each recognized file: generated files are skipped whole (`generated_files_skipped`
@@ -329,6 +400,7 @@ pub fn build_model(
     let total_files_scanned = files.len();
     let mut raw_call_sites: Vec<RawCallSite> = Vec::new();
     let mut raw_field_access_sites: Vec<RawFieldAccessSite> = Vec::new();
+    let mut raw_type_relation_sites: Vec<RawTypeRelationSite> = Vec::new();
     let mut struct_fields: HashMap<(String, String), std::collections::HashSet<String>> =
         HashMap::new();
     // Go-only, see `ArchModel::file_import_aliases`'s doc comment. Collected per-file
@@ -413,12 +485,23 @@ pub fn build_model(
             &package_path,
             path,
         ));
+
+        raw_type_relation_sites.extend(collect_type_relation_sites(
+            language,
+            source,
+            &tree,
+            &package_path,
+            path,
+        ));
     }
 
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
     let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites);
     let file_import_aliases =
         resolve_file_import_aliases(&packages, &package_short_names, raw_file_imports);
+    // Must run after `file_import_aliases` is fully computed — Go qualified-embed
+    // resolution (`resolve_one_type_edge`) depends on it.
+    let type_edges = resolve_type_edges(&packages, &file_import_aliases, raw_type_relation_sites);
 
     Ok(ArchModel {
         repo_root: repo_root.to_path_buf(),
@@ -426,6 +509,7 @@ pub fn build_model(
         import_edges: import_graph.edges.clone(),
         call_edges,
         field_accesses,
+        type_edges,
         file_import_aliases,
         pruning: PruningSummary {
             include_private: prune.include_private,
@@ -557,6 +641,199 @@ fn resolve_call_edges(
         .collect()
 }
 
+/// `SymbolNode.name -> [(package, id, kind)]`, the type-relation sibling of `SymbolIndex`.
+/// Carries `kind` (unlike `SymbolIndex`) because a resolved target's `SymbolKind` is what
+/// `resolve_one_type_edge` infers `Extends`/`Implements` from when `kind_hint` is absent.
+type TypeRelationIndex<'a> = HashMap<&'a str, Vec<(&'a str, &'a str, SymbolKind)>>;
+
+/// `(package, name) -> (id, kind)`, used for a Go qualified embed (`other.Animal`) once its
+/// qualifier has already been resolved to a target package path via `file_import_aliases` —
+/// an exact-package lookup rather than the name-only, ambiguity-tolerant `TypeRelationIndex`.
+type TypeRelationPackageIndex<'a> = HashMap<(&'a str, &'a str), (&'a str, SymbolKind)>;
+
+/// Builds the whole-repo `Type`/`Interface` indexes `resolve_one_type_edge` looks
+/// supertype/interface names up in — mirrors `build_call_target_indexes`'s traversal, but
+/// filters to `SymbolKind::Type | SymbolKind::Interface` (a type-hierarchy edge never
+/// targets a `Function`/`Method`) and additionally builds the per-package exact index a
+/// qualified Go embed needs.
+fn build_type_relation_indexes(
+    packages: &BTreeMap<String, PackageNode>,
+) -> (TypeRelationIndex<'_>, TypeRelationPackageIndex<'_>) {
+    let mut by_name: TypeRelationIndex = HashMap::new();
+    let mut by_package: TypeRelationPackageIndex = HashMap::new();
+
+    for (pkg_path, pkg) in packages {
+        for sym in &pkg.symbols {
+            if !matches!(sym.kind, SymbolKind::Type | SymbolKind::Interface) {
+                continue;
+            }
+            by_name.entry(sym.name.as_str()).or_default().push((
+                pkg_path.as_str(),
+                sym.id.as_str(),
+                sym.kind,
+            ));
+            by_package.insert(
+                (pkg_path.as_str(), sym.name.as_str()),
+                (sym.id.as_str(), sym.kind),
+            );
+        }
+    }
+
+    (by_name, by_package)
+}
+
+/// Same same-package-preferred / then-globally-unique / else-`None`-on-ambiguity algorithm
+/// as `resolve_in`, adapted to a `TypeRelationIndex` and returning the resolved symbol's
+/// `SymbolKind` alongside its id (the caller needs it to infer `Extends`/`Implements`).
+fn resolve_in_typed<'a>(
+    index: &TypeRelationIndex<'a>,
+    caller_pkg: &str,
+    name: &str,
+) -> Option<(&'a str, SymbolKind)> {
+    let candidates = index.get(name)?;
+    let same_package: Vec<&(&str, &str, SymbolKind)> = candidates
+        .iter()
+        .filter(|(pkg, _, _)| *pkg == caller_pkg)
+        .collect();
+    if same_package.len() == 1 {
+        return Some((same_package[0].1, same_package[0].2));
+    }
+    if candidates.len() == 1 {
+        return Some((candidates[0].1, candidates[0].2));
+    }
+    None
+}
+
+/// The qualified/unqualified target-lookup half of `resolve_one_type_edge`, split out
+/// purely to keep that function short — see its doc comment for the actual resolution
+/// rules this implements.
+///
+/// Only a Go embed (`site.dotted_text_is_go_package_qualifier`) ever has its `target_text`
+/// split on `.` and its prefix stripped for a bare-name fallback lookup. A dot in any other
+/// language's `target_text` — TS/JS's `React.Component`-style member-expression
+/// supertypes, Java's `pkg.Base`/`scoped_type_identifier` targets, a qualified Kotlin
+/// type — is real, but stripping its qualifier and doing a same-name lookup elsewhere in
+/// the model would be a *guess* that some other, unrelated same-named symbol is the
+/// target, not a resolution: `TypeRelationEdge`'s "never guess" contract requires treating
+/// the whole dotted text as one atomic (and, in practice, never-matching) name instead —
+/// correctly falling through to `resolved: false` rather than risking a false match.
+fn resolve_type_edge_target<'a>(
+    type_index: &TypeRelationIndex<'a>,
+    package_index: &TypeRelationPackageIndex<'a>,
+    file_import_aliases: &BTreeMap<PathBuf, HashMap<String, String>>,
+    site: &RawTypeRelationSite,
+    caller_pkg: &str,
+) -> Option<(&'a str, SymbolKind)> {
+    if !site.dotted_text_is_go_package_qualifier {
+        return resolve_in_typed(type_index, caller_pkg, site.target_text.as_str());
+    }
+    match site.target_text.split_once('.') {
+        Some((qualifier, name)) => match file_import_aliases
+            .get(&site.file)
+            .and_then(|aliases| aliases.get(qualifier))
+        {
+            Some(target_pkg) => package_index
+                .get(&(target_pkg.as_str(), name))
+                .map(|(id, kind)| (*id, *kind)),
+            None => resolve_in_typed(type_index, caller_pkg, name),
+        },
+        None => resolve_in_typed(type_index, caller_pkg, site.target_text.as_str()),
+    }
+}
+
+/// Maps a resolved target's `SymbolKind` to the `TypeRelationKind` it implies — the
+/// "resolution succeeded but `kind_hint` didn't say" case in `TypeRelationEdge`'s doc
+/// comment. Never called with `Function`/`Method`: both index types this resolves against
+/// (`TypeRelationIndex`/`TypeRelationPackageIndex`) only ever hold `Type`/`Interface`
+/// symbols (see `build_type_relation_indexes`).
+fn type_relation_kind_of(kind: SymbolKind) -> TypeRelationKind {
+    match kind {
+        SymbolKind::Type => TypeRelationKind::Extends,
+        SymbolKind::Interface => TypeRelationKind::Implements,
+        SymbolKind::Function | SymbolKind::Method => {
+            unreachable!(
+                "TypeRelationIndex/TypeRelationPackageIndex only ever hold Type/Interface symbols"
+            )
+        }
+    }
+}
+
+/// Resolves one `RawTypeRelationSite` against the whole-repo `Type`/`Interface` indexes.
+///
+/// A dot in `target_text` is only ever treated as a package qualifier for a genuinely
+/// Go-qualified embed (`site.dotted_text_is_go_package_qualifier`, set only by
+/// `go_embedded_type_relations`) — see `resolve_type_edge_target`'s doc comment for why
+/// TS/Java/Kotlin's own dotted targets (`React.Component`, `pkg.Base`, ...) are
+/// deliberately NOT split and looked up by their last segment: doing so would be a guess,
+/// not a resolution. For a Go-qualified target, `file_import_aliases` is tried first; when
+/// the qualifier resolves to a known target package, the lookup is an exact `(package,
+/// name)` match via `package_index` — deliberately not falling through to the name-only
+/// `type_index` on a package-index miss, since a qualifier that *does* name a real target
+/// package but has no matching type there is a real "unresolved," not a cue to guess
+/// elsewhere. When the qualifier ISN'T a known alias for this file at all (no alias entry
+/// for this exact qualifier), this falls back to treating the qualified text's segment
+/// after the first `.` as if unqualified — the same *ceiling* (falling back to a bare-name
+/// lookup rather than guessing) `resolve_one_call_edge` accepts for a qualified callee,
+/// though that fn splits on the *last* `.` (`rsplit_once`) since a call site can be
+/// multiply-qualified (`pkg.Type.Method`); every Go embed site this fn ever sees has at
+/// most one `.`, so `split_once` vs `rsplit_once` is equivalent here today.
+///
+/// `kind` prefers `site.kind_hint` (source syntax) over the resolved target's own
+/// `SymbolKind` — see `TypeRelationEdge`'s doc comment on why a hint always wins even when
+/// resolution disagrees or fails to produce one.
+fn resolve_one_type_edge(
+    type_index: &TypeRelationIndex,
+    package_index: &TypeRelationPackageIndex,
+    file_import_aliases: &BTreeMap<PathBuf, HashMap<String, String>>,
+    site: RawTypeRelationSite,
+) -> TypeRelationEdge {
+    let caller_pkg = caller_package(&site.type_id);
+    let resolved = resolve_type_edge_target(
+        type_index,
+        package_index,
+        file_import_aliases,
+        &site,
+        caller_pkg,
+    );
+    let kind = site
+        .kind_hint
+        .or_else(|| resolved.map(|(_, kind)| type_relation_kind_of(kind)));
+
+    match resolved {
+        Some((id, _)) => TypeRelationEdge {
+            from: site.type_id,
+            to: id.to_string(),
+            kind,
+            resolved: true,
+            file: site.file,
+            line: site.line,
+        },
+        None => TypeRelationEdge {
+            from: site.type_id,
+            to: site.target_text,
+            kind,
+            resolved: false,
+            file: site.file,
+            line: site.line,
+        },
+    }
+}
+
+/// Resolves every `RawTypeRelationSite` against a whole-repo index of `Type`/`Interface`
+/// symbols built fresh from `packages` — the type-hierarchy graph's only source of
+/// resolution truth, mirroring `resolve_call_edges`.
+fn resolve_type_edges(
+    packages: &BTreeMap<String, PackageNode>,
+    file_import_aliases: &BTreeMap<PathBuf, HashMap<String, String>>,
+    raw_sites: Vec<RawTypeRelationSite>,
+) -> Vec<TypeRelationEdge> {
+    let (type_index, package_index) = build_type_relation_indexes(packages);
+    raw_sites
+        .into_iter()
+        .map(|site| resolve_one_type_edge(&type_index, &package_index, file_import_aliases, site))
+        .collect()
+}
+
 /// Resolves every `RawFieldAccessSite` against `struct_fields` (the whole-repo
 /// `(package_path, type_name) -> field names` index gathered while walking every file in
 /// `build_model`'s loop) — a site whose `field_name` isn't a declared field of its
@@ -679,6 +956,7 @@ impl ArchModel {
             import_edges: self.import_edges.clone(),
             call_edges: self.call_edges.clone(),
             field_accesses: self.field_accesses.clone(),
+            type_edges: self.type_edges.clone(),
             file_import_aliases: self.file_import_aliases.clone(),
             pruning: self.pruning.clone(),
         }
@@ -970,9 +1248,29 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         }
+    }
+
+    #[test]
+    fn type_edges_field_is_additive_and_empty_by_default() {
+        let model = empty_model(&PathBuf::from("/repo"));
+        assert!(model.type_edges.is_empty());
+
+        let edge = TypeRelationEdge {
+            from: "pkg::Dog".to_string(),
+            to: "pkg::Animal".to_string(),
+            kind: Some(TypeRelationKind::Extends),
+            resolved: true,
+            file: PathBuf::from("pkg/dog.go"),
+            line: 5,
+        };
+        let json = serde_json::to_string(&edge).expect("serializes");
+        assert!(json.contains(r#""kind":"extends""#), "got {json}");
+        let round_tripped: TypeRelationEdge = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(round_tripped, edge);
     }
 
     #[test]
@@ -987,6 +1285,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
@@ -1714,6 +2013,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
@@ -1755,6 +2055,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
@@ -1789,6 +2090,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
@@ -1823,6 +2125,7 @@ mod tests {
             import_edges: vec![],
             call_edges: vec![],
             field_accesses: vec![],
+            type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: empty_pruning(),
         };
@@ -1963,6 +2266,494 @@ mod tests {
             .unwrap();
 
         assert!(!Arc::ptr_eq(&first, &second));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Epic 1.6: resolve_type_edges ---
+
+    #[test]
+    fn resolve_type_edges_infers_extends_kind_from_resolved_type_target() {
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+        let mut pkg = empty_package("pkg");
+        pkg.symbols.push(symbol_of_kind("Animal", SymbolKind::Type));
+        pkg.symbols.push(symbol_of_kind("Dog", SymbolKind::Type));
+        packages.insert("pkg".to_string(), pkg);
+
+        let site = RawTypeRelationSite {
+            type_id: "pkg::Dog".to_string(),
+            package_path: "pkg".to_string(),
+            target_text: "Animal".to_string(),
+            kind_hint: None,
+            file: PathBuf::from("pkg/dog.go"),
+            line: 3,
+            dotted_text_is_go_package_qualifier: true,
+        };
+
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(
+            edges,
+            vec![TypeRelationEdge {
+                from: "pkg::Dog".to_string(),
+                to: "pkg::Animal".to_string(),
+                kind: Some(TypeRelationKind::Extends),
+                resolved: true,
+                file: PathBuf::from("pkg/dog.go"),
+                line: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_type_edges_infers_implements_kind_from_resolved_interface_target() {
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+        let mut pkg = empty_package("pkg");
+        pkg.symbols
+            .push(symbol_of_kind("Reader", SymbolKind::Interface));
+        pkg.symbols.push(symbol_of_kind("File", SymbolKind::Type));
+        packages.insert("pkg".to_string(), pkg);
+
+        let site = RawTypeRelationSite {
+            type_id: "pkg::File".to_string(),
+            package_path: "pkg".to_string(),
+            target_text: "Reader".to_string(),
+            kind_hint: None,
+            file: PathBuf::from("pkg/file.go"),
+            line: 4,
+            dotted_text_is_go_package_qualifier: true,
+        };
+
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(
+            edges,
+            vec![TypeRelationEdge {
+                from: "pkg::File".to_string(),
+                to: "pkg::Reader".to_string(),
+                kind: Some(TypeRelationKind::Implements),
+                resolved: true,
+                file: PathBuf::from("pkg/file.go"),
+                line: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_type_edges_keeps_unresolved_edge_with_raw_text_and_none_kind() {
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+        packages.insert("pkg".to_string(), empty_package("pkg"));
+
+        let site = RawTypeRelationSite {
+            type_id: "pkg::Locker".to_string(),
+            package_path: "pkg".to_string(),
+            target_text: "sync.Mutex".to_string(),
+            kind_hint: None,
+            file: PathBuf::from("pkg/locker.go"),
+            line: 2,
+            dotted_text_is_go_package_qualifier: true,
+        };
+
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(
+            edges,
+            vec![TypeRelationEdge {
+                from: "pkg::Locker".to_string(),
+                to: "sync.Mutex".to_string(),
+                kind: None,
+                resolved: false,
+                file: PathBuf::from("pkg/locker.go"),
+                line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_type_edges_routes_qualified_go_embed_through_file_import_aliases() {
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+
+        let mut other_pkg = empty_package("example.com/app/other");
+        other_pkg.symbols.push(SymbolNode {
+            id: "example.com/app/other::Animal".to_string(),
+            name: "Animal".to_string(),
+            kind: SymbolKind::Type,
+            file: PathBuf::from("other/animal.go"),
+            line: 1,
+            exported: true,
+            parent: None,
+        });
+        packages.insert("example.com/app/other".to_string(), other_pkg);
+
+        // A same-named `Animal` in a wholly unrelated package: if the alias route weren't
+        // actually used, name-only fallback would find two candidates and refuse to guess
+        // (ambiguous), never accidentally landing on the right one.
+        let mut decoy_pkg = empty_package("somepkg");
+        decoy_pkg.symbols.push(SymbolNode {
+            id: "somepkg::Animal".to_string(),
+            name: "Animal".to_string(),
+            kind: SymbolKind::Type,
+            file: PathBuf::from("somepkg/animal.go"),
+            line: 1,
+            exported: true,
+            parent: None,
+        });
+        packages.insert("somepkg".to_string(), decoy_pkg);
+
+        packages.insert("pkg".to_string(), empty_package("pkg"));
+
+        let file = PathBuf::from("pkg/dog.go");
+        let mut file_aliases = HashMap::new();
+        file_aliases.insert("other".to_string(), "example.com/app/other".to_string());
+        let mut aliases = BTreeMap::new();
+        aliases.insert(file.clone(), file_aliases);
+
+        let site = RawTypeRelationSite {
+            type_id: "pkg::Dog".to_string(),
+            package_path: "pkg".to_string(),
+            target_text: "other.Animal".to_string(),
+            kind_hint: None,
+            file: file.clone(),
+            line: 5,
+            dotted_text_is_go_package_qualifier: true,
+        };
+
+        let edges = resolve_type_edges(&packages, &aliases, vec![site]);
+
+        assert_eq!(edges.len(), 1, "got: {edges:?}");
+        let edge = &edges[0];
+        assert!(edge.resolved, "got: {edge:?}");
+        assert_eq!(edge.to, "example.com/app/other::Animal");
+        assert_eq!(edge.kind, Some(TypeRelationKind::Extends));
+    }
+
+    #[test]
+    fn resolve_type_edges_prefers_kind_hint_over_inferred_kind_when_both_available() {
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+        let mut pkg = empty_package("app");
+        pkg.symbols.push(SymbolNode {
+            id: "app::Foo".to_string(),
+            name: "Foo".to_string(),
+            kind: SymbolKind::Interface,
+            file: PathBuf::from("app/foo.ts"),
+            line: 1,
+            exported: true,
+            parent: None,
+        });
+        packages.insert("app".to_string(), pkg);
+
+        let site = RawTypeRelationSite {
+            type_id: "app::Bar".to_string(),
+            package_path: "app".to_string(),
+            target_text: "Foo".to_string(),
+            kind_hint: Some(TypeRelationKind::Implements),
+            file: PathBuf::from("app/bar.ts"),
+            line: 2,
+            dotted_text_is_go_package_qualifier: false,
+        };
+
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(edges.len(), 1, "got: {edges:?}");
+        let edge = &edges[0];
+        assert!(edge.resolved);
+        assert_eq!(edge.to, "app::Foo");
+        assert_eq!(edge.kind, Some(TypeRelationKind::Implements));
+    }
+
+    #[test]
+    fn resolve_type_edges_keeps_kind_hint_when_target_is_unresolved() {
+        let packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+
+        let site = RawTypeRelationSite {
+            type_id: "app::Bar".to_string(),
+            package_path: "app".to_string(),
+            target_text: "Foo".to_string(),
+            kind_hint: Some(TypeRelationKind::Implements),
+            file: PathBuf::from("app/bar.ts"),
+            line: 2,
+            dotted_text_is_go_package_qualifier: false,
+        };
+
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(
+            edges,
+            vec![TypeRelationEdge {
+                from: "app::Bar".to_string(),
+                to: "Foo".to_string(),
+                kind: Some(TypeRelationKind::Implements),
+                resolved: false,
+                file: PathBuf::from("app/bar.ts"),
+                line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_type_edges_never_resolves_a_non_go_dotted_target_by_stripping_its_qualifier() {
+        // A TS `class Foo extends React.Component {}`-style site: `target_text` is
+        // `"React.Component"`, dotted, but NOT a Go package-qualified embed
+        // (`dotted_text_is_go_package_qualifier: false`). A model that happens to contain
+        // an unrelated local `Component` type/interface must NOT have this edge silently
+        // resolve to it — that would be exactly the "guess" `TypeRelationEdge`'s doc
+        // comment forbids. The dotted text is looked up atomically instead, which never
+        // matches any real symbol name, so the edge stays unresolved with the raw text.
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+        let mut pkg = empty_package("app");
+        pkg.symbols
+            .push(symbol_of_kind("Component", SymbolKind::Interface));
+        packages.insert("app".to_string(), pkg);
+
+        let site = RawTypeRelationSite {
+            type_id: "app::Foo".to_string(),
+            package_path: "app".to_string(),
+            target_text: "React.Component".to_string(),
+            kind_hint: Some(TypeRelationKind::Extends),
+            file: PathBuf::from("app/foo.tsx"),
+            line: 1,
+            dotted_text_is_go_package_qualifier: false,
+        };
+
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(
+            edges,
+            vec![TypeRelationEdge {
+                from: "app::Foo".to_string(),
+                to: "React.Component".to_string(),
+                kind: Some(TypeRelationKind::Extends),
+                resolved: false,
+                file: PathBuf::from("app/foo.tsx"),
+                line: 1,
+            }],
+            "must not silently resolve to the unrelated local `Component` interface"
+        );
+    }
+
+    #[test]
+    fn build_model_populates_type_edges_for_go_embedding() {
+        let dir = tmp_dir("type-edges-go-embed");
+        write_fixture(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let animal = write_fixture(
+            &dir,
+            "types/animal.go",
+            "package types\n\ntype Animal struct{}\n",
+        );
+        let dog = write_fixture(
+            &dir,
+            "types/dog.go",
+            "package types\n\ntype Dog struct {\n\tAnimal\n}\n",
+        );
+
+        let file_paths = vec![animal.clone(), dog.clone()];
+        let import_graph = crate::import_graph::build(&dir, &file_paths).unwrap();
+        let files: Vec<(PathBuf, String)> = file_paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap()))
+            .collect();
+
+        let model = build_model(&dir, &files, &import_graph, &PruneConfig::default()).unwrap();
+
+        let edge = model
+            .type_edges
+            .iter()
+            .find(|e| e.from.ends_with("::Dog"))
+            .expect("type edge from Dog");
+        assert!(edge.resolved, "got: {edge:?}");
+        assert!(edge.to.ends_with("::Animal"), "got: {edge:?}");
+        assert_eq!(edge.kind, Some(TypeRelationKind::Extends));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_model_populates_type_edges_across_go_and_typescript_in_one_call() {
+        let dir = tmp_dir("type-edges-mixed-langs");
+        write_fixture(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let go_animal = write_fixture(
+            &dir,
+            "animals/animal.go",
+            "package animals\n\ntype Animal struct{}\n",
+        );
+        let go_dog = write_fixture(
+            &dir,
+            "animals/dog.go",
+            "package animals\n\ntype Dog struct {\n\tAnimal\n}\n",
+        );
+        let ts_feline = write_fixture(&dir, "web/feline.ts", "export class Feline {}\n");
+        let ts_cat = write_fixture(&dir, "web/cat.ts", "export class Cat extends Feline {}\n");
+
+        let file_paths = vec![
+            go_animal.clone(),
+            go_dog.clone(),
+            ts_feline.clone(),
+            ts_cat.clone(),
+        ];
+        let import_graph = crate::import_graph::build(&dir, &file_paths).unwrap();
+        let files: Vec<(PathBuf, String)> = file_paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap()))
+            .collect();
+
+        let model = build_model(&dir, &files, &import_graph, &PruneConfig::default()).unwrap();
+
+        assert_eq!(model.type_edges.len(), 2, "got: {:?}", model.type_edges);
+
+        let go_edge = model
+            .type_edges
+            .iter()
+            .find(|e| e.from.ends_with("::Dog"))
+            .expect("go type edge from Dog");
+        assert!(go_edge.resolved, "got: {go_edge:?}");
+        assert!(go_edge.to.ends_with("::Animal"), "got: {go_edge:?}");
+
+        let ts_edge = model
+            .type_edges
+            .iter()
+            .find(|e| e.from.ends_with("::Cat"))
+            .expect("ts type edge from Cat");
+        assert!(ts_edge.resolved, "got: {ts_edge:?}");
+        assert!(ts_edge.to.ends_with("::Feline"), "got: {ts_edge:?}");
+        assert_eq!(ts_edge.kind, Some(TypeRelationKind::Extends));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_model_resolves_qualified_go_embed_across_two_packages_through_the_real_pipeline() {
+        let dir = tmp_dir("type-edges-qualified-embed");
+        write_fixture(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let other_animal = write_fixture(
+            &dir,
+            "other/animal.go",
+            "package other\n\ntype Animal struct{}\n",
+        );
+        let dog = write_fixture(
+            &dir,
+            "pkg/dog.go",
+            "package pkg\n\nimport \"example.com/app/other\"\n\ntype Dog struct {\n\tother.Animal\n}\n",
+        );
+
+        let file_paths = vec![other_animal.clone(), dog.clone()];
+        let import_graph = crate::import_graph::build(&dir, &file_paths).unwrap();
+        let files: Vec<(PathBuf, String)> = file_paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap()))
+            .collect();
+
+        let model = build_model(&dir, &files, &import_graph, &PruneConfig::default()).unwrap();
+
+        let animal_id = model
+            .package("example.com/app/other")
+            .expect("other package exists under its module-qualified key")
+            .symbols
+            .iter()
+            .find(|s| s.name == "Animal")
+            .expect("Animal symbol exists")
+            .id
+            .clone();
+
+        let edge = model
+            .type_edges
+            .iter()
+            .find(|e| e.from.ends_with("::Dog"))
+            .expect("type edge from Dog");
+        assert!(edge.resolved, "got: {edge:?}");
+        assert_eq!(
+            edge.to, animal_id,
+            "resolved via file_import_aliases, not name-only luck"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_model_type_edges_invariant_every_resolved_edge_targets_a_real_type_or_interface_node()
+    {
+        let dir = tmp_dir("type-edges-invariant");
+        write_fixture(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let go_file = write_fixture(
+            &dir,
+            "goworld/types.go",
+            "package goworld\n\nimport \"sync\"\n\ntype Animal struct{}\n\ntype Dog struct {\n\tAnimal\n}\n\ntype Locker struct {\n\tsync.Mutex\n}\n",
+        );
+        let ts_file = write_fixture(
+            &dir,
+            "tsworld/hierarchy.ts",
+            "export interface Doer {\n  do(): void;\n}\n\nexport class Feline {}\n\nexport class Cat extends Feline {}\n\nexport class Worker implements Doer {}\n",
+        );
+        let kt_file = write_fixture(
+            &dir,
+            "ktworld/Animals.kt",
+            "open class Animal\n\nclass Dog : Animal()\n",
+        );
+
+        let file_paths = vec![go_file.clone(), ts_file.clone(), kt_file.clone()];
+        let import_graph = crate::import_graph::build(&dir, &file_paths).unwrap();
+        let files: Vec<(PathBuf, String)> = file_paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap()))
+            .collect();
+
+        let model = build_model(&dir, &files, &import_graph, &PruneConfig::default()).unwrap();
+
+        // Sanity: this fixture actually exercises all three `kind` outcomes, so the
+        // invariant checked below isn't vacuously true over an empty/uniform edge set.
+        assert!(
+            model
+                .type_edges
+                .iter()
+                .any(|e| e.resolved && e.kind == Some(TypeRelationKind::Extends)),
+            "got: {:?}",
+            model.type_edges
+        );
+        assert!(
+            model
+                .type_edges
+                .iter()
+                .any(|e| e.resolved && e.kind == Some(TypeRelationKind::Implements)),
+            "got: {:?}",
+            model.type_edges
+        );
+        assert!(
+            model
+                .type_edges
+                .iter()
+                .any(|e| !e.resolved && e.kind.is_none()),
+            "got: {:?}",
+            model.type_edges
+        );
+
+        let all_symbols: Vec<&SymbolNode> =
+            model.packages.values().flat_map(|p| &p.symbols).collect();
+
+        for edge in model.type_edges.iter().filter(|e| e.resolved) {
+            let target = all_symbols
+                .iter()
+                .find(|s| s.id == edge.to)
+                .unwrap_or_else(|| {
+                    panic!("resolved edge {edge:?} has no matching SymbolNode for `to`")
+                });
+            assert!(
+                matches!(target.kind, SymbolKind::Type | SymbolKind::Interface),
+                "resolved edge {edge:?} targets non-type symbol {target:?}"
+            );
+            if let Some(kind) = edge.kind {
+                let expected = match target.kind {
+                    SymbolKind::Type => TypeRelationKind::Extends,
+                    SymbolKind::Interface => TypeRelationKind::Implements,
+                    SymbolKind::Function | SymbolKind::Method => {
+                        unreachable!("asserted above every resolved edge targets Type/Interface")
+                    }
+                };
+                assert_eq!(
+                    kind, expected,
+                    "edge {edge:?} kind disagrees with target's actual SymbolKind {:?}",
+                    target.kind
+                );
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
