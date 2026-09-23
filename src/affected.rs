@@ -81,17 +81,37 @@ pub enum AffectedResult {
     BailOut(BailOutReason),
 }
 
+/// Runs `git <args>` with `cwd = repo_root`, returning the raw `Output` — callers decide
+/// whether a non-zero exit is a hard error, an `Ok(None)`, or something else (this
+/// module has all three shapes), so this stays a thin wrapper rather than baking in one
+/// call site's error-handling policy.
+fn run_git(repo_root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))
+}
+
+/// Whether `path` has a `.go` extension — the Go-only v1 scope's single-path check, used
+/// where a bulk file-list filter (`import_graph::files_for`) doesn't apply.
+fn is_go_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("go")
+}
+
+/// `path` as a `/`-separated string, matching git's own path convention — needed
+/// wherever a `PathBuf` is handed to `git diff -- <path>` or `glob::matches_scope`.
+fn git_path_str(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Resolves `repo_root` to the actual git working-tree top-level — matches
 /// `hotspots.rs::git_toplevel`'s convention, since every subsequent git call and every
 /// path comparison against `ArchModel` needs the true top-level, not a subdirectory a
 /// caller happened to pass. A non-zero exit here (not a git repo, `git` binary missing)
 /// is a hard error, never a bail-out — there is nothing to compute at all.
 fn repo_toplevel(repo_root: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git rev-parse --show-toplevel")?;
+    let output = run_git(repo_root, &["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
         bail!(
             "{} is not a git repository: git rev-parse --show-toplevel exited with {}: {}",
@@ -110,11 +130,7 @@ fn repo_toplevel(repo_root: &Path) -> Result<PathBuf> {
 /// unresolvable `base` (typo, unfetched branch) is a **hard error**, not a bail-out —
 /// see `plan.md` Story 1.1.1's reconciled exit contract.
 pub fn resolve_base_sha(repo_root: &Path, base: &str) -> Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", base])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git rev-parse")?;
+    let output = run_git(repo_root, &["rev-parse", base])?;
     if !output.status.success() {
         bail!(
             "base ref '{base}' did not resolve to a commit: {}",
@@ -134,32 +150,23 @@ fn parse_name_status(output: &str) -> Vec<ChangedFile> {
         }
         let mut parts = line.split('\t');
         let Some(code) = parts.next() else { continue };
-        match code.chars().next() {
-            Some('A') => {
-                if let Some(path) = parts.next() {
-                    result.push(ChangedFile {
-                        path: PathBuf::from(path),
-                        status: ChangeStatus::Added,
-                    });
-                }
+        let Some(first_char) = code.chars().next() else {
+            continue;
+        };
+        match first_char {
+            'A' | 'M' | 'D' => {
+                let Some(path) = parts.next() else { continue };
+                let status = match first_char {
+                    'A' => ChangeStatus::Added,
+                    'M' => ChangeStatus::Modified,
+                    _ => ChangeStatus::Deleted,
+                };
+                result.push(ChangedFile {
+                    path: PathBuf::from(path),
+                    status,
+                });
             }
-            Some('M') => {
-                if let Some(path) = parts.next() {
-                    result.push(ChangedFile {
-                        path: PathBuf::from(path),
-                        status: ChangeStatus::Modified,
-                    });
-                }
-            }
-            Some('D') => {
-                if let Some(path) = parts.next() {
-                    result.push(ChangedFile {
-                        path: PathBuf::from(path),
-                        status: ChangeStatus::Deleted,
-                    });
-                }
-            }
-            Some('R') => {
+            'R' => {
                 if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
                     result.push(ChangedFile {
                         path: PathBuf::from(new),
@@ -179,14 +186,19 @@ fn parse_name_status(output: &str) -> Vec<ChangedFile> {
 /// base, with rename detection. `Ok(None)` (not `Err`) on a non-zero exit: this is the
 /// ambiguous "no common history" case (e.g. a shallow clone), which `compute_affected`
 /// maps to `BailOutReason::ShallowCloneOrNoCommonHistory` rather than a hard error —
-/// `base_sha` itself already resolved fine.
+/// `base_sha` itself already resolved fine. The discarded stderr is still surfaced (not
+/// silently dropped) since a real git failure unrelated to shared history would
+/// otherwise be misclassified as "shallow clone" with no diagnostic trail.
 fn diff_base_head(repo_root: &Path, base_sha: &str) -> Result<Option<Vec<ChangedFile>>> {
-    let output = Command::new("git")
-        .args(["diff", "--name-status", "-M", &format!("{base_sha}...HEAD")])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git diff --name-status")?;
+    let output = run_git(
+        repo_root,
+        &["diff", "--name-status", "-M", &format!("{base_sha}...HEAD")],
+    )?;
     if !output.status.success() {
+        eprintln!(
+            "[kibitzer] git diff --name-status failed (treated as no common history): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
         return Ok(None);
     }
     Ok(Some(parse_name_status(&String::from_utf8_lossy(
@@ -198,11 +210,7 @@ fn diff_base_head(repo_root: &Path, base_sha: &str) -> Result<Option<Vec<Changed
 /// (`git ls-files --others --exclude-standard`, all `Added`) — matching
 /// `test-affected.py`'s working-tree-inclusive scope.
 fn diff_working_tree(repo_root: &Path) -> Result<Vec<ChangedFile>> {
-    let tracked = Command::new("git")
-        .args(["diff", "--name-status", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git diff --name-status HEAD")?;
+    let tracked = run_git(repo_root, &["diff", "--name-status", "HEAD"])?;
     if !tracked.status.success() {
         bail!(
             "git diff --name-status HEAD exited with {}: {}",
@@ -212,11 +220,7 @@ fn diff_working_tree(repo_root: &Path) -> Result<Vec<ChangedFile>> {
     }
     let mut changed = parse_name_status(&String::from_utf8_lossy(&tracked.stdout));
 
-    let untracked = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git ls-files --others --exclude-standard")?;
+    let untracked = run_git(repo_root, &["ls-files", "--others", "--exclude-standard"])?;
     if !untracked.status.success() {
         bail!(
             "git ls-files --others --exclude-standard exited with {}: {}",
@@ -262,15 +266,13 @@ pub fn diff_changed_files(repo_root: &Path, base_sha: &str) -> Result<Option<Vec
 /// `diff_changed_files` already establishes, not a full tree-sitter re-parse. Non-`.go`
 /// files are never checked (Go-only v1 scope).
 fn detect_package_clause_change(repo_root: &Path, base_sha: &str, path: &Path) -> Result<bool> {
-    if path.extension().and_then(|e| e.to_str()) != Some("go") {
+    if !is_go_path(path) {
         return Ok(false);
     }
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    let output = Command::new("git")
-        .args(["diff", "-U0", base_sha, "--", &path_str])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git diff -U0")?;
+    let output = run_git(
+        repo_root,
+        &["diff", "-U0", base_sha, "--", &git_path_str(path)],
+    )?;
     if !output.status.success() {
         bail!(
             "git diff -U0 exited with {}: {}",
@@ -333,17 +335,15 @@ fn reverse_bfs(
 /// entries and a `Renamed` entry's *old*-side path are handled separately by
 /// [`resolve_removed_path`], called directly from `compute_affected`.
 fn resolve_changed_packages(changed: &[ChangedFile], model: &ArchModel) -> BTreeSet<String> {
-    let mut seeds = BTreeSet::new();
-    for entry in changed {
-        if matches!(entry.status, ChangeStatus::Deleted) {
-            continue;
-        }
-        let abs = model.repo_root.join(&entry.path);
-        if let Some(key) = model.package_for_file(&abs) {
-            seeds.insert(key.to_string());
-        }
-    }
-    seeds
+    changed
+        .iter()
+        .filter(|entry| !matches!(entry.status, ChangeStatus::Deleted))
+        .filter_map(|entry| {
+            model
+                .package_for_file(&model.repo_root.join(&entry.path))
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// For a `Deleted` path or a `Renamed` entry's old-side path: does the package that used
@@ -371,7 +371,7 @@ fn matches_any_bail_out_glob(
     globs: &[String],
 ) -> Option<(String, PathBuf)> {
     for entry in changed {
-        let path_str = entry.path.to_string_lossy().replace('\\', "/");
+        let path_str = git_path_str(&entry.path);
         for glob in globs {
             if crate::glob::matches_scope(&path_str, std::slice::from_ref(glob)) {
                 return Some((glob.clone(), entry.path.clone()));
@@ -443,10 +443,11 @@ pub fn compute_affected(
     // only the Go import graph is ever consulted.
     let all_files = crate::check::walk_and_collect_files(&repo_root)
         .with_context(|| format!("walking {}", repo_root.display()))?;
-    let go_files: Vec<PathBuf> = all_files
-        .into_iter()
-        .filter(|f| crate::checker::Language::for_path(f) == Some(crate::checker::Language::Go))
-        .collect();
+    let go_files: Vec<PathBuf> =
+        crate::import_graph::files_for(&all_files, crate::checker::Language::Go)
+            .into_iter()
+            .cloned()
+            .collect();
     let model = arch_model::build_model_from_files(
         &repo_root,
         &go_files,
@@ -469,7 +470,7 @@ pub fn compute_affected(
         // deleted markdown file in a Go-free docs directory (`resolve_removed_path`
         // finds no surviving `.go` file there because there never was one), turning
         // an everyday doc edit into an unnecessary `__ALL__`.
-        let old_path = old_path.filter(|p| p.extension().and_then(|e| e.to_str()) == Some("go"));
+        let old_path = old_path.filter(|p| is_go_path(p));
         if let Some(old_path) = old_path {
             match resolve_removed_path(&repo_root, &old_path, &model) {
                 Some(key) => {
