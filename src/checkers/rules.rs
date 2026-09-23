@@ -37,6 +37,61 @@ const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// might be.
 const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
 
+// `replace-magic-literal`'s per-language `literal_kinds`/`numeric_literal_kinds` node-kind
+// tables, hoisted to named constants (rather than inline in each `*_lang_config()`) so
+// adding them didn't push these constructors' bodies over `LONG_FUNCTION_LINES` — the
+// same threshold this rule catalog enforces on every other codebase it checks.
+const GO_LITERAL_KINDS: &[&str] = &[
+    "int_literal",
+    "float_literal",
+    "imaginary_literal",
+    "rune_literal",
+    "interpreted_string_literal",
+    "raw_string_literal",
+];
+const GO_NUMERIC_LITERAL_KINDS: &[&str] = &[
+    "int_literal",
+    "float_literal",
+    "imaginary_literal",
+    "rune_literal",
+];
+const PYTHON_LITERAL_KINDS: &[&str] = &["integer", "float", "string"];
+const PYTHON_NUMERIC_LITERAL_KINDS: &[&str] = &["integer", "float"];
+const JAVA_LITERAL_KINDS: &[&str] = &[
+    "decimal_integer_literal",
+    "hex_integer_literal",
+    "octal_integer_literal",
+    "binary_integer_literal",
+    "decimal_floating_point_literal",
+    "hex_floating_point_literal",
+    "string_literal",
+];
+const JAVA_NUMERIC_LITERAL_KINDS: &[&str] = &[
+    "decimal_integer_literal",
+    "hex_integer_literal",
+    "octal_integer_literal",
+    "binary_integer_literal",
+    "decimal_floating_point_literal",
+    "hex_floating_point_literal",
+];
+// Verified against `tree-sitter-kotlin-ng` 1.1.0's `node-types.json`: no separate
+// hex/binary/long/unsigned literal kinds exist — `number_literal` covers every integer
+// form.
+const KOTLIN_LITERAL_KINDS: &[&str] = &[
+    "number_literal",
+    "float_literal",
+    "string_literal",
+    "multiline_string_literal",
+];
+const KOTLIN_NUMERIC_LITERAL_KINDS: &[&str] = &["number_literal", "float_literal"];
+const RUST_LITERAL_KINDS: &[&str] = &[
+    "integer_literal",
+    "float_literal",
+    "string_literal",
+    "raw_string_literal",
+];
+const RUST_NUMERIC_LITERAL_KINDS: &[&str] = &["integer_literal", "float_literal"];
+
 /// Metadata for one rule in the catalog. Thresholds above are fixed for now —
 /// per-rule configurability is a natural follow-up, not required for the initial
 /// catalog.
@@ -788,20 +843,8 @@ fn go_lang_config() -> LangRuleConfig {
         unwrap_statement: identity_stmt,
         terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
         panic_detector: go_panic_detector,
-        literal_kinds: &[
-            "int_literal",
-            "float_literal",
-            "imaginary_literal",
-            "rune_literal",
-            "interpreted_string_literal",
-            "raw_string_literal",
-        ],
-        numeric_literal_kinds: &[
-            "int_literal",
-            "float_literal",
-            "imaginary_literal",
-            "rune_literal",
-        ],
+        literal_kinds: GO_LITERAL_KINDS,
+        numeric_literal_kinds: GO_NUMERIC_LITERAL_KINDS,
         binding_finder: go_const_binding,
     }
 }
@@ -900,8 +943,8 @@ fn python_lang_config() -> LangRuleConfig {
         // kind as a plain string literal (verified via `codegen/node-types/python.json`
         // and `to_sexp()`), so it's already visited by `literal_kinds` without a
         // separate entry.
-        literal_kinds: &["integer", "float", "string"],
-        numeric_literal_kinds: &["integer", "float"],
+        literal_kinds: PYTHON_LITERAL_KINDS,
+        numeric_literal_kinds: PYTHON_NUMERIC_LITERAL_KINDS,
         binding_finder: py_screaming_snake_binding,
     }
 }
@@ -935,23 +978,8 @@ fn java_lang_config() -> LangRuleConfig {
         unwrap_statement: identity_stmt,
         terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
         panic_detector: no_panic_detector,
-        literal_kinds: &[
-            "decimal_integer_literal",
-            "hex_integer_literal",
-            "octal_integer_literal",
-            "binary_integer_literal",
-            "decimal_floating_point_literal",
-            "hex_floating_point_literal",
-            "string_literal",
-        ],
-        numeric_literal_kinds: &[
-            "decimal_integer_literal",
-            "hex_integer_literal",
-            "octal_integer_literal",
-            "binary_integer_literal",
-            "decimal_floating_point_literal",
-            "hex_floating_point_literal",
-        ],
+        literal_kinds: JAVA_LITERAL_KINDS,
+        numeric_literal_kinds: JAVA_NUMERIC_LITERAL_KINDS,
         binding_finder: java_final_binding,
     }
 }
@@ -996,16 +1024,8 @@ fn kotlin_lang_config() -> LangRuleConfig {
         // `break`/`continue` omitted — see `terminal_kinds`'s doc comment.
         terminal_kinds: &["return_expression"],
         panic_detector: no_panic_detector,
-        // Verified against `tree-sitter-kotlin-ng` 1.1.0's `node-types.json`: no
-        // separate hex/binary/long/unsigned literal kinds exist — `number_literal`
-        // covers every integer form.
-        literal_kinds: &[
-            "number_literal",
-            "float_literal",
-            "string_literal",
-            "multiline_string_literal",
-        ],
-        numeric_literal_kinds: &["number_literal", "float_literal"],
+        literal_kinds: KOTLIN_LITERAL_KINDS,
+        numeric_literal_kinds: KOTLIN_NUMERIC_LITERAL_KINDS,
         binding_finder: kotlin_val_binding,
     }
 }
@@ -1052,13 +1072,8 @@ fn rust_lang_config() -> LangRuleConfig {
             "continue_expression",
         ],
         panic_detector: rust_panic_detector,
-        literal_kinds: &[
-            "integer_literal",
-            "float_literal",
-            "string_literal",
-            "raw_string_literal",
-        ],
-        numeric_literal_kinds: &["integer_literal", "float_literal"],
+        literal_kinds: RUST_LITERAL_KINDS,
+        numeric_literal_kinds: RUST_NUMERIC_LITERAL_KINDS,
         binding_finder: rust_const_binding,
     }
 }
@@ -1195,7 +1210,10 @@ fn resolve_excluded_constants(root: Node, src: &[u8], bound: &[ConstBinding]) ->
 /// empty-literal comparison against `MAGIC_LITERAL_ALLOWLIST` is structural, not a
 /// fixed-string match — a raw-text allow-list of `"\"\""`/`"''"` never matches Kotlin's
 /// empty `""""""`, Rust's `r""`, Go's empty backtick raw string, or Python's `r`/`b`/`f`-
-/// prefixed empty string.
+/// prefixed empty string. Dispatches on `kind()` alone: `"raw_string_literal"` covers both
+/// Go (backtick) and Rust (`r"..."`, tried second, after Go's strip no-ops on it) and
+/// `"string"` covers both Python and TS/JS (harmless — a TS/JS string never starts with an
+/// `r`/`b`/`f` prefix letter) — intentional, not accidental cross-language dispatch.
 fn normalize_literal_value<'a>(raw: &'a str, kind: &str) -> &'a str {
     // Kotlin's multiline string: strip the triple-quote delimiter on each side.
     if kind == "multiline_string_literal"
@@ -1212,40 +1230,54 @@ fn normalize_literal_value<'a>(raw: &'a str, kind: &str) -> &'a str {
         return inner;
     }
     // Rust's raw string literal: `r"..."`, `r#"..."#`, `r##"..."##`, etc.
-    if kind == "raw_string_literal" {
-        let mut hashes = 0usize;
-        let mut rest = raw.strip_prefix('r').unwrap_or(raw);
-        while let Some(r) = rest.strip_prefix('#') {
-            hashes += 1;
-            rest = r;
-        }
-        let close = format!("\"{}", "#".repeat(hashes));
-        if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix(&close)) {
-            return inner;
-        }
+    if kind == "raw_string_literal"
+        && let Some(inner) = strip_rust_raw_string_delimiters(raw)
+    {
+        return inner;
     }
-    // Python's string-prefix letters (`r`/`b`/`f`/`rb`/`br`/`rf`/`fr`, any case) ahead of
-    // the quote character, then the (single or triple) quote delimiter itself.
-    if kind == "string" {
-        let prefix_len = raw
-            .chars()
-            .take_while(|c| c.is_ascii_alphabetic())
-            .take(2)
-            .count();
-        let (prefix, rest) = raw.split_at(prefix_len);
-        if prefix
-            .chars()
-            .all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f'))
-            && let Some(inner) = strip_quote_delimiter(rest)
-        {
-            return inner;
-        }
+    if kind == "string"
+        && let Some(inner) = strip_python_prefixed_quote_delimiter(raw)
+    {
+        return inner;
     }
     // Every other basic quoted form: `"..."`/`'...'` (single- or double-quoted).
     if let Some(inner) = strip_quote_delimiter(raw) {
         return inner;
     }
     raw
+}
+
+/// Strips Rust raw-string delimiters (`r"..."`, `r#"..."#`, `r##"..."##`, etc.) from
+/// `raw`, if it matches that shape. Split out of `normalize_literal_value` to keep that
+/// function's body under `LONG_FUNCTION_LINES`.
+fn strip_rust_raw_string_delimiters(raw: &str) -> Option<&str> {
+    let mut hashes = 0usize;
+    let mut rest = raw.strip_prefix('r').unwrap_or(raw);
+    while let Some(r) = rest.strip_prefix('#') {
+        hashes += 1;
+        rest = r;
+    }
+    let close = format!("\"{}", "#".repeat(hashes));
+    rest.strip_prefix('"').and_then(|s| s.strip_suffix(&close))
+}
+
+/// Strips Python's string-prefix letters (`r`/`b`/`f`/`rb`/`br`/`rf`/`fr`, any case)
+/// ahead of the quote character, then the quote delimiter itself. Split out of
+/// `normalize_literal_value` to keep that function's body under `LONG_FUNCTION_LINES`.
+fn strip_python_prefixed_quote_delimiter(raw: &str) -> Option<&str> {
+    let prefix_len = raw
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .take(2)
+        .count();
+    let (prefix, rest) = raw.split_at(prefix_len);
+    if !prefix
+        .chars()
+        .all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f'))
+    {
+        return None;
+    }
+    strip_quote_delimiter(rest)
 }
 
 /// Strips a matching pair of `"`/`'` (single-char) or `"""` (triple, for a plain,
@@ -1280,40 +1312,66 @@ fn emit_literal_findings(
     excluded: &HashSet<usize>,
     findings: &mut Vec<Finding>,
 ) {
-    for (text, occurrences) in &collector.occurrences {
-        let Some(first) = occurrences.first() else {
-            continue;
-        };
-        if is_allowlisted_literal(text, first.kind) {
-            continue;
-        }
-        let mut remaining: Vec<&LiteralOccurrence> = occurrences
-            .iter()
-            .filter(|occ| !excluded.contains(&occ.node.id()))
-            .collect();
-        if remaining.len() < MAGIC_LITERAL_MIN_OCCURRENCES {
-            continue;
-        }
-        remaining.sort_by_key(|occ| occ.node.start_position().row);
-        let label = if cfg.numeric_literal_kinds.contains(&remaining[0].kind) {
-            "numeric"
-        } else {
-            "string"
-        };
-        let line = remaining[0].node.start_position().row + 1;
-        let other_lines: Vec<String> = remaining[1..]
-            .iter()
-            .map(|occ| (occ.node.start_position().row + 1).to_string())
-            .collect();
-        findings.push(Finding {
-            line,
-            message: format!(
-                "[replace-magic-literal] {label} literal {text} appears {} times (also line {}) — consider extracting a named constant",
-                remaining.len(),
-                other_lines.join(", ")
-            ),
-        });
+    // `collector.occurrences` is a `HashMap`, whose iteration order is randomized per
+    // process — collected into a local `Vec` and sorted by line so this rule's findings
+    // are deterministic across runs, matching `go_table_driven_test.rs`/
+    // `markdown_link_integrity.rs`'s existing `sort_by_key(|f| f.line)` convention.
+    let mut new_findings: Vec<Finding> = collector
+        .occurrences
+        .iter()
+        .filter_map(|(text, occurrences)| build_literal_finding(text, occurrences, cfg, excluded))
+        .collect();
+    new_findings.sort_by_key(|f| f.line);
+    findings.extend(new_findings);
+}
+
+/// Applies the allow-list and the excluded-node-id set to one literal value's
+/// occurrences, returning a `Finding` if >= `MAGIC_LITERAL_MIN_OCCURRENCES` remain —
+/// anchored at the first remaining occurrence's line. Split out of
+/// `emit_literal_findings` so the loop stays a filter/collect, not a 40+-line body.
+fn build_literal_finding(
+    text: &str,
+    occurrences: &[LiteralOccurrence],
+    cfg: &LangRuleConfig,
+    excluded: &HashSet<usize>,
+) -> Option<Finding> {
+    let first = occurrences.first()?;
+    if is_allowlisted_literal(text, first.kind) {
+        return None;
     }
+    let mut remaining: Vec<&LiteralOccurrence> = occurrences
+        .iter()
+        .filter(|occ| !excluded.contains(&occ.node.id()))
+        .collect();
+    if remaining.len() < MAGIC_LITERAL_MIN_OCCURRENCES {
+        return None;
+    }
+    remaining.sort_by_key(|occ| occ.node.start_position().row);
+    let label = if cfg.numeric_literal_kinds.contains(&remaining[0].kind) {
+        "numeric"
+    } else {
+        "string"
+    };
+    let line = remaining[0].node.start_position().row + 1;
+    let other_lines: Vec<String> = remaining[1..]
+        .iter()
+        .map(|occ| (occ.node.start_position().row + 1).to_string())
+        .collect();
+    // `MAGIC_LITERAL_MIN_OCCURRENCES` is >= 2, so `other_lines` always has >= 1 entry —
+    // pluralize "line" instead of hardcoding the singular.
+    let line_word = if other_lines.len() == 1 {
+        "line"
+    } else {
+        "lines"
+    };
+    Some(Finding {
+        line,
+        message: format!(
+            "[replace-magic-literal] {label} literal {text} appears {} times (also {line_word} {}) — consider extracting a named constant",
+            remaining.len(),
+            other_lines.join(", ")
+        ),
+    })
 }
 
 /// Flags at most one statement per block: the first one found after an unconditional
