@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 use crate::checker::Language;
+use crate::node_kind::{GoKind, JavaKind, JavaScriptKind, KotlinKind, PythonKind, RustKind};
 
 /// A directed edge from one package/module directory to another, plus the specific
 /// import statement (file + line) that produced it — kept so findings derived from the
@@ -337,7 +338,7 @@ fn go_package_identity(
 }
 
 fn collect_go_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
-    if node.kind() == "import_spec"
+    if GoKind::of(node) == GoKind::ImportSpec
         && let Some(path_node) = node.child_by_field_name("path")
         && let Ok(text) = path_node.utf8_text(src)
     {
@@ -386,7 +387,7 @@ pub(crate) fn extract_go_file_imports(tree: &tree_sitter::Tree, source: &str) ->
     let package_name = {
         let mut cursor = root.walk();
         root.children(&mut cursor)
-            .find(|c| c.kind() == "package_clause")
+            .find(|c| GoKind::of(*c) == GoKind::PackageClause)
             .and_then(|pc| pc.named_child(0))
             .and_then(|id| id.utf8_text(src).ok())
             .map(str::to_string)
@@ -400,7 +401,7 @@ pub(crate) fn extract_go_file_imports(tree: &tree_sitter::Tree, source: &str) ->
 }
 
 fn collect_go_import_specs(node: Node, src: &[u8], out: &mut Vec<GoImportSpec>) {
-    if node.kind() == "import_spec" {
+    if GoKind::of(node) == GoKind::ImportSpec {
         // Leaf node for this grammar (an `import_spec`'s only children are `name`/
         // `path`, never a nested `import_spec`) — no need to recurse further once
         // handled, whether or not it yields an entry.
@@ -425,7 +426,9 @@ fn go_import_spec(node: Node, src: &[u8]) -> Option<GoImportSpec> {
     let path_text = path_node.utf8_text(src).ok()?;
     let alias = match node.child_by_field_name("name") {
         None => None,
-        Some(n) if n.kind() == "package_identifier" => Some(n.utf8_text(src).ok()?.to_string()),
+        Some(n) if GoKind::of(n) == GoKind::PackageIdentifier => {
+            Some(n.utf8_text(src).ok()?.to_string())
+        }
         Some(_) => return None,
     };
     Some(GoImportSpec {
@@ -463,8 +466,14 @@ pub(crate) fn js_ts_language(file: &Path) -> tree_sitter::Language {
 /// `import_statement` and `export ... from ...` re-exports both carry a `source:`
 /// field pointing to a `string` node whose actual path text lives in a nested
 /// `string_fragment` child — the surrounding quote characters are separate leaves.
+// `import_statement`/`export_statement`/`string_fragment` are stable, identically named,
+// identically `named: true` kinds across all three JS-family grammars (verified against
+// javascript.json/typescript.json/tsx.json) — this function runs over trees parsed by
+// whichever of the three `js_ts_language` picked per file, so `JavaScriptKind` here is a
+// representative choice among equivalents, not a claim the tree is always JavaScript.
 fn collect_js_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
-    if (node.kind() == "import_statement" || node.kind() == "export_statement")
+    if (JavaScriptKind::of(node) == JavaScriptKind::ImportStatement
+        || JavaScriptKind::of(node) == JavaScriptKind::ExportStatement)
         && let Some(source_node) = node.child_by_field_name("source")
         && let Some(text) = string_fragment_text(source_node, src)
     {
@@ -479,7 +488,7 @@ fn collect_js_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
 fn string_fragment_text(string_node: Node, src: &[u8]) -> Option<String> {
     let mut cursor = string_node.walk();
     for child in string_node.children(&mut cursor) {
-        if child.kind() == "string_fragment" {
+        if JavaScriptKind::of(child) == JavaScriptKind::StringFragment {
             return child.utf8_text(src).ok().map(str::to_string);
         }
     }
@@ -596,7 +605,7 @@ fn java_package_identity(
     let mut cursor = root.walk();
     let package_decl = root
         .named_children(&mut cursor)
-        .find(|c| c.kind() == "package_declaration")?;
+        .find(|c| JavaKind::of(*c) == JavaKind::PackageDeclaration)?;
     let name_node = package_decl.named_child(0)?;
     let text = name_node.utf8_text(src).ok()?;
     Some(normalize_package_identity(text))
@@ -613,8 +622,15 @@ fn java_package_identity(
 /// `(import_declaration (scoped_identifier ...))` — so detection here uses a raw
 /// (unnamed-included) child scan for the anonymous `"static"` token, per the verified
 /// finding in the doc comment block below.
+///
+/// The wildcard check below (`asterisk`) stays a typed `JavaKind` comparison since
+/// `"asterisk"` is `"named": true` in java.json — contrast with Kotlin's structurally
+/// parallel wildcard marker (`collect_kotlin_imports` below, `c.kind() == "*"`), which
+/// is an *anonymous* punctuation token (`"named": false` in kotlin.json) and must stay
+/// a raw string comparison. The `"static"` scan just below stays raw for the same
+/// anonymous-token reason `"asterisk"` doesn't.
 fn collect_java_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
-    if node.kind() == "import_declaration" {
+    if JavaKind::of(node) == JavaKind::ImportDeclaration {
         let mut is_static = false;
         for i in 0..node.child_count() as u32 {
             if node.child(i).map(|c| c.kind()) == Some("static") {
@@ -627,12 +643,9 @@ fn collect_java_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) 
             && let Some(name_node) = node.named_child(0)
             && let Ok(text) = name_node.utf8_text(src)
         {
-            // A second positional *named* child of kind `asterisk` marks a wildcard
-            // import (Story 4.1.1's verified finding) — its qualified name is already
-            // the package, with no trailing member segment to strip.
             let is_wildcard = node
                 .named_child(1)
-                .map(|c| c.kind() == "asterisk")
+                .map(|c| JavaKind::of(c) == JavaKind::Asterisk)
                 .unwrap_or(false);
             let package_dotted = if is_wildcard {
                 text
@@ -680,7 +693,7 @@ fn kotlin_package_identity(
     let mut cursor = root.walk();
     let package_header = root
         .named_children(&mut cursor)
-        .find(|c| c.kind() == "package_header")?;
+        .find(|c| KotlinKind::of(*c) == KotlinKind::PackageHeader)?;
     let name_node = package_header.named_child(0)?;
     let text = name_node.utf8_text(src).ok()?;
     Some(normalize_package_identity(text))
@@ -699,10 +712,14 @@ fn kotlin_package_identity(
 /// child's qualified name already includes the pre-alias symbol segment to strip, same
 /// as a plain import.
 fn collect_kotlin_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
-    if node.kind() == "import"
+    if KotlinKind::of(node) == KotlinKind::Import
         && let Some(name_node) = node.named_child(0)
         && let Ok(text) = name_node.utf8_text(src)
     {
+        // Kotlin's wildcard marker `"*"` is `"named": false` in kotlin.json (unlike
+        // Java's `asterisk` in `collect_java_imports` above, which is `"named": true`)
+        // — stays a raw string comparison, the typed-node-kind migration's documented
+        // non-goal for anonymous tokens.
         let is_wildcard = node.child_count() > 0
             && node
                 .child(node.child_count() as u32 - 1)
@@ -992,11 +1009,11 @@ enum PythonImportTarget {
 /// Story 5.2.1's acceptance criteria must produce zero edges and no error — excluded
 /// at the source rather than mishandled as an unresolvable local import.
 fn collect_python_imports(node: Node, src: &[u8], out: &mut Vec<(PythonImportTarget, usize)>) {
-    match node.kind() {
-        "import_statement" => {
+    match PythonKind::of(node) {
+        PythonKind::ImportStatement => {
             let mut cursor = node.walk();
             for name_node in node.children_by_field_name("name", &mut cursor) {
-                let dotted_node = if name_node.kind() == "aliased_import" {
+                let dotted_node = if PythonKind::of(name_node) == PythonKind::AliasedImport {
                     name_node.child_by_field_name("name")
                 } else {
                     Some(name_node)
@@ -1011,27 +1028,27 @@ fn collect_python_imports(node: Node, src: &[u8], out: &mut Vec<(PythonImportTar
                 }
             }
         }
-        "import_from_statement" => {
+        PythonKind::ImportFromStatement => {
             if let Some(module_name) = node.child_by_field_name("module_name") {
                 let line = node.start_position().row + 1;
-                match module_name.kind() {
-                    "dotted_name" => {
+                match PythonKind::of(module_name) {
+                    PythonKind::DottedName => {
                         if let Ok(text) = module_name.utf8_text(src) {
                             out.push((PythonImportTarget::Absolute(text.to_string()), line));
                         }
                     }
-                    "relative_import" => {
+                    PythonKind::RelativeImport => {
                         let mut dots = 0usize;
                         let mut suffix = String::new();
                         let mut rcursor = module_name.walk();
                         for child in module_name.named_children(&mut rcursor) {
-                            match child.kind() {
-                                "import_prefix" => {
+                            match PythonKind::of(child) {
+                                PythonKind::ImportPrefix => {
                                     if let Ok(text) = child.utf8_text(src) {
                                         dots = text.chars().filter(|&c| c == '.').count();
                                     }
                                 }
-                                "dotted_name" => {
+                                PythonKind::DottedName => {
                                     if let Ok(text) = child.utf8_text(src) {
                                         suffix = text.to_string();
                                     }
@@ -1258,8 +1275,8 @@ fn rust_module_key(repo_root: &Path, file: &Path) -> Option<String> {
 /// `scoped_identifier`s until a leaf keyword (`crate`/`self`/`super`) or plain
 /// `identifier` ends the chain.
 fn flatten_rust_path(node: Node, src: &[u8]) -> Vec<String> {
-    match node.kind() {
-        "scoped_identifier" => {
+    match RustKind::of(node) {
+        RustKind::ScopedIdentifier => {
             let mut segments = node
                 .child_by_field_name("path")
                 .map(|p| flatten_rust_path(p, src))
@@ -1271,10 +1288,10 @@ fn flatten_rust_path(node: Node, src: &[u8]) -> Vec<String> {
             }
             segments
         }
-        "crate" => vec!["crate".to_string()],
-        "self" => vec!["self".to_string()],
-        "super" => vec!["super".to_string()],
-        "identifier" | "type_identifier" => node
+        RustKind::Crate => vec!["crate".to_string()],
+        RustKind::SelfValue => vec!["self".to_string()],
+        RustKind::Super => vec!["super".to_string()],
+        RustKind::Identifier | RustKind::TypeIdentifier => node
             .utf8_text(src)
             .map(|t| vec![t.to_string()])
             .unwrap_or_default(),
@@ -1300,18 +1317,23 @@ fn collect_rust_use_paths(
     line: usize,
     out: &mut Vec<(Vec<String>, usize)>,
 ) {
-    match argument.kind() {
-        "self" if !prefix.is_empty() => {
+    match RustKind::of(argument) {
+        RustKind::SelfValue if !prefix.is_empty() => {
             out.push((prefix.to_vec(), line));
         }
-        "scoped_identifier" | "crate" | "self" | "super" | "identifier" | "type_identifier" => {
+        RustKind::ScopedIdentifier
+        | RustKind::Crate
+        | RustKind::SelfValue
+        | RustKind::Super
+        | RustKind::Identifier
+        | RustKind::TypeIdentifier => {
             let mut segments = prefix.to_vec();
             segments.extend(flatten_rust_path(argument, src));
             if !segments.is_empty() {
                 out.push((segments, line));
             }
         }
-        "scoped_use_list" => {
+        RustKind::ScopedUseList => {
             let path_prefix = argument
                 .child_by_field_name("path")
                 .map(|p| flatten_rust_path(p, src))
@@ -1323,12 +1345,12 @@ fn collect_rust_use_paths(
                 }
             }
         }
-        "use_as_clause" => {
+        RustKind::UseAsClause => {
             if let Some(path) = argument.child_by_field_name("path") {
                 collect_rust_use_paths(path, src, prefix, line, out);
             }
         }
-        "use_wildcard" => {
+        RustKind::UseWildcard => {
             if let Some(inner) = argument.named_child(0) {
                 collect_rust_use_paths(inner, src, prefix, line, out);
             }
@@ -1338,7 +1360,7 @@ fn collect_rust_use_paths(
 }
 
 fn collect_rust_imports(node: Node, src: &[u8], out: &mut Vec<(Vec<String>, usize)>) {
-    if node.kind() == "use_declaration"
+    if RustKind::of(node) == RustKind::UseDeclaration
         && let Some(argument) = node.child_by_field_name("argument")
     {
         collect_rust_use_paths(argument, src, &[], node.start_position().row + 1, out);
@@ -1680,8 +1702,8 @@ mod tests {
         let static_import = static_tree.root_node().named_child(0).unwrap();
         let plain_import = plain_tree.root_node().named_child(0).unwrap();
 
-        assert_eq!(static_import.kind(), "import_declaration");
-        assert_eq!(plain_import.kind(), "import_declaration");
+        assert_eq!(JavaKind::of(static_import), JavaKind::ImportDeclaration);
+        assert_eq!(JavaKind::of(plain_import), JavaKind::ImportDeclaration);
         // Both have exactly one *named* child (the scoped_identifier) — `static`
         // contributes nothing to the named-child shape.
         assert_eq!(static_import.named_child_count(), 1);
@@ -1760,13 +1782,16 @@ mod tests {
         let tree = parse_kotlin("import com.example.infra.Legacy as LegacyClient\n");
         let import_node = tree.root_node().named_child(0).unwrap();
 
-        assert_eq!(import_node.kind(), "import");
+        assert_eq!(KotlinKind::of(import_node), KotlinKind::Import);
         assert_eq!(import_node.named_child_count(), 2);
         assert_eq!(
-            import_node.named_child(0).unwrap().kind(),
-            "qualified_identifier"
+            KotlinKind::of(import_node.named_child(0).unwrap()),
+            KotlinKind::QualifiedIdentifier
         );
-        assert_eq!(import_node.named_child(1).unwrap().kind(), "identifier");
+        assert_eq!(
+            KotlinKind::of(import_node.named_child(1).unwrap()),
+            KotlinKind::Identifier
+        );
         assert_eq!(
             import_node
                 .named_child(1)
@@ -2224,9 +2249,9 @@ mod tests {
         let tree = parse_python("import os as o\n");
         let import_node = tree.root_node().named_child(0).unwrap();
 
-        assert_eq!(import_node.kind(), "import_statement");
+        assert_eq!(PythonKind::of(import_node), PythonKind::ImportStatement);
         let name_field = import_node.child_by_field_name("name").unwrap();
-        assert_eq!(name_field.kind(), "aliased_import");
+        assert_eq!(PythonKind::of(name_field), PythonKind::AliasedImport);
         assert_eq!(
             name_field
                 .child_by_field_name("alias")
@@ -2250,12 +2275,12 @@ mod tests {
         ] {
             let tree = parse_python(src);
             let import_from = tree.root_node().named_child(0).unwrap();
-            assert_eq!(import_from.kind(), "import_from_statement");
+            assert_eq!(PythonKind::of(import_from), PythonKind::ImportFromStatement);
             let module_name = import_from.child_by_field_name("module_name").unwrap();
-            assert_eq!(module_name.kind(), "relative_import");
+            assert_eq!(PythonKind::of(module_name), PythonKind::RelativeImport);
 
             let prefix = module_name.named_child(0).unwrap();
-            assert_eq!(prefix.kind(), "import_prefix");
+            assert_eq!(PythonKind::of(prefix), PythonKind::ImportPrefix);
             assert_eq!(prefix.utf8_text(src.as_bytes()).unwrap(), expected_dots);
 
             assert_eq!(
