@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::GoKind;
 
 /// Flags Go blank imports (`import _ "pkg"`) with no adjacent comment explaining the
 /// side effect being relied on. A blank import that isn't explained reads as dead code
@@ -62,7 +63,7 @@ inventory::submit! {
 }
 
 fn collect_comment_rows(node: Node, rows: &mut std::collections::HashSet<usize>) {
-    if node.kind() == "comment" {
+    if GoKind::of(node) == GoKind::Comment {
         rows.insert(node.start_position().row);
     }
     let mut cursor = node.walk();
@@ -72,7 +73,7 @@ fn collect_comment_rows(node: Node, rows: &mut std::collections::HashSet<usize>)
 }
 
 fn collect_import_spec_rows(node: Node, rows: &mut std::collections::HashSet<usize>) {
-    if node.kind() == "import_spec" {
+    if GoKind::of(node) == GoKind::ImportSpec {
         rows.insert(node.start_position().row);
     }
     let mut cursor = node.walk();
@@ -102,7 +103,7 @@ fn justified_by_leading_run(
     let mut siblings: Vec<Node> = Vec::new();
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
-        if child.kind() == "comment" || child.kind() == "import_spec" {
+        if matches!(GoKind::of(child), GoKind::Comment | GoKind::ImportSpec) {
             siblings.push(child);
         }
     }
@@ -120,7 +121,9 @@ fn justified_by_leading_run(
         if gap > 1 {
             break;
         }
-        if prev.kind() == "comment" && leading_comment_rows.contains(&prev.start_position().row) {
+        if GoKind::of(prev) == GoKind::Comment
+            && leading_comment_rows.contains(&prev.start_position().row)
+        {
             return true;
         }
         idx -= 1;
@@ -135,9 +138,9 @@ fn collect_blank_imports(
     leading_comment_rows: &std::collections::HashSet<usize>,
     findings: &mut Vec<Finding>,
 ) {
-    if node.kind() == "import_spec"
+    if GoKind::of(node) == GoKind::ImportSpec
         && let Some(name) = node.child_by_field_name("name")
-        && name.kind() == "blank_identifier"
+        && GoKind::of(name) == GoKind::BlankIdentifier
     {
         let row = node.start_position().row;
         // Justified if a comment sits on the same line (trailing), or a leading

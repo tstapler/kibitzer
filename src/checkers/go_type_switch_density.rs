@@ -5,6 +5,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::file_size::is_generated;
+use crate::node_kind::GoKind;
 
 /// Minimum number of `case` clauses on a single `switch x.(type)` before it's flagged —
 /// #38's "OCP proxy: type-switch density" item. No stronger literature citation than
@@ -68,7 +69,7 @@ inventory::submit! {
 }
 
 fn collect_dense_type_switches(node: Node, src: &[u8], out: &mut Vec<Finding>) {
-    if node.kind() == "type_switch_statement" {
+    if GoKind::of(node) == GoKind::TypeSwitchStatement {
         let case_count = type_case_count(node);
         if case_count >= MIN_TYPE_SWITCH_CASES {
             let subject = node
@@ -101,7 +102,7 @@ fn type_case_count(type_switch: Node) -> usize {
     let mut cursor = type_switch.walk();
     type_switch
         .children(&mut cursor)
-        .filter(|c| c.kind() == "type_case")
+        .filter(|c| GoKind::of(*c) == GoKind::TypeCase)
         .count()
 }
 

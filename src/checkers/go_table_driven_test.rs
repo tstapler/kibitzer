@@ -6,20 +6,21 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::duplicate_code::MIN_OCCURRENCES;
+use crate::node_kind::GoKind;
 
 /// Literal-value node kinds treated as wildcards when comparing two test bodies — the
 /// "inputs/expected values" issue #31 describes near-identical table-driven-test
 /// candidates as differing only by.
-const LITERAL_KINDS: &[&str] = &[
-    "int_literal",
-    "float_literal",
-    "imaginary_literal",
-    "rune_literal",
-    "interpreted_string_literal",
-    "raw_string_literal",
-    "true",
-    "false",
-    "nil",
+const LITERAL_KINDS: &[GoKind] = &[
+    GoKind::IntLiteral,
+    GoKind::FloatLiteral,
+    GoKind::ImaginaryLiteral,
+    GoKind::RuneLiteral,
+    GoKind::InterpretedStringLiteral,
+    GoKind::RawStringLiteral,
+    GoKind::True,
+    GoKind::False,
+    GoKind::Nil,
 ];
 
 /// Minimum normalized-token count a test body must reach to be considered. A near-empty
@@ -67,7 +68,7 @@ impl Checker for TableDrivenTestChecker {
 
         let mut groups: HashMap<String, Vec<(&str, usize)>> = HashMap::new();
         crate::tree_walk::walk_preorder(tree.root_node(), &mut |n| {
-            if n.kind() == "function_declaration"
+            if GoKind::of(n) == GoKind::FunctionDeclaration
                 && let Some((name, line, signature)) = test_function_signature(n, src)
             {
                 groups.entry(signature).or_default().push((name, line));
@@ -148,7 +149,7 @@ fn has_single_testing_t_param(params: Node, src: &[u8]) -> bool {
     let mut cursor = params.walk();
     let decls: Vec<Node> = params
         .children(&mut cursor)
-        .filter(|n| n.kind() == "parameter_declaration")
+        .filter(|n| GoKind::of(*n) == GoKind::ParameterDeclaration)
         .collect();
     let [decl] = decls.as_slice() else {
         return false;
@@ -167,7 +168,7 @@ fn has_single_testing_t_param(params: Node, src: &[u8]) -> bool {
 
 /// True for a `pointer_type` wrapping the qualified type `testing.T` — i.e. `*testing.T`.
 fn is_testing_t_pointer(ty: Node, src: &[u8]) -> bool {
-    ty.kind() == "pointer_type"
+    GoKind::of(ty) == GoKind::PointerType
         && ty
             .named_child(0)
             .and_then(|inner| inner.utf8_text(src).ok())
@@ -181,14 +182,14 @@ fn is_testing_t_pointer(ty: Node, src: &[u8]) -> bool {
 fn normalize_body_tokens<'a>(body: Node<'a>, src: &'a [u8]) -> Vec<&'a str> {
     let mut tokens = Vec::new();
     crate::tree_walk::walk_preorder(body, &mut |n| {
-        if LITERAL_KINDS.contains(&n.kind()) {
+        if LITERAL_KINDS.contains(&GoKind::of(n)) {
             tokens.push("<lit>");
             // A literal node isn't a leaf (e.g. `interpreted_string_literal` wraps its
             // quotes and content), so don't descend into it — that content would
             // otherwise be emitted as an ordinary token instead of collapsed away.
             return false;
         }
-        if n.kind() != "comment"
+        if GoKind::of(n) != GoKind::Comment
             && n.child_count() == 0
             && let Ok(text) = n.utf8_text(src)
         {
