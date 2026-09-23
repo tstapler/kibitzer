@@ -17,10 +17,13 @@ const MAX_NESTING_DEPTH: usize = 4;
 /// A function/method parameter list naming more identifiers than this is flagged by
 /// `long-parameter-list`.
 const LONG_PARAM_LIST_COUNT: usize = 5;
-/// The repetition threshold for `replace-magic-literal`. Ships at 2 per AC2, gated by
-/// the mandatory corpus backtest (ADR-001): bumped to 3 in the same PR if the corpus
-/// triage shows the same table-driven-test overcorrection `duplicate-code` hit.
-const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 2;
+/// The repetition threshold for `replace-magic-literal`. Bumped from AC2's literal `2`
+/// to `3` per ADR-001's pre-committed 40% false-positive bar: the corpus backtest
+/// (`docs/backtest-triage/*/replace-magic-literal.jsonl`, 200 sampled findings across 7
+/// real-world repos) found a 76% overall false-positive rate, 46% of it citing the same
+/// table-driven-test/fixture overcorrection `duplicate-code` hit — both well past the
+/// bar, so this is the binding half of that gate, not a preemptive guess.
+const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// Near-universal literal values `replace-magic-literal` never flags regardless of
 /// repeat count, compared against a value already normalized by
 /// `normalize_literal_value` (delimiters/prefixes stripped) — so `""` here also matches
@@ -635,10 +638,7 @@ fn py_screaming_snake_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<Const
     }
     let name = left.utf8_text(src).ok()?;
     if name.is_empty()
-        || !name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase())
+        || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         || !name
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
@@ -665,9 +665,13 @@ fn java_final_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<
         return None;
     }
     let mut cursor = node.walk();
-    let modifiers = node.children(&mut cursor).find(|c| c.kind() == "modifiers")?;
+    let modifiers = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "modifiers")?;
     let mut mcursor = modifiers.walk();
-    let has_final = modifiers.children(&mut mcursor).any(|c| c.kind() == "final");
+    let has_final = modifiers
+        .children(&mut mcursor)
+        .any(|c| c.kind() == "final");
     if !has_final {
         return None;
     }
@@ -1048,7 +1052,12 @@ fn rust_lang_config() -> LangRuleConfig {
             "continue_expression",
         ],
         panic_detector: rust_panic_detector,
-        literal_kinds: &["integer_literal", "float_literal", "string_literal", "raw_string_literal"],
+        literal_kinds: &[
+            "integer_literal",
+            "float_literal",
+            "string_literal",
+            "raw_string_literal",
+        ],
         numeric_literal_kinds: &["integer_literal", "float_literal"],
         binding_finder: rust_const_binding,
     }
@@ -1138,7 +1147,14 @@ fn walk_literals<'tree>(
     src: &'tree [u8],
     collector: &mut LiteralCollector<'tree>,
 ) {
-    if cfg.literal_kinds.contains(&node.kind())
+    // `node.is_named()` matters here: TS/JS's grammar reuses the bare token names
+    // "string"/"number" for the anonymous keyword inside a `predefined_type` type
+    // annotation (`x: string`), which otherwise collides with the *named* literal
+    // node kinds of the same name — `x: string` was firing as if `"string"` were a
+    // repeated string literal. Confirmed via node-types.json: both a named (the
+    // literal) and an unnamed (the type keyword) node share `kind() == "string"`.
+    if node.is_named()
+        && cfg.literal_kinds.contains(&node.kind())
         && let Ok(text) = node.utf8_text(src)
     {
         collector
@@ -1165,11 +1181,7 @@ fn walk_literals<'tree>(
 /// declaration (count >= 2: the declaration itself plus >=1 real use). Same same-file,
 /// non-scope-resolved heuristic as `collect_condition_identifiers` (ADR-001) — a binding
 /// shadowed in a different function scope is an accepted, documented false negative.
-fn resolve_excluded_constants(
-    root: Node,
-    src: &[u8],
-    bound: &[ConstBinding],
-) -> HashSet<usize> {
+fn resolve_excluded_constants(root: Node, src: &[u8], bound: &[ConstBinding]) -> HashSet<usize> {
     let mut ref_counts = HashMap::new();
     collect_identifiers(root, src, &mut ref_counts);
     bound
@@ -1187,7 +1199,9 @@ fn resolve_excluded_constants(
 fn normalize_literal_value<'a>(raw: &'a str, kind: &str) -> &'a str {
     // Kotlin's multiline string: strip the triple-quote delimiter on each side.
     if kind == "multiline_string_literal"
-        && let Some(inner) = raw.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\""))
+        && let Some(inner) = raw
+            .strip_prefix("\"\"\"")
+            .and_then(|s| s.strip_suffix("\"\"\""))
     {
         return inner;
     }
@@ -1219,7 +1233,9 @@ fn normalize_literal_value<'a>(raw: &'a str, kind: &str) -> &'a str {
             .take(2)
             .count();
         let (prefix, rest) = raw.split_at(prefix_len);
-        if prefix.chars().all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f'))
+        if prefix
+            .chars()
+            .all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f'))
             && let Some(inner) = strip_quote_delimiter(rest)
         {
             return inner;
@@ -1235,7 +1251,10 @@ fn normalize_literal_value<'a>(raw: &'a str, kind: &str) -> &'a str {
 /// Strips a matching pair of `"`/`'` (single-char) or `"""` (triple, for a plain,
 /// non-prefixed Python triple-quoted string) delimiters from `s`, if present.
 fn strip_quote_delimiter(s: &str) -> Option<&str> {
-    if let Some(inner) = s.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\"")) {
+    if let Some(inner) = s
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+    {
         return Some(inner);
     }
     if let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
@@ -1861,11 +1880,11 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nfunc f() {\n\ta := 86400\n\tb := 86400\n}\n",
+            "package main\nfunc f() {\n\ta := 86400\n\tb := 86400\n\tc := 86400\n}\n",
         );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("86400"));
-        assert!(findings[0].message.contains("2 times"));
+        assert!(findings[0].message.contains("3 times"));
     }
 
     #[test]
@@ -1874,6 +1893,20 @@ mod tests {
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
             "package main\nfunc f() {\n\ta := 86400\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn allows_replace_magic_literal_below_bumped_threshold() {
+        // Locks in ADR-001's Story 3.2.2 outcome: the corpus backtest's 76%
+        // false-positive rate (46% citing table-driven-test/fixture noise) crossed
+        // the pre-committed 40% bar, so MAGIC_LITERAL_MIN_OCCURRENCES bumped from the
+        // literal `2` in AC2's text to `3` — 2 occurrences alone must no longer fire.
+        let findings = magic_literal_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f() {\n\ta := 86400\n\tb := 86400\n}\n",
         );
         assert!(findings.is_empty());
     }
@@ -1893,7 +1926,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nfunc f() {\n\ta := 2\n\tb := 2\n}\n",
+            "package main\nfunc f() {\n\ta := 2\n\tb := 2\n\tc := 2\n}\n",
         );
         assert_eq!(findings.len(), 1);
     }
@@ -1917,7 +1950,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nconst a, b = 42, 42\nfunc f() { use(a); use(b) }\n",
+            "package main\nconst a, b = 42, 42\nfunc f() { use(a); use(b); use2(42) }\n",
         );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("42"));
@@ -1925,7 +1958,7 @@ mod tests {
 
     #[test]
     fn flags_replace_magic_literal_skips_generated_file() {
-        let body = "func f() {\n\ta := 1234\n\tb := 1234\n}\n";
+        let body = "func f() {\n\ta := 1234\n\tb := 1234\n\tc := 1234\n}\n";
         let generated =
             format!("// Code generated by protoc-gen-go. DO NOT EDIT.\npackage main\n{body}");
         let hand_written = format!("package main\n{body}");
@@ -1973,7 +2006,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::TypeScript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "function f() {\n  console.log(42);\n  console.log(42);\n}\n",
+            "function f() {\n  console.log(42);\n  console.log(42);\n  console.log(42);\n}\n",
         );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("42"));
@@ -1987,9 +2020,25 @@ mod tests {
         let findings = magic_literal_findings(
             Language::TypeScript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "function f() {\n  let x = 42;\n  use(x);\n  let y = 42;\n}\n",
+            "function f() {\n  let x = 42;\n  use(x);\n  let y = 42;\n  let z = 42;\n}\n",
         );
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn ts_replace_magic_literal_ignores_predefined_type_keywords() {
+        // Regression for a corpus-backtest finding (docs/backtest-triage/microsoft-vscode,
+        // docs/backtest-triage/denoland-deno): TS/JS's grammar reuses the bare token
+        // "string"/"number" for the anonymous keyword inside a `predefined_type` type
+        // annotation, which collides with the *named* literal node kinds of the same
+        // name — `walk_literals` was flagging `x: string` as if `"string"` were a
+        // repeated string literal, with zero actual literals in the file.
+        let findings = magic_literal_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f(a: string, b: string): string {\n  return a + b;\n}\nfunction g(x: number, y: number): number {\n  return x + y;\n}\n",
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -1997,7 +2046,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Python,
             tree_sitter_python::LANGUAGE.into(),
-            "def f():\n    print(42)\n    print(42)\n",
+            "def f():\n    print(42)\n    print(42)\n    print(42)\n",
         );
         assert_eq!(findings.len(), 1);
     }
@@ -2027,7 +2076,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Java,
             tree_sitter_java::LANGUAGE.into(),
-            "class C {\n  void f() {\n    System.out.println(42);\n    System.out.println(42);\n  }\n}\n",
+            "class C {\n  void f() {\n    System.out.println(42);\n    System.out.println(42);\n    System.out.println(42);\n  }\n}\n",
         );
         assert_eq!(findings.len(), 1);
     }
@@ -2047,7 +2096,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Kotlin,
             tree_sitter_kotlin_ng::LANGUAGE.into(),
-            "fun f() {\n  println(42)\n  println(42)\n}\n",
+            "fun f() {\n  println(42)\n  println(42)\n  println(42)\n}\n",
         );
         assert_eq!(findings.len(), 1);
     }
@@ -2077,7 +2126,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
-            "fn f() {\n    use(42);\n    use(42);\n}\n",
+            "fn f() {\n    use(42);\n    use(42);\n    use(42);\n}\n",
         );
         assert_eq!(findings.len(), 1);
     }
@@ -2087,7 +2136,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
-            "fn f() {\n    let x = 42;\n    use(x);\n    let y = 42;\n}\n",
+            "fn f() {\n    let x = 42;\n    use(x);\n    let y = 42;\n    let z = 42;\n}\n",
         );
         assert_eq!(findings.len(), 1);
     }

@@ -66,6 +66,44 @@ install, and none of them are fully pinned down by the requirements text as writ
   different function scope is a known, accepted false negative (matches this file's
   existing `collect_condition_identifiers` precedent, `src/rules.rs:878-880`).
 
+## Outcome (2026-09-22)
+
+The mandatory backtest ran: `kibitzer check backtest` against all 8 `syntax-rules-*`
+checkers over `~/.claude/projects` transcript history, plus a corpus backtest sampling
+25 findings each from `kubernetes/kubernetes`, `apache/cassandra`, `servo/servo`,
+`BurntSushi/ripgrep`, `denoland/deno` (Rust and TypeScript separately), `microsoft/vscode`,
+and `tstapler/stapler-squad` (200 findings total, read in source context and verdicted by
+hand — `docs/backtest-triage/*/replace-magic-literal.jsonl`). Result: a 76% overall
+false-positive rate, 46.0% (92/200) of all triaged findings citing a
+table-driven-test/fixture rationale specifically — both well past the pre-committed 40%
+bar. Per the Decision above, `MAGIC_LITERAL_MIN_OCCURRENCES` bumped from 2 to 3
+(`src/rules.rs`) in this same PR, with affected unit tests updated to a 3-occurrence
+fixture and a new regression test locking in that 2 occurrences alone no longer fire.
+
+The backtest also surfaced a real, unrelated correctness bug it wasn't looking for:
+TS/JS's grammar reuses the bare node kind `string`/`number` for both the actual literal
+node type and the anonymous keyword token inside a `predefined_type` type annotation
+(`x: string`) — `walk_literals` was flagging plain type annotations as repeated string
+literals, confirmed independently by two corpus agents (`microsoft-vscode`,
+`denoland-deno` TS) and reproduced directly (`x: string` × 3, zero literals in the file).
+Fixed by requiring `node.is_named()` in `walk_literals`'s match, which the underlying
+`tree-sitter-typescript` grammar's `node-types.json` confirms distinguishes the two
+(`named: true` for the literal, `named: false` for the anonymous keyword).
+
+**Scope-exclusion sub-recommendation not implemented**: `plan.md`'s Story 3.2.2 also
+called for an 8-language test-file `scope` glob exclusion (`!**/*_test.go` etc.) on
+`replace-magic-literal`'s entry in `src/config.rs::syntax_rules_checks()`. This isn't
+implementable as scoped: `Check.scope` (`src/config.rs`) excludes files for an entire
+`Check` entry, and `syntax_rules_checks()` has one `Check` per *language* covering all 6
+bundled rules (`long-function`, `deep-nesting`, `long-parameter-list`, `flag-argument`,
+`unreachable-code`, `replace-magic-literal`) — there is no per-rule scoping mechanism to
+exclude test files for `replace-magic-literal` alone without also silently suppressing
+the other 5 rules there, none of which have backtest evidence justifying that. Adding one
+would be a new suppression mechanism, which AC11 explicitly rules out. The threshold bump
+above is therefore the sole binding mitigation from this backtest; a genuinely per-rule
+`scope` mechanism is a real gap worth its own follow-up item if test-file noise on other
+`syntax-rules-*` rules is ever backtested and confirmed.
+
 ## Alternatives Considered
 
 - **Ship `>=3` preemptively** (skip validating `>=2` at all): rejected — would silently
