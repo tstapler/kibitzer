@@ -5,6 +5,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::file_size::is_generated;
+use crate::node_kind::GoKind;
 
 /// Flags `if err != nil { return err }` — a bare passthrough that discards the call
 /// site's context — but only in files that already demonstrate an `fmt.Errorf(...,
@@ -72,9 +73,9 @@ inventory::submit! {
 /// their format string — each is independent signal that this codebase wraps errors
 /// on purpose.
 fn count_wrapping_occurrences(node: Node, src: &[u8]) -> usize {
-    let mut count = if node.kind() == "call_expression"
+    let mut count = if GoKind::of(node) == GoKind::CallExpression
         && let Some(function) = node.child_by_field_name("function")
-        && function.kind() == "selector_expression"
+        && GoKind::of(function) == GoKind::SelectorExpression
         && let Some(operand) = function.child_by_field_name("operand")
         && let Some(field) = function.child_by_field_name("field")
         && operand.utf8_text(src) == Ok("fmt")
@@ -84,8 +85,8 @@ fn count_wrapping_occurrences(node: Node, src: &[u8]) -> usize {
         let mut cursor = args.walk();
         args.children(&mut cursor).any(|arg| {
             matches!(
-                arg.kind(),
-                "interpreted_string_literal" | "raw_string_literal"
+                GoKind::of(arg),
+                GoKind::InterpretedStringLiteral | GoKind::RawStringLiteral
             ) && arg
                 .utf8_text(src)
                 .map(|s| s.contains("%w"))
@@ -109,7 +110,7 @@ fn wrapping_convention_established(wrap_count: usize, bare_count: usize) -> bool
 }
 
 fn collect_bare_passthroughs(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "if_statement"
+    if GoKind::of(node) == GoKind::IfStatement
         && let Some(err_name) = bare_err_passthrough_name(node, src)
         && !wrapped_earlier_in_enclosing_function(node, err_name, src)
     {
@@ -135,21 +136,23 @@ fn collect_bare_passthroughs(node: Node, src: &[u8], findings: &mut Vec<Finding>
 /// bare bool.
 fn bare_err_passthrough_name<'a>(if_stmt: Node, src: &'a [u8]) -> Option<&'a str> {
     let mut condition = if_stmt.child_by_field_name("condition")?;
-    while condition.kind() == "parenthesized_expression" {
+    while GoKind::of(condition) == GoKind::ParenthesizedExpression {
         let mut cursor = condition.walk();
+        // "(" / ")" are anonymous tokens with no GoKind variant (go.json: named=false).
         condition = condition
             .children(&mut cursor)
             .find(|c| c.kind() != "(" && c.kind() != ")")?;
     }
-    if condition.kind() != "binary_expression" {
+    if GoKind::of(condition) != GoKind::BinaryExpression {
         return None;
     }
     let left = condition.child_by_field_name("left")?;
     let right = condition.child_by_field_name("right")?;
-    if left.kind() != "identifier" || right.kind() != "nil" {
+    if GoKind::of(left) != GoKind::Identifier || GoKind::of(right) != GoKind::Nil {
         return None;
     }
     let mut cursor = condition.walk();
+    // "!=" is an anonymous token with no GoKind variant (go.json: named=false).
     if !condition.children(&mut cursor).any(|c| c.kind() == "!=") {
         return None;
     }
@@ -160,13 +163,13 @@ fn bare_err_passthrough_name<'a>(if_stmt: Node, src: &'a [u8]) -> Option<&'a str
 
 /// True when `consequence` is a `block` whose only statement is `return <name>`.
 fn consequence_returns_only(consequence: Node, src: &[u8], name: &str) -> bool {
-    if consequence.kind() != "block" {
+    if GoKind::of(consequence) != GoKind::Block {
         return false;
     }
     let mut cursor = consequence.walk();
     let statements: Vec<Node> = consequence
         .children(&mut cursor)
-        .filter(|n| n.kind() == "statement_list")
+        .filter(|n| GoKind::of(*n) == GoKind::StatementList)
         .flat_map(|list| {
             let mut inner_cursor = list.walk();
             list.children(&mut inner_cursor)
@@ -177,7 +180,7 @@ fn consequence_returns_only(consequence: Node, src: &[u8], name: &str) -> bool {
     let [only] = statements.as_slice() else {
         return false;
     };
-    if only.kind() != "return_statement" {
+    if GoKind::of(*only) != GoKind::ReturnStatement {
         return false;
     }
     // return_statement's returned expressions aren't exposed as a named field in
@@ -185,7 +188,7 @@ fn consequence_returns_only(consequence: Node, src: &[u8], name: &str) -> bool {
     let mut cursor = only.walk();
     let exprs: Vec<Node> = only
         .children(&mut cursor)
-        .filter(|n| n.kind() == "expression_list")
+        .filter(|n| GoKind::of(*n) == GoKind::ExpressionList)
         .collect();
     exprs.len() == 1 && single_identifier_matches(exprs[0], src, name)
 }
@@ -215,8 +218,8 @@ fn enclosing_function_body(node: Node) -> Option<Node> {
     let mut current = node.parent()?;
     loop {
         if matches!(
-            current.kind(),
-            "function_declaration" | "method_declaration" | "func_literal"
+            GoKind::of(current),
+            GoKind::FunctionDeclaration | GoKind::MethodDeclaration | GoKind::FuncLiteral
         ) {
             return current.child_by_field_name("body");
         }
@@ -246,12 +249,12 @@ fn find_prior_wrap(node: Node, err_name: &str, src: &[u8], before: usize, found:
 /// `short_var_declaration` whose LHS is exactly `err_name` and whose RHS is a
 /// `%w`-wrapping `fmt.Errorf` call referencing `err_name` among its arguments).
 fn is_wrap_reassignment(node: Node, err_name: &str, src: &[u8]) -> bool {
-    let (left, right) = match node.kind() {
-        "assignment_statement" => (
+    let (left, right) = match GoKind::of(node) {
+        GoKind::AssignmentStatement => (
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
         ),
-        "short_var_declaration" => (
+        GoKind::ShortVarDeclaration => (
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
         ),
@@ -270,7 +273,7 @@ fn is_wrap_reassignment(node: Node, err_name: &str, src: &[u8]) -> bool {
 }
 
 fn is_wrapf_call_referencing(node: Node, err_name: &str, src: &[u8]) -> bool {
-    node.kind() == "call_expression"
+    GoKind::of(node) == GoKind::CallExpression
         && is_fmt_errorf_callee(node, src)
         && node
             .child_by_field_name("arguments")
@@ -280,7 +283,7 @@ fn is_wrapf_call_referencing(node: Node, err_name: &str, src: &[u8]) -> bool {
 fn is_fmt_errorf_callee(call: Node, src: &[u8]) -> bool {
     call.child_by_field_name("function")
         .is_some_and(|function| {
-            function.kind() == "selector_expression"
+            GoKind::of(function) == GoKind::SelectorExpression
                 && function
                     .child_by_field_name("operand")
                     .is_some_and(|o| o.utf8_text(src) == Ok("fmt"))
@@ -296,8 +299,8 @@ fn errorf_args_wrap_and_reference(args: Node, err_name: &str, src: &[u8]) -> boo
     let mut has_name = false;
     for arg in args.children(&mut cursor) {
         if matches!(
-            arg.kind(),
-            "interpreted_string_literal" | "raw_string_literal"
+            GoKind::of(arg),
+            GoKind::InterpretedStringLiteral | GoKind::RawStringLiteral
         ) && arg
             .utf8_text(src)
             .map(|s| s.contains("%w"))
@@ -305,7 +308,7 @@ fn errorf_args_wrap_and_reference(args: Node, err_name: &str, src: &[u8]) -> boo
         {
             has_wrap_verb = true;
         }
-        if arg.kind() == "identifier" && arg.utf8_text(src) == Ok(err_name) {
+        if GoKind::of(arg) == GoKind::Identifier && arg.utf8_text(src) == Ok(err_name) {
             has_name = true;
         }
     }
@@ -316,7 +319,7 @@ fn single_identifier_matches(expr_list: Node, src: &[u8], name: &str) -> bool {
     let mut cursor = expr_list.walk();
     let idents: Vec<Node> = expr_list
         .children(&mut cursor)
-        .filter(|n| n.kind() == "identifier")
+        .filter(|n| GoKind::of(*n) == GoKind::Identifier)
         .collect();
     idents.len() == 1 && idents[0].utf8_text(src) == Ok(name)
 }
