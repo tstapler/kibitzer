@@ -36,6 +36,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::arch_model::{AccessKind, SymbolKind, SymbolNode};
 use crate::checker::Language;
+use crate::node_kind::{GoKind, JavaScriptKind, RustKind, TsxKind, TypeScriptKind};
 
 /// Per-`Language` table of node-kind strings driving symbol extraction — the
 /// type/interface sibling of `rules.rs`'s `LangRuleConfig`.
@@ -97,6 +98,14 @@ fn python_is_exported(node: Node, source: &str) -> bool {
 /// node (verified via `to_sexp()`/`field_name_for_child`: `modifiers` is a positional
 /// child of `class_declaration`/`interface_declaration`/`method_declaration`, not a
 /// field — e.g. `(class_declaration (modifiers (public)) name: ... )`).
+/// Non-goal (typed-node-kind-migration, Story 3.2.1 — see ADR-001): intentionally
+/// generic over `kind: &str` rather than a `<Lang>Kind`, since it's shared by
+/// `java_is_exported`/`kotlin_is_exported`/`kotlin_is_interface` below for both named
+/// container nodes (`"modifiers"`/`"visibility_modifier"`, both `"named": true`) and the
+/// anonymous keyword tokens they wrap (`"public"`/`"private"`/`"internal"`/`"interface"`,
+/// all `"named": false` in `java.json`/`kotlin.json` — confirmed by inspecting both
+/// files). Typing only the container-node calls would leave the actual decision-bearing
+/// keyword check as a raw string anyway, so the whole helper stays generic.
 fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     node.children(&mut cursor).find(|c| c.kind() == kind)
@@ -133,7 +142,9 @@ fn kotlin_is_exported(node: Node, _source: &str) -> bool {
 /// positional keyword child of `class_declaration` (`kind() == "interface"`) rather than
 /// a modifier or field, verified via `to_sexp()` (this was explicitly *not* assumed, per
 /// the pitfalls research's warning that Kotlin already broke one assumption in
-/// `rules.rs`). A plain class's first keyword child is `"class"` instead.
+/// `rules.rs`). A plain class's first keyword child is `"class"` instead. Non-goal, same
+/// as `java_is_exported`/`kotlin_is_exported` above: `"interface"` is `"named": false` in
+/// `kotlin.json`, so there's no `KotlinKind` variant to convert this to.
 fn kotlin_is_interface(node: Node) -> bool {
     find_child_by_kind(node, "interface").is_some()
 }
@@ -147,7 +158,11 @@ fn kotlin_is_interface(node: Node) -> bool {
 /// `visibility_modifier` child at all means private (Rust's default), same as Go's
 /// lowercase-first-letter default.
 fn rust_is_exported(node: Node, _source: &str) -> bool {
-    match find_child_by_kind(node, "visibility_modifier") {
+    let mut cursor = node.walk();
+    match node
+        .children(&mut cursor)
+        .find(|c| RustKind::of(*c) == RustKind::VisibilityModifier)
+    {
         Some(vis) => vis.named_child_count() == 0,
         None => false,
     }
@@ -168,7 +183,7 @@ fn rust_is_exported(node: Node, _source: &str) -> bool {
 fn rust_impl_type_name(node: Node, source: &str) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if n.kind() == "impl_item" {
+        if RustKind::of(n) == RustKind::ImplItem {
             return n
                 .child_by_field_name("type")
                 .map(|t| strip_generic_params(node_text(t, source)));
@@ -312,9 +327,9 @@ fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
     let mut cursor = receiver.walk();
     let decl = receiver
         .children(&mut cursor)
-        .find(|c| c.kind() == "parameter_declaration")?;
+        .find(|c| GoKind::of(*c) == GoKind::ParameterDeclaration)?;
     let ty = decl.child_by_field_name("type")?;
-    let ident = if ty.kind() == "pointer_type" {
+    let ident = if GoKind::of(ty) == GoKind::PointerType {
         ty.named_child(0)?
     } else {
         ty
@@ -361,14 +376,14 @@ fn go_type_declaration_symbols(
     let mut cursor = node.walk();
     for spec in node
         .children(&mut cursor)
-        .filter(|c| c.kind() == "type_spec")
+        .filter(|c| GoKind::of(*c) == GoKind::TypeSpec)
     {
         let Some(name_node) = spec.child_by_field_name("name") else {
             continue;
         };
         let name = strip_generic_params(node_text(name_node, source));
         let kind = match spec.child_by_field_name("type") {
-            Some(t) if t.kind() == "interface_type" => SymbolKind::Interface,
+            Some(t) if GoKind::of(t) == GoKind::InterfaceType => SymbolKind::Interface,
             _ => SymbolKind::Type,
         };
         let exported = go_is_exported(spec, source);
@@ -416,6 +431,8 @@ fn classify_node(
         SymbolKind::Type
     } else if cfg.function_kinds.contains(&kind) {
         if language == Language::Go {
+            // Branch guard already guarantees a Go node — `receiver` is a field lookup,
+            // not a `.kind()` comparison, so there's nothing else here to type.
             if node.child_by_field_name("receiver").is_some() {
                 SymbolKind::Method
             } else {
@@ -446,10 +463,31 @@ fn classify_node(
             } else {
                 SymbolKind::Function
             }
-        } else if kind == "method_definition" {
-            SymbolKind::Method
+        } else if language == Language::JavaScript {
+            // Was a raw `kind == "method_definition"` fallback reached by process of
+            // elimination (only TypeScript/Tsx/JavaScript remain once Go/Java/Kotlin/
+            // Python/Rust are excluded above) — split into explicit per-language branches
+            // here so each gets its own grammar's typed `Kind`, matching the branches
+            // above rather than leaving one raw comparison behind.
+            if JavaScriptKind::of(node) == JavaScriptKind::MethodDefinition {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        } else if language == Language::Tsx {
+            if TsxKind::of(node) == TsxKind::MethodDefinition {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
         } else {
-            SymbolKind::Function
+            // Only Language::TypeScript remains here (Language is an 8-variant enum and
+            // the other 7 are all excluded above).
+            if TypeScriptKind::of(node) == TypeScriptKind::MethodDefinition {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
         }
     } else {
         return None;
@@ -494,7 +532,7 @@ fn walk(
     package_path: &str,
     out: &mut Vec<SymbolNode>,
 ) {
-    if language == Language::Go && node.kind() == "type_declaration" {
+    if language == Language::Go && GoKind::of(node) == GoKind::TypeDeclaration {
         go_type_declaration_symbols(node, source, package_path, out);
     } else if let Some(symbol) = classify_node(node, language, cfg, source, package_path) {
         out.push(symbol);
@@ -652,7 +690,7 @@ fn go_receiver_var_name(method: Node, source: &str) -> Option<String> {
     let mut cursor = receiver.walk();
     let decl = receiver
         .children(&mut cursor)
-        .find(|c| c.kind() == "parameter_declaration")?;
+        .find(|c| GoKind::of(*c) == GoKind::ParameterDeclaration)?;
     let name = decl.child_by_field_name("name")?;
     Some(node_text(name, source).to_string())
 }
@@ -669,7 +707,7 @@ fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String
     let mut cursor = type_decl.walk();
     for spec in type_decl
         .children(&mut cursor)
-        .filter(|c| c.kind() == "type_spec")
+        .filter(|c| GoKind::of(*c) == GoKind::TypeSpec)
     {
         let Some(name_node) = spec.child_by_field_name("name") else {
             continue;
@@ -677,21 +715,21 @@ fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String
         let Some(struct_ty) = spec.child_by_field_name("type") else {
             continue;
         };
-        if struct_ty.kind() != "struct_type" {
+        if GoKind::of(struct_ty) != GoKind::StructType {
             continue;
         }
         let type_name = strip_generic_params(node_text(name_node, source));
         let mut sc = struct_ty.walk();
         let Some(field_list) = struct_ty
             .children(&mut sc)
-            .find(|c| c.kind() == "field_declaration_list")
+            .find(|c| GoKind::of(*c) == GoKind::FieldDeclarationList)
         else {
             continue;
         };
         let mut fc = field_list.walk();
         for decl in field_list
             .children(&mut fc)
-            .filter(|c| c.kind() == "field_declaration")
+            .filter(|c| GoKind::of(*c) == GoKind::FieldDeclaration)
         {
             let mut nc = decl.walk();
             for field_name_node in decl.children_by_field_name("name", &mut nc) {
@@ -710,7 +748,7 @@ fn walk_struct_fields(
     source: &str,
     out: &mut Vec<(String, String)>,
 ) {
-    if language == Language::Go && node.kind() == "type_declaration" {
+    if language == Language::Go && GoKind::of(node) == GoKind::TypeDeclaration {
         go_struct_fields(node, source, out);
     }
     let mut cursor = node.walk();
@@ -787,7 +825,7 @@ struct FieldAccessCtx {
 /// equality, which this tree-sitter version's `Node` doesn't implement.
 fn selector_is_call_target(selector: Node) -> bool {
     selector.parent().is_some_and(|p| {
-        p.kind() == "call_expression"
+        GoKind::of(p) == GoKind::CallExpression
             && p.child_by_field_name("function").is_some_and(|f| {
                 f.start_byte() == selector.start_byte() && f.end_byte() == selector.end_byte()
             })
@@ -803,9 +841,9 @@ fn selector_access_kind(selector: Node) -> AccessKind {
     let Some(list) = selector.parent() else {
         return AccessKind::Read;
     };
-    match list.kind() {
-        "inc_statement" | "dec_statement" => AccessKind::Write,
-        "expression_list" => {
+    match GoKind::of(list) {
+        GoKind::IncStatement | GoKind::DecStatement => AccessKind::Write,
+        GoKind::ExpressionList => {
             let Some(stmt) = list.parent() else {
                 return AccessKind::Read;
             };
@@ -813,8 +851,8 @@ fn selector_access_kind(selector: Node) -> AccessKind {
                 left.start_byte() == list.start_byte() && left.end_byte() == list.end_byte()
             });
             if matches!(
-                stmt.kind(),
-                "assignment_statement" | "short_var_declaration"
+                GoKind::of(stmt),
+                GoKind::AssignmentStatement | GoKind::ShortVarDeclaration
             ) && is_left
             {
                 AccessKind::Write
@@ -860,7 +898,7 @@ fn parameter_list_names(list: Node, source: &str) -> Vec<String> {
     let mut cursor = list.walk();
     for decl in list
         .children(&mut cursor)
-        .filter(|c| c.kind() == "parameter_declaration")
+        .filter(|c| GoKind::of(*c) == GoKind::ParameterDeclaration)
     {
         let mut nc = decl.walk();
         for name_node in decl.children_by_field_name("name", &mut nc) {
@@ -884,8 +922,8 @@ fn parameter_list_names(list: Node, source: &str) -> Vec<String> {
 /// "unusual enough in idiomatic Go to leave undetected" tradeoff as the shadowing case
 /// this function exists to catch.
 fn shadow_candidate_names(node: Node, source: &str) -> Vec<String> {
-    match node.kind() {
-        "short_var_declaration" | "var_spec" => {
+    match GoKind::of(node) {
+        GoKind::ShortVarDeclaration | GoKind::VarSpec => {
             // short_var_declaration: `left` is an expression_list of identifiers.
             let mut names = node
                 .child_by_field_name("left")
@@ -898,7 +936,7 @@ fn shadow_candidate_names(node: Node, source: &str) -> Vec<String> {
             }
             names
         }
-        "func_literal" => node
+        GoKind::FuncLiteral => node
             .child_by_field_name("parameters")
             .map(|p| parameter_list_names(p, source))
             .unwrap_or_default(),
@@ -912,7 +950,7 @@ fn shadow_candidate_names(node: Node, source: &str) -> Vec<String> {
 fn direct_identifier_names(node: Node, source: &str) -> Vec<String> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .filter(|c| c.kind() == "identifier")
+        .filter(|c| GoKind::of(*c) == GoKind::Identifier)
         .map(|id| node_text(id, source).to_string())
         .collect()
 }
@@ -940,7 +978,7 @@ fn shadows_receiver(node: Node, source: &str, receiver_var: &str) -> bool {
 /// `for t = range xs` reassigns, `for t := range xs` declares. Empty for every other node
 /// kind, and for a `=`-form range_clause.
 fn range_clause_declared_names(node: Node, source: &str) -> Vec<String> {
-    if node.kind() != "range_clause" {
+    if GoKind::of(node) != GoKind::RangeClause {
         return Vec::new();
     }
     let Some(list) = node.child_by_field_name("left") else {
@@ -978,7 +1016,7 @@ fn walk_field_accesses(
     ctx: Option<&FieldAccessCtx>,
     out: &mut Vec<RawFieldAccessSite>,
 ) {
-    let is_method = node.kind() == "method_declaration";
+    let is_method = GoKind::of(node) == GoKind::MethodDeclaration;
     let owned_ctx = is_method
         .then(|| method_field_access_ctx(node, source, package_path))
         .flatten();
@@ -991,12 +1029,12 @@ fn walk_field_accesses(
         c.shadowed.set(true);
     }
 
-    if node.kind() == "selector_expression"
+    if GoKind::of(node) == GoKind::SelectorExpression
         && let Some(c) = ctx
         && !c.shadowed.get()
         && !selector_is_call_target(node)
         && let Some(operand) = node.child_by_field_name("operand")
-        && operand.kind() == "identifier"
+        && GoKind::of(operand) == GoKind::Identifier
         && node_text(operand, source) == c.receiver_var
         && let Some(field) = node.child_by_field_name("field")
     {
