@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::config::Severity;
+use crate::node_kind::{GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind};
 
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
@@ -155,8 +156,10 @@ fn go_param_identifier_count(params: Node) -> usize {
     let mut count = 0;
     let mut cursor = params.walk();
     for decl in params.children(&mut cursor) {
-        if decl.kind() != "parameter_declaration" && decl.kind() != "variadic_parameter_declaration"
-        {
+        if !matches!(
+            GoKind::of(decl),
+            GoKind::ParameterDeclaration | GoKind::VariadicParameterDeclaration
+        ) {
             continue;
         }
         let mut name_cursor = decl.walk();
@@ -190,7 +193,12 @@ fn py_param_count(params: Node) -> usize {
     let mut cursor = params.walk();
     params
         .named_children(&mut cursor)
-        .filter(|c| c.kind() != "positional_separator" && c.kind() != "keyword_separator")
+        .filter(|c| {
+            !matches!(
+                PythonKind::of(*c),
+                PythonKind::PositionalSeparator | PythonKind::KeywordSeparator
+            )
+        })
         .count()
 }
 
@@ -201,7 +209,7 @@ fn kotlin_param_count(params: Node) -> usize {
     let mut cursor = params.walk();
     params
         .named_children(&mut cursor)
-        .filter(|c| c.kind() == "parameter")
+        .filter(|c| KotlinKind::of(*c) == KotlinKind::Parameter)
         .count()
 }
 
@@ -213,7 +221,7 @@ fn rust_param_count(params: Node) -> usize {
     let mut cursor = params.walk();
     params
         .named_children(&mut cursor)
-        .filter(|c| c.kind() == "parameter")
+        .filter(|c| RustKind::of(*c) == RustKind::Parameter)
         .count()
 }
 
@@ -226,13 +234,13 @@ fn go_bool_params(params: Node, src: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = params.walk();
     for decl in params.children(&mut cursor) {
-        if decl.kind() != "parameter_declaration" {
+        if GoKind::of(decl) != GoKind::ParameterDeclaration {
             continue;
         }
         let Some(ty) = decl.child_by_field_name("type") else {
             continue;
         };
-        if ty.kind() != "type_identifier" || ty.utf8_text(src) != Ok("bool") {
+        if GoKind::of(ty) != GoKind::TypeIdentifier || ty.utf8_text(src) != Ok("bool") {
             continue;
         }
         let mut names = decl.walk();
@@ -251,21 +259,29 @@ fn go_bool_params(params: Node, src: &[u8]) -> Vec<String> {
 /// so `child_by_field_name("type")` naturally returns `None` there and the parameter is
 /// skipped — correct, since JS has no static types to check. Destructured/rest patterns
 /// (`pattern` isn't a plain `identifier`) are skipped too: not a nameable flag argument.
+///
+/// Called with TypeScript-, Tsx-, *and* JavaScript-parsed nodes (via `lang_config`'s
+/// `..lang_config(Language::TypeScript)` reuse) — `TypeScriptKind` is used uniformly
+/// below rather than one enum per grammar because `"identifier"`/`"predefined_type"`
+/// are named the same way in all three grammars' `node-types.json`, and JS parameters
+/// never carry a `type` field at all (so the `PredefinedType` arm is simply unreached
+/// for JS, not mismatched).
 fn ts_js_bool_params(params: Node, src: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = params.walk();
     for param in params.named_children(&mut cursor) {
         let name_node = param.child_by_field_name("pattern").unwrap_or(param);
-        if name_node.kind() != "identifier" {
+        if TypeScriptKind::of(name_node) != TypeScriptKind::Identifier {
             continue;
         }
         let Some(annotation) = param.child_by_field_name("type") else {
             continue;
         };
         let mut acursor = annotation.walk();
-        let is_bool = annotation
-            .named_children(&mut acursor)
-            .any(|t| t.kind() == "predefined_type" && t.utf8_text(src) == Ok("boolean"));
+        let is_bool = annotation.named_children(&mut acursor).any(|t| {
+            TypeScriptKind::of(t) == TypeScriptKind::PredefinedType
+                && t.utf8_text(src) == Ok("boolean")
+        });
         if is_bool && let Ok(text) = name_node.utf8_text(src) {
             out.push(text.to_string());
         }
@@ -281,7 +297,10 @@ fn py_bool_params(params: Node, src: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = params.walk();
     for param in params.named_children(&mut cursor) {
-        if param.kind() != "typed_parameter" && param.kind() != "typed_default_parameter" {
+        if !matches!(
+            PythonKind::of(param),
+            PythonKind::TypedParameter | PythonKind::TypedDefaultParameter
+        ) {
             continue;
         }
         let Some(ty) = param.child_by_field_name("type") else {
@@ -294,7 +313,7 @@ fn py_bool_params(params: Node, src: &[u8]) -> Vec<String> {
         let mut names = param.walk();
         if let Some(name) = param
             .named_children(&mut names)
-            .find(|c| c.id() != ty_id && c.kind() == "identifier")
+            .find(|c| c.id() != ty_id && PythonKind::of(*c) == PythonKind::Identifier)
             && let Ok(text) = name.utf8_text(src)
         {
             out.push(text.to_string());
@@ -311,14 +330,14 @@ fn java_bool_params(params: Node, src: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = params.walk();
     for param in params.named_children(&mut cursor) {
-        if param.kind() != "formal_parameter" {
+        if JavaKind::of(param) != JavaKind::FormalParameter {
             continue;
         }
         let Some(ty) = param.child_by_field_name("type") else {
             continue;
         };
-        let is_bool = ty.kind() == "boolean_type"
-            || (ty.kind() == "type_identifier" && ty.utf8_text(src) == Ok("Boolean"));
+        let is_bool = JavaKind::of(ty) == JavaKind::BooleanType
+            || (JavaKind::of(ty) == JavaKind::TypeIdentifier && ty.utf8_text(src) == Ok("Boolean"));
         if is_bool
             && let Some(name) = param.child_by_field_name("name")
             && let Ok(text) = name.utf8_text(src)
@@ -339,15 +358,18 @@ fn kotlin_bool_params(params: Node, src: &[u8]) -> Vec<String> {
     let mut cursor = params.walk();
     for param in params
         .named_children(&mut cursor)
-        .filter(|c| c.kind() == "parameter")
+        .filter(|c| KotlinKind::of(*c) == KotlinKind::Parameter)
     {
         let mut pcursor = param.walk();
         let children: Vec<Node> = param.named_children(&mut pcursor).collect();
-        let Some(name_node) = children.iter().find(|c| c.kind() == "identifier") else {
+        let Some(name_node) = children
+            .iter()
+            .find(|c| KotlinKind::of(**c) == KotlinKind::Identifier)
+        else {
             continue;
         };
         let is_bool = children.iter().any(|c| {
-            c.kind() == "user_type"
+            KotlinKind::of(*c) == KotlinKind::UserType
                 && c.named_child(0)
                     .is_some_and(|inner| inner.utf8_text(src) == Ok("Boolean"))
         });
@@ -369,18 +391,18 @@ fn rust_bool_params(params: Node, src: &[u8]) -> Vec<String> {
     let mut cursor = params.walk();
     for param in params
         .named_children(&mut cursor)
-        .filter(|c| c.kind() == "parameter")
+        .filter(|c| RustKind::of(*c) == RustKind::Parameter)
     {
         let Some(pattern) = param.child_by_field_name("pattern") else {
             continue;
         };
-        if pattern.kind() != "identifier" {
+        if RustKind::of(pattern) != RustKind::Identifier {
             continue;
         }
         let Some(ty) = param.child_by_field_name("type") else {
             continue;
         };
-        if ty.kind() != "primitive_type" || ty.utf8_text(src) != Ok("bool") {
+        if RustKind::of(ty) != RustKind::PrimitiveType || ty.utf8_text(src) != Ok("bool") {
             continue;
         }
         if let Ok(text) = pattern.utf8_text(src) {
@@ -397,7 +419,7 @@ fn rust_bool_params(params: Node, src: &[u8]) -> Vec<String> {
 fn kotlin_body(decl: Node) -> Option<Node> {
     let mut cursor = decl.walk();
     decl.named_children(&mut cursor)
-        .find(|c| c.kind() == "function_body")
+        .find(|c| KotlinKind::of(*c) == KotlinKind::FunctionBody)
 }
 
 /// Same positional situation as `kotlin_body`: the parameter list is the first
@@ -405,7 +427,7 @@ fn kotlin_body(decl: Node) -> Option<Node> {
 fn kotlin_params(decl: Node) -> Option<Node> {
     let mut cursor = decl.walk();
     decl.named_children(&mut cursor)
-        .find(|c| c.kind() == "function_value_parameters")
+        .find(|c| KotlinKind::of(*c) == KotlinKind::FunctionValueParameters)
 }
 
 /// `statement_container`/`unwrap_statement` default for every grammar but Go/Rust.
@@ -421,26 +443,26 @@ fn go_statement_container(block: Node) -> Node {
     let mut cursor = block.walk();
     block
         .named_children(&mut cursor)
-        .find(|c| c.kind() == "statement_list")
+        .find(|c| GoKind::of(*c) == GoKind::StatementList)
         .unwrap_or(block)
 }
 
 /// Go has no dedicated "diverging call" node kind — `panic(...)` is an ordinary
 /// `call_expression`, so this matches on the called identifier's text.
 fn go_panic_detector(stmt: Node, src: &[u8]) -> bool {
-    if stmt.kind() != "expression_statement" {
+    if GoKind::of(stmt) != GoKind::ExpressionStatement {
         return false;
     }
     let Some(call) = stmt.named_child(0) else {
         return false;
     };
-    if call.kind() != "call_expression" {
+    if GoKind::of(call) != GoKind::CallExpression {
         return false;
     }
     let Some(func) = call.child_by_field_name("function") else {
         return false;
     };
-    func.kind() == "identifier" && func.utf8_text(src) == Ok("panic")
+    GoKind::of(func) == GoKind::Identifier && func.utf8_text(src) == Ok("panic")
 }
 
 /// No language besides Go/Rust has a built-in the `unreachable-code` rule treats as
@@ -453,7 +475,7 @@ fn no_panic_detector(_stmt: Node, _src: &[u8]) -> bool {
 /// statement is wrapped in an `expression_statement` (verified via `to_sexp()`) —
 /// unlike every other grammar here, which gives them their own direct statement kind.
 fn rust_unwrap_statement(stmt: Node) -> Node {
-    if stmt.kind() == "expression_statement" {
+    if RustKind::of(stmt) == RustKind::ExpressionStatement {
         stmt.named_child(0).unwrap_or(stmt)
     } else {
         stmt
@@ -463,13 +485,13 @@ fn rust_unwrap_statement(stmt: Node) -> Node {
 /// Matches Rust's diverging macros (`panic!`, `unreachable!`, `todo!`, `unimplemented!`)
 /// invoked as a bare statement.
 fn rust_panic_detector(stmt: Node, src: &[u8]) -> bool {
-    if stmt.kind() != "expression_statement" {
+    if RustKind::of(stmt) != RustKind::ExpressionStatement {
         return false;
     }
     let Some(invocation) = stmt.named_child(0) else {
         return false;
     };
-    if invocation.kind() != "macro_invocation" {
+    if RustKind::of(invocation) != RustKind::MacroInvocation {
         return false;
     }
     let Some(name) = invocation.child_by_field_name("macro") else {
