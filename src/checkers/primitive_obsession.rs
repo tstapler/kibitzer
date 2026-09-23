@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::GoKind;
 
 /// Go's built-in primitive types worth flagging when two or more parameters share one.
 /// Deliberately wider than the old ast-grep rule (which only covered
@@ -64,7 +65,7 @@ fn check_source(src: &str) -> Result<Vec<Finding>> {
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
     crate::tree_walk::walk_preorder(node, &mut |n| {
-        if n.kind() == "parameter_list" && !is_named_return_list(n) {
+        if GoKind::of(n) == GoKind::ParameterList && !is_named_return_list(n) {
             check_parameter_list(n, src, findings);
         }
         true
@@ -102,7 +103,7 @@ fn check_parameter_list<'a>(list: Node<'a>, src: &'a [u8], findings: &mut Vec<Fi
     let mut cursor = list.walk();
     let params: Vec<Param<'a>> = list
         .children(&mut cursor)
-        .filter(|n| n.kind() == "parameter_declaration")
+        .filter(|n| GoKind::of(*n) == GoKind::ParameterDeclaration)
         .map(|decl| describe_param(decl, src))
         .collect();
 
@@ -163,7 +164,7 @@ fn describe_param<'a>(decl: Node<'a>, src: &'a [u8]) -> Param<'a> {
         .count();
 
     let primitive_type = decl.child_by_field_name("type").and_then(|ty| {
-        if ty.kind() == "type_identifier" {
+        if GoKind::of(ty) == GoKind::TypeIdentifier {
             let text = ty.utf8_text(src).unwrap_or("");
             PRIMITIVE_TYPES.iter().find(|&&p| p == text).copied()
         } else {

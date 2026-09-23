@@ -29,6 +29,7 @@ use crate::god_class::{
     FileCache, collect_typed_locals, find_method_node, is_call_target, node_text,
     resolve_qualified_type,
 };
+use crate::node_kind::GoKind;
 
 /// An interface needs at least this many declared methods before a "no consumer uses all
 /// of it" observation is worth flagging — same "too small to matter" status as
@@ -258,10 +259,10 @@ fn walk_calls_resolving_interfaces<'i>(
     ctx: &InterfaceUsageCtx<'_, 'i>,
     out: &mut HashMap<&'i str, HashSet<String>>,
 ) {
-    if node.kind() == "selector_expression"
+    if GoKind::of(node) == GoKind::SelectorExpression
         && is_call_target(node)
         && let Some(operand) = node.child_by_field_name("operand")
-        && operand.kind() == "identifier"
+        && GoKind::of(operand) == GoKind::Identifier
         && let Some(local_type) = ctx.typed_locals.get(node_text(operand, source))
         && let Some(key) = resolve_interface_key(local_type, ctx.consumer_pkg, ctx.file_aliases)
         && let Some((interface_id, _)) = ctx.interfaces.get_key_value(&key)
@@ -286,14 +287,14 @@ fn interface_declared_methods(sym: &SymbolNode, files: &mut FileCache) -> Option
     let (source, tree) = files.get(&sym.file)?;
     let node = find_interface_node(tree.root_node(), sym.line, &sym.name, source)?;
     let interface_type = node.child_by_field_name("type")?;
-    if interface_type.kind() != "interface_type" {
+    if GoKind::of(interface_type) != GoKind::InterfaceType {
         return None;
     }
     let mut methods = HashSet::new();
     let mut cursor = interface_type.walk();
     for child in interface_type
         .children(&mut cursor)
-        .filter(|c| c.kind() == "method_elem")
+        .filter(|c| GoKind::of(*c) == GoKind::MethodElem)
     {
         if let Some(name) = child.child_by_field_name("name") {
             methods.insert(node_text(name, source).to_string());
@@ -311,7 +312,7 @@ fn find_interface_node<'a>(
     name: &str,
     source: &str,
 ) -> Option<Node<'a>> {
-    if node.kind() == "type_spec"
+    if GoKind::of(node) == GoKind::TypeSpec
         && node.start_position().row + 1 == line
         && node
             .child_by_field_name("name")

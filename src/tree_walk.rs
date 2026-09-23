@@ -44,6 +44,7 @@ pub(crate) fn walk_preorder<'a>(node: Node<'a>, visit: &mut impl FnMut(Node<'a>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_kind::GoKind;
 
     fn parse_go(src: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
@@ -72,10 +73,10 @@ mod tests {
         let tree = parse_go("package main\nfunc f() { g() }\n");
         let mut visited_call = false;
         walk_preorder(tree.root_node(), &mut |n| {
-            if n.kind() == "function_declaration" {
+            if GoKind::of(n) == GoKind::FunctionDeclaration {
                 return false; // prune: never descend into f's body
             }
-            if n.kind() == "call_expression" {
+            if GoKind::of(n) == GoKind::CallExpression {
                 visited_call = true;
             }
             true
