@@ -237,8 +237,11 @@ pub struct ArchModel {
     pub import_edges: Vec<ImportEdge>,
     pub call_edges: Vec<CallEdge>,
     pub field_accesses: Vec<FieldAccessEdge>,
-    /// Type-hierarchy (`extends`/`implements`) edges. Populated by `resolve_type_edges`
-    /// (a later story) — always empty for now.
+    /// Type-hierarchy (`extends`/`implements`) edges, populated by `resolve_type_edges`.
+    /// `#[serde(default)]` so an `arch.json`/cached `ArchModel` written before this field
+    /// existed still deserializes instead of failing outright — same reasoning as
+    /// `cache.rs`'s `registry_stamp` field.
+    #[serde(default)]
     pub type_edges: Vec<TypeRelationEdge>,
     /// Per-file `alias -> target package path` map, Go-only, for resolving a
     /// `pkg.Type`-qualified local's package back to a real `packages` key —
@@ -1271,6 +1274,30 @@ mod tests {
         assert!(json.contains(r#""kind":"extends""#), "got {json}");
         let round_tripped: TypeRelationEdge = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(round_tripped, edge);
+    }
+
+    #[test]
+    fn type_edges_defaults_to_empty_when_deserializing_pre_feature_arch_model_json() {
+        // Simulates a real `arch.json`/cached `ArchModel` written before `type_edges`
+        // existed: no `type_edges` key at all, not an empty array. Without
+        // `#[serde(default)]` on the field, this must fail deserialization outright
+        // (serde's default behavior for a missing non-Option field) — exactly the
+        // regression `cache.rs`'s `registry_stamp` precedent already guards against.
+        let mut value = serde_json::to_value(empty_model(&PathBuf::from("/repo")))
+            .expect("ArchModel serializes to a JSON value");
+        let removed = value
+            .as_object_mut()
+            .expect("ArchModel serializes to a JSON object")
+            .remove("type_edges");
+        assert!(
+            removed.is_some(),
+            "type_edges must be a real key in the serialized shape for this test to be \
+             meaningful"
+        );
+
+        let model: ArchModel = serde_json::from_value(value)
+            .expect("pre-type_edges ArchModel JSON (no type_edges key) must still deserialize");
+        assert!(model.type_edges.is_empty());
     }
 
     #[test]
