@@ -36,7 +36,9 @@ use tree_sitter::{Node, Tree};
 
 use crate::arch_model::{AccessKind, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::checker::Language;
-use crate::node_kind::{GoKind, JavaScriptKind, RustKind, TsxKind, TypeScriptKind};
+use crate::node_kind::{
+    GoKind, JavaKind, JavaScriptKind, KotlinKind, RustKind, TsxKind, TypeScriptKind,
+};
 
 /// Per-`Language` table of node-kind strings driving symbol extraction — the
 /// type/interface sibling of `rules.rs`'s `LangRuleConfig`.
@@ -1138,29 +1140,31 @@ fn walk_type_relations(
 ) {
     match language {
         Language::Go => {
-            if node.kind() == "type_declaration" {
+            if GoKind::of(node) == GoKind::TypeDeclaration {
                 go_embedded_type_relations(node, source, package_path, out);
                 go_embedded_interface_relations(node, source, package_path, out);
             }
         }
-        Language::Java => match node.kind() {
-            "class_declaration" => java_class_type_relations(node, source, package_path, out),
-            "interface_declaration" => {
+        Language::Java => match JavaKind::of(node) {
+            JavaKind::ClassDeclaration => {
+                java_class_type_relations(node, source, package_path, out)
+            }
+            JavaKind::InterfaceDeclaration => {
                 java_interface_type_relations(node, source, package_path, out)
             }
             _ => {}
         },
         Language::TypeScript | Language::Tsx => {
-            if node.kind() == "class_declaration" {
+            if TypeScriptKind::of(node) == TypeScriptKind::ClassDeclaration {
                 ts_class_heritage_relations(node, source, package_path, out);
             }
         }
         Language::JavaScript => {
-            if node.kind() == "class_declaration" {
+            if JavaScriptKind::of(node) == JavaScriptKind::ClassDeclaration {
                 js_class_heritage_relation(node, source, package_path, out);
             }
         }
-        Language::Kotlin if node.kind() == "class_declaration" => {
+        Language::Kotlin if KotlinKind::of(node) == KotlinKind::ClassDeclaration => {
             kotlin_delegation_type_relations(node, source, package_path, out);
         }
         _ => {}
@@ -1402,7 +1406,7 @@ fn kotlin_delegation_type_relations(
     let mut cursor = specifiers.walk();
     for specifier in specifiers
         .children(&mut cursor)
-        .filter(|c| c.kind() == "delegation_specifier")
+        .filter(|c| KotlinKind::of(*c) == KotlinKind::DelegationSpecifier)
     {
         let Some((target, kind_hint)) = kotlin_delegation_specifier_target(specifier) else {
             continue;
@@ -1428,11 +1432,15 @@ fn kotlin_delegation_specifier_target(specifier: Node) -> Option<(Node, Option<T
     let mut cursor = specifier.walk();
     let shape = specifier
         .children(&mut cursor)
-        .find(|c| c.kind() != "annotation")?;
+        .find(|c| KotlinKind::of(*c) != KotlinKind::Annotation)?;
 
-    match shape.kind() {
-        "constructor_invocation" => Some((shape.named_child(0)?, Some(TypeRelationKind::Extends))),
-        "explicit_delegation" => Some((shape.named_child(0)?, Some(TypeRelationKind::Implements))),
+    match KotlinKind::of(shape) {
+        KotlinKind::ConstructorInvocation => {
+            Some((shape.named_child(0)?, Some(TypeRelationKind::Extends)))
+        }
+        KotlinKind::ExplicitDelegation => {
+            Some((shape.named_child(0)?, Some(TypeRelationKind::Implements)))
+        }
         _ => Some((shape, None)),
     }
 }
@@ -1444,9 +1452,9 @@ fn kotlin_delegation_specifier_target(specifier: Node) -> Option<(Node, Option<T
 /// name, or a `qualified_type`'s `package.Name` join. Any other shape (e.g. an
 /// anonymous inline `struct_type`) has no name to report and yields `None`.
 fn go_embedded_type_name(ty: Node, source: &str) -> Option<String> {
-    match ty.kind() {
-        "type_identifier" => Some(node_text(ty, source).to_string()),
-        "qualified_type" => {
+    match GoKind::of(ty) {
+        GoKind::TypeIdentifier => Some(node_text(ty, source).to_string()),
+        GoKind::QualifiedType => {
             let package = ty.child_by_field_name("package")?;
             let name = ty.child_by_field_name("name")?;
             Some(format!(
@@ -1455,8 +1463,8 @@ fn go_embedded_type_name(ty: Node, source: &str) -> Option<String> {
                 node_text(name, source)
             ))
         }
-        "pointer_type" => go_embedded_type_name(ty.named_child(0)?, source),
-        "generic_type" => go_embedded_type_name(ty.child_by_field_name("type")?, source),
+        GoKind::PointerType => go_embedded_type_name(ty.named_child(0)?, source),
+        GoKind::GenericType => go_embedded_type_name(ty.child_by_field_name("type")?, source),
         _ => None,
     }
 }
@@ -1478,7 +1486,7 @@ fn go_embedded_type_relations(
     let mut cursor = type_decl.walk();
     for spec in type_decl
         .children(&mut cursor)
-        .filter(|c| c.kind() == "type_spec")
+        .filter(|c| GoKind::of(*c) == GoKind::TypeSpec)
     {
         let Some(name_node) = spec.child_by_field_name("name") else {
             continue;
@@ -1486,7 +1494,7 @@ fn go_embedded_type_relations(
         let Some(struct_ty) = spec.child_by_field_name("type") else {
             continue;
         };
-        if struct_ty.kind() != "struct_type" {
+        if GoKind::of(struct_ty) != GoKind::StructType {
             continue;
         }
         let type_name = strip_generic_params(node_text(name_node, source));
@@ -1494,14 +1502,14 @@ fn go_embedded_type_relations(
         let mut sc = struct_ty.walk();
         let Some(field_list) = struct_ty
             .children(&mut sc)
-            .find(|c| c.kind() == "field_declaration_list")
+            .find(|c| GoKind::of(*c) == GoKind::FieldDeclarationList)
         else {
             continue;
         };
         let mut fc = field_list.walk();
         for decl in field_list
             .children(&mut fc)
-            .filter(|c| c.kind() == "field_declaration")
+            .filter(|c| GoKind::of(*c) == GoKind::FieldDeclaration)
         {
             if decl.child_by_field_name("name").is_some() {
                 continue;
@@ -1544,7 +1552,7 @@ fn go_embedded_interface_relations(
     let mut cursor = type_decl.walk();
     for spec in type_decl
         .children(&mut cursor)
-        .filter(|c| c.kind() == "type_spec")
+        .filter(|c| GoKind::of(*c) == GoKind::TypeSpec)
     {
         let Some(name_node) = spec.child_by_field_name("name") else {
             continue;
@@ -1552,7 +1560,7 @@ fn go_embedded_interface_relations(
         let Some(interface_ty) = spec.child_by_field_name("type") else {
             continue;
         };
-        if interface_ty.kind() != "interface_type" {
+        if GoKind::of(interface_ty) != GoKind::InterfaceType {
             continue;
         }
         let type_name = strip_generic_params(node_text(name_node, source));
@@ -1560,7 +1568,7 @@ fn go_embedded_interface_relations(
         let mut ic = interface_ty.walk();
         for elem in interface_ty
             .children(&mut ic)
-            .filter(|c| c.kind() == "type_elem")
+            .filter(|c| GoKind::of(*c) == GoKind::TypeElem)
         {
             let Some(ty) = elem.named_child(0) else {
                 continue;

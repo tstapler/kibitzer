@@ -635,13 +635,13 @@ fn rust_panic_detector(stmt: Node, src: &[u8]) -> bool {
 /// spec returns `None` rather than guessing which name pairs with which value
 /// (Unresolved Question 3: an accepted, documented false-negative gap, not fixed here).
 fn go_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
-    if node.kind() != "const_spec" {
+    if GoKind::of(node) != GoKind::ConstSpec {
         return None;
     }
     let mut name_cursor = node.walk();
     let names: Vec<Node> = node
         .children_by_field_name("name", &mut name_cursor)
-        .filter(|n| n.kind() == "identifier")
+        .filter(|n| GoKind::of(*n) == GoKind::Identifier)
         .collect();
     if names.len() != 1 {
         return None;
@@ -673,25 +673,32 @@ fn go_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a
 /// single-declarator statement qualifies (`const a = 1, b = 2` returns `None`, same
 /// accepted gap as Go's multi-value `const_spec`). `let` is deliberately excluded
 /// (ADR-001 / Pattern Decision "JS/TS/Rust binding scope").
+///
+/// Called with both TypeScript- and JavaScript-parsed nodes — `TypeScriptKind` is used
+/// uniformly below, same reuse convention as `ts_js_bool_params`, since
+/// `lexical_declaration`/`variable_declarator`/`identifier` are named identically in both
+/// grammars' `node-types.json`.
 fn ts_js_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
-    if node.kind() != "lexical_declaration" {
+    if TypeScriptKind::of(node) != TypeScriptKind::LexicalDeclaration {
         return None;
     }
     let kind = node.child_by_field_name("kind")?;
+    // "const" is an anonymous token with no TypeScriptKind/JavaScriptKind variant
+    // (node-types.json: named=false).
     if kind.kind() != "const" {
         return None;
     }
     let mut cursor = node.walk();
     let declarators: Vec<Node> = node
         .named_children(&mut cursor)
-        .filter(|c| c.kind() == "variable_declarator")
+        .filter(|c| TypeScriptKind::of(*c) == TypeScriptKind::VariableDeclarator)
         .collect();
     if declarators.len() != 1 {
         return None;
     }
     let declarator = declarators[0];
     let name_node = declarator.child_by_field_name("name")?;
-    if name_node.kind() != "identifier" {
+    if TypeScriptKind::of(name_node) != TypeScriptKind::Identifier {
         return None;
     }
     let initializer = declarator.child_by_field_name("value")?;
@@ -706,11 +713,11 @@ fn ts_js_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding
 /// is the idiomatic convention (ADR-001, Pattern Decision "Python constant heuristic").
 /// Weaker than the other 7 languages' keyword-backed guarantee, deliberately.
 fn py_screaming_snake_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
-    if node.kind() != "assignment" {
+    if PythonKind::of(node) != PythonKind::Assignment {
         return None;
     }
     let left = node.child_by_field_name("left")?;
-    if left.kind() != "identifier" {
+    if PythonKind::of(left) != PythonKind::Identifier {
         return None;
     }
     let name = left.utf8_text(src).ok()?;
@@ -778,10 +785,11 @@ fn java_final_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<
 /// or its positional `variable_declaration`/initializer children (same positional shape
 /// as `kotlin_body`/`kotlin_params`) — found via raw-child and kind-based scans.
 fn kotlin_val_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
-    if node.kind() != "property_declaration" {
+    if KotlinKind::of(node) != KotlinKind::PropertyDeclaration {
         return None;
     }
     let mut cursor = node.walk();
+    // "val" is an anonymous token with no KotlinKind variant (node-types.json: named=false).
     let is_val = node.children(&mut cursor).any(|c| c.kind() == "val");
     if !is_val {
         return None;
@@ -790,11 +798,11 @@ fn kotlin_val_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<
     let children: Vec<Node> = node.children(&mut cursor2).collect();
     let var_decl = children
         .iter()
-        .find(|c| c.kind() == "variable_declaration")?;
+        .find(|c| KotlinKind::of(**c) == KotlinKind::VariableDeclaration)?;
     let mut vcursor = var_decl.walk();
     let name_node = var_decl
         .named_children(&mut vcursor)
-        .find(|c| c.kind() == "identifier")?;
+        .find(|c| KotlinKind::of(*c) == KotlinKind::Identifier)?;
     let initializer = *children.iter().find(|c| {
         matches!(
             c.kind(),
@@ -809,7 +817,7 @@ fn kotlin_val_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<
 /// `node-types.json`) — `let_declaration` is deliberately excluded (ADR-001 / Pattern
 /// Decision "JS/TS/Rust binding scope").
 fn rust_const_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<'a>> {
-    if node.kind() != "const_item" && node.kind() != "static_item" {
+    if RustKind::of(node) != RustKind::ConstItem && RustKind::of(node) != RustKind::StaticItem {
         return None;
     }
     let name_node = node.child_by_field_name("name")?;
