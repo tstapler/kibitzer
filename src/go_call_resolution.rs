@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Tree};
 
+use crate::node_kind::GoKind;
+
 /// The RHS `call_expression` when `node` (a `short_var_declaration`) has a single-call
 /// right side — the shape a multi-value call unpacked via `:=` takes (e.g. `all, err :=
 /// s.ListAllX()`), as opposed to a comma-ok type assertion or map index that shares the
@@ -11,7 +13,7 @@ pub(crate) fn single_rhs_call_expression(node: Node) -> Option<Node> {
     let mut cursor = right.walk();
     let mut exprs = right.named_children(&mut cursor);
     match (exprs.next(), exprs.next()) {
-        (Some(only), None) if only.kind() == "call_expression" => Some(only),
+        (Some(only), None) if GoKind::of(only) == GoKind::CallExpression => Some(only),
         _ => None,
     }
 }
@@ -70,7 +72,7 @@ fn parse_file_imports(tree: &Tree, src: &[u8]) -> Vec<ImportBinding> {
 }
 
 fn collect_import_specs(node: Node, src: &[u8], out: &mut Vec<ImportBinding>) {
-    if node.kind() == "import_spec" {
+    if GoKind::of(node) == GoKind::ImportSpec {
         if let Some(binding) = import_binding(node, src) {
             out.push(binding);
         }
@@ -91,7 +93,9 @@ fn import_binding(spec: Node, src: &[u8]) -> Option<ImportBinding> {
     }
 
     let alias = match spec.child_by_field_name("name") {
-        Some(name) if name.kind() == "package_identifier" => name.utf8_text(src).ok()?.to_string(),
+        Some(name) if GoKind::of(name) == GoKind::PackageIdentifier => {
+            name.utf8_text(src).ok()?.to_string()
+        }
         Some(_) => return None, // blank_identifier or dot import — no usable/unambiguous alias
         None => import_path.rsplit('/').next()?.to_string(),
     };
@@ -164,7 +168,7 @@ fn find_function_last_return_is_error(file_src: &str, func_name: &str) -> Option
 fn find_top_level_function(root: Node, src: &[u8], func_name: &str) -> Option<bool> {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        if child.kind() != "function_declaration" {
+        if GoKind::of(child) != GoKind::FunctionDeclaration {
             continue;
         }
         let Some(name) = child.child_by_field_name("name") else {
@@ -187,7 +191,7 @@ fn last_result_type_is_error(func_decl: Node, src: &[u8]) -> bool {
     let Some(result) = func_decl.child_by_field_name("result") else {
         return false;
     };
-    if result.kind() != "parameter_list" {
+    if GoKind::of(result) != GoKind::ParameterList {
         // A single unnamed return type with no parens, e.g. `func f() error` (only
         // possible for a single-value return, which the caller's 2+-name LHS check
         // already rules out for the shapes this resolver is used against) — no
@@ -197,7 +201,7 @@ fn last_result_type_is_error(func_decl: Node, src: &[u8]) -> bool {
     let mut cursor = result.walk();
     let declarations: Vec<Node> = result
         .named_children(&mut cursor)
-        .filter(|n| n.kind() == "parameter_declaration")
+        .filter(|n| GoKind::of(*n) == GoKind::ParameterDeclaration)
         .collect();
     let Some(last) = declarations.last() else {
         return false;

@@ -5,6 +5,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::go_call_resolution;
+use crate::node_kind::GoKind;
 
 /// Name prefixes conventionally used for a bulk-fetch-everything call (`ListAllX`,
 /// `GetAllFoo`, `FindAllBar`) — flags the "fetch everything, then find one row" shape
@@ -42,7 +43,10 @@ impl Checker for BulkFetchLinearScanChecker {
             .context("go-bulk-fetch-linear-scan checker requires a parsed tree")?;
         let mut findings = Vec::new();
         crate::tree_walk::walk_preorder(tree.root_node(), &mut |n| {
-            if matches!(n.kind(), "function_declaration" | "method_declaration") {
+            if matches!(
+                GoKind::of(n),
+                GoKind::FunctionDeclaration | GoKind::MethodDeclaration
+            ) {
                 check_function(n, ctx.source.as_bytes(), &mut findings);
             }
             true
@@ -103,7 +107,7 @@ fn scan_for_lookup<'a>(
     param_names: &[&str],
     active: Option<LoopContext<'a>>,
 ) -> Option<Finding> {
-    if node.kind() == "for_statement"
+    if GoKind::of(node) == GoKind::ForStatement
         && let Some((ranged_name, item_name)) = range_over_bulk_var(node, src, bulk_vars)
     {
         let loop_body = node.child_by_field_name("body")?;
@@ -116,7 +120,7 @@ fn scan_for_lookup<'a>(
         );
     }
 
-    if node.kind() == "if_statement"
+    if GoKind::of(node) == GoKind::IfStatement
         && let Some((for_stmt, ranged_name, item_name)) = active
         && matches_lookup_pattern(node, src, item_name, param_names)
     {
@@ -147,7 +151,7 @@ fn collect_param_names<'a>(params: Node<'a>, src: &'a [u8]) -> Vec<&'a str> {
     let mut cursor = params.walk();
     for decl in params
         .children(&mut cursor)
-        .filter(|n| n.kind() == "parameter_declaration")
+        .filter(|n| GoKind::of(*n) == GoKind::ParameterDeclaration)
     {
         let mut inner = decl.walk();
         for name in decl.children_by_field_name("name", &mut inner) {
@@ -166,7 +170,7 @@ fn collect_param_names<'a>(params: Node<'a>, src: &'a [u8]) -> Vec<&'a str> {
 fn collect_bulk_fetch_vars<'a>(body: Node<'a>, src: &'a [u8]) -> Vec<&'a str> {
     let mut vars = Vec::new();
     crate::tree_walk::walk_preorder(body, &mut |n| {
-        if n.kind() == "short_var_declaration"
+        if GoKind::of(n) == GoKind::ShortVarDeclaration
             && let Some(name) = bulk_fetch_bound_var(n, src)
         {
             vars.push(name);
@@ -188,7 +192,7 @@ fn bulk_fetch_bound_var<'a>(decl: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
     let mut cursor = left.walk();
     let bound = left
         .children(&mut cursor)
-        .find(|c| c.kind() == "identifier")?;
+        .find(|c| GoKind::of(*c) == GoKind::Identifier)?;
     let text = bound.utf8_text(src).ok()?;
     (text != "_").then_some(text)
 }
@@ -197,9 +201,9 @@ fn bulk_fetch_bound_var<'a>(decl: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
 /// field name for a method/package-qualified call (`s.ListAllX()` → `ListAllX`).
 fn callee_name<'a>(call: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
     let function = call.child_by_field_name("function")?;
-    let name_node = match function.kind() {
-        "identifier" => function,
-        "selector_expression" => function.child_by_field_name("field")?,
+    let name_node = match GoKind::of(function) {
+        GoKind::Identifier => function,
+        GoKind::SelectorExpression => function.child_by_field_name("field")?,
         _ => return None,
     };
     name_node.utf8_text(src).ok()
@@ -225,10 +229,10 @@ fn range_over_bulk_var<'a>(
     let mut cursor = for_stmt.walk();
     let range = for_stmt
         .children(&mut cursor)
-        .find(|c| c.kind() == "range_clause")?;
+        .find(|c| GoKind::of(*c) == GoKind::RangeClause)?;
 
     let right = range.child_by_field_name("right")?;
-    if right.kind() != "identifier" {
+    if GoKind::of(right) != GoKind::Identifier {
         return None;
     }
     let ranged_name = right.utf8_text(src).ok()?;
@@ -240,7 +244,7 @@ fn range_over_bulk_var<'a>(
     let mut left_cursor = left.walk();
     let item_name = left
         .children(&mut left_cursor)
-        .filter(|c| c.kind() == "identifier")
+        .filter(|c| GoKind::of(*c) == GoKind::Identifier)
         .last()
         .and_then(|n| n.utf8_text(src).ok())
         .filter(|&name| name != "_")?;
@@ -272,7 +276,7 @@ fn matches_lookup_pattern(
     // children — walk the whole subtree rather than assume return sits at depth 1.
     let mut found = false;
     crate::tree_walk::walk_preorder(consequence, &mut |n| {
-        if n.kind() == "return_statement" {
+        if GoKind::of(n) == GoKind::ReturnStatement {
             found = true;
         }
         !found
@@ -286,7 +290,7 @@ fn is_equality_of_item_field_and_param(
     item_name: &str,
     param_names: &[&str],
 ) -> bool {
-    if cond.kind() != "binary_expression" {
+    if GoKind::of(cond) != GoKind::BinaryExpression {
         return false;
     }
     let Some(operator) = cond.child_by_field_name("operator") else {
@@ -308,14 +312,14 @@ fn is_equality_of_item_field_and_param(
 /// True for `<item_name>.Field` — a selector expression rooted at the range loop's
 /// element variable.
 fn is_item_field(n: Node, src: &[u8], item_name: &str) -> bool {
-    n.kind() == "selector_expression"
+    GoKind::of(n) == GoKind::SelectorExpression
         && n.child_by_field_name("operand")
             .and_then(|op| op.utf8_text(src).ok())
             == Some(item_name)
 }
 
 fn is_param_ref(n: Node, src: &[u8], param_names: &[&str]) -> bool {
-    n.kind() == "identifier"
+    GoKind::of(n) == GoKind::Identifier
         && n.utf8_text(src)
             .is_ok_and(|text| param_names.contains(&text))
 }
