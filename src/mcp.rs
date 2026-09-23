@@ -500,6 +500,19 @@ fn traverse_type_edges(
     (collected, false)
 }
 
+/// Parses a pagination cursor into an offset. `None` legitimately means "start from page
+/// 1"; a non-numeric cursor is corrupt input and must surface as an error (the returned
+/// `Err` message) rather than silently reset to page 1 — shared by every tool that pairs
+/// with `paginate`.
+fn parse_cursor(cursor: Option<&str>) -> Result<usize, String> {
+    match cursor {
+        None => Ok(0),
+        Some(c) => c
+            .parse::<usize>()
+            .map_err(|_| format!("invalid cursor: {c:?}")),
+    }
+}
+
 /// Shared skip/take/next_cursor pagination — extracted out of
 /// `list_architecture_symbols` (its original, sole caller) so `type_hierarchy` can reuse
 /// the same page-and-cursor semantics rather than reimplementing them. Returns
@@ -528,27 +541,32 @@ fn paginate<T>(items: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, usize, Op
 /// `direction` names the *actual* tool the caller invoked (`list_supertypes` or
 /// `list_subtypes`) in the returned hint, rather than hardcoding one — both tools share
 /// this helper via `type_hierarchy`.
+/// Linear scan for a `SymbolNode` by id across every package — shared by
+/// `get_architecture_node` and `non_type_node_hint` rather than each reimplementing it.
+fn find_symbol<'a>(model: &'a ArchModel, id: &str) -> Option<&'a SymbolNode> {
+    model
+        .packages
+        .values()
+        .find_map(|pkg| pkg.symbols.iter().find(|s| s.id == id))
+}
+
 fn non_type_node_hint(
     model: &ArchModel,
     node: &str,
     direction: TypeHierarchyDirection,
 ) -> Option<(SymbolKind, String)> {
-    for pkg in model.packages.values() {
-        if let Some(sym) = pkg.symbols.iter().find(|s| s.id == node) {
-            return match sym.kind {
-                SymbolKind::Type | SymbolKind::Interface => None,
-                other => Some((
-                    other,
-                    format!(
-                        "node exists but is not a Type or Interface; call \
-                         get_architecture_node to check node.kind before calling {}",
-                        direction.tool_name()
-                    ),
-                )),
-            };
-        }
+    let sym = find_symbol(model, node)?;
+    match sym.kind {
+        SymbolKind::Type | SymbolKind::Interface => None,
+        other => Some((
+            other,
+            format!(
+                "node exists but is not a Type or Interface; call get_architecture_node \
+                 to check node.kind before calling {}",
+                direction.tool_name()
+            ),
+        )),
     }
-    None
 }
 
 fn symbol_kind_matches(kind: SymbolKind, want: &str) -> bool {
@@ -1042,14 +1060,9 @@ impl KibitzerServer {
         };
         let limit = req.limit.clamp(1, 1000);
 
-        // `None` legitimately means "start from page 1"; a non-numeric cursor is corrupt
-        // input and must surface as an error rather than silently reset to page 1.
-        let offset: usize = match req.cursor.as_deref() {
-            None => 0,
-            Some(c) => match c.parse::<usize>() {
-                Ok(n) => n,
-                Err(_) => return json_error(format!("invalid cursor: {c:?}")),
-            },
+        let offset = match parse_cursor(req.cursor.as_deref()) {
+            Ok(offset) => offset,
+            Err(e) => return json_error(e),
         };
 
         let model = match self
@@ -1143,12 +1156,10 @@ impl KibitzerServer {
                 .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
         }
 
-        for pkg in model.packages.values() {
-            if let Some(sym) = pkg.symbols.iter().find(|s| s.id == req.node) {
-                let value = serde_json::json!({ "kind": "symbol", "symbol": sym });
-                return serde_json::to_string(&value)
-                    .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
-            }
+        if let Some(sym) = find_symbol(&model, &req.node) {
+            let value = serde_json::json!({ "kind": "symbol", "symbol": sym });
+            return serde_json::to_string(&value)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
         }
 
         let exists_but_pruned = model.pruning.pruned_symbol_ids.contains(&req.node);
@@ -1349,15 +1360,9 @@ impl KibitzerServer {
         let depth = req.depth.clamp(1, MAX_TYPE_HIERARCHY_DEPTH);
         let limit = req.limit.clamp(1, 1000);
 
-        // `None` legitimately means "start from page 1"; a non-numeric cursor is corrupt
-        // input and must surface as an error rather than silently reset to page 1 — same
-        // convention as `list_architecture_symbols`.
-        let offset: usize = match req.cursor.as_deref() {
-            None => 0,
-            Some(c) => match c.parse::<usize>() {
-                Ok(n) => n,
-                Err(_) => return json_error(format!("invalid cursor: {c:?}")),
-            },
+        let offset = match parse_cursor(req.cursor.as_deref()) {
+            Ok(offset) => offset,
+            Err(e) => return json_error(e),
         };
 
         let model = match self
@@ -1368,29 +1373,31 @@ impl KibitzerServer {
             Err(e) => return json_error(e),
         };
 
-        if let Some((node_kind, hint)) = non_type_node_hint(&model, &req.node, direction) {
-            let response = TypeHierarchyResponse {
-                node: req.node,
-                depth,
-                truncated: false,
-                total_matched: 0,
-                returned: 0,
-                next_cursor: None,
-                possibly_pruned: false,
-                node_kind: Some(node_kind),
-                hint: Some(hint.to_string()),
-                edges: Vec::new(),
-            };
-            return serde_json::to_string(&response)
-                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")));
-        }
-
         let (all_edges, truncated) =
             traverse_type_edges(&model.type_edges, &req.node, depth, direction);
         let (edges, total_matched, next_cursor) = paginate(all_edges, offset, limit);
         let returned = edges.len();
 
-        let possibly_pruned = total_matched == 0
+        // `non_type_node_hint` is only ever informative on a zero-match result: a
+        // Function/Method id can never match a TypeRelationEdge endpoint (every edge's
+        // `from`/`to` is a Type/Interface id when resolved), so BFS already returns empty
+        // for exactly the case this hint explains — checking it eagerly, before BFS, would
+        // pay its own whole-model linear scan on every call for no benefit.
+        let (node_kind, hint) = if total_matched == 0 {
+            match non_type_node_hint(&model, &req.node, direction) {
+                Some((kind, hint)) => (Some(kind), Some(hint)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        // `node_kind.is_some()` means `node` definitively resolved to a real, non-pruned
+        // symbol (just not a Type/Interface) — an unrelated symbol being pruned elsewhere
+        // in the model doesn't make that ambiguous, so `possibly_pruned` only applies to
+        // the "nothing matched at all" case.
+        let possibly_pruned = node_kind.is_none()
+            && total_matched == 0
             && !req.include_private
             && !model.pruning.pruned_symbol_ids.is_empty();
 
@@ -1402,8 +1409,8 @@ impl KibitzerServer {
             returned,
             next_cursor,
             possibly_pruned,
-            node_kind: None,
-            hint: None,
+            node_kind,
+            hint,
             edges,
         };
         serde_json::to_string(&response)
@@ -2597,6 +2604,13 @@ mod tests {
         assert_eq!(page, vec![5]);
         assert_eq!(total_matched, 5);
         assert_eq!(next_cursor, None);
+    }
+
+    #[test]
+    fn parse_cursor_defaults_to_zero_and_rejects_non_numeric_input() {
+        assert_eq!(parse_cursor(None), Ok(0));
+        assert_eq!(parse_cursor(Some("5")), Ok(5));
+        assert!(parse_cursor(Some("not-a-number")).is_err());
     }
 
     #[test]

@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use tree_sitter::{Node, Tree};
 
-use crate::arch_model::{AccessKind, SymbolKind, SymbolNode};
+use crate::arch_model::{AccessKind, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::checker::Language;
 
 /// Per-`Language` table of node-kind strings driving symbol extraction — the
@@ -1046,7 +1046,7 @@ pub struct RawTypeRelationSite {
     pub type_id: String,
     pub package_path: String,
     pub target_text: String,
-    pub kind_hint: Option<crate::arch_model::TypeRelationKind>,
+    pub kind_hint: Option<TypeRelationKind>,
     pub file: PathBuf,
     pub line: usize,
     /// `true` only for a Go embedded field whose `target_text` is package-qualified
@@ -1057,7 +1057,7 @@ pub struct RawTypeRelationSite {
     /// possibilities too, but resolving *those* by stripping the qualifier and doing a
     /// same-name lookup elsewhere in the model would be a guess, not a resolution — see
     /// `resolve_type_edge_target`'s doc comment in `arch_model.rs`. Defaults to `false`;
-    /// only `go_embedded_type_relations` sets it `true`.
+    /// only `go_embedded_type_relations`/`go_embedded_interface_relations` set it `true`.
     pub dotted_text_is_go_package_qualifier: bool,
 }
 
@@ -1086,6 +1086,7 @@ fn walk_type_relations(
         Language::Go => {
             if node.kind() == "type_declaration" {
                 go_embedded_type_relations(node, source, package_path, out);
+                go_embedded_interface_relations(node, source, package_path, out);
             }
         }
         Language::Java => match node.kind() {
@@ -1159,7 +1160,7 @@ fn java_class_type_relations(
             type_id: type_id.clone(),
             package_path: package_path.to_string(),
             target_text: strip_generic_params(node_text(target, source)),
-            kind_hint: Some(crate::arch_model::TypeRelationKind::Extends),
+            kind_hint: Some(TypeRelationKind::Extends),
             file: PathBuf::new(),
             line,
             dotted_text_is_go_package_qualifier: false,
@@ -1175,7 +1176,7 @@ fn java_class_type_relations(
                 type_id: type_id.clone(),
                 package_path: package_path.to_string(),
                 target_text: strip_generic_params(node_text(target, source)),
-                kind_hint: Some(crate::arch_model::TypeRelationKind::Implements),
+                kind_hint: Some(TypeRelationKind::Implements),
                 file: PathBuf::new(),
                 line,
                 dotted_text_is_go_package_qualifier: false,
@@ -1214,7 +1215,7 @@ fn java_interface_type_relations(
             type_id: type_id.clone(),
             package_path: package_path.to_string(),
             target_text: strip_generic_params(node_text(target, source)),
-            kind_hint: Some(crate::arch_model::TypeRelationKind::Extends),
+            kind_hint: Some(TypeRelationKind::Extends),
             file: PathBuf::new(),
             line,
             dotted_text_is_go_package_qualifier: false,
@@ -1267,13 +1268,13 @@ fn ts_class_heritage_relations(
     if let Some(extends) = find_child_by_kind(heritage, "extends_clause")
         && let Some(value) = extends.child_by_field_name("value")
     {
-        push(value, crate::arch_model::TypeRelationKind::Extends, out);
+        push(value, TypeRelationKind::Extends, out);
     }
 
     if let Some(implements) = find_child_by_kind(heritage, "implements_clause") {
         let mut cursor = implements.walk();
         for ty in implements.named_children(&mut cursor) {
-            push(ty, crate::arch_model::TypeRelationKind::Implements, out);
+            push(ty, TypeRelationKind::Implements, out);
         }
     }
 }
@@ -1308,31 +1309,22 @@ fn js_class_heritage_relation(
         ),
         package_path: package_path.to_string(),
         target_text: strip_generic_params(node_text(superclass, source)),
-        kind_hint: Some(crate::arch_model::TypeRelationKind::Extends),
+        kind_hint: Some(TypeRelationKind::Extends),
         file: PathBuf::new(),
         line: class_decl.start_position().row + 1,
         dotted_text_is_go_package_qualifier: false,
     });
 }
 
-/// Kotlin `class_declaration` (covers both plain classes and interfaces — see
-/// `kotlin_is_interface`) → its `delegation_specifiers` supertype list, split three ways by
-/// shape rather than a uniform rule, per `tree-sitter-kotlin-ng`'s grammar (verified against
-/// `grammar.js`: none of `delegation_specifier`/`constructor_invocation`/
-/// `explicit_delegation` declare named fields, so children are read positionally):
-///
-/// - `constructor_invocation` (`Base()`, call syntax) → unambiguously a class → `Extends`.
-///   Its first named child is the type (`seq($.type, $.value_arguments)`).
-/// - `explicit_delegation` (`Iface by impl`) → unambiguously interface delegation →
-///   `Implements`. Its first named child is likewise the type (`seq($.type, 'by',
-///   $.primary_expression)` — `'by'` is an anonymous token, not a named child).
-/// - a bare `type` (concretely `user_type` etc. — `type` itself is an inlined supertype
-///   node, never a real node kind) → genuinely ambiguous → `kind_hint: None`. This is NOT
-///   always an interface: Kotlin's "class with no primary constructor" idiom (each secondary
-///   constructor delegates via `: super(...)`) writes its superclass bare too (e.g. `class
-///   MyView : View { constructor(ctx: Int) : super(ctx) }`, where `View` is a class) — so
-///   bare `type` is deliberately left unresolved here rather than guessed, matching
-///   `TypeRelationEdge::kind`'s doc comment.
+/// Kotlin `class_declaration` (covers both plain classes and interfaces) →
+/// `delegation_specifiers`, split three ways by shape (verified against
+/// `tree-sitter-kotlin-ng`'s `grammar.js`; all children read positionally, no named
+/// fields): `constructor_invocation` (`Base()`) → unambiguously a class → `Extends`;
+/// `explicit_delegation` (`Iface by impl`) → unambiguously interface delegation →
+/// `Implements`; a bare `type` (`user_type` etc.) → genuinely ambiguous → `kind_hint: None`
+/// — NOT always an interface (Kotlin's "no primary constructor" idiom writes its
+/// superclass bare too, see the `..._no_primary_constructor_superclass_...` test below),
+/// so it's deliberately left unresolved rather than guessed.
 fn kotlin_delegation_type_relations(
     class_decl: Node,
     source: &str,
@@ -1378,23 +1370,15 @@ fn kotlin_delegation_type_relations(
 /// specifier is malformed (an `annotation`-only child list, or a shape node missing its
 /// expected first named child) — never used to mean "ambiguous", which is
 /// `Some((_, None))`.
-fn kotlin_delegation_specifier_target(
-    specifier: Node,
-) -> Option<(Node, Option<crate::arch_model::TypeRelationKind>)> {
+fn kotlin_delegation_specifier_target(specifier: Node) -> Option<(Node, Option<TypeRelationKind>)> {
     let mut cursor = specifier.walk();
     let shape = specifier
         .children(&mut cursor)
         .find(|c| c.kind() != "annotation")?;
 
     match shape.kind() {
-        "constructor_invocation" => Some((
-            shape.named_child(0)?,
-            Some(crate::arch_model::TypeRelationKind::Extends),
-        )),
-        "explicit_delegation" => Some((
-            shape.named_child(0)?,
-            Some(crate::arch_model::TypeRelationKind::Implements),
-        )),
+        "constructor_invocation" => Some((shape.named_child(0)?, Some(TypeRelationKind::Extends))),
+        "explicit_delegation" => Some((shape.named_child(0)?, Some(TypeRelationKind::Implements))),
         _ => Some((shape, None)),
     }
 }
@@ -1479,6 +1463,62 @@ fn go_embedded_type_relations(
                 package_path: package_path.to_string(),
                 target_text,
                 kind_hint: None,
+                file: PathBuf::new(),
+                line: type_decl.start_position().row + 1,
+                dotted_text_is_go_package_qualifier: true,
+            });
+        }
+    }
+}
+
+/// Appends one `RawTypeRelationSite` per embedded interface declared directly on a Go
+/// `interface_type` under `type_decl` (same grouped-`type (...)` handling as
+/// `go_embedded_type_relations`). Opposite branch from `interface_declared_methods`
+/// (`isp_fat_interface.rs`): a `type_elem` child is the embedded interface this extracts
+/// (skipped there as "real cross-type/cross-package work, deferred"); a `method_elem`
+/// child is an ordinary method signature and is skipped here. Unlike struct embedding
+/// (ambiguous between `Extends`/`Implements`, resolved later by symbol-kind lookup), Go's
+/// grammar only allows embedding an interface inside another interface — there's no
+/// "embed a struct inside an interface" shape — so `kind_hint` is always
+/// `Some(Implements)` here, no ambiguity to defer.
+fn go_embedded_interface_relations(
+    type_decl: Node,
+    source: &str,
+    package_path: &str,
+    out: &mut Vec<RawTypeRelationSite>,
+) {
+    let mut cursor = type_decl.walk();
+    for spec in type_decl
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "type_spec")
+    {
+        let Some(name_node) = spec.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(interface_ty) = spec.child_by_field_name("type") else {
+            continue;
+        };
+        if interface_ty.kind() != "interface_type" {
+            continue;
+        }
+        let type_name = strip_generic_params(node_text(name_node, source));
+        let type_id = build_id(package_path, None, &type_name);
+        let mut ic = interface_ty.walk();
+        for elem in interface_ty
+            .children(&mut ic)
+            .filter(|c| c.kind() == "type_elem")
+        {
+            let Some(ty) = elem.named_child(0) else {
+                continue;
+            };
+            let Some(target_text) = go_embedded_type_name(ty, source) else {
+                continue;
+            };
+            out.push(RawTypeRelationSite {
+                type_id: type_id.clone(),
+                package_path: package_path.to_string(),
+                target_text,
+                kind_hint: Some(TypeRelationKind::Implements),
                 file: PathBuf::new(),
                 line: type_decl.start_position().row + 1,
                 dotted_text_is_go_package_qualifier: true,
@@ -2165,14 +2205,14 @@ mod tests {
 
         let extends: Vec<_> = sites
             .iter()
-            .filter(|s| s.kind_hint == Some(crate::arch_model::TypeRelationKind::Extends))
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Extends))
             .collect();
         assert_eq!(extends.len(), 1);
         assert_eq!(extends[0].target_text, "Animal");
 
         let implements: Vec<&str> = sites
             .iter()
-            .filter(|s| s.kind_hint == Some(crate::arch_model::TypeRelationKind::Implements))
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Implements))
             .map(|s| s.target_text.as_str())
             .collect();
         assert_eq!(implements, vec!["Runnable", "Named"]);
@@ -2193,7 +2233,7 @@ mod tests {
         assert!(
             sites
                 .iter()
-                .all(|s| s.kind_hint == Some(crate::arch_model::TypeRelationKind::Extends))
+                .all(|s| s.kind_hint == Some(TypeRelationKind::Extends))
         );
 
         let targets: Vec<&str> = sites.iter().map(|s| s.target_text.as_str()).collect();
@@ -2214,14 +2254,14 @@ mod tests {
 
         let extends: Vec<_> = sites
             .iter()
-            .filter(|s| s.kind_hint == Some(crate::arch_model::TypeRelationKind::Extends))
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Extends))
             .collect();
         assert_eq!(extends.len(), 1);
         assert_eq!(extends[0].target_text, "Animal");
 
         let implements: Vec<&str> = sites
             .iter()
-            .filter(|s| s.kind_hint == Some(crate::arch_model::TypeRelationKind::Implements))
+            .filter(|s| s.kind_hint == Some(TypeRelationKind::Implements))
             .map(|s| s.target_text.as_str())
             .collect();
         assert_eq!(implements, vec!["Runnable", "Named"]);
@@ -2248,10 +2288,7 @@ mod tests {
         assert_eq!(tsx_sites.len(), 1);
         assert_eq!(tsx_sites[0].target_text, ts_sites[0].target_text);
         assert_eq!(tsx_sites[0].kind_hint, ts_sites[0].kind_hint);
-        assert_eq!(
-            tsx_sites[0].kind_hint,
-            Some(crate::arch_model::TypeRelationKind::Extends)
-        );
+        assert_eq!(tsx_sites[0].kind_hint, Some(TypeRelationKind::Extends));
     }
 
     #[test]
@@ -2260,10 +2297,7 @@ mod tests {
             type_relation_sites(Language::JavaScript, "class Dog extends Animal {}\n", "pkg");
         assert_eq!(sites.len(), 1, "got: {sites:?}");
         assert_eq!(sites[0].target_text, "Animal");
-        assert_eq!(
-            sites[0].kind_hint,
-            Some(crate::arch_model::TypeRelationKind::Extends)
-        );
+        assert_eq!(sites[0].kind_hint, Some(TypeRelationKind::Extends));
     }
 
     #[test]
@@ -2340,6 +2374,49 @@ mod tests {
         assert!(sites.is_empty(), "got: {sites:?}");
     }
 
+    // --- go_embedded_interface_relations ---
+
+    #[test]
+    fn go_embedded_interface_relations_captures_embedded_interface_as_implements() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n\ntype Writer interface {\n\tWrite(p []byte) (n int, err error)\n}\n\ntype ReadWriter interface {\n\tReader\n\tWriter\n}\n",
+            "pkg",
+        );
+        let mut targets: Vec<&str> = sites.iter().map(|s| s.target_text.as_str()).collect();
+        targets.sort_unstable();
+        assert_eq!(targets, vec!["Reader", "Writer"], "got: {sites:?}");
+        assert!(
+            sites
+                .iter()
+                .all(|s| s.kind_hint == Some(TypeRelationKind::Implements)),
+            "got: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn go_embedded_interface_relations_does_not_treat_a_method_signature_as_an_embed() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n",
+            "pkg",
+        );
+        assert!(sites.is_empty(), "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_embedded_interface_relations_keeps_qualifier_on_cross_package_embedded_interface() {
+        let sites = type_relation_sites(
+            Language::Go,
+            "package pkg\n\ntype Named interface {\n\tio.Reader\n\tName() string\n}\n",
+            "pkg",
+        );
+        assert_eq!(sites.len(), 1, "got: {sites:?}");
+        assert_eq!(sites[0].target_text, "io.Reader");
+        assert_eq!(sites[0].kind_hint, Some(TypeRelationKind::Implements));
+        assert!(sites[0].dotted_text_is_go_package_qualifier);
+    }
+
     #[test]
     fn type_relation_supports_returns_true_for_supported_languages_false_for_python_and_rust() {
         for language in [
@@ -2391,10 +2468,7 @@ mod tests {
             .iter()
             .find(|s| s.target_text == "Animal")
             .unwrap_or_else(|| panic!("no Animal site in {sites:?}"));
-        assert_eq!(
-            animal.kind_hint,
-            Some(crate::arch_model::TypeRelationKind::Extends)
-        );
+        assert_eq!(animal.kind_hint, Some(TypeRelationKind::Extends));
         assert_eq!(animal.type_id, "pkg::Dog");
     }
 
@@ -2409,10 +2483,7 @@ mod tests {
             .iter()
             .find(|s| s.target_text == "Runnable")
             .unwrap_or_else(|| panic!("no Runnable site in {sites:?}"));
-        assert_eq!(
-            runnable.kind_hint,
-            Some(crate::arch_model::TypeRelationKind::Implements)
-        );
+        assert_eq!(runnable.kind_hint, Some(TypeRelationKind::Implements));
     }
 
     #[test]
@@ -2462,10 +2533,7 @@ mod tests {
                 .find(|s| s.target_text == name)
                 .unwrap_or_else(|| panic!("no {name} site in {sites:?}"))
         };
-        assert_eq!(
-            find("Animal").kind_hint,
-            Some(crate::arch_model::TypeRelationKind::Extends)
-        );
+        assert_eq!(find("Animal").kind_hint, Some(TypeRelationKind::Extends));
         assert_eq!(find("Runnable").kind_hint, None);
         assert_eq!(find("Named").kind_hint, None);
     }

@@ -189,33 +189,19 @@ pub enum TypeRelationKind {
     Implements,
 }
 
-/// One type-hierarchy edge: `from` is the declaring `Type`/`Interface`'s `SymbolNode::id`;
-/// `to` is a `SymbolNode::id` when `resolved`, else the raw supertype/interface text —
-/// never silently dropped, matching `CallEdge`'s convention (an unresolved target is
-/// routinely a legitimate external/vendored/stdlib base, not a typo).
+/// One type-hierarchy edge. `to` is a `SymbolNode::id` when `resolved`, else the raw
+/// supertype/interface text — never dropped, matching `CallEdge`'s convention (an
+/// unresolved target is often a legitimate external/vendored/stdlib base, not a typo).
+/// `kind` is `None` only when neither source syntax nor resolution can disambiguate
+/// `extends`/`implements` — never guess this away (e.g. no `kind.unwrap_or(Extends)`).
+/// `None` is common (every unresolved Go embed, every ambiguous Kotlin bare-`type` entry),
+/// not a rare corner case.
 ///
-/// `kind` is `None` only when the source syntax alone can't distinguish `extends` from
-/// `implements` (Go embedded fields; Kotlin's bare-`type` supertype-list entries) *and*
-/// resolution couldn't determine it either (the target's `SymbolKind` would have settled
-/// it, but the target didn't resolve) — this is never guessed.
-///
-/// `None` is common, not a rare corner case — every unresolved external-base Go embed
-/// (`sync.Mutex`, an un-indexed `io.Reader`) and every ambiguous Kotlin bare-`type` entry
-/// produces it. A consumer that cares about the extends/implements distinction MUST treat
-/// `None` as unclassified — never default it to `Extends`/`Implements` (e.g. never
-/// `kind.unwrap_or(Extends)` or a catch-all `_ => Extends` match arm). Doing so would
-/// silently reintroduce exactly the guessing `resolve_in`'s doc comment already forbids.
-///
-/// Note: `(resolved: true, kind: None)` is type-representable but never produced by
-/// `resolve_one_type_edge`'s spec'd logic — any successfully-resolved target always
-/// yields a `SymbolKind` to infer `kind` from, unless `kind_hint` already supplied one.
-///
-/// v1 scope note: Go interface satisfaction is only captured when it's expressed via
-/// explicit struct embedding. Go's *structural* interface satisfaction (a type implements
-/// an interface purely by having a matching method set, no embedding keyword) is out of
-/// scope for this data model and is a fast-follow, not something `type_edges` represents —
-/// see `list_supertypes`/`list_subtypes`'s tool descriptions in `mcp.rs` for the
-/// consumer-facing version of this same caveat.
+/// v1 scope note: Go interface satisfaction is only captured via explicit embedding
+/// (struct-embeds-struct, interface-embeds-interface). Go's *structural* satisfaction (a
+/// type implements an interface purely via a matching method set, no embedding keyword) is
+/// out of scope and a fast-follow — see `list_supertypes`/`list_subtypes`'s tool
+/// descriptions in `mcp.rs` for the consumer-facing version of this same caveat.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypeRelationEdge {
     pub from: String,
@@ -707,19 +693,14 @@ fn resolve_in_typed<'a>(
     None
 }
 
-/// The qualified/unqualified target-lookup half of `resolve_one_type_edge`, split out
-/// purely to keep that function short — see its doc comment for the actual resolution
-/// rules this implements.
-///
-/// Only a Go embed (`site.dotted_text_is_go_package_qualifier`) ever has its `target_text`
-/// split on `.` and its prefix stripped for a bare-name fallback lookup. A dot in any other
-/// language's `target_text` — TS/JS's `React.Component`-style member-expression
-/// supertypes, Java's `pkg.Base`/`scoped_type_identifier` targets, a qualified Kotlin
-/// type — is real, but stripping its qualifier and doing a same-name lookup elsewhere in
-/// the model would be a *guess* that some other, unrelated same-named symbol is the
-/// target, not a resolution: `TypeRelationEdge`'s "never guess" contract requires treating
-/// the whole dotted text as one atomic (and, in practice, never-matching) name instead —
-/// correctly falling through to `resolved: false` rather than risking a false match.
+/// The qualified/unqualified target-lookup half of `resolve_one_type_edge`. Only a Go
+/// embed (`site.dotted_text_is_go_package_qualifier`) ever has its `target_text` split on
+/// `.`; any other language's dotted target (TS `React.Component`, Java `pkg.Base`, ...) is
+/// looked up as one atomic, never-matching name instead — splitting it and matching by
+/// last segment would be a *guess* that an unrelated same-named symbol is the target, not
+/// a resolution (see `TypeRelationEdge`'s "never guess" contract). For a Go-qualified
+/// target whose alias resolves to a known package, a package-index miss there is a real
+/// "unresolved," not a cue to fall through to a name-only lookup elsewhere.
 fn resolve_type_edge_target<'a>(
     type_index: &TypeRelationIndex<'a>,
     package_index: &TypeRelationPackageIndex<'a>,
@@ -761,29 +742,10 @@ fn type_relation_kind_of(kind: SymbolKind) -> TypeRelationKind {
     }
 }
 
-/// Resolves one `RawTypeRelationSite` against the whole-repo `Type`/`Interface` indexes.
-///
-/// A dot in `target_text` is only ever treated as a package qualifier for a genuinely
-/// Go-qualified embed (`site.dotted_text_is_go_package_qualifier`, set only by
-/// `go_embedded_type_relations`) — see `resolve_type_edge_target`'s doc comment for why
-/// TS/Java/Kotlin's own dotted targets (`React.Component`, `pkg.Base`, ...) are
-/// deliberately NOT split and looked up by their last segment: doing so would be a guess,
-/// not a resolution. For a Go-qualified target, `file_import_aliases` is tried first; when
-/// the qualifier resolves to a known target package, the lookup is an exact `(package,
-/// name)` match via `package_index` — deliberately not falling through to the name-only
-/// `type_index` on a package-index miss, since a qualifier that *does* name a real target
-/// package but has no matching type there is a real "unresolved," not a cue to guess
-/// elsewhere. When the qualifier ISN'T a known alias for this file at all (no alias entry
-/// for this exact qualifier), this falls back to treating the qualified text's segment
-/// after the first `.` as if unqualified — the same *ceiling* (falling back to a bare-name
-/// lookup rather than guessing) `resolve_one_call_edge` accepts for a qualified callee,
-/// though that fn splits on the *last* `.` (`rsplit_once`) since a call site can be
-/// multiply-qualified (`pkg.Type.Method`); every Go embed site this fn ever sees has at
-/// most one `.`, so `split_once` vs `rsplit_once` is equivalent here today.
-///
-/// `kind` prefers `site.kind_hint` (source syntax) over the resolved target's own
-/// `SymbolKind` — see `TypeRelationEdge`'s doc comment on why a hint always wins even when
-/// resolution disagrees or fails to produce one.
+/// Resolves one `RawTypeRelationSite` against the whole-repo `Type`/`Interface` indexes —
+/// target lookup via `resolve_type_edge_target` (see its doc comment for the qualifier
+/// rules), then `kind` prefers `site.kind_hint` (source syntax) over the resolved target's
+/// own `SymbolKind` (never the reverse — see `TypeRelationEdge`'s doc comment).
 fn resolve_one_type_edge(
     type_index: &TypeRelationIndex,
     package_index: &TypeRelationPackageIndex,
@@ -935,10 +897,10 @@ impl ArchModel {
     /// `crate::glob::matches_scope` — empty `scope` keeps everything, matching that
     /// function's existing empty-means-all semantics), and with every package's `symbols`
     /// cleared when `level == ModelLevel::Component` (component view has no code-level
-    /// detail; `packages`/`import_edges`/`call_edges` are unaffected by `level`, matching
-    /// `import_edges`'s existing precedent of not being scope-filtered either — a
-    /// consumer that wants call edges scoped to a package subset filters `call_edges`
-    /// itself by `from`'s `"{package}::"` prefix).
+    /// detail; `packages`/`import_edges`/`call_edges`/`field_accesses`/`type_edges` are all
+    /// unaffected by `level` or `scope`, matching `import_edges`'s existing precedent — a
+    /// consumer that wants edges scoped to a package subset filters them itself by
+    /// `from`'s `"{package}::"` prefix).
     pub fn filtered(&self, scope: &[String], level: ModelLevel) -> ArchModel {
         let mut packages: BTreeMap<String, PackageNode> = self
             .packages
@@ -2455,6 +2417,53 @@ mod tests {
     }
 
     #[test]
+    fn resolve_type_edges_qualified_embed_falls_back_to_bare_name_when_qualifier_unknown() {
+        // `other.Animal` where `other` has NO `file_import_aliases` entry at all for this
+        // file (not just "resolves to a package with no matching type" — the qualifier
+        // itself is unrecognized). This is the accepted ceiling `resolve_type_edge_target`'s
+        // doc comment names (matching `resolve_one_call_edge`'s existing qualified-name
+        // ceiling): fall back to a bare-name lookup of the text after the dot. Here that
+        // lookup succeeds (globally unique), exercising the success path this ceiling was
+        // only ever tested on its failure path (`sync.Mutex`, above) for.
+        let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
+        let mut elsewhere = empty_package("elsewhere");
+        elsewhere.symbols.push(SymbolNode {
+            id: "elsewhere::Animal".to_string(),
+            name: "Animal".to_string(),
+            kind: SymbolKind::Type,
+            file: PathBuf::from("elsewhere/animal.go"),
+            line: 1,
+            exported: true,
+            parent: None,
+        });
+        packages.insert("elsewhere".to_string(), elsewhere);
+        packages.insert("pkg".to_string(), empty_package("pkg"));
+
+        let site = RawTypeRelationSite {
+            type_id: "pkg::Dog".to_string(),
+            package_path: "pkg".to_string(),
+            target_text: "other.Animal".to_string(),
+            kind_hint: None,
+            file: PathBuf::from("pkg/dog.go"),
+            line: 1,
+            dotted_text_is_go_package_qualifier: true,
+        };
+
+        // No file_import_aliases entry for "other" at all — the fallback path this test
+        // targets.
+        let edges = resolve_type_edges(&packages, &BTreeMap::new(), vec![site]);
+
+        assert_eq!(edges.len(), 1, "got: {edges:?}");
+        let edge = &edges[0];
+        assert!(
+            edge.resolved,
+            "bare-name fallback should land on elsewhere::Animal — got {edge:?}"
+        );
+        assert_eq!(edge.to, "elsewhere::Animal");
+        assert_eq!(edge.kind, Some(TypeRelationKind::Extends));
+    }
+
+    #[test]
     fn resolve_type_edges_prefers_kind_hint_over_inferred_kind_when_both_available() {
         let mut packages: BTreeMap<String, PackageNode> = BTreeMap::new();
         let mut pkg = empty_package("app");
@@ -2590,6 +2599,42 @@ mod tests {
         assert!(edge.resolved, "got: {edge:?}");
         assert!(edge.to.ends_with("::Animal"), "got: {edge:?}");
         assert_eq!(edge.kind, Some(TypeRelationKind::Extends));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_model_populates_type_edges_for_go_interface_embedding() {
+        let dir = tmp_dir("type-edges-go-interface-embed");
+        write_fixture(&dir, "go.mod", "module example.com/app\n\ngo 1.21\n");
+        let reader = write_fixture(
+            &dir,
+            "types/reader.go",
+            "package types\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n",
+        );
+        let read_writer = write_fixture(
+            &dir,
+            "types/readwriter.go",
+            "package types\n\ntype ReadWriter interface {\n\tReader\n}\n",
+        );
+
+        let file_paths = vec![reader.clone(), read_writer.clone()];
+        let import_graph = crate::import_graph::build(&dir, &file_paths).unwrap();
+        let files: Vec<(PathBuf, String)> = file_paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap()))
+            .collect();
+
+        let model = build_model(&dir, &files, &import_graph, &PruneConfig::default()).unwrap();
+
+        let edge = model
+            .type_edges
+            .iter()
+            .find(|e| e.from.ends_with("::ReadWriter"))
+            .expect("type edge from ReadWriter");
+        assert!(edge.resolved, "got: {edge:?}");
+        assert!(edge.to.ends_with("::Reader"), "got: {edge:?}");
+        assert_eq!(edge.kind, Some(TypeRelationKind::Implements));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
