@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::JavaKind;
 
 /// Flags a Java `catch` block with no statements and no comment explaining why the
 /// exception is being swallowed — the Java shape of the same "silently ignoring an
@@ -55,7 +56,10 @@ inventory::submit! {
 }
 
 fn is_comment(node: Node) -> bool {
-    matches!(node.kind(), "line_comment" | "block_comment")
+    matches!(
+        JavaKind::of(node),
+        JavaKind::LineComment | JavaKind::BlockComment
+    )
 }
 
 /// True if `catch_clause`'s bound exception variable is named (case-insensitively)
@@ -64,7 +68,7 @@ fn is_comment(node: Node) -> bool {
 fn has_justified_name(catch_clause: Node, src: &[u8]) -> bool {
     catch_clause
         .named_child(0)
-        .filter(|n| n.kind() == "catch_formal_parameter")
+        .filter(|n| JavaKind::of(*n) == JavaKind::CatchFormalParameter)
         .and_then(|param| param.child_by_field_name("name"))
         .and_then(|name| name.utf8_text(src).ok())
         .is_some_and(|name| {
@@ -82,7 +86,7 @@ fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
 }
 
 fn check_catch_clause(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() != "catch_clause" {
+    if JavaKind::of(node) != JavaKind::CatchClause {
         return;
     }
     let Some(body) = node.child_by_field_name("body") else {

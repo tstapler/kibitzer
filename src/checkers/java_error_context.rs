@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::JavaKind;
 
 /// Flags `catch (X e) { throw e; }` — a bare rethrow that discards the catch site's
 /// context — but only in files that already demonstrate a `throw new
@@ -62,18 +63,18 @@ inventory::submit! {
 /// literal and an identifier among its constructor arguments — the signal that this
 /// codebase wraps a caught exception with a message on purpose.
 fn has_wrapping_convention(node: Node) -> bool {
-    if node.kind() == "throw_statement"
+    if JavaKind::of(node) == JavaKind::ThrowStatement
         && let Some(expr) = node.named_child(0)
-        && expr.kind() == "object_creation_expression"
+        && JavaKind::of(expr) == JavaKind::ObjectCreationExpression
         && let Some(args) = expr.child_by_field_name("arguments")
     {
         let mut cursor = args.walk();
         let mut has_message = false;
         let mut has_cause = false;
         for arg in args.named_children(&mut cursor) {
-            match arg.kind() {
-                "string_literal" => has_message = true,
-                "identifier" => has_cause = true,
+            match JavaKind::of(arg) {
+                JavaKind::StringLiteral => has_message = true,
+                JavaKind::Identifier => has_cause = true,
                 _ => {}
             }
         }
@@ -87,7 +88,7 @@ fn has_wrapping_convention(node: Node) -> bool {
 
 fn collect_bare_rethrows(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
     crate::tree_walk::walk_preorder(node, &mut |n| {
-        if n.kind() == "catch_clause" && is_bare_rethrow(n, src) {
+        if JavaKind::of(n) == JavaKind::CatchClause && is_bare_rethrow(n, src) {
             findings.push(Finding {
                 line: n.start_position().row + 1,
                 message: "rethrows the caught exception unwrapped despite this file's \
@@ -106,7 +107,7 @@ fn collect_bare_rethrows(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
 fn is_bare_rethrow(catch_clause: Node, src: &[u8]) -> bool {
     let Some(param) = catch_clause
         .named_child(0)
-        .filter(|n| n.kind() == "catch_formal_parameter")
+        .filter(|n| JavaKind::of(*n) == JavaKind::CatchFormalParameter)
     else {
         return false;
     };
@@ -123,15 +124,20 @@ fn is_bare_rethrow(catch_clause: Node, src: &[u8]) -> bool {
     let mut cursor = body.walk();
     let statements: Vec<Node> = body
         .named_children(&mut cursor)
-        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .filter(|n| {
+            !matches!(
+                JavaKind::of(*n),
+                JavaKind::LineComment | JavaKind::BlockComment
+            )
+        })
         .collect();
-    if statements.len() != 1 || statements[0].kind() != "throw_statement" {
+    if statements.len() != 1 || JavaKind::of(statements[0]) != JavaKind::ThrowStatement {
         return false;
     }
     let Some(thrown) = statements[0].named_child(0) else {
         return false;
     };
-    thrown.kind() == "identifier" && thrown.utf8_text(src) == Ok(param_name)
+    JavaKind::of(thrown) == JavaKind::Identifier && thrown.utf8_text(src) == Ok(param_name)
 }
 
 #[cfg(test)]

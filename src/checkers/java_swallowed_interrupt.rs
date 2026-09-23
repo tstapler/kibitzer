@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::JavaKind;
 
 /// Flags a `catch (InterruptedException ...)` (bare or as part of a multi-catch) whose
 /// body neither restores the interrupt status (a call to `.interrupt()`, conventionally
@@ -55,13 +56,13 @@ impl Checker for SwallowedInterruptChecker {
 fn catches_interrupted_exception(catch_clause: Node, src: &[u8]) -> bool {
     let Some(param) = catch_clause
         .named_child(0)
-        .filter(|n| n.kind() == "catch_formal_parameter")
+        .filter(|n| JavaKind::of(*n) == JavaKind::CatchFormalParameter)
     else {
         return false;
     };
     let Some(catch_type) = param
         .children(&mut param.walk())
-        .find(|n| n.kind() == "catch_type")
+        .find(|n| JavaKind::of(*n) == JavaKind::CatchType)
     else {
         return false;
     };
@@ -74,10 +75,10 @@ fn catches_interrupted_exception(catch_clause: Node, src: &[u8]) -> bool {
 /// True if `node`'s subtree contains a `throw_statement` or a call whose method name is
 /// `interrupt` — either is an accepted way to not silently lose the interrupt signal.
 fn restores_or_propagates_interrupt(node: Node, src: &[u8]) -> bool {
-    if node.kind() == "throw_statement" {
+    if JavaKind::of(node) == JavaKind::ThrowStatement {
         return true;
     }
-    if node.kind() == "method_invocation"
+    if JavaKind::of(node) == JavaKind::MethodInvocation
         && let Some(name) = node.child_by_field_name("name")
         && name.utf8_text(src) == Ok("interrupt")
     {
@@ -90,8 +91,12 @@ fn restores_or_propagates_interrupt(node: Node, src: &[u8]) -> bool {
 
 fn has_justifying_comment(body: Node) -> bool {
     let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .any(|child| matches!(child.kind(), "line_comment" | "block_comment"))
+    body.named_children(&mut cursor).any(|child| {
+        matches!(
+            JavaKind::of(child),
+            JavaKind::LineComment | JavaKind::BlockComment
+        )
+    })
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
@@ -102,7 +107,7 @@ fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
 }
 
 fn check_catch_clause(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
-    if node.kind() == "catch_clause"
+    if JavaKind::of(node) == JavaKind::CatchClause
         && catches_interrupted_exception(node, src)
         && let Some(body) = node.child_by_field_name("body")
         && !restores_or_propagates_interrupt(body, src)

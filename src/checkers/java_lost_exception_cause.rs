@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::node_kind::JavaKind;
 
 /// Flags `throw new SomeException("message: " + e.getMessage())`-shaped constructions
 /// inside a `catch` block: a *new* `...Exception`/`...Error` is thrown with at least one
@@ -59,7 +60,7 @@ impl Checker for LostExceptionCauseChecker {
 fn catch_param_name<'a>(catch_clause: Node, src: &'a [u8]) -> Option<&'a str> {
     catch_clause
         .named_child(0)
-        .filter(|n| n.kind() == "catch_formal_parameter")
+        .filter(|n| JavaKind::of(*n) == JavaKind::CatchFormalParameter)
         .and_then(|param| param.child_by_field_name("name"))
         .and_then(|name| name.utf8_text(src).ok())
 }
@@ -76,7 +77,7 @@ fn looks_like_throwable_type(type_node: Node, src: &[u8]) -> bool {
 /// `IOError`'s wrapped `IOException`. Recognized as cause-preserving alongside a bare
 /// `caught_name` reference (see `preserves_cause`).
 fn is_get_cause_call(node: Node, src: &[u8], caught_name: &str) -> bool {
-    node.kind() == "method_invocation"
+    JavaKind::of(node) == JavaKind::MethodInvocation
         && node
             .child_by_field_name("object")
             .and_then(|o| o.utf8_text(src).ok())
@@ -98,13 +99,13 @@ fn preserves_cause(object_creation: Node, src: &[u8], caught_name: &str) -> bool
     };
     let mut cursor = args.walk();
     args.named_children(&mut cursor).any(|arg| {
-        if arg.kind() == "identifier" && arg.utf8_text(src) == Ok(caught_name) {
+        if JavaKind::of(arg) == JavaKind::Identifier && arg.utf8_text(src) == Ok(caught_name) {
             return true;
         }
         if is_get_cause_call(arg, src, caught_name) {
             return true;
         }
-        if arg.kind() == "cast_expression"
+        if JavaKind::of(arg) == JavaKind::CastExpression
             && let Some(value) = arg.child_by_field_name("value")
             && is_get_cause_call(value, src, caught_name)
         {
@@ -129,7 +130,7 @@ fn walk<'a>(
     findings: &mut Vec<Finding>,
 ) {
     crate::tree_walk::walk_preorder(node, &mut |n| {
-        if n.kind() == "catch_clause" {
+        if JavaKind::of(n) == JavaKind::CatchClause {
             walk_catch_body(n, src, findings);
             return false;
         }
@@ -156,10 +157,10 @@ fn check_throw_statement(
     enclosing_catch_name: Option<&str>,
     findings: &mut Vec<Finding>,
 ) {
-    if node.kind() == "throw_statement"
+    if JavaKind::of(node) == JavaKind::ThrowStatement
         && let Some(caught_name) = enclosing_catch_name
         && let Some(expr) = node.named_child(0)
-        && expr.kind() == "object_creation_expression"
+        && JavaKind::of(expr) == JavaKind::ObjectCreationExpression
         && let Some(type_node) = expr.child_by_field_name("type")
         && looks_like_throwable_type(type_node, src)
         && let Some(args) = expr.child_by_field_name("arguments")
