@@ -1261,9 +1261,12 @@ fn strip_rust_raw_string_delimiters(raw: &str) -> Option<&str> {
     rest.strip_prefix('"').and_then(|s| s.strip_suffix(&close))
 }
 
-/// Strips Python's string-prefix letters (`r`/`b`/`f`/`rb`/`br`/`rf`/`fr`, any case)
-/// ahead of the quote character, then the quote delimiter itself. Split out of
-/// `normalize_literal_value` to keep that function's body under `LONG_FUNCTION_LINES`.
+/// Strips Python's string-prefix letters ahead of the quote character, then the quote
+/// delimiter itself — `r`/`b`/`f`/`rb`/`br`/`rf`/`fr` (any case), plus the legacy
+/// Python-2-compat standalone `u`/`U` (never combines with `r`/`b`/`f` in real Python,
+/// but accepting the combination here is harmless: a real parse never produces it, so
+/// being lenient about the character *set* can't misnormalize valid source). Split out
+/// of `normalize_literal_value` to keep that function's body under `LONG_FUNCTION_LINES`.
 fn strip_python_prefixed_quote_delimiter(raw: &str) -> Option<&str> {
     let prefix_len = raw
         .chars()
@@ -1273,7 +1276,7 @@ fn strip_python_prefixed_quote_delimiter(raw: &str) -> Option<&str> {
     let (prefix, rest) = raw.split_at(prefix_len);
     if !prefix
         .chars()
-        .all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f'))
+        .all(|c| matches!(c.to_ascii_lowercase(), 'r' | 'b' | 'f' | 'u'))
     {
         return None;
     }
@@ -1833,6 +1836,59 @@ mod tests {
         );
     }
 
+    /// Epic 1.0's equivalence probe (validation.md): confirms the dispatcher wiring
+    /// survived splitting the old single `lang_config()` match arm into 8 named
+    /// constructor functions.
+    #[test]
+    fn lang_config_dispatches_to_the_matching_constructor() {
+        assert_eq!(lang_config(Language::Go).name, go_lang_config().name);
+        assert_eq!(
+            lang_config(Language::TypeScript).name,
+            typescript_lang_config().name
+        );
+        assert_eq!(lang_config(Language::Tsx).name, tsx_lang_config().name);
+        assert_eq!(
+            lang_config(Language::JavaScript).name,
+            javascript_lang_config().name
+        );
+        assert_eq!(
+            lang_config(Language::Python).name,
+            python_lang_config().name
+        );
+        assert_eq!(lang_config(Language::Java).name, java_lang_config().name);
+        assert_eq!(
+            lang_config(Language::Kotlin).name,
+            kotlin_lang_config().name
+        );
+        assert_eq!(lang_config(Language::Rust).name, rust_lang_config().name);
+    }
+
+    /// Epic 1.0's equivalence probe (validation.md): catches a mistranslation of the
+    /// `..lang_config(Language::TypeScript)` struct-update syntax into
+    /// `..typescript_lang_config()` during Task 1.0.1a's extraction — e.g. a field
+    /// accidentally hardcoded instead of inherited. Compares every data field (not the
+    /// function-pointer fields: the compiler's own `unpredictable_function_pointer_
+    /// comparisons` lint warns those addresses aren't reliably comparable across
+    /// codegen units, so a derived/manual `PartialEq` on them would be a flaky test).
+    #[test]
+    fn tsx_and_javascript_configs_inherit_typescript_fields() {
+        fn assert_data_fields_match(inherited: &LangRuleConfig, base: &LangRuleConfig) {
+            assert_eq!(inherited.function_kinds, base.function_kinds);
+            assert_eq!(inherited.if_kind, base.if_kind);
+            assert_eq!(inherited.nesting_kinds, base.nesting_kinds);
+            assert_eq!(inherited.else_wrapper_kinds, base.else_wrapper_kinds);
+            assert_eq!(inherited.chain_kinds, base.chain_kinds);
+            assert_eq!(inherited.ternary_kind, base.ternary_kind);
+            assert_eq!(inherited.block_kind, base.block_kind);
+            assert_eq!(inherited.terminal_kinds, base.terminal_kinds);
+            assert_eq!(inherited.literal_kinds, base.literal_kinds);
+            assert_eq!(inherited.numeric_literal_kinds, base.numeric_literal_kinds);
+        }
+        let ts = typescript_lang_config();
+        assert_data_fields_match(&tsx_lang_config(), &ts);
+        assert_data_fields_match(&javascript_lang_config(), &ts);
+    }
+
     /// Task 1.3.1c: dedicated companion to `node_kind_literals_are_valid_for_their_grammar`
     /// covering `replace-magic-literal`'s two new per-language fields — kept as its own
     /// test function (rather than folded into that one) so neither grows past
@@ -1971,10 +2027,12 @@ mod tests {
 
     #[test]
     fn allows_replace_magic_literal_allowlisted_values() {
+        // Each allowlisted value appears 3x (>= MAGIC_LITERAL_MIN_OCCURRENCES) so this
+        // test actually discriminates: without the allow-list, each would fire.
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nfunc f() {\n\ta := 0\n\tb := 0\n\tc := 1\n\td := 1\n\te := -1\n\tg := -1\n\th := \"\"\n\ti := \"\"\n}\n",
+            "package main\nfunc f() {\n\ta := 0\n\tb := 0\n\tc := 0\n\td := 1\n\te := 1\n\tg := 1\n\th := -1\n\ti := -1\n\tj := -1\n\tk := \"\"\n\tl := \"\"\n\tm := \"\"\n}\n",
         );
         assert!(findings.is_empty());
     }
@@ -1991,10 +2049,14 @@ mod tests {
 
     #[test]
     fn flags_replace_magic_literal_excludes_named_constant() {
+        // Discriminating, not tautological: without the exclusion, "30" appears 3 times
+        // (the const initializer plus 2 raw uses) which meets the bumped threshold and
+        // would fire; the const initializer's exclusion drops the remaining count to 2,
+        // below threshold, so this genuinely proves the exclusion logic runs.
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nconst Timeout = 30\nfunc f() { wait(Timeout) }\nfunc g() { wait(Timeout) }\nfunc h() { sleep(30) }\n",
+            "package main\nconst Timeout = 30\nfunc f() { wait(Timeout) }\nfunc g() { sleep(30) }\nfunc h() { sleep(30) }\n",
         );
         assert!(findings.is_empty());
     }
@@ -2038,7 +2100,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nfunc f() {\n\ta := ``\n\tb := ``\n}\n",
+            "package main\nfunc f() {\n\ta := ``\n\tb := ``\n\tc := ``\n}\n",
         );
         assert!(findings.is_empty());
     }
@@ -2074,13 +2136,27 @@ mod tests {
     fn ts_flags_replace_magic_literal_excludes_const_not_let() {
         // Locks in ADR-001's deliberate narrowing: only `const` (not `let`) qualifies
         // for the named-constant exclusion, even though `x` is referenced once beyond
-        // its own declaration.
+        // its own declaration. All 3 occurrences are `let`, so none should be excluded.
         let findings = magic_literal_findings(
             Language::TypeScript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "function f() {\n  let x = 42;\n  use(x);\n  let y = 42;\n  let z = 42;\n}\n",
         );
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn ts_flags_replace_magic_literal_excludes_const_referenced_elsewhere() {
+        // Companion to the `let`-negative-case test above: proves `const` actually IS
+        // excluded, discriminating (not tautological) — without the exclusion, "7"
+        // appears 3 times (meets the bumped threshold); with it, the const initializer
+        // drops out, leaving 2, below threshold.
+        let findings = magic_literal_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  const x = 7;\n  use(x);\n}\nfunction g() {\n  use2(7);\n}\nfunction h() {\n  use3(7);\n}\n",
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -2111,10 +2187,12 @@ mod tests {
 
     #[test]
     fn py_flags_replace_magic_literal_excludes_screaming_snake_case() {
+        // Discriminating: without the exclusion, "30" appears 3 times (meets the
+        // bumped threshold); with it, the assignment's value drops out, leaving 2.
         let findings = magic_literal_findings(
             Language::Python,
             tree_sitter_python::LANGUAGE.into(),
-            "TIMEOUT = 30\ndef f():\n    wait(TIMEOUT)\ndef g():\n    wait(TIMEOUT)\ndef h():\n    sleep(30)\n",
+            "TIMEOUT = 30\ndef f():\n    wait(TIMEOUT)\ndef g():\n    sleep(30)\ndef h():\n    sleep(30)\n",
         );
         assert!(findings.is_empty());
     }
@@ -2124,7 +2202,21 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Python,
             tree_sitter_python::LANGUAGE.into(),
-            "def f():\n    a = r\"\"\n    b = r\"\"\n",
+            "def f():\n    a = r\"\"\n    b = r\"\"\n    c = r\"\"\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn py_flags_replace_magic_literal_allowlist_u_prefixed_empty_string() {
+        // Regression: Python's legacy (PEP 414) `u`/`U` prefix wasn't in
+        // strip_python_prefixed_quote_delimiter's accepted character set, so `u""`
+        // normalized to the 4-char string `u""` instead of an empty string, missing
+        // the allow-list match — `u""` repeated would have been incorrectly flagged.
+        let findings = magic_literal_findings(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    a = u\"\"\n    b = u\"\"\n    c = u\"\"\n",
         );
         assert!(findings.is_empty());
     }
@@ -2141,10 +2233,12 @@ mod tests {
 
     #[test]
     fn java_flags_replace_magic_literal_excludes_final() {
+        // Discriminating: without the exclusion, "30" appears 3 times (meets the
+        // bumped threshold); with it, the final field's initializer drops out.
         let findings = magic_literal_findings(
             Language::Java,
             tree_sitter_java::LANGUAGE.into(),
-            "class C {\n  void f() {\n    final int Timeout = 30;\n    use(Timeout);\n    use(Timeout);\n  }\n  void g() {\n    sleep(30);\n  }\n}\n",
+            "class C {\n  void f() {\n    final int Timeout = 30;\n    use(Timeout);\n  }\n  void g() {\n    sleep(30);\n  }\n  void h() {\n    sleep(30);\n  }\n}\n",
         );
         assert!(findings.is_empty());
     }
@@ -2161,10 +2255,12 @@ mod tests {
 
     #[test]
     fn kotlin_flags_replace_magic_literal_excludes_val() {
+        // Discriminating: without the exclusion, "30" appears 3 times (meets the
+        // bumped threshold); with it, the `val`'s initializer drops out.
         let findings = magic_literal_findings(
             Language::Kotlin,
             tree_sitter_kotlin_ng::LANGUAGE.into(),
-            "fun f() {\n  val Timeout = 30\n  use(Timeout)\n  use(Timeout)\n}\nfun g() {\n  sleep(30)\n}\n",
+            "fun f() {\n  val Timeout = 30\n  use(Timeout)\n}\nfun g() {\n  sleep(30)\n}\nfun h() {\n  sleep(30)\n}\n",
         );
         assert!(findings.is_empty());
     }
@@ -2174,7 +2270,7 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Kotlin,
             tree_sitter_kotlin_ng::LANGUAGE.into(),
-            "fun f() {\n  val a = \"\"\"\"\"\"\n  val b = \"\"\"\"\"\"\n}\n",
+            "fun f() {\n  val a = \"\"\"\"\"\"\n  val b = \"\"\"\"\"\"\n  val c = \"\"\"\"\"\"\n}\n",
         );
         assert!(findings.is_empty());
     }
@@ -2191,6 +2287,8 @@ mod tests {
 
     #[test]
     fn rust_flags_replace_magic_literal_excludes_const_not_let() {
+        // All 3 occurrences are `let`, so none should be excluded (locks in ADR-001's
+        // narrowing: only `const`/`static`, not `let`, qualifies).
         let findings = magic_literal_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
@@ -2200,11 +2298,25 @@ mod tests {
     }
 
     #[test]
+    fn rust_flags_replace_magic_literal_excludes_const_referenced_elsewhere() {
+        // Companion to the `let`-negative-case test above: proves `const` actually IS
+        // excluded, discriminating (not tautological) — without the exclusion, "7"
+        // appears 3 times (meets the bumped threshold); with it, the const's
+        // initializer drops out, leaving 2, below threshold.
+        let findings = magic_literal_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    const X: i32 = 7;\n    use(X);\n}\nfn g() {\n    use2(7);\n}\nfn h() {\n    use3(7);\n}\n",
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
     fn rust_flags_replace_magic_literal_allowlist_empty_raw_string() {
         let findings = magic_literal_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
-            "fn f() {\n    let a = r\"\";\n    let b = r\"\";\n}\n",
+            "fn f() {\n    let a = r\"\";\n    let b = r\"\";\n    let c = r\"\";\n}\n",
         );
         assert!(findings.is_empty());
     }
