@@ -22,6 +22,7 @@ use crate::architecture_checks::{ArchFinding, ArchModelChecker, methods_by_type}
 use crate::checker::{GrammarCache, Language};
 use crate::checkers::complexity::{SubtestHandling, cyclomatic_complexity};
 use crate::config::ArchitectureConfig;
+use crate::node_kind::GoKind;
 
 /// PMD's default God Class thresholds (PMD's `GodClassRule`: `WMC > 47`, `ATFD > 5`,
 /// `TCC < 0.33`). The issue that scoped this checker (#38) quoted these as `WMC ≤ 47`;
@@ -209,8 +210,10 @@ pub(crate) fn find_method_node<'a>(
     name: &str,
     source: &str,
 ) -> Option<Node<'a>> {
-    if matches!(node.kind(), "method_declaration" | "function_declaration")
-        && node.start_position().row + 1 == line
+    if matches!(
+        GoKind::of(node),
+        GoKind::MethodDeclaration | GoKind::FunctionDeclaration
+    ) && node.start_position().row + 1 == line
         && node
             .child_by_field_name("name")
             .is_some_and(|n| node_text(n, source) == name)
@@ -301,7 +304,7 @@ pub(crate) fn collect_typed_locals(method: Node, source: &str, out: &mut HashMap
         let mut cursor = params.walk();
         for decl in params
             .children(&mut cursor)
-            .filter(|c| c.kind() == "parameter_declaration")
+            .filter(|c| GoKind::of(*c) == GoKind::ParameterDeclaration)
         {
             let Some(ty) = decl
                 .child_by_field_name("type")
@@ -319,8 +322,8 @@ pub(crate) fn collect_typed_locals(method: Node, source: &str, out: &mut HashMap
 }
 
 fn walk_typed_locals(node: Node, source: &str, out: &mut HashMap<String, String>) {
-    match node.kind() {
-        "var_spec" => {
+    match GoKind::of(node) {
+        GoKind::VarSpec => {
             if let Some(ty) = node
                 .child_by_field_name("type")
                 .and_then(|t| simple_type_name(t, source))
@@ -331,18 +334,18 @@ fn walk_typed_locals(node: Node, source: &str, out: &mut HashMap<String, String>
                 }
             }
         }
-        "short_var_declaration" => {
+        GoKind::ShortVarDeclaration => {
             if let (Some(left), Some(right)) = (
                 node.child_by_field_name("left"),
                 node.child_by_field_name("right"),
-            ) && left.kind() == "expression_list"
-                && right.kind() == "expression_list"
+            ) && GoKind::of(left) == GoKind::ExpressionList
+                && GoKind::of(right) == GoKind::ExpressionList
                 && left.named_child_count() == 1
                 && right.named_child_count() == 1
                 && let Some(name_node) = left.named_child(0)
-                && name_node.kind() == "identifier"
+                && GoKind::of(name_node) == GoKind::Identifier
                 && let Some(value) = right.named_child(0)
-                && value.kind() == "composite_literal"
+                && GoKind::of(value) == GoKind::CompositeLiteral
                 && let Some(ty) = value
                     .child_by_field_name("type")
                     .and_then(|t| simple_type_name(t, source))
@@ -368,10 +371,10 @@ fn walk_typed_locals(node: Node, source: &str, out: &mut HashMap<String, String>
 /// (a function's return value, an interface's dynamic type, a generic instantiation)
 /// still resolves to `None` — that ceiling is unaffected by cross-package resolution.
 pub(crate) fn simple_type_name(ty: Node, source: &str) -> Option<String> {
-    match ty.kind() {
-        "type_identifier" => Some(node_text(ty, source).to_string()),
-        "pointer_type" => ty.named_child(0).and_then(|c| simple_type_name(c, source)),
-        "qualified_type" => Some(node_text(ty, source).to_string()),
+    match GoKind::of(ty) {
+        GoKind::TypeIdentifier => Some(node_text(ty, source).to_string()),
+        GoKind::PointerType => ty.named_child(0).and_then(|c| simple_type_name(c, source)),
+        GoKind::QualifiedType => Some(node_text(ty, source).to_string()),
         _ => None,
     }
 }
@@ -448,10 +451,10 @@ fn walk_selectors_on_typed_locals(
     ctx: &ForeignAccessCtx,
     out: &mut HashSet<(String, String)>,
 ) {
-    if node.kind() == "selector_expression"
+    if GoKind::of(node) == GoKind::SelectorExpression
         && !is_call_target(node)
         && let Some(operand) = node.child_by_field_name("operand")
-        && operand.kind() == "identifier"
+        && GoKind::of(operand) == GoKind::Identifier
         && let Some(local_type) = ctx.typed_locals.get(node_text(operand, source))
         && let Some(foreign_type) = foreign_type_of(local_type, ctx.own_type, ctx.file_aliases)
         && let Some(field) = node.child_by_field_name("field")
@@ -470,7 +473,7 @@ fn walk_selectors_on_typed_locals(
 /// foreign method calls.
 pub(crate) fn is_call_target(selector: Node) -> bool {
     selector.parent().is_some_and(|p| {
-        p.kind() == "call_expression"
+        GoKind::of(p) == GoKind::CallExpression
             && p.child_by_field_name("function").is_some_and(|f| {
                 f.start_byte() == selector.start_byte() && f.end_byte() == selector.end_byte()
             })
