@@ -13,6 +13,7 @@ use tree_sitter::Node;
 
 use crate::checker::Language;
 use crate::config::{Component, component_of};
+use crate::node_kind::{GoKind, JavaKind, KotlinKind, PythonKind, TypeScriptKind};
 
 /// The shape of one enumerated declaration. `Enum` has no producer yet in Go/JS/TS
 /// (Go has no enum node kind; JS/TS `enum` support can follow later) — kept here now so
@@ -159,15 +160,15 @@ fn resolve_component(repo_root: &Path, file: &Path, components: &[Component]) ->
 ///   respectively) directly usable without distinguishing the two further — both map to
 ///   `DeclKind::Function`.
 fn collect_go_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
-    match node.kind() {
-        "type_spec" => {
+    match GoKind::of(node) {
+        GoKind::TypeSpec => {
             if let Some(name_node) = node.child_by_field_name("name")
                 && let Some(type_node) = node.child_by_field_name("type")
                 && let Ok(name) = name_node.utf8_text(src)
             {
-                let kind = match type_node.kind() {
-                    "struct_type" => Some(DeclKind::Struct),
-                    "interface_type" => Some(DeclKind::Interface),
+                let kind = match GoKind::of(type_node) {
+                    GoKind::StructType => Some(DeclKind::Struct),
+                    GoKind::InterfaceType => Some(DeclKind::Interface),
                     _ => None,
                 };
                 if let Some(kind) = kind {
@@ -175,7 +176,7 @@ fn collect_go_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKi
                 }
             }
         }
-        "function_declaration" | "method_declaration" => {
+        GoKind::FunctionDeclaration | GoKind::MethodDeclaration => {
             if let Some(name_node) = node.child_by_field_name("name")
                 && let Ok(name) = name_node.utf8_text(src)
             {
@@ -249,10 +250,10 @@ fn build_go_declarations(
 /// into every child unconditionally). `function_declaration` carries a `name` field
 /// (`identifier`).
 fn collect_js_ts_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
-    let kind = match node.kind() {
-        "class_declaration" => Some(DeclKind::Class),
-        "interface_declaration" => Some(DeclKind::Interface),
-        "function_declaration" => Some(DeclKind::Function),
+    let kind = match TypeScriptKind::of(node) {
+        TypeScriptKind::ClassDeclaration => Some(DeclKind::Class),
+        TypeScriptKind::InterfaceDeclaration => Some(DeclKind::Interface),
+        TypeScriptKind::FunctionDeclaration => Some(DeclKind::Function),
         _ => None,
     };
     if let Some(kind) = kind
@@ -333,9 +334,9 @@ fn build_js_ts_declarations(
 /// Java has no top-level functions outside a class/interface/record body — method
 /// declarations are intentionally never extracted here (see `DeclKind`'s doc comment).
 fn collect_java_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
-    let kind = match node.kind() {
-        "class_declaration" | "record_declaration" => Some(DeclKind::Class),
-        "interface_declaration" => Some(DeclKind::Interface),
+    let kind = match JavaKind::of(node) {
+        JavaKind::ClassDeclaration | JavaKind::RecordDeclaration => Some(DeclKind::Class),
+        JavaKind::InterfaceDeclaration => Some(DeclKind::Interface),
         _ => None,
     };
     if let Some(kind) = kind
@@ -427,8 +428,12 @@ fn build_java_declarations(
 /// declaration node's own direct children — never anything inside its body — so
 /// classification here is unaffected either way.
 fn collect_kotlin_declarations(node: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
-    match node.kind() {
-        "class_declaration" => {
+    match KotlinKind::of(node) {
+        KotlinKind::ClassDeclaration => {
+            // typed-node-kind-migration (ADR-001): stays a raw string comparison —
+            // both "class" and "interface" are "named": false in kotlin.json, so
+            // neither has a KotlinKind variant; collapsing them into KotlinKind::Other
+            // would defeat the point of distinguishing class from interface here.
             let mut kw_cursor = node.walk();
             let keyword_kind = node
                 .children(&mut kw_cursor)
@@ -446,7 +451,7 @@ fn collect_kotlin_declarations(node: Node, src: &[u8], out: &mut Vec<(String, De
                 out.push((name.to_string(), kind, node.start_position().row + 1));
             }
         }
-        "object_declaration" => {
+        KotlinKind::ObjectDeclaration => {
             if let Some(name_node) = node.child_by_field_name("name")
                 && let Ok(name) = name_node.utf8_text(src)
             {
@@ -510,9 +515,9 @@ fn build_kotlin_declarations(
 /// direct match arm below and by the `decorated_definition` unwrap, so a decorator
 /// can never change how the wrapped declaration is classified.
 fn classify_python_definition(node: Node, src: &[u8]) -> Option<(String, DeclKind, usize)> {
-    let kind = match node.kind() {
-        "class_definition" => DeclKind::Class,
-        "function_definition" => DeclKind::Function,
+    let kind = match PythonKind::of(node) {
+        PythonKind::ClassDefinition => DeclKind::Class,
+        PythonKind::FunctionDefinition => DeclKind::Function,
         _ => return None,
     };
     let name = node.child_by_field_name("name")?.utf8_text(src).ok()?;
@@ -553,13 +558,13 @@ fn classify_python_definition(node: Node, src: &[u8]) -> Option<(String, DeclKin
 fn collect_python_declarations(root: Node, src: &[u8], out: &mut Vec<(String, DeclKind, usize)>) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
-        match child.kind() {
-            "class_definition" | "function_definition" => {
+        match PythonKind::of(child) {
+            PythonKind::ClassDefinition | PythonKind::FunctionDefinition => {
                 if let Some(decl) = classify_python_definition(child, src) {
                     out.push(decl);
                 }
             }
-            "decorated_definition" => {
+            PythonKind::DecoratedDefinition => {
                 if let Some(inner) = child.child_by_field_name("definition")
                     && let Some(decl) = classify_python_definition(inner, src)
                 {
@@ -725,10 +730,12 @@ mod tests {
         let class_node = class_tree.root_node().named_child(0).unwrap();
         let iface_node = iface_tree.root_node().named_child(0).unwrap();
 
-        assert_eq!(class_node.kind(), "class_declaration");
-        assert_eq!(iface_node.kind(), "class_declaration");
+        assert_eq!(KotlinKind::of(class_node), KotlinKind::ClassDeclaration);
+        assert_eq!(KotlinKind::of(iface_node), KotlinKind::ClassDeclaration);
 
-        // Distinguishing keyword is the raw (unnamed) first child.
+        // Distinguishing keyword is the raw (unnamed) first child — typed-node-kind-
+        // migration (ADR-001) non-goal: "class"/"interface" are "named": false in
+        // kotlin.json, so no KotlinKind variant exists for either; stays a raw string.
         assert_eq!(class_node.child(0).unwrap().kind(), "class");
         assert_eq!(iface_node.child(0).unwrap().kind(), "interface");
     }
@@ -738,8 +745,8 @@ mod tests {
         let object_tree = parse_kotlin("object Singleton {\n    val x = 1\n}\n");
         let object_node = object_tree.root_node().named_child(0).unwrap();
 
-        assert_eq!(object_node.kind(), "object_declaration");
-        assert_ne!(object_node.kind(), "class_declaration");
+        assert_eq!(KotlinKind::of(object_node), KotlinKind::ObjectDeclaration);
+        assert_ne!(KotlinKind::of(object_node), KotlinKind::ClassDeclaration);
     }
 
     #[test]
@@ -747,11 +754,16 @@ mod tests {
         let tree = parse_kotlin("abstract class Base\n");
         let class_node = tree.root_node().named_child(0).unwrap();
 
-        assert_eq!(class_node.kind(), "class_declaration");
+        assert_eq!(KotlinKind::of(class_node), KotlinKind::ClassDeclaration);
         // The distinguishing "class"/"interface" keyword is no longer at raw index 0
         // once modifiers precede it — a real extractor must search children by kind,
         // not assume a fixed positional index.
-        assert_eq!(class_node.child(0).unwrap().kind(), "modifiers");
+        assert_eq!(
+            KotlinKind::of(class_node.child(0).unwrap()),
+            KotlinKind::Modifiers
+        );
+        // typed-node-kind-migration (ADR-001) non-goal: "class" is "named": false in
+        // kotlin.json, so this stays a raw string comparison (see above).
         let has_class_keyword = (0..class_node.child_count())
             .any(|i| class_node.child(i as u32).unwrap().kind() == "class");
         assert!(has_class_keyword);
