@@ -631,6 +631,24 @@ impl ArchModel {
         self.packages.get(path)
     }
 
+    /// The package key `file` was grouped under, or `None` if `file` doesn't appear in
+    /// any `PackageNode.files` (an unsupported-language file, a generated file skipped
+    /// during `build_model`, or a path outside this model entirely). `file` must match
+    /// exactly as stored in `packages` (the same path shape `collect_repo_files`/
+    /// `build_model_from_files` produced it with — typically absolute, joined against
+    /// `repo_root`).
+    ///
+    /// A small, additive query on the existing shared model (linear scan — this repo's
+    /// package/file counts don't warrant a second index), rather than a caller building
+    /// its own private `PathBuf -> package key` map derived from `packages`, which would
+    /// be a second representation that must stay consistent with this one.
+    pub fn package_for_file(&self, file: &Path) -> Option<&str> {
+        self.packages
+            .values()
+            .find(|pkg| pkg.files.iter().any(|f| f == file))
+            .map(|pkg| pkg.path.as_str())
+    }
+
     /// Every `(package_path, &SymbolNode)` pair across all packages whose `SymbolNode.name`
     /// exactly equals `name` — a repo can have same-named symbols in different packages
     /// (that's exactly what the owner-qualified `id` scheme exists to disambiguate), so
@@ -1436,6 +1454,45 @@ mod tests {
         assert_eq!(pkg.files, vec![PathBuf::from("/repo/pkg/a.go")]);
         assert_eq!(model.pruning.unsupported_language_files, 1);
         assert_eq!(model.pruning.total_files_scanned, 2);
+    }
+
+    #[test]
+    fn package_for_file_returns_the_owning_package_key() {
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![(
+            PathBuf::from("/repo/pkg/a.go"),
+            "package pkg\n\nfunc A() {}\n".to_string(),
+        )];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            model.package_for_file(Path::new("/repo/pkg/a.go")),
+            Some("pkg")
+        );
+    }
+
+    #[test]
+    fn package_for_file_returns_none_for_an_unmodeled_path() {
+        let repo_root = PathBuf::from("/repo");
+        let files = vec![(
+            PathBuf::from("/repo/pkg/a.go"),
+            "package pkg\n\nfunc A() {}\n".to_string(),
+        )];
+        let model = build_model(
+            &repo_root,
+            &files,
+            &ImportGraph::default(),
+            &PruneConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(model.package_for_file(Path::new("/repo/other/b.go")), None);
     }
 
     #[test]
