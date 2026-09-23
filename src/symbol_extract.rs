@@ -78,6 +78,8 @@ fn go_is_exported(node: Node, source: &str) -> bool {
         .unwrap_or(false)
 }
 
+// SEAM(typed-node-kind-migration): `export_statement` is shared TypeScript/Tsx/JavaScript
+// vocabulary reached from one function body — see ADR-001.
 fn js_ts_is_exported(node: Node, _source: &str) -> bool {
     node.parent()
         .map(|p| p.kind() == "export_statement")
@@ -345,6 +347,9 @@ fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
 /// (`class_declaration`/`interface_declaration`/`enum_declaration`/`record_declaration`);
 /// Kotlin passes `&["class_declaration"]` (covers both class and interface, since Kotlin
 /// has no distinct interface node kind — see `kotlin_is_interface`).
+// SEAM(typed-node-kind-migration): `target_kinds` is a per-caller kind-name slice shared
+// across TS/JS/Python/Java/Kotlin call sites, each spelling a different grammar's kind —
+// see ADR-001.
 fn enclosing_kind_name(node: Node, source: &str, target_kinds: &[&str]) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -600,6 +605,10 @@ fn call_graph_supports(language: Language) -> bool {
 /// qualified text for `pkg.Foo()`/`recv.Method()` — kept qualified (not trimmed to the
 /// last segment here) so `arch_model::resolve_call_edges` can itself tell a bare call
 /// from a qualified one and pick which symbol index to search first.
+// SEAM(typed-node-kind-migration): the single hardest snippet in the whole migration —
+// this match arm unions Go's `selector_expression` and JS/TS's `member_expression`
+// vocabularies in one arm, which no single `<Lang>Kind` enum can express without a shared
+// trait; deliberately excluded per ADR-001's Option C — see ADR-001.
 fn callee_text_for(call: Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     match function.kind() {
@@ -627,6 +636,9 @@ struct CallWalkCtx<'a> {
 /// resolvable name → no symbol" behavior for such nodes.
 fn walk_calls(node: Node, ctx: &CallWalkCtx, caller: Option<&str>, out: &mut Vec<RawCallSite>) {
     let mut current_caller = caller.map(str::to_string);
+    // SEAM(typed-node-kind-migration): `function_kinds` is `LangSymbolConfig`'s seamed
+    // `&'static [&'static str]` field, shared across all languages by this one function
+    // body — see ADR-001.
     if ctx.cfg.function_kinds.contains(&node.kind())
         && let Some(sym) = classify_node(node, ctx.language, ctx.cfg, ctx.source, ctx.package_path)
     {
