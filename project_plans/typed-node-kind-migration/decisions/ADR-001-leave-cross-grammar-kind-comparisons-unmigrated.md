@@ -1,7 +1,18 @@
-# ADR-001: Leave the 11 cross-grammar-shared kind comparisons unmigrated
+# ADR-001: Leave the 13 cross-grammar-shared kind comparisons unmigrated
 
 **Status**: Accepted
 **Date**: 2026-09-22
+
+**Correction (Story 4.1.1/4.1.2)**: this ADR originally identified 11 sites (8 in
+`rules.rs`, 3 in `symbol_extract.rs`). Story 3.2.2's `js_ts_is_exported`
+`export_statement` check and Story 4.1.1's completeness sweep found two more genuinely
+cross-grammar-shared sites in `symbol_extract.rs` (`walk_calls`'s `call_expression`
+check, alongside the originally-identified `function_kinds.contains` check) that fit
+this ADR's same reasoning and were seamed the same way. The final, confirmed count is
+**13** (8 in `rules.rs`, 5 in `symbol_extract.rs` — verified via `rg -c
+'SEAM\(typed-node-kind-migration\)' src/checkers/rules.rs src/symbol_extract.rs`). The
+body below is left as originally written for historical accuracy; read "11"/"3" as
+superseded by "13"/"5" throughout.
 
 ## Context
 

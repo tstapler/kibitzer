@@ -23,13 +23,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,covgate
+          tool: cargo-llvm-cov,covgate,ripgrep
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
         run: cargo build --workspace
+      - name: node-kind migration completeness gate
+        run: scripts/check-node-kind-completeness.sh
       - name: test with coverage
         # cargo llvm-cov builds everything itself in a separate, instrumented target dir
         # (target/llvm-cov-target) and, for a workspace member with no tests of its own
