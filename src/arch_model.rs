@@ -638,10 +638,12 @@ impl ArchModel {
     /// `build_model_from_files` produced it with — typically absolute, joined against
     /// `repo_root`).
     ///
-    /// A small, additive query on the existing shared model (linear scan — this repo's
-    /// package/file counts don't warrant a second index), rather than a caller building
-    /// its own private `PathBuf -> package key` map derived from `packages`, which would
-    /// be a second representation that must stay consistent with this one.
+    /// A small, additive query on the existing shared model (linear scan — cheap for a
+    /// single lookup, but see `affected.rs::PackageIndex` for a caller that needs this
+    /// once per changed file and builds its own reverse index instead). Kept as public
+    /// API and exercised directly by this module's own tests even though `affected.rs`
+    /// no longer calls it in its hot loop.
+    #[allow(dead_code)]
     pub fn package_for_file(&self, file: &Path) -> Option<&str> {
         self.packages
             .values()

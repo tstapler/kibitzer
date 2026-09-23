@@ -7,7 +7,7 @@
 //! Batch-only — never wired into `default_checks()`/hook mode, matching the rest of the
 //! `ArchitectureAction` family. v1 is Go-only (see `ArchModel`'s import-graph coverage).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -140,22 +140,23 @@ pub fn resolve_base_sha(repo_root: &Path, base: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Parses `git diff --name-status [-M]` output into `ChangedFile`s. Tab-separated:
-/// `A\tpath`, `M\tpath`, `D\tpath`, or `R<score>\told\tnew`.
+/// Parses `git diff --name-status -z [-M]` output into `ChangedFile`s. `-z` makes every
+/// status code and every path its own NUL-terminated token (`A\0path\0`,
+/// `R<score>\0old\0new\0`) instead of git's default tab/newline-separated form — which
+/// this parser must NOT be pointed at, since git's default `core.quotepath=true` C-quotes
+/// non-ASCII/special-byte paths in that form and nothing here ever dequoted them, silently
+/// dropping such a changed file from the diff. `-z` disables that quoting entirely, so
+/// NUL-delimited splitting alone is sufficient.
 fn parse_name_status(output: &str) -> Vec<ChangedFile> {
     let mut result = Vec::new();
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let Some(code) = parts.next() else { continue };
+    let mut tokens = output.split('\0').filter(|s| !s.is_empty());
+    while let Some(code) = tokens.next() {
         let Some(first_char) = code.chars().next() else {
             continue;
         };
         match first_char {
             'A' | 'M' | 'D' => {
-                let Some(path) = parts.next() else { continue };
+                let Some(path) = tokens.next() else { continue };
                 let status = match first_char {
                     'A' => ChangeStatus::Added,
                     'M' => ChangeStatus::Modified,
@@ -167,7 +168,7 @@ fn parse_name_status(output: &str) -> Vec<ChangedFile> {
                 });
             }
             'R' => {
-                if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
+                if let (Some(old), Some(new)) = (tokens.next(), tokens.next()) {
                     result.push(ChangedFile {
                         path: PathBuf::from(new),
                         status: ChangeStatus::Renamed {
@@ -192,7 +193,13 @@ fn parse_name_status(output: &str) -> Vec<ChangedFile> {
 fn diff_base_head(repo_root: &Path, base_sha: &str) -> Result<Option<Vec<ChangedFile>>> {
     let output = run_git(
         repo_root,
-        &["diff", "--name-status", "-M", &format!("{base_sha}...HEAD")],
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            &format!("{base_sha}...HEAD"),
+        ],
     )?;
     if !output.status.success() {
         eprintln!(
@@ -210,7 +217,7 @@ fn diff_base_head(repo_root: &Path, base_sha: &str) -> Result<Option<Vec<Changed
 /// (`git ls-files --others --exclude-standard`, all `Added`) — matching
 /// `test-affected.py`'s working-tree-inclusive scope.
 fn diff_working_tree(repo_root: &Path) -> Result<Vec<ChangedFile>> {
-    let tracked = run_git(repo_root, &["diff", "--name-status", "HEAD"])?;
+    let tracked = run_git(repo_root, &["diff", "--name-status", "-z", "HEAD"])?;
     if !tracked.status.success() {
         bail!(
             "git diff --name-status HEAD exited with {}: {}",
@@ -220,7 +227,10 @@ fn diff_working_tree(repo_root: &Path) -> Result<Vec<ChangedFile>> {
     }
     let mut changed = parse_name_status(&String::from_utf8_lossy(&tracked.stdout));
 
-    let untracked = run_git(repo_root, &["ls-files", "--others", "--exclude-standard"])?;
+    let untracked = run_git(
+        repo_root,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )?;
     if !untracked.status.success() {
         bail!(
             "git ls-files --others --exclude-standard exited with {}: {}",
@@ -228,12 +238,12 @@ fn diff_working_tree(repo_root: &Path) -> Result<Vec<ChangedFile>> {
             String::from_utf8_lossy(&untracked.stderr).trim()
         );
     }
-    for line in String::from_utf8_lossy(&untracked.stdout).lines() {
-        if line.is_empty() {
-            continue;
-        }
+    for path in String::from_utf8_lossy(&untracked.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+    {
         changed.push(ChangedFile {
-            path: PathBuf::from(line),
+            path: PathBuf::from(path),
             status: ChangeStatus::Added,
         });
     }
@@ -260,27 +270,11 @@ pub fn diff_changed_files(repo_root: &Path, base_sha: &str) -> Result<Option<Vec
     Ok(Some(by_path.into_values().collect()))
 }
 
-/// A `Modified` `.go` file's diff hunk (base vs. working tree — covers both a committed
-/// and an uncommitted edit) touched its own `package` line and the identifier actually
-/// changed. A cheap content-level check on top of the same `git diff` machinery
-/// `diff_changed_files` already establishes, not a full tree-sitter re-parse. Non-`.go`
-/// files are never checked (Go-only v1 scope).
-fn detect_package_clause_change(repo_root: &Path, base_sha: &str, path: &Path) -> Result<bool> {
-    if !is_go_path(path) {
-        return Ok(false);
-    }
-    let output = run_git(
-        repo_root,
-        &["diff", "-U0", base_sha, "--", &git_path_str(path)],
-    )?;
-    if !output.status.success() {
-        bail!(
-            "git diff -U0 exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+/// Whether a single `-U0` diff hunk's text shows a `package` line changing to a
+/// *different* identifier (not just re-touched) — the shared content check behind both
+/// [`detect_package_clause_change`] (one file) and [`detect_package_clause_changes`]
+/// (a whole batch).
+fn package_clause_changed_in_diff_text(text: &str) -> bool {
     let mut removed_pkg: Option<&str> = None;
     let mut added_pkg: Option<&str> = None;
     for line in text.lines() {
@@ -290,7 +284,107 @@ fn detect_package_clause_change(repo_root: &Path, base_sha: &str, path: &Path) -
             added_pkg = Some(rest.trim());
         }
     }
-    Ok(matches!((removed_pkg, added_pkg), (Some(a), Some(b)) if a != b))
+    matches!((removed_pkg, added_pkg), (Some(a), Some(b)) if a != b)
+}
+
+/// Runs `git diff -U0 <extra_args>`, bailing on a non-zero exit — the spawn-and-check
+/// shared by [`detect_package_clause_change`] (one path) and
+/// [`detect_package_clause_changes`] (a batch of paths), factored out so the two don't
+/// duplicate the same error-handling block.
+fn run_git_diff_u0(repo_root: &Path, extra_args: &[&str]) -> Result<String> {
+    let mut args: Vec<&str> = vec!["diff", "-U0"];
+    args.extend_from_slice(extra_args);
+    let output = run_git(repo_root, &args)?;
+    if !output.status.success() {
+        bail!(
+            "git diff -U0 exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A `Modified` `.go` file's diff hunk (base vs. working tree — covers both a committed
+/// and an uncommitted edit) touched its own `package` line and the identifier actually
+/// changed. A cheap content-level check on top of the same `git diff` machinery
+/// `diff_changed_files` already establishes, not a full tree-sitter re-parse. Non-`.go`
+/// files are never checked (Go-only v1 scope). Kept as a single-file entry point for
+/// direct unit testing; `compute_affected`'s hot loop uses the batched
+/// [`detect_package_clause_changes`] instead, to avoid one `git diff` spawn per file.
+#[allow(dead_code)]
+fn detect_package_clause_change(repo_root: &Path, base_sha: &str, path: &Path) -> Result<bool> {
+    if !is_go_path(path) {
+        return Ok(false);
+    }
+    let path_str = git_path_str(path);
+    let text = run_git_diff_u0(repo_root, &[base_sha, "--", &path_str])?;
+    Ok(package_clause_changed_in_diff_text(&text))
+}
+
+/// Splits a multi-file `git diff` payload into `(path, per_file_diff_text)` pairs, one per
+/// `diff --git a/<path> b/<path>` header — recovers per-file hunks from the single batched
+/// invocation [`detect_package_clause_changes`] makes instead of spawning `git diff` once
+/// per file. `path` is read from the header's `b/`-side, present for every rename/modify
+/// git emits here (this batch never sees a pure delete, since `compute_affected` only
+/// passes `Modified` paths).
+fn split_diff_by_file(diff: &str) -> Vec<(String, &str)> {
+    const HEADER: &str = "diff --git ";
+    let mut starts: Vec<usize> = Vec::new();
+    if diff.starts_with(HEADER) {
+        starts.push(0);
+    }
+    starts.extend(
+        diff.match_indices(&format!("\n{HEADER}"))
+            .map(|(i, _)| i + 1),
+    );
+
+    let mut result = Vec::new();
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).copied().unwrap_or(diff.len());
+        let block = &diff[start..end];
+        let header_end = block.find('\n').unwrap_or(block.len());
+        let header = &block[..header_end];
+        if let Some(path) = header
+            .rfind(" b/")
+            .map(|idx| header[idx + " b/".len()..].to_string())
+        {
+            result.push((path, block));
+        }
+    }
+    result
+}
+
+/// Batched counterpart of [`detect_package_clause_change`]: one `git diff -U0 <base_sha>
+/// -- path1 path2 ...` spawn covering every `.go` path in `paths` (non-`.go` entries are
+/// filtered out, matching the single-file check's Go-only scope), instead of
+/// `compute_affected`'s old N+1-subprocess loop. Returns the first path (in `paths`
+/// order, not git's diff-output order) whose `package` clause changed, or `None`.
+fn detect_package_clause_changes(
+    repo_root: &Path,
+    base_sha: &str,
+    paths: &[PathBuf],
+) -> Result<Option<PathBuf>> {
+    let go_paths: Vec<&PathBuf> = paths.iter().filter(|p| is_go_path(p)).collect();
+    if go_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let path_strs: Vec<String> = go_paths.iter().map(|p| git_path_str(p)).collect();
+    let mut extra_args: Vec<&str> = vec![base_sha, "--"];
+    extra_args.extend(path_strs.iter().map(String::as_str));
+    let text = run_git_diff_u0(repo_root, &extra_args)?;
+
+    let changed_paths: BTreeSet<String> = split_diff_by_file(&text)
+        .into_iter()
+        .filter(|(_, block)| package_clause_changed_in_diff_text(block))
+        .map(|(path, _)| path)
+        .collect();
+
+    Ok(go_paths
+        .into_iter()
+        .find(|p| changed_paths.contains(&git_path_str(p)))
+        .cloned())
 }
 
 /// Inverts `edges` (`from -> to`) into `to -> {from}` — the reverse adjacency
@@ -329,19 +423,57 @@ fn reverse_bfs(
     visited
 }
 
+/// One-time reverse index over `ArchModel.packages`, built once per `compute_affected`
+/// call so `resolve_changed_packages`/`resolve_removed_path` do an O(1) map lookup per
+/// changed file instead of each re-running `ArchModel::package_for_file`'s linear scan
+/// over every package's file list — the difference between O(changed_files) and
+/// O(changed_files * total_repo_files) once a repo has any real size to it.
+struct PackageIndex<'a> {
+    /// Exact file path -> owning package key, mirroring `package_for_file`. Used by
+    /// [`resolve_changed_packages`] for `Added`/`Modified`/`Renamed` (new-side) paths,
+    /// which still exist on disk.
+    by_file: HashMap<&'a Path, &'a str>,
+    /// A file's parent directory -> owning package key. Used by [`resolve_removed_path`]
+    /// for a `Deleted`/`Renamed`-away path, which no longer exists on disk and so can't
+    /// be looked up by exact file path — only by whether its old directory still holds
+    /// any surviving file.
+    by_dir: HashMap<&'a Path, &'a str>,
+}
+
+impl<'a> PackageIndex<'a> {
+    fn build(model: &'a ArchModel) -> Self {
+        let mut by_file = HashMap::new();
+        let mut by_dir = HashMap::new();
+        for pkg in model.packages.values() {
+            for file in &pkg.files {
+                by_file.insert(file.as_path(), pkg.path.as_str());
+                if let Some(parent) = file.parent() {
+                    by_dir.entry(parent).or_insert(pkg.path.as_str());
+                }
+            }
+        }
+        Self { by_file, by_dir }
+    }
+}
+
 /// Maps every `Added`/`Modified`/`Renamed` (new-side path) entry to its package key via
-/// the working-tree `ArchModel`, silently skipping any entry with no `file_packages`
-/// entry (unsupported extension, or excluded by `SKIP_DIRS` — e.g. `vendor/`). `Deleted`
-/// entries and a `Renamed` entry's *old*-side path are handled separately by
-/// [`resolve_removed_path`], called directly from `compute_affected`.
-fn resolve_changed_packages(changed: &[ChangedFile], model: &ArchModel) -> BTreeSet<String> {
+/// `index`, silently skipping any entry with no matching entry (unsupported extension, or
+/// excluded by `SKIP_DIRS` — e.g. `vendor/`). `Deleted` entries and a `Renamed` entry's
+/// *old*-side path are handled separately by [`resolve_removed_path`], called directly
+/// from `compute_affected`.
+fn resolve_changed_packages(
+    changed: &[ChangedFile],
+    repo_root: &Path,
+    index: &PackageIndex,
+) -> BTreeSet<String> {
     changed
         .iter()
         .filter(|entry| !matches!(entry.status, ChangeStatus::Deleted))
         .filter_map(|entry| {
-            model
-                .package_for_file(&model.repo_root.join(&entry.path))
-                .map(str::to_string)
+            index
+                .by_file
+                .get(repo_root.join(&entry.path).as_path())
+                .map(|pkg| pkg.to_string())
         })
         .collect()
 }
@@ -352,14 +484,10 @@ fn resolve_changed_packages(changed: &[ChangedFile], model: &ArchModel) -> BTree
 /// set as a changed package — no bail-out, its continued existence is directly
 /// observable); `None` if the directory has no surviving recognized-language files at
 /// all (the package was fully removed — caller bails out per ADR-001).
-fn resolve_removed_path(repo_root: &Path, old_path: &Path, model: &ArchModel) -> Option<String> {
+fn resolve_removed_path(repo_root: &Path, old_path: &Path, index: &PackageIndex) -> Option<String> {
     let abs = repo_root.join(old_path);
     let parent = abs.parent()?;
-    model
-        .packages
-        .values()
-        .find(|pkg| pkg.files.iter().any(|f| f.parent() == Some(parent)))
-        .map(|pkg| pkg.path.clone())
+    index.by_dir.get(parent).map(|pkg| pkg.to_string())
 }
 
 /// First bail-out glob (from `globs`, e.g. `AffectedConfig::effective_bail_out_globs()`)
@@ -420,16 +548,15 @@ pub fn compute_affected(
         }));
     }
 
-    for entry in &changed {
-        if entry.status == ChangeStatus::Modified
-            && detect_package_clause_change(&repo_root, &base_sha, &entry.path)?
-        {
-            return Ok(AffectedResult::BailOut(
-                BailOutReason::PackageClauseChanged {
-                    path: entry.path.clone(),
-                },
-            ));
-        }
+    let modified_paths: Vec<PathBuf> = changed
+        .iter()
+        .filter(|entry| entry.status == ChangeStatus::Modified)
+        .map(|entry| entry.path.clone())
+        .collect();
+    if let Some(path) = detect_package_clause_changes(&repo_root, &base_sha, &modified_paths)? {
+        return Ok(AffectedResult::BailOut(
+            BailOutReason::PackageClauseChanged { path },
+        ));
     }
 
     // Go-only v1 (this module's doc comment, and requirements.md's explicit scope):
@@ -456,7 +583,8 @@ pub fn compute_affected(
         },
     )?;
 
-    let mut seeds = resolve_changed_packages(&changed, &model);
+    let index = PackageIndex::build(&model);
+    let mut seeds = resolve_changed_packages(&changed, &repo_root, &index);
 
     for entry in &changed {
         let old_path = match &entry.status {
@@ -472,7 +600,7 @@ pub fn compute_affected(
         // an everyday doc edit into an unnecessary `__ALL__`.
         let old_path = old_path.filter(|p| is_go_path(p));
         if let Some(old_path) = old_path {
-            match resolve_removed_path(&repo_root, &old_path, &model) {
+            match resolve_removed_path(&repo_root, &old_path, &index) {
                 Some(key) => {
                     seeds.insert(key);
                 }
@@ -819,6 +947,76 @@ mod tests {
             result,
             AffectedResult::BailOut(BailOutReason::GlobMatched { .. })
         ));
+    }
+
+    #[test]
+    fn compute_affected_returns_glob_matched_bail_out_for_a_repo_configured_extra_glob() {
+        let repo = TempGitRepo::new("e2e-extra-glob");
+        go_mod_fixture(&repo);
+        repo.write("a/a.go", "package a\n\nfunc A() {}\n");
+        repo.commit_all("init");
+        let base = repo.head_sha();
+
+        repo.write("Makefile", "build:\n\techo hi\n");
+        repo.write("a/a.go", "package a\n\nfunc A() { println(1) }\n");
+        repo.commit_all("touch Makefile");
+
+        let config = AffectedConfig {
+            extra_bail_out_globs: vec!["Makefile".to_string()],
+        };
+        let result = compute_affected(&repo.dir, &base, &config).unwrap();
+
+        match result {
+            AffectedResult::BailOut(BailOutReason::GlobMatched { glob, path }) => {
+                assert_eq!(glob, "Makefile");
+                assert_eq!(path, PathBuf::from("Makefile"));
+            }
+            other => panic!("expected GlobMatched bail-out for the extra glob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_affected_does_not_bail_out_when_a_rename_stays_within_the_same_package_directory() {
+        let repo = TempGitRepo::new("e2e-rename-same-pkg");
+        go_mod_fixture(&repo);
+        repo.write("a/old_name.go", "package a\n\nfunc A() {}\n");
+        repo.commit_all("init");
+        let base = repo.head_sha();
+
+        TempGitRepo::run(&repo.dir, &["mv", "a/old_name.go", "a/new_name.go"]);
+        repo.commit_all("rename within package");
+
+        let result = compute_affected(&repo.dir, &base, &AffectedConfig::default()).unwrap();
+
+        match result {
+            AffectedResult::Packages(pkgs) => {
+                assert!(pkgs.contains(&"example.com/app/a".to_string()));
+            }
+            other => panic!("expected Packages (no bail-out), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_affected_returns_package_fully_removed_bail_out_when_a_rename_empties_the_old_package()
+     {
+        let repo = TempGitRepo::new("e2e-rename-empties-pkg");
+        go_mod_fixture(&repo);
+        repo.write("a/only.go", "package a\n\nfunc A() {}\n");
+        repo.commit_all("init");
+        let base = repo.head_sha();
+
+        std::fs::create_dir_all(repo.dir.join("b")).unwrap();
+        TempGitRepo::run(&repo.dir, &["mv", "a/only.go", "b/only.go"]);
+        repo.commit_all("move to a different package, emptying the old one");
+
+        let result = compute_affected(&repo.dir, &base, &AffectedConfig::default()).unwrap();
+
+        assert_eq!(
+            result,
+            AffectedResult::BailOut(BailOutReason::PackageFullyRemoved {
+                path: PathBuf::from("a/only.go")
+            })
+        );
     }
 
     #[test]

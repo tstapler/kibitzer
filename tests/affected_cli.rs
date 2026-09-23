@@ -148,6 +148,37 @@ fn affected_cli_prints_all_sentinel_to_stdout_and_reason_to_stderr_on_bail_out()
     assert!(stderr.contains("go.mod"), "got: {stderr}");
 }
 
+/// Confirms `run_affected`'s `config::find_config` branch (main.rs's `Some((config,
+/// root))` arm) actually takes effect end-to-end: `Makefile` isn't one of
+/// `default_bail_out_globs`, so this bail-out can only fire if the repo's own
+/// `.claude/inspect.json` `affected.extra_bail_out_globs` was loaded and consulted.
+#[test]
+fn affected_cli_bails_out_on_an_extra_glob_configured_in_claude_inspect_json() {
+    let repo = TempRepo::new("extra-glob-config");
+    repo.write("go.mod", "module example.com/app\n\ngo 1.21\n");
+    repo.write("a/a.go", "package a\n\nfunc A() {}\n");
+    repo.write(
+        ".claude/inspect.json",
+        r#"{"affected": {"extra_bail_out_globs": ["Makefile"]}}"#,
+    );
+    repo.commit_all("init");
+    let base = repo.head_sha();
+
+    repo.write("Makefile", "build:\n\techo hi\n");
+    repo.write("a/a.go", "package a\n\nfunc A() { println(1) }\n");
+    repo.commit_all("touch Makefile");
+
+    let (code, stdout, stderr) = repo.run_affected(&base);
+
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "__ALL__\n");
+    assert!(
+        stderr.contains("Makefile"),
+        "expected the .claude/inspect.json extra_bail_out_globs entry to drive the \
+         bail-out, got: {stderr}"
+    );
+}
+
 #[test]
 fn affected_cli_prints_empty_stdout_with_stderr_note_when_nothing_affected() {
     let repo = TempRepo::new("empty");

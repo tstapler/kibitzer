@@ -193,23 +193,11 @@ pub struct ArchitectureConfig {
     pub naming_rules: Vec<NamingRule>,
 }
 
-/// The hardcoded, portable, Go-ecosystem bail-out globs `kibitzer architecture affected`
-/// (`affected.rs`) always checks, regardless of `AffectedConfig`. Every entry uses a
-/// `**/` prefix rather than a bare filename: `glob.rs`'s `glob_to_regex` anchors every
-/// pattern with `^...$` and has no implicit path-prefix wildcarding, so a bare `"go.mod"`
-/// would only ever match a root-level file — a real gap in a multi-module repo (e.g. a
-/// repo with `tools/scanner/go.mod` alongside its root `go.mod`).
-///
-/// Deliberately contains no kibitzer-repo-specific path (e.g. `src/affected.rs`) — those
-/// would be inert, always-`false`-matching entries in every other adopting repo's tree.
-/// Kibitzer's own dogfooding protection for its own graph-building source files is added
-/// via `AffectedConfig.extra_bail_out_globs` in *this* repo's own `.claude/inspect.json`,
-/// not baked into this shipped default.
-///
-/// Also deliberately does not (and cannot) cover `//go:build`-gated files: a build-tag
-/// constraint is a content signal inside a file, not something a path glob can express —
-/// the same accepted, documented gap `import_graph.rs`'s lack of build-tag awareness
-/// already carries for every other `ArchModel` consumer.
+/// Hardcoded, portable Go-ecosystem bail-out globs `affected.rs` always checks, on top
+/// of `AffectedConfig::extra_bail_out_globs`. Each uses a `**/` prefix rather than a bare
+/// filename: `glob.rs`'s `glob_to_regex` anchors every pattern with `^...$` and has no
+/// implicit path-prefix wildcarding, so `"go.mod"` alone would only match a root-level
+/// file — missing e.g. `tools/scanner/go.mod` in a multi-module repo.
 pub fn default_bail_out_globs() -> Vec<String> {
     vec![
         "**/go.mod".to_string(),
