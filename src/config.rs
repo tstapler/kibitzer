@@ -1189,6 +1189,62 @@ mod tests {
     }
 
     #[test]
+    fn default_checks_still_registers_all_eight_syntax_rules_checkers() {
+        // Regression guard for `replace-magic-literal` (validation.md): this rule needed
+        // zero edits to `syntax_rules_checks()` since it rides along inside the existing
+        // per-language `SyntaxRulesChecker` — this locks in that the 8 pre-existing
+        // `syntax-rules-*` checker names are still exactly what's registered, catching an
+        // accidental checker-registration change future work might introduce.
+        let defaults = default_checks();
+        let names: std::collections::HashSet<&str> =
+            defaults.iter().map(|c| c.name.as_str()).collect();
+        for expected in [
+            "syntax-rules-go",
+            "syntax-rules-typescript",
+            "syntax-rules-tsx",
+            "syntax-rules-javascript",
+            "syntax-rules-python",
+            "syntax-rules-java",
+            "syntax-rules-kotlin",
+            "syntax-rules-rust",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing default check: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_flags_repeated_literal_with_no_inspect_json() {
+        // `default_checks()` is what a repo with no `.claude/inspect.json` gets — this
+        // exercises `replace-magic-literal` through the actual config-layer dispatch
+        // (`Check::checker` -> `checker::run_checker`) rather than calling
+        // `SyntaxRulesChecker::check()` directly the way `rules.rs`'s own module tests do.
+        let defaults = default_checks();
+        let check = defaults
+            .iter()
+            .find(|c| c.name == "syntax-rules-go")
+            .expect("syntax-rules-go must be a default check");
+        let checker_name = check
+            .checker
+            .as_deref()
+            .expect("syntax-rules-go must dispatch via a native checker");
+        let findings = crate::checker::run_checker(
+            checker_name,
+            Path::new("fixture.go"),
+            "package main\nfunc f() {\n\ta := 42\n\tb := 42\n\tc := 42\n}\n",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[replace-magic-literal]")),
+            "expected a replace-magic-literal finding, got: {findings:?}"
+        );
+    }
+
+    #[test]
     fn find_effective_config_falls_back_to_defaults_with_no_inspect_json() {
         // Asserts an exact count against `default_checks()` — serialized against every
         // `XDG_DATA_HOME`-mutating test (this module and `plugin.rs`) via the shared

@@ -32,6 +32,7 @@ kinds each language's `lang_config()` entry checks against differ:
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
 | `unreachable-code`     | dead-code  | advisory          | n/a                    | A statement follows an unconditional `return`/`break`/`continue`/panic-call in the same `{ ... }` block — Fowler's *Remove Dead Code*. Only the first dead statement in a block is flagged (everything after it is dead by construction). Doesn't descend into `switch`/`match`/`when` case bodies. Go's `panic(...)` and Rust's `panic!`/`unreachable!`/`todo!`/`unimplemented!` count as diverging calls; other languages have no such built-in and are return/break/continue-only. Kotlin is return-only — `tree-sitter-kotlin-ng` 1.1.0 has no dedicated node kind for a bare `break`/`continue` (it parses as a plain identifier). |
+| `replace-magic-literal` | duplication | advisory        | >= 3 occurrences       | A non-trivial numeric or string literal (not `0`, `1`, `-1`, `""`, or an empty collection literal) repeats at least this many times in one file with no bound named constant — Fowler's *Replace Magic Literal*. Excludes a literal that's the direct initializer of a `const`/`final`/`val`-style binding (Python: `SCREAMING_SNAKE_CASE`) referenced elsewhere by name; a `let`/non-const binding does not qualify. Bumped from AC2's literal `2` to `3` per a corpus backtest against a pre-committed 40% false-positive bar — see `project_plans/replace-magic-literal/decisions/ADR-001-magic-literal-exclusion-and-threshold-strategy.md`. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
 each grammar's real `to_sexp()` output:
@@ -134,8 +135,35 @@ the grammar exposes a ternary with a `condition` field, that node kind too
 (`ternary_expression` for TS/JS/Java; Python's `conditional_expression` and
 Kotlin/Go/Rust, which have no ternary, are `None`).
 
+`replace-magic-literal`'s literal node kinds and named-constant exclusion per
+language (`literal_kinds`/`binding_finder` in `src/rules.rs`): Go's
+`int_literal`/`float_literal`/`imaginary_literal`/`rune_literal`/
+`interpreted_string_literal`/`raw_string_literal`, excluding a `const` spec's
+initializer; TS/TSX/JS's `number`/`string` (a bare `predefined_type` keyword like
+`x: string` shares the same node-kind name as the literal but is unnamed —
+`walk_literals` requires `node.is_named()` to tell them apart), excluding a
+`lexical_declaration`'s `const` (not `let`) initializer; Python's `integer`/`float`/
+`string`, excluding a module- or function-level assignment whose target matches the
+`^[A-Z][A-Z0-9_]*$` screaming-snake-case convention (Python has no `const` keyword);
+Java's numeric/`string_literal`, excluding a `final` local/field's initializer;
+Kotlin's numeric/string literal kinds, excluding a `val` (not `var`) initializer
+(Kotlin has no separate `const` keyword usable at local scope); Rust's numeric/
+`string_literal`/`raw_string_literal`, excluding a `const_item`/`static_item` (not a
+`let_declaration`) initializer. Every exclusion additionally requires the binding's
+name be referenced at least once beyond its own declaration — same-file,
+non-scope-resolved (a same-named binding shadowed in a different function scope is
+an accepted false negative; see ADR-001).
+
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.
+`replace-magic-literal` is the rule most likely to hit table-driven-test/fixture
+false positives (the corpus backtest above found this dominates its false-positive
+set) — see `docs/suppressing-checks.md`'s "Exclude one file or directory" section for
+a `scope` glob that drops a whole fixture file/directory (note: this excludes the
+entire `syntax-rules-*` checker for that path, not just `replace-magic-literal` —
+there's no per-rule scoping today), or `docs/accepting-findings.md`'s
+`.kibitzer/accepted/` for keeping one specific, deliberately-repeated literal with a
+written reason (`"rule": "replace-magic-literal"`).
 
 ## Wiring into `.claude/inspect.json`
 
