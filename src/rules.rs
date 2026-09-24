@@ -16,6 +16,12 @@ const MAX_NESTING_DEPTH: usize = 4;
 /// A function/method parameter list naming more identifiers than this is flagged by
 /// `long-parameter-list`.
 const LONG_PARAM_LIST_COUNT: usize = 5;
+/// An expression chaining more dot-accesses (method calls and/or field reads) than this
+/// is flagged by `hide-delegate`, i.e. a chain is flagged at 3+ dot-accesses. Chosen by
+/// shape-analogy to `MAX_NESTING_DEPTH`, not data-driven calibration against real
+/// dot-chain density — provisional pending a corpus backtest, same as every other
+/// threshold here once one is run.
+const MAX_CHAIN_LINKS: usize = 2;
 
 /// Metadata for one rule in the catalog. Thresholds above are fixed for now —
 /// per-rule configurability is a natural follow-up, not required for the initial
@@ -62,7 +68,17 @@ pub const CATALOG: &[RuleMeta] = &[
         description: "A statement follows an unconditional return/break/continue/panic in the same block — Fowler's Remove Dead Code.",
         default_severity: Severity::Advisory,
     },
+    RuleMeta {
+        id: "hide-delegate",
+        category: "design",
+        description: "Expression chains 3+ dot-accesses (method calls and/or field reads) — Law of Demeter / Fowler's Hide Delegate.",
+        default_severity: Severity::Advisory,
+    },
 ];
+
+/// Given a `dot_chain_kinds` node, returns the next node toward the chain root plus the
+/// accessor name text at this hop, or `None` when the node isn't a real hop.
+type ChainStep = for<'a> fn(Node<'a>, &[u8]) -> Option<(Node<'a>, String)>;
 
 /// Per-language node-kind table the AST walk consults instead of hardcoded literals.
 /// Verified against each grammar's real `to_sexp()` output, not guessed by analogy —
@@ -141,6 +157,26 @@ pub(crate) struct LangRuleConfig {
     /// `panic!`/`unreachable!`/`todo!`/`unimplemented!`. `no_panic_detector` for every
     /// other grammar, which has no such built-in.
     panic_detector: fn(Node, &[u8]) -> bool,
+    /// Node kinds that can appear as one hop of a `hide-delegate` dot-chain — a
+    /// member-access kind and a call kind. Distinct from `chain_kinds` above (that one is
+    /// if/elif chaining; this is unrelated method-call/field-access chaining) — reusing
+    /// the name would collide. `walk_chains` never inspects a node whose kind isn't
+    /// listed here, so `chain_step` is only ever called on a matching node.
+    dot_chain_kinds: &'static [&'static str],
+    /// Given a `dot_chain_kinds` node, returns the next node toward the chain root plus
+    /// the accessor name text at this hop, or `None` when the node isn't a real hop (e.g.
+    /// a bare call whose callee isn't a member access, or a static/namespaced call whose
+    /// grammar gives it a distinct node kind).
+    chain_step: ChainStep,
+    /// Accessor names whose stdlib/ecosystem contract makes a hop safe to treat as
+    /// non-Demeter-violating (Rust iterator/Option/Result adapters, Java Stream/Optional,
+    /// JS/TS Array/Promise, Kotlin's `also`/`apply` plus collection methods). Checked
+    /// per-hop by `is_chain_suppressed`, independent of `BUILDER_VERB_PREFIXES`'s
+    /// language-agnostic prefix match. Empty for Go and Python in v1 — a deliberate,
+    /// documented scope decision, not an oversight (no comparably prevalent
+    /// stdlib-fluent-chaining idiom for Go; Python's fluent chains, e.g. pandas, are
+    /// third-party ecosystem convention, not stdlib).
+    fluent_allowlist: &'static [&'static str],
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -449,6 +485,232 @@ fn no_panic_detector(_stmt: Node, _src: &[u8]) -> bool {
     false
 }
 
+/// Language-agnostic name prefixes that make a hop's accessor name look like a classic
+/// OOP builder setter (`WithTimeout`, `withTimeout`, `and_then`) — unlike
+/// `fluent_allowlist`, shared across all seven languages rather than per-language data.
+const BUILDER_VERB_PREFIXES: &[&str] = &["set", "with", "add", "put", "append", "and"];
+
+/// True if `name` starts with one of `BUILDER_VERB_PREFIXES`, case-insensitively, followed
+/// by an ASCII uppercase letter or `_` — covers `WithTimeout`/`withTimeout` (camelCase) and
+/// Rust's `and_then` (snake_case) without also matching unrelated names like `andrew`
+/// (the character after `and` there is lowercase `r`).
+fn has_builder_verb_prefix(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    BUILDER_VERB_PREFIXES.iter().any(|prefix| {
+        bytes.len() > prefix.len()
+            && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && matches!(bytes[prefix.len()], b'A'..=b'Z' | b'_')
+    })
+}
+
+/// The AC4 suppression heuristic: a chain is suppressed only when every hop's accessor
+/// name is either in the language's `fluent_allowlist` or matches a builder-verb prefix.
+/// A syntactic proxy for "locally-constructed receiver," not a detector of it — see
+/// ADR-001.
+fn is_chain_suppressed(names: &[String], cfg: &LangRuleConfig) -> bool {
+    names
+        .iter()
+        .all(|n| cfg.fluent_allowlist.contains(&n.as_str()) || has_builder_verb_prefix(n))
+}
+
+/// Go's `selector_expression` has `operand`/`field` fields; a `call_expression` is a hop
+/// only when its `function` is itself a `selector_expression` (a bare `foo()` call isn't a
+/// chain hop). No `fluent_allowlist` entries — Go has no comparably prevalent
+/// stdlib-fluent-chaining idiom.
+fn go_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
+    let selector = match node.kind() {
+        "call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() != "selector_expression" {
+                return None;
+            }
+            func
+        }
+        "selector_expression" => node,
+        _ => return None,
+    };
+    let operand = selector.child_by_field_name("operand")?;
+    let field = selector.child_by_field_name("field")?;
+    Some((operand, field.utf8_text(src).ok()?.to_string()))
+}
+
+/// TS/JS/Tsx share this: `member_expression` has `object`/`property`; a `call_expression`
+/// is a hop only when its `function` is a `member_expression`.
+fn ts_js_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
+    let member = match node.kind() {
+        "call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() != "member_expression" {
+                return None;
+            }
+            func
+        }
+        "member_expression" => node,
+        _ => return None,
+    };
+    let object = member.child_by_field_name("object")?;
+    let property = member.child_by_field_name("property")?;
+    Some((object, property.utf8_text(src).ok()?.to_string()))
+}
+
+/// Array/Promise methods whose contract makes a chain hop safe to treat as
+/// non-Demeter-violating.
+const TS_JS_FLUENT_ALLOWLIST: &[&str] = &[
+    "map",
+    "filter",
+    "reduce",
+    "flatMap",
+    "forEach",
+    "some",
+    "every",
+    "find",
+    "findIndex",
+    "sort",
+    "then",
+    "catch",
+    "finally",
+];
+
+/// Python's `attribute` has `object`/`attribute`; a `call` is a hop only when its
+/// `function` is an `attribute`. `fluent_allowlist` deliberately empty in v1 — Python's
+/// fluent chains (e.g. pandas) are third-party ecosystem convention, not stdlib.
+fn py_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
+    let attribute = match node.kind() {
+        "call" => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() != "attribute" {
+                return None;
+            }
+            func
+        }
+        "attribute" => node,
+        _ => return None,
+    };
+    let object = attribute.child_by_field_name("object")?;
+    let attr = attribute.child_by_field_name("attribute")?;
+    Some((object, attr.utf8_text(src).ok()?.to_string()))
+}
+
+/// Java fuses receiver+call into one `method_invocation` node (`object`/`name` fields,
+/// no unwrap step needed), alongside plain `field_access` (`object`/`field`).
+fn java_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
+    match node.kind() {
+        "method_invocation" => {
+            let object = node.child_by_field_name("object")?;
+            let name = node.child_by_field_name("name")?;
+            Some((object, name.utf8_text(src).ok()?.to_string()))
+        }
+        "field_access" => {
+            let object = node.child_by_field_name("object")?;
+            let field = node.child_by_field_name("field")?;
+            Some((object, field.utf8_text(src).ok()?.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Stream/Optional methods whose contract makes a chain hop safe to treat as
+/// non-Demeter-violating.
+const JAVA_FLUENT_ALLOWLIST: &[&str] = &[
+    "map", "filter", "collect", "reduce", "sorted", "distinct", "limit", "flatMap", "orElse",
+    "stream", "boxed",
+];
+
+/// Kotlin's `navigation_expression`/`call_expression` expose no field names (verified —
+/// `tree_sitter_kotlin_ng`'s grammar shape is positional-only for these, like
+/// `kotlin_body`/`kotlin_params` already handle elsewhere in this file): a
+/// `navigation_expression`'s first named child is the receiver, its last named child is
+/// the accessor-name `identifier`; a `call_expression`'s first named child is its callee.
+fn kotlin_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
+    let nav = match node.kind() {
+        "call_expression" => {
+            let callee = node.named_child(0)?;
+            if callee.kind() != "navigation_expression" {
+                return None;
+            }
+            callee
+        }
+        "navigation_expression" => node,
+        _ => return None,
+    };
+    let receiver = nav.named_child(0)?;
+    let name = nav.named_child(nav.named_child_count().checked_sub(1)?.try_into().ok()?)?;
+    Some((receiver, name.utf8_text(src).ok()?.to_string()))
+}
+
+/// `also`/`apply` (Kotlin's scope functions — an unconditional stdlib-contract exemption,
+/// same suppression mechanism as an ordinary fluent-naming allowlist entry, see plan's
+/// Pattern Decisions) plus common collection methods.
+const KOTLIN_FLUENT_ALLOWLIST: &[&str] = &[
+    "also",
+    "apply",
+    "map",
+    "filter",
+    "filterNot",
+    "flatMap",
+    "fold",
+    "sorted",
+    "distinct",
+    "forEach",
+    "associate",
+    "joinToString",
+];
+
+/// Rust's `field_expression` has `value`/`field`; a `call_expression` is a hop only when
+/// its `function` is a `field_expression` — a static/namespaced call's `function` field is
+/// `scoped_identifier`/`generic_function` instead, so it's excluded with zero
+/// special-casing (Design Position 3).
+fn rust_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
+    let field_expr = match node.kind() {
+        "call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            if func.kind() != "field_expression" {
+                return None;
+            }
+            func
+        }
+        "field_expression" => node,
+        _ => return None,
+    };
+    let value = field_expr.child_by_field_name("value")?;
+    let field = field_expr.child_by_field_name("field")?;
+    Some((value, field.utf8_text(src).ok()?.to_string()))
+}
+
+/// Iterator/Option/Result adapters whose contract makes a chain hop safe to treat as
+/// non-Demeter-violating.
+const RUST_FLUENT_ALLOWLIST: &[&str] = &[
+    "map",
+    "filter",
+    "filter_map",
+    "flat_map",
+    "and_then",
+    "collect",
+    "fold",
+    "zip",
+    "chain",
+    "take",
+    "skip",
+    "enumerate",
+    "rev",
+    "sum",
+    "count",
+    "for_each",
+    "iter",
+    "into_iter",
+    "ok",
+    "ok_or",
+    "ok_or_else",
+    "unwrap_or",
+    "unwrap_or_else",
+    "unwrap_or_default",
+    "map_err",
+    "as_ref",
+    "as_mut",
+    "cloned",
+    "copied",
+];
+
 /// Rust's `return`/`break`/`continue` are expressions, so a bare one used as a
 /// statement is wrapped in an `expression_statement` (verified via `to_sexp()`) —
 /// unlike every other grammar here, which gives them their own direct statement kind.
@@ -510,6 +772,9 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             unwrap_statement: identity_stmt,
             terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
             panic_detector: go_panic_detector,
+            dot_chain_kinds: &["call_expression", "selector_expression"],
+            chain_step: go_chain_step,
+            fluent_allowlist: &[],
         },
         Language::TypeScript => LangRuleConfig {
             name: "syntax-rules-typescript",
@@ -543,6 +808,9 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             unwrap_statement: identity_stmt,
             terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
             panic_detector: no_panic_detector,
+            dot_chain_kinds: &["call_expression", "member_expression"],
+            chain_step: ts_js_chain_step,
+            fluent_allowlist: TS_JS_FLUENT_ALLOWLIST,
         },
         Language::Tsx => LangRuleConfig {
             name: "syntax-rules-tsx",
@@ -587,6 +855,11 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             unwrap_statement: identity_stmt,
             terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
             panic_detector: no_panic_detector,
+            // Deliberately empty for v1, not an oversight — Python's fluent chains (e.g.
+            // pandas) are third-party ecosystem convention, not stdlib.
+            dot_chain_kinds: &["call", "attribute"],
+            chain_step: py_chain_step,
+            fluent_allowlist: &[],
         },
         Language::Java => LangRuleConfig {
             name: "syntax-rules-java",
@@ -616,6 +889,9 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             unwrap_statement: identity_stmt,
             terminal_kinds: &["return_statement", "break_statement", "continue_statement"],
             panic_detector: no_panic_detector,
+            dot_chain_kinds: &["method_invocation", "field_access"],
+            chain_step: java_chain_step,
+            fluent_allowlist: JAVA_FLUENT_ALLOWLIST,
         },
         Language::Kotlin => LangRuleConfig {
             name: "syntax-rules-kotlin",
@@ -656,6 +932,9 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
             // `break`/`continue` omitted — see `terminal_kinds`'s doc comment.
             terminal_kinds: &["return_expression"],
             panic_detector: no_panic_detector,
+            dot_chain_kinds: &["navigation_expression", "call_expression"],
+            chain_step: kotlin_chain_step,
+            fluent_allowlist: KOTLIN_FLUENT_ALLOWLIST,
         },
         Language::Rust => LangRuleConfig {
             name: "syntax-rules-rust",
@@ -698,6 +977,9 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
                 "continue_expression",
             ],
             panic_detector: rust_panic_detector,
+            dot_chain_kinds: &["call_expression", "field_expression"],
+            chain_step: rust_chain_step,
+            fluent_allowlist: RUST_FLUENT_ALLOWLIST,
         },
     }
 }
@@ -718,7 +1000,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, hide-delegate (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -738,6 +1020,7 @@ impl Checker for SyntaxRulesChecker {
         let src = ctx.source.as_bytes();
         walk_declarations(tree.root_node(), &cfg, src, &mut findings);
         walk_blocks(tree.root_node(), &cfg, src, &mut findings);
+        walk_chains(tree.root_node(), &cfg, src, &mut findings);
         Ok(findings)
     }
 }
@@ -802,6 +1085,50 @@ fn check_block_for_unreachable(
         } else if (cfg.panic_detector)(stmt, src) {
             terminal = Some(("panic", stmt.start_position().row + 1));
         }
+    }
+}
+
+/// Recurses over the whole tree looking for the outermost node of each dot-chain
+/// expression — a `dot_chain_kinds` node whose parent is not itself a `dot_chain_kinds`
+/// node — and hands each to `check_chain` exactly once. Descends into every child
+/// regardless (so a chain nested inside another, e.g. a lambda body mid-chain, is still
+/// found and evaluated as its own separate outermost chain — Design Position 6).
+fn walk_chains(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
+    if cfg.dot_chain_kinds.contains(&node.kind())
+        && node
+            .parent()
+            .is_none_or(|parent| !cfg.dot_chain_kinds.contains(&parent.kind()))
+    {
+        check_chain(node, cfg, src, findings);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_chains(child, cfg, src, findings);
+    }
+}
+
+/// Walks `chain_step` repeatedly from `node` (the outermost node of one chain
+/// expression) to collect hop names, then flags the chain if its hop count exceeds
+/// `MAX_CHAIN_LINKS` and it isn't suppressed.
+fn check_chain(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
+    let mut names = Vec::new();
+    let mut current = node;
+    while let Some((next, name)) = (cfg.chain_step)(current, src) {
+        names.push(name);
+        if !cfg.dot_chain_kinds.contains(&next.kind()) {
+            break;
+        }
+        current = next;
+    }
+
+    let hop_count = names.len();
+    if hop_count > MAX_CHAIN_LINKS && !is_chain_suppressed(&names, cfg) {
+        findings.push(Finding {
+            line: node.start_position().row + 1,
+            message: format!(
+                "[hide-delegate] expression chains {hop_count} dot-accesses (over {MAX_CHAIN_LINKS}) — add a method on the base object that exposes the needed behavior directly, rather than a wrapper that just forwards the same chain one level down"
+            ),
+        });
     }
 }
 
@@ -2324,6 +2651,288 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[flag-argument]"))
+        );
+    }
+
+    /// `hide-delegate` companions need `walk_chains`, not `walk_declarations`/`walk_blocks`
+    /// — same parameterized-by-grammar shape as `check_unreachable`.
+    fn check_hide_delegate(
+        lang: Language,
+        ts_lang: tree_sitter::Language,
+        src: &str,
+    ) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let cfg = lang_config(lang);
+        let mut findings = Vec::new();
+        walk_chains(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
+        findings
+    }
+
+    #[test]
+    fn flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f(a A) {\n\ta.GetB().GetC().DoThing()\n}\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn go_suppresses_builder_chain() {
+        let findings = check_hide_delegate(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f(c *Config) {\n\tc.WithTimeout(5).WithRetries(3).WithHost(\"x\")\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    /// AC2's exact-threshold boundary: exactly `MAX_CHAIN_LINKS` (2) hops must NOT be
+    /// flagged (mirrors `five_params_is_not_long`'s own exact-boundary convention).
+    #[test]
+    fn two_hops_not_flagged() {
+        let findings = check_hide_delegate(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f(a A) {\n\ta.GetB().DoThing()\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn ts_flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f(doc: Document) {\n  doc.querySelector(\"a\").closest(\"div\").dataset;\n}\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn ts_suppresses_fluent_chain() {
+        let findings = check_hide_delegate(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f(xs: number[]) {\n  xs.filter(x => x > 0).map(x => x * 2).sort();\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn js_flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::JavaScript,
+            tree_sitter_javascript::LANGUAGE.into(),
+            "function f(a) {\n  a.getB().getC().doThing();\n}\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn js_suppresses_fluent_chain() {
+        let findings = check_hide_delegate(
+            Language::JavaScript,
+            tree_sitter_javascript::LANGUAGE.into(),
+            "function f(xs) {\n  xs.filter(x => x > 0).map(x => x * 2).sort();\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn py_flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f(a):\n    a.get_b().get_c().do_thing()\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    /// Demonstrates the two suppression paths are independent: Python's `fluent_allowlist`
+    /// is empty, yet this chain is still suppressed via `has_builder_verb_prefix`.
+    #[test]
+    fn py_prefix_heuristic_still_suppresses() {
+        let findings = check_hide_delegate(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f(b):\n    b.with_x(1).with_y(2).with_z(3)\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn java_flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f(Msg m) {\n  m.getFoo().getBar().getBaz();\n} }\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn java_suppresses_stream_chain() {
+        let findings = check_hide_delegate(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f(List<Integer> xs) {\n  xs.stream().filter(x -> x > 0).map(x -> x * 2).collect(Collectors.toList());\n} }\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f(a: A) {\n  a.getB().getC().doThing()\n}\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn kotlin_suppresses_also_apply_chain() {
+        let findings = check_hide_delegate(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f(x: X) {\n    x.also { it.a() }.apply { it.b() }.map { it }\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    #[test]
+    fn rust_flags_hide_delegate() {
+        let findings = check_hide_delegate(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f(a: &A) {\n    a.get_b().get_c().do_thing();\n}\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    /// requirements.md's own canonical AC4 example.
+    #[test]
+    fn rust_suppresses_iterator_chain() {
+        let findings = check_hide_delegate(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f(data: &[i32]) -> Vec<i32> {\n    data.iter().filter(|x| **x > 0).map(|x| x * 2).collect()\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    /// Design Position 1: `this`/`self`-qualified chains count identically to a
+    /// stranger-qualified chain — no special-casing.
+    #[test]
+    fn java_this_qualified_chain_is_still_flagged() {
+        let findings = check_hide_delegate(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  this.getA().getB().getC();\n} }\n",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    /// Design Position 4: indexed access is a hard chain boundary — only `.D()` (past the
+    /// last index) is counted, undercounting the "true" reach-through depth deliberately.
+    #[test]
+    fn go_index_expression_breaks_chain() {
+        let findings = check_hide_delegate(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package main\nfunc f(a [][]B) {\n\ta[0].C[1].D()\n}\n",
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[hide-delegate]"))
+        );
+    }
+
+    /// Design Position 6: a lambda body mid-chain is walked as its own separate outermost
+    /// chain — no special pruning/fusion needed.
+    #[test]
+    fn java_lambda_body_chain_flagged_independently() {
+        let findings = check_hide_delegate(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f(List<A> xs) {\n  xs.forEach(x -> x.getB().getC().getD());\n} }\n",
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.message.contains("[hide-delegate]"))
+                .count(),
+            1,
+            "findings: {findings:?}"
         );
     }
 }

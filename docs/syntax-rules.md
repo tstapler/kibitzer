@@ -32,6 +32,7 @@ kinds each language's `lang_config()` entry checks against differ:
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
 | `unreachable-code`     | dead-code  | advisory          | n/a                    | A statement follows an unconditional `return`/`break`/`continue`/panic-call in the same `{ ... }` block — Fowler's *Remove Dead Code*. Only the first dead statement in a block is flagged (everything after it is dead by construction). Doesn't descend into `switch`/`match`/`when` case bodies. Go's `panic(...)` and Rust's `panic!`/`unreachable!`/`todo!`/`unimplemented!` count as diverging calls; other languages have no such built-in and are return/break/continue-only. Kotlin is return-only — `tree-sitter-kotlin-ng` 1.1.0 has no dedicated node kind for a bare `break`/`continue` (it parses as a plain identifier). |
+| `hide-delegate`        | design     | advisory          | > 2 hops (3+ dot-accesses) | Expression chains 3+ dot-accesses (method calls and/or field reads) in one expression — Fowler's *Hide Delegate* / Law of Demeter. A chain is suppressed if every hop's accessor name is either a known stdlib-fluent method for that language or matches a builder-verb prefix (`set`/`with`/`add`/`put`/`append`/`and`) — a syntactic proxy for "fluent builder," not true type inference. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
 each grammar's real `to_sexp()` output:
@@ -115,6 +116,52 @@ each grammar's real `to_sexp()` output:
   method, a leading `self_parameter` (`&self`/`&mut self`/`self`) — excluded
   from the count the same way Go's implicit receiver never appears in its
   parameter list at all.
+
+`hide-delegate`'s per-language chain shape (`dot_chain_kinds`/`chain_step` in
+`src/rules.rs`): Go's `selector_expression` (`operand`/`field`) and
+`call_expression` (a hop only when its `function` is a `selector_expression`),
+empty `fluent_allowlist` — Go has no comparably prevalent stdlib-fluent-chaining
+idiom. TS/TSX/JS's `member_expression` (`object`/`property`) and
+`call_expression`, `fluent_allowlist` covering Array/Promise adapters (`map`,
+`filter`, `reduce`, `flatMap`, `forEach`, `some`, `every`, `find`, `findIndex`,
+`sort`, `then`, `catch`, `finally`). Python's `attribute` (`object`/`attribute`)
+and `call`, deliberately empty `fluent_allowlist` in v1 — pandas-style chains
+are third-party ecosystem convention, not stdlib, so they're still flagged.
+Java's `method_invocation` (fuses receiver+call into one node — `object`/`name`
+fields, no unwrap step) alongside plain `field_access` (`object`/`field`),
+`fluent_allowlist` covering Stream/Optional (`map`, `filter`, `collect`,
+`reduce`, `sorted`, `distinct`, `limit`, `flatMap`, `orElse`, `stream`,
+`boxed`). Kotlin's `navigation_expression`/`call_expression`, both
+field-less like `kotlin_body`/`kotlin_params` — the receiver and accessor
+name are the first/last positional named children — `fluent_allowlist`
+covering the `also`/`apply` scope-function contract plus common collection
+methods (`map`, `filter`, `filterNot`, `flatMap`, `fold`, `sorted`,
+`distinct`, `forEach`, `associate`, `joinToString`). Rust's `field_expression`
+(`value`/`field`) and `call_expression`, `fluent_allowlist` covering
+Iterator/Option/Result combinators (`map`, `filter`, `filter_map`,
+`flat_map`, `and_then`, `collect`, `fold`, `zip`, `chain`, `take`, `skip`,
+`enumerate`, `rev`, `sum`, `count`, `for_each`, `iter`, `into_iter`, `ok`,
+`ok_or`, `ok_or_else`, `unwrap_or`, `unwrap_or_else`, `unwrap_or_default`,
+`map_err`, `as_ref`, `as_mut`, `cloned`, `copied`) — a static/namespaced call
+like `std::mem::size_of::<T>()` is excluded for free since its `function`
+field is `scoped_identifier`, never `field_expression`.
+
+Known limitations, applied uniformly across all 7 languages: `this`/`self`-
+qualified chains are **not** special-cased — they count identical hops to a
+stranger-qualified chain. There is no locally-constructed-receiver detection
+(`new Builder().setX().setY()` is suppressed via the builder-verb-prefix
+heuristic, not by tracking that `Builder` was just constructed) — the
+allowlist/prefix match is a syntactic proxy for "fluent builder," not real
+type inference. A static/namespaced call is excluded only where the grammar
+gives it a distinct node kind (verified true for Rust; Java/Kotlin/Go give a
+class- or package-qualified call the same node shape as an instance chain, so
+those are not excluded and may false-positive). Indexed access
+(`a[0].b[1].c()`) is a hard chain boundary — only the hops after the last
+index are counted, undercounting the "true" reach-through depth rather than
+guessing whether an index changes the effective root type. Chains split
+across statements via an intermediate variable (`let b = a.getB();
+b.getC().doThing();`) are invisible to this per-expression walk by
+construction.
 
 `flag-argument`'s boolean-type detection per language, verified against real
 `to_sexp()` output (`bool_param_finder` in `src/rules.rs`): Go's plain `bool`
