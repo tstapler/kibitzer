@@ -25,6 +25,9 @@ information and cannot confirm a real call's discarded value is actually an
 - **Non-error last return value from a method call on a local variable, or any
   call into stdlib/vendor/another module.** `sync.Map.LoadOrStore` (`m.LoadOrStore(...)`
   where `m sync.Map`), `singleflight.Group.Do` (`g.Do(...)` where `g singleflight.Group`),
+  `EventBus.Subscribe` (`bus.Subscribe(ctx)` in tstapler/stapler-squad
+  `server/push/subscriber.go`, whose real second return is a subscriber ID
+  string, not an error — confirmed 2026-09-23 against `pkg/events/bus.go`),
   and any call whose callee isn't a same-module package-qualified free function are
   still flagged when the real last return isn't an error — resolving these would need
   either local type-inference (to know `m`'s/`g`'s declared type) or reading
