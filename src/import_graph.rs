@@ -90,7 +90,7 @@ pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
 /// per-language file-filtering every builder below needs, all going through the one
 /// extension table instead of each maintaining its own `has_ext` check (see
 /// `Language::extensions`'s doc comment for why that used to be risky).
-fn files_for(files: &[PathBuf], lang: Language) -> Vec<&PathBuf> {
+pub(crate) fn files_for(files: &[PathBuf], lang: Language) -> Vec<&PathBuf> {
     files
         .iter()
         .filter(|f| Language::for_path(f) == Some(lang))

@@ -1,4 +1,5 @@
 mod accepted_findings;
+mod affected;
 mod arch_diagram;
 mod arch_export;
 mod arch_model;
@@ -238,6 +239,26 @@ enum ArchitectureAction {
         /// How many top-scoring files to report, same convention as `change-coupling --top`.
         #[arg(long, default_value_t = 20)]
         top: usize,
+    },
+    /// Diffs the working tree against `--base`, walks `ArchModel.import_edges` in
+    /// reverse from the changed files' packages, and prints the affected package set
+    /// (or the `__ALL__` bail-out sentinel) — see `affected.rs`. Unlike every other
+    /// `ArchitectureAction` variant, this subcommand's stdout is load-bearing for a CI
+    /// consumer (`go test $(kibitzer architecture affected --base ...)`), not a
+    /// "report, don't gate" prioritization list.
+    ///
+    /// Prints one package per line, or the literal `__ALL__` if the diff can't be
+    /// safely narrowed. IMPORTANT: guard callers with `[ -z "$PKGS" ] && exit 0`
+    /// before passing output to `go test $PKGS` — an unguarded empty result silently
+    /// becomes `go test` with no args, which runs whatever package `cwd` resolves to
+    /// instead of skipping.
+    Affected {
+        /// Any path inside the repo to analyze (the repo root or a subdirectory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// The base ref (branch, tag, or SHA) to diff the working tree against.
+        #[arg(long)]
+        base: String,
     },
 }
 
@@ -495,6 +516,7 @@ fn main() -> Result<ExitCode> {
                 run_root_cause_clusters(&path, limit, top)
             }
             ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
+            ArchitectureAction::Affected { path, base } => run_affected(&path, &base),
         },
         Command::Plugin { action } => match action {
             PluginAction::Install {
@@ -720,6 +742,44 @@ fn run_hotspots(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `kibitzer architecture affected`: diffs `path`'s repo against `base` and prints the
+/// affected package set. Unlike `run_change_coupling`/`run_hotspots`/
+/// `run_root_cause_clusters`, this subcommand's stdout is a load-bearing CI contract
+/// (see `affected.rs`'s module doc comment) — `ExitCode::SUCCESS` still covers every
+/// *successful computation* (a narrowed list, an empty list, or the `__ALL__` bail-out
+/// are all valid answers); only a genuine failure to compute an answer at all (bad
+/// repo, git spawn failure, unresolvable `--base`) is non-zero.
+fn run_affected(path: &Path, base: &str) -> Result<ExitCode> {
+    let (config, repo_root) = match config::find_config(path)? {
+        Some((config, root)) => (config.affected, root),
+        None => (config::AffectedConfig::default(), path.to_path_buf()),
+    };
+    match affected::compute_affected(&repo_root, base, &config)? {
+        affected::AffectedResult::Packages(packages) if packages.is_empty() => {
+            // Distinct `AFFECTED:` prefix (not the usual `[kibitzer] ...` shape) so
+            // this line is easy to `grep` for in CI logs — the empty-set case is the
+            // one state where a silent-skip-as-pass consumer bug is both possible and
+            // invisible on an otherwise-green run.
+            eprintln!(
+                "AFFECTED: 0 packages — verify your CI wrapper guards against empty output \
+                 (see --help)"
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        affected::AffectedResult::Packages(packages) => {
+            for pkg in packages {
+                println!("{pkg}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        affected::AffectedResult::BailOut(reason) => {
+            println!("__ALL__");
+            eprintln!("[kibitzer] bail-out: {reason}");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 /// Covers every language `duplicate-code` (single-file) covers — see

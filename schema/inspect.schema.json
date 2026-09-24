@@ -3,6 +3,14 @@
   "title": "Config",
   "type": "object",
   "properties": {
+    "affected": {
+      "description": "`kibitzer architecture affected`'s repo-configurable bail-out surface. See [`AffectedConfig`].",
+      "allOf": [
+        {
+          "$ref": "#/definitions/AffectedConfig"
+        }
+      ]
+    },
     "architecture": {
       "$ref": "#/definitions/ArchitectureConfig"
     },
@@ -22,6 +30,20 @@
     }
   },
   "definitions": {
+    "AffectedConfig": {
+      "description": "`kibitzer architecture affected`'s repo-configurable blast-radius surface.",
+      "type": "object",
+      "properties": {
+        "extra_bail_out_globs": {
+          "description": "Extra glob patterns (matched via `glob::matches_scope`, `**` supported) that trigger `affected`'s `__ALL__` bail-out sentinel, in addition to the hardcoded [`default_bail_out_globs`] (`**/go.mod`, `**/go.sum`, `**/*.proto`) — never a replacement for them. Use this to protect repo-specific codegen inputs or build config `affected` can't otherwise know are unbounded-blast-radius (e.g. `\"Makefile\"`, `\".golangci.yml\"`). See [`AffectedConfig::effective_bail_out_globs`].",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "ArchitectureConfig": {
       "description": "Project-wide settings consumed by `architecture_checker`s that need more than the import graph itself — currently just the declared layer order for `layering`.",
       "type": "object",

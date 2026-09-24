@@ -193,6 +193,45 @@ pub struct ArchitectureConfig {
     pub naming_rules: Vec<NamingRule>,
 }
 
+/// Hardcoded, portable Go-ecosystem bail-out globs `affected.rs` always checks, on top
+/// of `AffectedConfig::extra_bail_out_globs`. Each uses a `**/` prefix rather than a bare
+/// filename: `glob.rs`'s `glob_to_regex` anchors every pattern with `^...$` and has no
+/// implicit path-prefix wildcarding, so `"go.mod"` alone would only match a root-level
+/// file — missing e.g. `tools/scanner/go.mod` in a multi-module repo.
+pub fn default_bail_out_globs() -> Vec<String> {
+    vec![
+        "**/go.mod".to_string(),
+        "**/go.sum".to_string(),
+        "**/*.proto".to_string(),
+    ]
+}
+
+/// `kibitzer architecture affected`'s repo-configurable blast-radius surface.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct AffectedConfig {
+    /// Extra glob patterns (matched via `glob::matches_scope`, `**` supported) that
+    /// trigger `affected`'s `__ALL__` bail-out sentinel, in addition to the hardcoded
+    /// [`default_bail_out_globs`] (`**/go.mod`, `**/go.sum`, `**/*.proto`) — never a
+    /// replacement for them. Use this to protect repo-specific codegen inputs or build
+    /// config `affected` can't otherwise know are unbounded-blast-radius (e.g.
+    /// `"Makefile"`, `".golangci.yml"`). See [`AffectedConfig::effective_bail_out_globs`].
+    #[serde(default)]
+    pub extra_bail_out_globs: Vec<String>,
+}
+
+impl AffectedConfig {
+    /// The full set of globs `affected` actually checks changed files against:
+    /// [`default_bail_out_globs`] unioned with `extra_bail_out_globs` — additive, never
+    /// replace-on-set, so a repo adding its own glob can never silently lose the
+    /// hardcoded `go.mod`/`go.sum`/`*.proto` protection it never re-typed.
+    pub fn effective_bail_out_globs(&self) -> Vec<String> {
+        default_bail_out_globs()
+            .into_iter()
+            .chain(self.extra_bail_out_globs.iter().cloned())
+            .collect()
+    }
+}
+
 /// One `Component` per layer name, reproducing `layer_of()`'s "segment anywhere"
 /// exact-match semantics as glob patterns: a bare segment match, a prefix match, a
 /// suffix match, and an anywhere-nested match.
@@ -373,6 +412,10 @@ pub struct Config {
     pub checks: Vec<Check>,
     #[serde(default)]
     pub architecture: ArchitectureConfig,
+    /// `kibitzer architecture affected`'s repo-configurable bail-out surface. See
+    /// [`AffectedConfig`].
+    #[serde(default)]
+    pub affected: AffectedConfig,
     /// Names of built-in default checks (`default_checks()`) to turn off for this repo.
     /// Has no effect on a check that isn't one of the defaults — just don't add it to
     /// `checks` in the first place. See docs/suppressing-checks.md.
@@ -822,6 +865,7 @@ pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
                 Config {
                     checks,
                     architecture: local.architecture,
+                    affected: local.affected,
                     disabled: Vec::new(),
                 },
                 root,
@@ -831,6 +875,7 @@ pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
             Config {
                 checks: defaults,
                 architecture: ArchitectureConfig::default(),
+                affected: AffectedConfig::default(),
                 disabled: Vec::new(),
             },
             start_dir(start),
@@ -1444,5 +1489,77 @@ mod tests {
 
         assert!(config.checks.iter().any(|c| c.name == "custom"));
         assert_eq!(config.checks.len(), default_checks().len() + 1);
+    }
+
+    #[test]
+    fn default_bail_out_globs_matches_go_mod_go_sum_and_proto_files_at_any_directory_depth() {
+        let globs = default_bail_out_globs();
+        assert!(crate::glob::matches_scope("go.sum", &globs));
+        assert!(crate::glob::matches_scope("tools/scanner/go.mod", &globs));
+        assert!(crate::glob::matches_scope("api/v1/service.proto", &globs));
+    }
+
+    #[test]
+    fn default_bail_out_globs_does_not_match_an_unrelated_go_source_file() {
+        let globs = default_bail_out_globs();
+        assert!(!crate::glob::matches_scope(
+            "internal/widget/widget.go",
+            &globs
+        ));
+    }
+
+    #[test]
+    fn default_bail_out_globs_contains_no_kibitzer_specific_source_path() {
+        let globs = default_bail_out_globs();
+        assert!(!globs.iter().any(|g| g.contains("affected.rs")));
+        assert!(!globs.iter().any(|g| g.contains("import_graph.rs")));
+        assert!(!globs.iter().any(|g| g.contains("arch_model.rs")));
+    }
+
+    #[test]
+    fn effective_bail_out_globs_equals_defaults_exactly_when_no_override_is_configured() {
+        let config = parse("{}").unwrap();
+        assert_eq!(
+            config.affected.effective_bail_out_globs(),
+            default_bail_out_globs()
+        );
+    }
+
+    #[test]
+    fn effective_bail_out_globs_unions_extra_globs_with_defaults_instead_of_replacing_them() {
+        let config = parse(r#"{"affected": {"extra_bail_out_globs": ["proto/**"]}}"#).unwrap();
+        let effective = config.affected.effective_bail_out_globs();
+        assert_eq!(effective.len(), default_bail_out_globs().len() + 1);
+        assert!(effective.contains(&"**/go.mod".to_string()));
+        assert!(effective.contains(&"proto/**".to_string()));
+    }
+
+    #[test]
+    fn config_deserializes_affected_block_reachable_via_find_config() {
+        let dir = tmp_dir("affected-config");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/inspect.json"),
+            r#"{"affected": {"extra_bail_out_globs": ["proto/**"]}}"#,
+        )
+        .unwrap();
+
+        let (config, _) = find_config(&dir).unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            config.affected.extra_bail_out_globs,
+            vec!["proto/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn schema_command_includes_affected_config_shape_without_a_hand_written_schema_path() {
+        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let properties = &schema["properties"];
+        assert!(
+            properties.get("affected").is_some(),
+            "expected Config's schema to contain an 'affected' property, got: {schema}"
+        );
     }
 }
