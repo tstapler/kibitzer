@@ -497,9 +497,12 @@ const BUILDER_VERB_PREFIXES: &[&str] = &["set", "with", "add", "put", "append", 
 fn has_builder_verb_prefix(name: &str) -> bool {
     let bytes = name.as_bytes();
     BUILDER_VERB_PREFIXES.iter().any(|prefix| {
-        bytes.len() > prefix.len()
-            && name[..prefix.len()].eq_ignore_ascii_case(prefix)
-            && matches!(bytes[prefix.len()], b'A'..=b'Z' | b'_')
+        // `name.get(..prefix.len())` (not `name[..prefix.len()]`) — a non-ASCII
+        // identifier (legal in Rust/Java/Kotlin/JS/TS/Python) can put that byte offset
+        // mid-character, and direct slicing panics rather than just failing the match.
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && matches!(bytes.get(prefix.len()), Some(b'A'..=b'Z' | b'_'))
     })
 }
 
@@ -513,44 +516,74 @@ fn is_chain_suppressed(names: &[String], cfg: &LangRuleConfig) -> bool {
         .all(|n| cfg.fluent_allowlist.contains(&n.as_str()) || has_builder_verb_prefix(n))
 }
 
+/// The four field/kind names `unwrap_call_then_member_step` needs to unwrap one
+/// language's member-access shape — bundled into a struct (rather than passed as four
+/// separate params) so the helper stays under `long-parameter-list`'s threshold.
+struct ChainStepShape {
+    call_kind: &'static str,
+    member_kind: &'static str,
+    object_field: &'static str,
+    name_field: &'static str,
+}
+
+/// Shared shape behind `go_chain_step`/`ts_js_chain_step`/`py_chain_step`/`rust_chain_step`:
+/// each of those grammars has one node kind for a bare member access (two named fields,
+/// object then accessor-name) and a distinct call-expression kind that's a hop only when
+/// its `function` field is that same member-access kind — the four differ solely in which
+/// node-kind/field-name strings apply, not in control flow, so that's the only thing they
+/// pass in. (Java fuses receiver+call into one node with no unwrap step, and Kotlin's
+/// grammar exposes no field names at all — both stay bespoke functions, not this helper.)
+fn unwrap_call_then_member_step<'a>(
+    node: Node<'a>,
+    src: &[u8],
+    shape: &ChainStepShape,
+) -> Option<(Node<'a>, String)> {
+    let member = if node.kind() == shape.call_kind {
+        let func = node.child_by_field_name("function")?;
+        if func.kind() != shape.member_kind {
+            return None;
+        }
+        func
+    } else if node.kind() == shape.member_kind {
+        node
+    } else {
+        return None;
+    };
+    let object = member.child_by_field_name(shape.object_field)?;
+    let name = member.child_by_field_name(shape.name_field)?;
+    Some((object, name.utf8_text(src).ok()?.to_string()))
+}
+
 /// Go's `selector_expression` has `operand`/`field` fields; a `call_expression` is a hop
 /// only when its `function` is itself a `selector_expression` (a bare `foo()` call isn't a
 /// chain hop). No `fluent_allowlist` entries — Go has no comparably prevalent
 /// stdlib-fluent-chaining idiom.
 fn go_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
-    let selector = match node.kind() {
-        "call_expression" => {
-            let func = node.child_by_field_name("function")?;
-            if func.kind() != "selector_expression" {
-                return None;
-            }
-            func
-        }
-        "selector_expression" => node,
-        _ => return None,
-    };
-    let operand = selector.child_by_field_name("operand")?;
-    let field = selector.child_by_field_name("field")?;
-    Some((operand, field.utf8_text(src).ok()?.to_string()))
+    unwrap_call_then_member_step(
+        node,
+        src,
+        &ChainStepShape {
+            call_kind: "call_expression",
+            member_kind: "selector_expression",
+            object_field: "operand",
+            name_field: "field",
+        },
+    )
 }
 
 /// TS/JS/Tsx share this: `member_expression` has `object`/`property`; a `call_expression`
 /// is a hop only when its `function` is a `member_expression`.
 fn ts_js_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
-    let member = match node.kind() {
-        "call_expression" => {
-            let func = node.child_by_field_name("function")?;
-            if func.kind() != "member_expression" {
-                return None;
-            }
-            func
-        }
-        "member_expression" => node,
-        _ => return None,
-    };
-    let object = member.child_by_field_name("object")?;
-    let property = member.child_by_field_name("property")?;
-    Some((object, property.utf8_text(src).ok()?.to_string()))
+    unwrap_call_then_member_step(
+        node,
+        src,
+        &ChainStepShape {
+            call_kind: "call_expression",
+            member_kind: "member_expression",
+            object_field: "object",
+            name_field: "property",
+        },
+    )
 }
 
 /// Array/Promise methods whose contract makes a chain hop safe to treat as
@@ -575,20 +608,16 @@ const TS_JS_FLUENT_ALLOWLIST: &[&str] = &[
 /// `function` is an `attribute`. `fluent_allowlist` deliberately empty in v1 — Python's
 /// fluent chains (e.g. pandas) are third-party ecosystem convention, not stdlib.
 fn py_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
-    let attribute = match node.kind() {
-        "call" => {
-            let func = node.child_by_field_name("function")?;
-            if func.kind() != "attribute" {
-                return None;
-            }
-            func
-        }
-        "attribute" => node,
-        _ => return None,
-    };
-    let object = attribute.child_by_field_name("object")?;
-    let attr = attribute.child_by_field_name("attribute")?;
-    Some((object, attr.utf8_text(src).ok()?.to_string()))
+    unwrap_call_then_member_step(
+        node,
+        src,
+        &ChainStepShape {
+            call_kind: "call",
+            member_kind: "attribute",
+            object_field: "object",
+            name_field: "attribute",
+        },
+    )
 }
 
 /// Java fuses receiver+call into one `method_invocation` node (`object`/`name` fields,
@@ -634,7 +663,11 @@ fn kotlin_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String
         _ => return None,
     };
     let receiver = nav.named_child(0)?;
-    let name = nav.named_child(nav.named_child_count().checked_sub(1)?.try_into().ok()?)?;
+    // `named_child_count()` returns `usize`; `named_child()` takes `u32` — the `try_into`
+    // is a real fallible conversion here, not a no-op (tree-sitter 0.26's binding, unlike
+    // some prior versions, doesn't use `usize` for both).
+    let last_index: u32 = nav.named_child_count().checked_sub(1)?.try_into().ok()?;
+    let name = nav.named_child(last_index)?;
     Some((receiver, name.utf8_text(src).ok()?.to_string()))
 }
 
@@ -661,20 +694,16 @@ const KOTLIN_FLUENT_ALLOWLIST: &[&str] = &[
 /// `scoped_identifier`/`generic_function` instead, so it's excluded with zero
 /// special-casing (Design Position 3).
 fn rust_chain_step<'a>(node: Node<'a>, src: &[u8]) -> Option<(Node<'a>, String)> {
-    let field_expr = match node.kind() {
-        "call_expression" => {
-            let func = node.child_by_field_name("function")?;
-            if func.kind() != "field_expression" {
-                return None;
-            }
-            func
-        }
-        "field_expression" => node,
-        _ => return None,
-    };
-    let value = field_expr.child_by_field_name("value")?;
-    let field = field_expr.child_by_field_name("field")?;
-    Some((value, field.utf8_text(src).ok()?.to_string()))
+    unwrap_call_then_member_step(
+        node,
+        src,
+        &ChainStepShape {
+            call_kind: "call_expression",
+            member_kind: "field_expression",
+            object_field: "value",
+            name_field: "field",
+        },
+    )
 }
 
 /// Iterator/Option/Result adapters whose contract makes a chain hop safe to treat as
@@ -2798,6 +2827,16 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[hide-delegate]"))
         );
+    }
+
+    /// Regression test for a real panic: `name[..prefix.len()]` byte-slicing crashed on a
+    /// non-ASCII hop name (a legal identifier in Python/Rust/Java/Kotlin/JS/TS) whenever a
+    /// multi-byte character straddled the prefix's byte offset — `anéd_then` straddles
+    /// `and`'s 3-byte offset (`é` is 2 bytes, occupying offset 2..4). Fixed via
+    /// `str::get` instead of direct indexing.
+    #[test]
+    fn has_builder_verb_prefix_does_not_panic_on_non_ascii() {
+        assert!(!has_builder_verb_prefix("anéd_then"));
     }
 
     #[test]
