@@ -37,6 +37,13 @@ const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// in the allow-list anyway as defense-in-depth for any future grammar/version where it
 /// might be.
 const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
+/// A method/field-access chain (`a.getB().getC().doThing()`) reaching this many
+/// `.member` hops or more is flagged by `hide-delegate`. Set to the issue's own
+/// proposed threshold (3), same "flag once the floor is hit" convention as
+/// `MAGIC_LITERAL_MIN_OCCURRENCES` rather than `MAX_NESTING_DEPTH`'s "flag once past
+/// the floor" — a 3-hop chain is already the smallest case Fowler's Hide Delegate
+/// targets, so there's no lower "acceptable" depth to exceed first.
+const HIDE_DELEGATE_MIN_CHAIN_DEPTH: usize = 3;
 
 // `replace-magic-literal`'s per-language `literal_kinds`/`numeric_literal_kinds` node-kind
 // tables, hoisted to named constants (rather than inline in each `*_lang_config()`) so
@@ -142,6 +149,12 @@ pub const CATALOG: &[RuleMeta] = &[
         id: "replace-magic-literal",
         category: "duplication",
         description: "A non-trivial numeric or string literal is repeated 2+ times in one file with no bound named constant — Fowler's Replace Magic Literal.",
+        default_severity: Severity::Advisory,
+    },
+    RuleMeta {
+        id: "hide-delegate",
+        category: "design",
+        description: "A method/field-access chain reaches 3+ dot-accesses deep — a Law of Demeter violation; Fowler's Hide Delegate.",
         default_severity: Severity::Advisory,
     },
 ];
@@ -269,6 +282,20 @@ pub(crate) struct LangRuleConfig {
     /// referenced by name elsewhere in the file, is excluded from
     /// `replace-magic-literal` (see `resolve_excluded_constants`).
     binding_finder: for<'a> fn(Node<'a>, &'a [u8]) -> Option<ConstBinding<'a>>,
+    /// One step of `hide-delegate`'s chain walk: given a node, returns `None` if it
+    /// doesn't participate in a method/field-access chain at all, or
+    /// `Some((next, is_hop, call_has_args))` if it does — `next` is the node to
+    /// continue unwrapping into (the callee/receiver), `is_hop` is true if this node
+    /// itself represents one `.member` dot-access (a call node that's merely a
+    /// transparent wrapper around its callee, e.g. Go/TS/Rust's `call_expression`,
+    /// reports `false`; a call node that also carries the access itself, e.g. Java's
+    /// `method_invocation`, reports `true`), and `call_has_args` is true if this node
+    /// is a call carrying at least one argument — the fluent-builder exclusion signal
+    /// (`walk_chains` skips a chain where any hop passed an argument, since a Law-of-
+    /// Demeter-violating accessor chain is near-universally zero-arg `getX()`/`getY()`
+    /// calls, while a fluent/builder/stream chain almost always threads an argument
+    /// through at least one hop — `.filter(pred).map(f)` vs `.getB().getC()`).
+    chain_unwrap: fn(Node) -> Option<(Node, bool, bool)>,
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -813,6 +840,128 @@ fn kotlin_val_binding<'a>(node: Node<'a>, src: &'a [u8]) -> Option<ConstBinding<
     Some(ConstBinding { name, initializer })
 }
 
+/// True if a call-like node's `field` child (its argument list) has at least one
+/// named argument — shared by every `chain_unwrap` impl below that locates arguments
+/// via a field name rather than positionally (Kotlin's is positional, see
+/// `kotlin_chain_unwrap`).
+fn call_has_args(node: Node, field: &str) -> bool {
+    node.child_by_field_name(field)
+        .is_some_and(|args| args.named_child_count() > 0)
+}
+
+/// Go: `call_expression` is a transparent wrapper (never itself a hop) around its
+/// `function`; `selector_expression`'s `operand`/`field` is one dot-access hop.
+/// Verified via `to_sexp()`: `a.getB().getC()` nests
+/// `call_expression(function: selector_expression(operand: call_expression(...), field: ...))`.
+fn go_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
+    match GoKind::of(node) {
+        GoKind::CallExpression => {
+            let func = node.child_by_field_name("function")?;
+            Some((func, false, call_has_args(node, "arguments")))
+        }
+        GoKind::SelectorExpression => {
+            let operand = node.child_by_field_name("operand")?;
+            Some((operand, true, false))
+        }
+        _ => None,
+    }
+}
+
+/// Shared across TS/JS/TSX (same reuse convention as `ts_js_bool_params`):
+/// `call_expression`'s `function` field is transparent; `member_expression`'s
+/// `object` field is one hop.
+fn ts_js_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
+    match TypeScriptKind::of(node) {
+        TypeScriptKind::CallExpression => {
+            let func = node.child_by_field_name("function")?;
+            Some((func, false, call_has_args(node, "arguments")))
+        }
+        TypeScriptKind::MemberExpression => {
+            let object = node.child_by_field_name("object")?;
+            Some((object, true, false))
+        }
+        _ => None,
+    }
+}
+
+/// Python: `call`'s `function` field is transparent; `attribute`'s `object` field is
+/// one hop.
+fn python_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
+    match PythonKind::of(node) {
+        PythonKind::Call => {
+            let func = node.child_by_field_name("function")?;
+            Some((func, false, call_has_args(node, "arguments")))
+        }
+        PythonKind::Attribute => {
+            let object = node.child_by_field_name("object")?;
+            Some((object, true, false))
+        }
+        _ => None,
+    }
+}
+
+/// Java merges the call and the access into one node — `method_invocation`'s `object`
+/// field is itself the hop (unlike every other grammar here, it also carries
+/// `arguments`, so both are reported off the same node); a bare (unqualified,
+/// implicit-`this`) `method_invocation` has no `object` field and correctly ends the
+/// walk. `field_access` (a non-call member read) is a hop with no arguments.
+fn java_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
+    match JavaKind::of(node) {
+        JavaKind::MethodInvocation => {
+            let object = node.child_by_field_name("object")?;
+            Some((object, true, call_has_args(node, "arguments")))
+        }
+        JavaKind::FieldAccess => {
+            let object = node.child_by_field_name("object")?;
+            Some((object, true, false))
+        }
+        _ => None,
+    }
+}
+
+/// Kotlin exposes no field names on either node (same positional shape as
+/// `kotlin_body`/`kotlin_params`). Verified via `to_sexp()`:
+/// `a.getB().getC()` nests `call_expression(navigation_expression(call_expression(
+/// navigation_expression(identifier, identifier), value_arguments), identifier),
+/// value_arguments)` — each node's first named child is the callee/receiver to
+/// unwrap into, and `call_expression`'s remaining named children include
+/// `value_arguments` only when the call passes arguments.
+fn kotlin_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
+    match KotlinKind::of(node) {
+        KotlinKind::CallExpression => {
+            let mut cursor = node.walk();
+            let mut children = node.named_children(&mut cursor);
+            let callee = children.next()?;
+            let has_args = children.any(|c| {
+                KotlinKind::of(c) == KotlinKind::ValueArguments && c.named_child_count() > 0
+            });
+            Some((callee, false, has_args))
+        }
+        KotlinKind::NavigationExpression => {
+            let mut cursor = node.walk();
+            let receiver = node.named_children(&mut cursor).next()?;
+            Some((receiver, true, false))
+        }
+        _ => None,
+    }
+}
+
+/// Rust: `call_expression`'s `function` field is transparent; `field_expression`'s
+/// `value` field is one hop.
+fn rust_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
+    match RustKind::of(node) {
+        RustKind::CallExpression => {
+            let func = node.child_by_field_name("function")?;
+            Some((func, false, call_has_args(node, "arguments")))
+        }
+        RustKind::FieldExpression => {
+            let value = node.child_by_field_name("value")?;
+            Some((value, true, false))
+        }
+        _ => None,
+    }
+}
+
 /// Rust's `const_item`/`static_item` have flat `name`/`value` fields (verified via
 /// `node-types.json`) — `let_declaration` is deliberately excluded (ADR-001 / Pattern
 /// Decision "JS/TS/Rust binding scope").
@@ -876,6 +1025,7 @@ fn go_lang_config() -> LangRuleConfig {
         literal_kinds: GO_LITERAL_KINDS,
         numeric_literal_kinds: GO_NUMERIC_LITERAL_KINDS,
         binding_finder: go_const_binding,
+        chain_unwrap: go_chain_unwrap,
     }
 }
 
@@ -915,6 +1065,7 @@ fn typescript_lang_config() -> LangRuleConfig {
         literal_kinds: &["number", "string"],
         numeric_literal_kinds: &["number"],
         binding_finder: ts_js_const_binding,
+        chain_unwrap: ts_js_chain_unwrap,
     }
 }
 
@@ -976,6 +1127,7 @@ fn python_lang_config() -> LangRuleConfig {
         literal_kinds: PYTHON_LITERAL_KINDS,
         numeric_literal_kinds: PYTHON_NUMERIC_LITERAL_KINDS,
         binding_finder: py_screaming_snake_binding,
+        chain_unwrap: python_chain_unwrap,
     }
 }
 
@@ -1011,6 +1163,7 @@ fn java_lang_config() -> LangRuleConfig {
         literal_kinds: JAVA_LITERAL_KINDS,
         numeric_literal_kinds: JAVA_NUMERIC_LITERAL_KINDS,
         binding_finder: java_final_binding,
+        chain_unwrap: java_chain_unwrap,
     }
 }
 
@@ -1057,6 +1210,7 @@ fn kotlin_lang_config() -> LangRuleConfig {
         literal_kinds: KOTLIN_LITERAL_KINDS,
         numeric_literal_kinds: KOTLIN_NUMERIC_LITERAL_KINDS,
         binding_finder: kotlin_val_binding,
+        chain_unwrap: kotlin_chain_unwrap,
     }
 }
 
@@ -1105,6 +1259,7 @@ fn rust_lang_config() -> LangRuleConfig {
         literal_kinds: RUST_LITERAL_KINDS,
         numeric_literal_kinds: RUST_NUMERIC_LITERAL_KINDS,
         binding_finder: rust_const_binding,
+        chain_unwrap: rust_chain_unwrap,
     }
 }
 
@@ -1124,7 +1279,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal, hide-delegate (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -1153,6 +1308,7 @@ impl Checker for SyntaxRulesChecker {
             let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
             emit_literal_findings(&collector, &cfg, &excluded, &mut findings);
         }
+        walk_chains(tree.root_node(), &cfg, src, &mut findings);
         Ok(findings)
     }
 }
@@ -1179,6 +1335,93 @@ fn walk_blocks(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_blocks(child, cfg, src, findings);
+    }
+}
+
+/// Base identifiers `walk_chains` never flags a chain from, regardless of depth: a
+/// chain reaching through the enclosing method's own receiver (`self.a.b.c()` in
+/// Rust/Python, `this.a.b.c()` in Java/JS/TS/Kotlin) isn't a Law of Demeter violation
+/// at all — Demeter is specifically about reaching through a *collaborator* object's
+/// internals, not a type's own encapsulated state, and this pattern is exactly how
+/// idiomatic code accesses a nested config/state field it already owns. Confirmed via
+/// real-world backtest (`docs/backtest-repos.md`'s `BurntSushi/ripgrep`): 179 of 212
+/// raw findings (84%) were `self.`-rooted before this exclusion existed. Go has no
+/// equivalent fixed keyword (a receiver can be named anything), so this gap is
+/// accepted there rather than guessed at.
+const CHAIN_SELF_LIKE_BASE_NAMES: &[&str] = &["self", "this"];
+
+/// True if `text` looks like a type/namespace name rather than an object-instance
+/// variable — PascalCase-by-convention in every language this catalog covers (Go
+/// exported identifiers/package aliases, Java/Kotlin/TS/JS classes, Python classes;
+/// Rust modules/types are the one partial exception, but a capitalized Rust base is
+/// still virtually always a type, never a local binding). A chain rooted at one, e.g.
+/// Java's `MonotonicClock.Global.approxTime.now()`, is namespace/singleton-qualified
+/// *naming* of a single value, not navigation through an object graph — nothing here
+/// is a "collaborator" whose internals are being improperly exposed, so Demeter simply
+/// doesn't apply. Confirmed via real-world backtest (`docs/backtest-repos.md`'s
+/// `apache/cassandra`): this pattern was the dominant remaining false-positive class
+/// after the `self`/`this` exclusion.
+fn looks_like_type_or_namespace(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Recurses over the whole tree (not just function bodies — a Law-of-Demeter chain can
+/// appear anywhere an expression can, including a top-level `var`/`const` initializer)
+/// looking for `hide-delegate` candidates. Only tests `is_chain_root` nodes: a node
+/// that's itself the callee/receiver consumed by an enclosing chain node is skipped
+/// here since `chain_metrics` on its root ancestor already accounts for it — this is
+/// what keeps a 5-hop chain from producing 5 overlapping findings.
+fn walk_chains(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
+    if (cfg.chain_unwrap)(node).is_some() && is_chain_root(node, cfg) {
+        let (depth, any_hop_has_args, base) = chain_metrics(node, cfg);
+        let base_text = base.utf8_text(src).unwrap_or("");
+        let is_excluded_base = CHAIN_SELF_LIKE_BASE_NAMES.contains(&base_text)
+            || looks_like_type_or_namespace(base_text);
+        if depth >= HIDE_DELEGATE_MIN_CHAIN_DEPTH && !any_hop_has_args && !is_excluded_base {
+            findings.push(Finding {
+                line: node.start_position().row + 1,
+                message: format!(
+                    "[hide-delegate] chain reaches {depth} dot-accesses deep (at least {HIDE_DELEGATE_MIN_CHAIN_DEPTH}) — Law of Demeter violation; consider Fowler's Hide Delegate (https://refactoring.com/catalog/hideDelegate.html)"
+                ),
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_chains(child, cfg, src, findings);
+    }
+}
+
+/// Walks `node`'s chain to its base, returning the number of `.member` dot-access hops,
+/// whether any call along the way passed at least one argument (the fluent-builder
+/// exclusion signal — see `LangRuleConfig::chain_unwrap`'s doc comment), and the base
+/// node the walk bottomed out at (the `self`/`this`-rooted exclusion signal — see
+/// `CHAIN_SELF_LIKE_BASE_NAMES`).
+fn chain_metrics<'tree>(node: Node<'tree>, cfg: &LangRuleConfig) -> (usize, bool, Node<'tree>) {
+    let mut cur = node;
+    let mut depth = 0;
+    let mut any_args = false;
+    while let Some((next, is_hop, has_args)) = (cfg.chain_unwrap)(cur) {
+        if is_hop {
+            depth += 1;
+        }
+        any_args |= has_args;
+        cur = next;
+    }
+    (depth, any_args, cur)
+}
+
+/// True if `node` is the outermost node of its chain — i.e. its parent (if any) isn't
+/// itself unwrapping through `node` as the next step. A node whose parent *does*
+/// unwrap through it is a sub-part of a larger chain that `walk_chains` will (or
+/// already did, in traversal order) evaluate from that parent instead.
+fn is_chain_root(node: Node, cfg: &LangRuleConfig) -> bool {
+    match node.parent() {
+        None => true,
+        Some(parent) => match (cfg.chain_unwrap)(parent) {
+            Some((next, _, _)) => next.id() != node.id(),
+            None => true,
+        },
     }
 }
 
@@ -3510,5 +3753,221 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[flag-argument]"))
         );
+    }
+
+    /// `hide-delegate` companions below need `walk_chains`, not `walk_declarations` —
+    /// same cross-language-parameterized shape as `check_unreachable`, since a chain
+    /// can live outside any function body too (Go/Rust top-level `var`/`const`
+    /// initializers are the only realistic case, but the check itself isn't scoped to
+    /// function bodies — see `walk_chains`'s doc comment).
+    fn check_chains(lang: Language, ts_lang: tree_sitter::Language, src: &str) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let cfg = lang_config(lang);
+        let mut findings = Vec::new();
+        walk_chains(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
+        findings
+    }
+
+    #[test]
+    fn go_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\ta.GetB().GetC().DoThing()\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("[hide-delegate]"));
+        assert!(findings[0].message.contains("3 dot-accesses"));
+    }
+
+    #[test]
+    fn go_allows_two_hop_chain() {
+        let findings = check_chains(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\ta.GetB().DoThing()\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn go_excludes_chain_where_a_hop_passes_an_argument() {
+        // The fluent-builder proxy: a chain where any hop threads an argument through
+        // is excluded, since a real Law-of-Demeter accessor chain is near-universally
+        // zero-arg.
+        let findings = check_chains(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\ta.Filter(p).Map(g).Collect()\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn go_flags_bare_field_access_chain() {
+        let findings = check_chains(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\tx := a.B.C.D\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn typescript_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  a.getB().getC().doThing();\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn typescript_excludes_fluent_stream_chain() {
+        let findings = check_chains(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  a.filter(p).map(g).collect();\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn javascript_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::JavaScript,
+            tree_sitter_javascript::LANGUAGE.into(),
+            "function f() {\n  a.getB().getC().doThing();\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn python_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    a.get_b().get_c().do_thing()\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn python_excludes_fluent_chain() {
+        let findings = check_chains(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    a.filter(p).map(g).collect()\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn java_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  a.getB().getC().doThing();\n} }\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn java_excludes_fluent_stream_chain() {
+        let findings = check_chains(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  a.filter(p).map(g).collect();\n} }\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn java_flags_bare_field_access_chain() {
+        let findings = check_chains(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  x = a.b.c.d;\n} }\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn kotlin_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  a.getB().getC().doThing()\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn kotlin_excludes_fluent_chain() {
+        let findings = check_chains(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  a.filter(p).map(g).collect()\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_flags_three_hop_zero_arg_accessor_chain() {
+        let findings = check_chains(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    a.get_b().get_c().do_thing();\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_excludes_fluent_iterator_chain() {
+        let findings = check_chains(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    a.iter().filter(p).map(g).collect();\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_flags_bare_field_access_chain() {
+        let findings = check_chains(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    let x = a.b.c.d;\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn java_excludes_chain_rooted_at_a_static_singleton_reference() {
+        // `MonotonicClock.Global.approxTime.now()` navigates a static/namespace-
+        // qualified path, not an object collaborator's internals — a real backtest
+        // finding from `apache/cassandra` (docs/backtest-repos.md).
+        let findings = check_chains(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  long t = MonotonicClock.Global.approxTime.now();\n} }\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn go_argument_chain_is_evaluated_independently_of_its_enclosing_call() {
+        // `x.GetY().GetZ().DoOther()` is a 3-hop chain passed as an argument to
+        // `DoThing`'s own (0-hop-so-far, unrelated) call — both should be evaluated on
+        // their own merits, not merged into or shadowed by the outer call.
+        let findings = check_chains(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\ta.DoThing(x.GetY().GetZ().DoOther())\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
 }
