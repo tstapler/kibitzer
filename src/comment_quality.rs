@@ -463,54 +463,70 @@ fn check_proportionality(
     let Some(body) = (cfg.body_finder)(decl) else {
         return;
     };
+    let leading_nodes = leading_comment_nodes(decl, comment_kinds, src);
+    let counts = comment_line_counts(decl, body, comment_kinds, &leading_nodes);
+
+    if counts.total_comment_lines == 0 || counts.body_code_lines == 0 {
+        return;
+    }
+    if is_exempt_from_proportionality_checks(body, &leading_nodes, src) {
+        return;
+    }
+
+    check_absolute_length(counts.leading_comment_lines, counts.finding_line, findings);
+    check_comment_to_code_ratio(
+        decl,
+        cfg,
+        (counts.total_comment_lines, counts.body_code_lines),
+        counts.finding_line,
+        findings,
+    );
+}
+
+/// A declaration is exempt from both `[comment-too-long]` and `[over-commented]`: a
+/// delegating single-statement body's comment documents the callee, not this line (see
+/// `is_delegating_single_statement_body`'s own doc comment, and
+/// docs/comment-quality-false-positives.md), and a `# Safety` block justifying unsafe
+/// invariants can legitimately run long regardless of function size.
+fn is_exempt_from_proportionality_checks(body: Node, leading_nodes: &[Node], src: &[u8]) -> bool {
+    is_delegating_single_statement_body(body, src) || has_safety_section(leading_nodes, src)
+}
+
+struct CommentLineCounts {
+    leading_comment_lines: usize,
+    total_comment_lines: usize,
+    body_code_lines: usize,
+    finding_line: usize,
+}
+
+/// Gathers the raw line counts `check_absolute_length`/`check_comment_to_code_ratio`
+/// need, in one place, so `check_proportionality` doesn't have to.
+fn comment_line_counts(
+    decl: Node,
+    body: Node,
+    comment_kinds: &[&str],
+    leading_nodes: &[Node],
+) -> CommentLineCounts {
     let body_total_lines = body.end_position().row - body.start_position().row + 1;
 
     let mut comment_rows = BTreeSet::new();
     collect_comment_rows(body, comment_kinds, &mut comment_rows);
     let body_comment_lines = comment_rows.len();
 
-    let leading_nodes = leading_comment_nodes(decl, comment_kinds, src);
-    let leading_rows = leading_comment_rows(&leading_nodes);
-    let leading_start_line = leading_rows.iter().next().map(|row| row + 1);
+    let leading_rows = leading_comment_rows(leading_nodes);
     let leading_comment_lines = leading_rows.len();
+    let finding_line = leading_rows
+        .iter()
+        .next()
+        .map(|row| row + 1)
+        .unwrap_or(decl.start_position().row + 1);
 
-    let total_comment_lines = body_comment_lines + leading_comment_lines;
-    let body_code_lines = body_total_lines.saturating_sub(body_comment_lines);
-
-    if total_comment_lines == 0 || body_code_lines == 0 {
-        return;
-    }
-    if is_delegating_single_statement_body(body, src) {
-        // A real backtest (docs/comment-quality-false-positives.md) found every
-        // sampled false positive had exactly this shape: a body that's one
-        // statement delegating to something else (a call, a method chain, a
-        // struct/object construction) — Go's `return &LimitedWriter{w, n}`, Java's
-        // `return CompactionManager.instance.performSSTableRewrite(...)`, Rust's
-        // `self.node.first_child_ref().map(Into::into)`. The comment in every case
-        // documented behavior that lives in the callee/constructed type, or an
-        // invariant the signature can't express — never a restatement of the one
-        // line actually visible here, no matter how long the comment ran. Exempts
-        // both findings below: a genuinely long justified comment over a trivial
-        // delegating body isn't restating the code either way it's measured.
-        return;
-    }
-    if has_safety_section(&leading_nodes, src) {
-        // A `# Safety` block justifying every unsafe invariant can legitimately run
-        // long regardless of the function's size — exempt both findings below, same
-        // rationale as the delegating-body case above.
-        return;
-    }
-
-    let finding_line = leading_start_line.unwrap_or(decl.start_position().row + 1);
-
-    check_absolute_length(leading_comment_lines, finding_line, findings);
-    check_comment_to_code_ratio(
-        decl,
-        cfg,
-        (total_comment_lines, body_code_lines),
+    CommentLineCounts {
+        leading_comment_lines,
+        total_comment_lines: body_comment_lines + leading_comment_lines,
+        body_code_lines: body_total_lines.saturating_sub(body_comment_lines),
         finding_line,
-        findings,
-    );
+    }
 }
 
 /// `[comment-too-long]` — see `MAX_LEADING_COMMENT_LINES`'s doc comment for why this is
