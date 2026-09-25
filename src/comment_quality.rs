@@ -503,6 +503,23 @@ fn check_proportionality(
 
     let finding_line = leading_start_line.unwrap_or(decl.start_position().row + 1);
 
+    check_absolute_length(leading_comment_lines, finding_line, findings);
+    check_comment_to_code_ratio(
+        decl,
+        cfg,
+        (total_comment_lines, body_code_lines),
+        finding_line,
+        findings,
+    );
+}
+
+/// `[comment-too-long]` — see `MAX_LEADING_COMMENT_LINES`'s doc comment for why this is
+/// independent of `check_comment_to_code_ratio`'s ratio.
+fn check_absolute_length(
+    leading_comment_lines: usize,
+    finding_line: usize,
+    findings: &mut Vec<Finding>,
+) {
     if leading_comment_lines > MAX_LEADING_COMMENT_LINES {
         findings.push(Finding {
             line: finding_line,
@@ -511,23 +528,34 @@ fn check_proportionality(
             ),
         });
     }
+}
 
-    if total_comment_lines >= MIN_COMMENT_LINES_FOR_RATIO {
-        let param_count = (cfg.params_finder)(decl)
-            .map(|params| (cfg.param_counter)(params))
-            .unwrap_or(0);
-        let effective_ratio = COMMENT_TO_CODE_RATIO
-            + PARAM_COUNT_RATIO_BONUS
-                * param_count.saturating_sub(PARAM_COUNT_RATIO_BASELINE) as f64;
-        if (total_comment_lines as f64) >= effective_ratio * (body_code_lines as f64) {
-            findings.push(Finding {
-                line: finding_line,
-                message: format!(
-                    "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
-                ),
-            });
-        }
+/// `[over-commented]` — see `COMMENT_TO_CODE_RATIO`'s doc comment for the ratio/param-
+/// count rationale.
+fn check_comment_to_code_ratio(
+    decl: Node,
+    cfg: &rules::LangRuleConfig,
+    (total_comment_lines, body_code_lines): (usize, usize),
+    finding_line: usize,
+    findings: &mut Vec<Finding>,
+) {
+    if total_comment_lines < MIN_COMMENT_LINES_FOR_RATIO {
+        return;
     }
+    let param_count = (cfg.params_finder)(decl)
+        .map(|params| (cfg.param_counter)(params))
+        .unwrap_or(0);
+    let effective_ratio = COMMENT_TO_CODE_RATIO
+        + PARAM_COUNT_RATIO_BONUS * param_count.saturating_sub(PARAM_COUNT_RATIO_BASELINE) as f64;
+    if (total_comment_lines as f64) < effective_ratio * (body_code_lines as f64) {
+        return;
+    }
+    findings.push(Finding {
+        line: finding_line,
+        message: format!(
+            "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
+        ),
+    });
 }
 
 /// Whether `body` (already known non-empty by the caller) contains exactly one
