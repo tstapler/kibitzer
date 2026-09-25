@@ -196,11 +196,11 @@ mod tests {
     /// what keeps this advisory.
     fn write_zero_match_only_component_deps_fixture(dir: &std::path::Path) {
         std::fs::create_dir_all(dir.join("pkg")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(dir.join("pkg/pkg.go"), "package pkg\n\nfunc F() {}\n").unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": {
     "components": [{"name": "ghost", "paths": ["**/ghost", "**/ghost/**"]}]
@@ -219,7 +219,7 @@ mod tests {
     fn write_real_component_deps_violation_fixture(dir: &std::path::Path) {
         std::fs::create_dir_all(dir.join("svcs")).unwrap();
         std::fs::create_dir_all(dir.join("ext")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(
             dir.join("svcs/svcs.go"),
@@ -228,7 +228,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("ext/ext.go"), "package ext\n\nfunc Do() {}\n").unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": {
     "components": [

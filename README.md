@@ -46,7 +46,7 @@ kibitzer check native markdown-link-integrity <file> # flag broken markdown refe
 kibitzer check native file-complexity <file>       # flag a Go file with several functions over a cyclomatic-complexity threshold
 kibitzer check duplicates <dir>      # cross-file duplicate-code detection, repo-wide (batch)
 kibitzer check list                  # list all natively implemented checkers
-kibitzer schema [--out <file>]       # emit .claude/inspect.json's JSON Schema
+kibitzer schema [--out <file>]       # emit .kibitzer/inspect.json's JSON Schema
 ```
 
 New to kibitzer? See `docs/getting-started.md` for a walkthrough of wiring
@@ -55,7 +55,7 @@ checks are wired up.
 
 ### `inspect.json` schema
 
-`kibitzer schema [--out <file>]` prints the JSON Schema for `.claude/inspect.json`,
+`kibitzer schema [--out <file>]` prints the JSON Schema for `.kibitzer/inspect.json`,
 generated from `config::Config`'s own type definitions (so it can't drift from what
 kibitzer actually parses) — each field's doc comment becomes its schema `description`,
 covering `scope` glob syntax, `triggers`, `{file}`/`{changed_lines}` substitution, and
@@ -70,7 +70,7 @@ everything else in `Check`/`ArchitectureConfig`. A generated copy is checked in 
 
 ### Migrating off `markdownlint-cli2` / `scripts/doc_report.py`
 
-If your `.claude/inspect.json` currently shells out to `markdownlint-cli2` and/or a
+If your `.kibitzer/inspect.json` currently shells out to `markdownlint-cli2` and/or a
 project-local `scripts/doc_report.py` for reference-link/anchor checking (see
 `docs/markdown-link-integrity-false-positives.md` for the whole-file false-positive
 issues that setup has), replace those `command` entries with a single native
@@ -125,7 +125,7 @@ see the module doc comment on `MarkdownLinkIntegrityChecker` in
 ### Diff-aware scoping
 
 When kibitzer knows which lines an edit touched (the `PostToolUse` hook,
-not batch mode), a check in `.claude/inspect.json` can opt into scoping its
+not batch mode), a check in `.kibitzer/inspect.json` can opt into scoping its
 results to just those lines, two ways:
 
 - `{changed_lines}` in `command`: substituted with a comma-separated list
@@ -183,7 +183,7 @@ Two more architecture checkers ship alongside `import-cycles`:
 
 - `layering` flags an import edge that runs from a later-declared layer back
   into an earlier-declared one. Declare the layer order, highest-level
-  first, in a top-level `architecture` section of `.claude/inspect.json`:
+  first, in a top-level `architecture` section of `.kibitzer/inspect.json`:
   ```jsonc
   {
     "architecture": {

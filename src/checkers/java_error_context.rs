@@ -15,7 +15,7 @@ use crate::node_kind::JavaKind;
 /// in codebases that propagate exceptions unwrapped on purpose.
 ///
 /// Advisory by default (wire it up with `"severity": "advisory"` in
-/// `.claude/inspect.json`): a style nudge, not a correctness bug, with the same
+/// `.kibitzer/inspect.json`): a style nudge, not a correctness bug, with the same
 /// deliberately narrow scope as `go-error-context` — see that checker's module doc
 /// for the class of gaps (multi-statement catch blocks, exception chaining via
 /// `initCause`, logging-then-rethrow) this one does not attempt to cover either.

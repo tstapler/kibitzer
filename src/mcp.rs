@@ -45,7 +45,7 @@ fn default_trigger() -> String {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct ListChecksRequest {
-    /// Any path inside the repo whose `.claude/inspect.json` should be listed.
+    /// Any path inside the repo whose `.kibitzer/inspect.json` should be listed.
     path: String,
 }
 
@@ -580,7 +580,7 @@ fn symbol_kind_matches(kind: SymbolKind, want: &str) -> bool {
 
 /// Names of the natively registered per-file complexity checkers (one per language) that
 /// an architecture assessment runs across every in-scope file, alongside whichever
-/// `architecture_checker`s the repo's `.claude/inspect.json` configures. Kept as a fixed
+/// `architecture_checker`s the repo's `.kibitzer/inspect.json` configures. Kept as a fixed
 /// list rather than deriving from `checker::registry()` so a future non-complexity native
 /// checker (e.g. `primitive-obsession`) isn't silently swept into "architecture."
 const SYNTAX_RULES_CHECKERS: &[&str] = &[
@@ -687,7 +687,7 @@ impl KibitzerServer {
 
     #[tool(
         description = "List the checks that actually run above the given path: the built-in default \
-                        catalog, overlaid with the nearest .claude/inspect.json if one exists."
+                        catalog, overlaid with the nearest .kibitzer/inspect.json if one exists."
     )]
     async fn list_checks(&self, req: Parameters<ListChecksRequest>) -> String {
         let path = PathBuf::from(&req.0.path);
@@ -1004,10 +1004,10 @@ impl KibitzerServer {
         }
     }
 
-    /// Resolves `path`'s nearest `.claude/inspect.json` repo root if one exists, else falls
+    /// Resolves `path`'s nearest `.kibitzer/inspect.json` repo root if one exists, else falls
     /// back to the nearest `.git` root (or `path` itself) via `find_repo_root` — these
     /// architecture-query tools only need a directory to walk for source files, not a real
-    /// config, so a missing `.claude/inspect.json` is never fatal here. Still returns `Err`
+    /// config, so a missing `.kibitzer/inspect.json` is never fatal here. Still returns `Err`
     /// for a config file that exists but fails to parse. Shared by `list_architecture_symbols`/
     /// `get_architecture_node`/the call-graph traversal tools, which previously each inlined
     /// this same `find_config` dispatch.
@@ -1598,7 +1598,7 @@ mod tests {
     fn write_fixture(dir: &std::path::Path) {
         std::fs::create_dir_all(dir.join("handlers")).unwrap();
         std::fs::create_dir_all(dir.join("domain")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(
             dir.join("handlers/handlers.go"),
@@ -1611,7 +1611,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": { "layers": ["handlers", "domain"] },
   "checks": [
@@ -1702,7 +1702,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("ext")).unwrap();
         std::fs::create_dir_all(dir.join("contentcomp")).unwrap();
         std::fs::create_dir_all(dir.join("namingcomp")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
 
         // `import-cycle`: cyclea <-> cycleb.
@@ -1777,7 +1777,7 @@ mod tests {
         // no declaration, so `component-deps`/`content-rules`/`naming-rules` each emit
         // the shared zero-match-component advisory (Story 1.1.3) for it independently.
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": {
     "layers": ["l1", "l2"],
@@ -1901,7 +1901,7 @@ mod tests {
     /// `ContentChecker` -> MCP tool output).
     fn write_content_rules_fixture(dir: &std::path::Path) {
         std::fs::create_dir_all(dir.join("domain")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(
             dir.join("domain/domain.go"),
@@ -1910,7 +1910,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": {
     "components": [{"name": "domain", "paths": ["**/domain", "**/domain/**"]}],
@@ -1970,10 +1970,10 @@ mod tests {
     #[tokio::test]
     async fn architecture_assessment_reports_no_findings_for_clean_repo() {
         let dir = tmp_dir("clean-repo");
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{"checks": [{"name": "import-cycles", "architecture_checker": "import-cycles", "severity": "advisory"}]}"#,
         )
         .unwrap();
@@ -1994,14 +1994,14 @@ mod tests {
 
     fn write_zero_match_only_component_deps_fixture(dir: &std::path::Path) {
         std::fs::create_dir_all(dir.join("pkg")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         // No imports at all: `ComponentDependencyChecker` has no edges to flag as a real
         // violation. The only finding is the zero-match advisory for "ghost", whose glob
         // matches no import-graph node.
         std::fs::write(dir.join("pkg/pkg.go"), "package pkg\n\nfunc F() {}\n").unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": {
     "components": [{"name": "ghost", "paths": ["**/ghost", "**/ghost/**"]}]
@@ -2067,7 +2067,7 @@ mod tests {
         let dir = tmp_dir("real-violation-stays-blocking");
         std::fs::create_dir_all(dir.join("svcs")).unwrap();
         std::fs::create_dir_all(dir.join("ext")).unwrap();
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(
             dir.join("svcs/svcs.go"),
@@ -2076,7 +2076,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("ext/ext.go"), "package ext\n\nfunc Do() {}\n").unwrap();
         std::fs::write(
-            dir.join(".claude/inspect.json"),
+            dir.join(".kibitzer/inspect.json"),
             r#"{
   "architecture": {
     "components": [
@@ -2127,8 +2127,8 @@ mod tests {
     /// (two types `A`/`B` each with a same-named `Close` method, for the
     /// owner-qualified-id collision case).
     fn write_arch_fixture(dir: &std::path::Path) {
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
 
         std::fs::create_dir_all(dir.join("widgets")).unwrap();
@@ -2164,8 +2164,8 @@ mod tests {
     /// tests — plus `Recursive` calling itself (to exercise the visited-set) and an
     /// `Unresolvable` call to an ambiguous same-named function in two other packages.
     fn write_call_graph_fixture(dir: &std::path::Path) {
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
 
         std::fs::create_dir_all(dir.join("chain")).unwrap();
@@ -2741,8 +2741,8 @@ mod tests {
     async fn list_architecture_symbols_works_without_inspect_json_via_git_root() {
         let dir = tmp_dir("list-no-config-git-root");
         write_arch_fixture(&dir);
-        std::fs::remove_file(dir.join(".claude/inspect.json")).unwrap();
-        std::fs::remove_dir(dir.join(".claude")).unwrap();
+        std::fs::remove_file(dir.join(".kibitzer/inspect.json")).unwrap();
+        std::fs::remove_dir(dir.join(".kibitzer")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
 
         let server = KibitzerServer::new();
@@ -3082,8 +3082,8 @@ mod tests {
     /// C/D on `Y`) — the minimal fixture `extract_class::extract_class_candidates` needs
     /// to propose a 2-group split.
     fn write_extract_class_fixture(dir: &std::path::Path) {
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
 
         std::fs::create_dir_all(dir.join("blob")).unwrap();
@@ -3136,8 +3136,8 @@ mod tests {
     /// unexported (lowercase) — clustering candidates that exist only in `internal`-style,
     /// unexported code, the common real-world case this test guards.
     fn write_unexported_extract_class_fixture(dir: &std::path::Path) {
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
 
         std::fs::create_dir_all(dir.join("blob")).unwrap();
@@ -3197,8 +3197,8 @@ mod tests {
     #[tokio::test]
     async fn list_refactor_candidates_returns_empty_array_for_zero_matches_not_error() {
         let dir = tmp_dir("refactor-candidates-empty");
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
         std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
         std::fs::write(dir.join("f.go"), "package fixture\n\nfunc A() {}\n").unwrap();
 

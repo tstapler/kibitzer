@@ -1,7 +1,7 @@
 # `go-primitive-obsession` check — known false positives
 
 Tracks confirmed false-positive firings of the `go-primitive-obsession` kibitzer
-check (`src/primitive_obsession.rs`, wired up per-project via `.claude/inspect.json`'s
+check (`src/primitive_obsession.rs`, wired up per-project via `.kibitzer/inspect.json`'s
 `go-primitive-obsession` entry running `kibitzer check native primitive-obsession {file}` on
 every `Edit|Write` to a `**/*.go` file). Check new occurrences against this list before
 re-investigating a firing from scratch.

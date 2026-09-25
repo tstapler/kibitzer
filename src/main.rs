@@ -78,7 +78,7 @@ enum Command {
         action: DaemonAction,
     },
     /// Run a specific built-in analysis directly against a file (for wiring into
-    /// .claude/inspect.json's shell-command checks).
+    /// .kibitzer/inspect.json's shell-command checks).
     Check {
         #[command(subcommand)]
         check: CheckCommand,
@@ -109,7 +109,7 @@ enum Command {
         #[command(subcommand)]
         action: PluginAction,
     },
-    /// Emit the JSON Schema for `.claude/inspect.json` (derived from `config::Config`),
+    /// Emit the JSON Schema for `.kibitzer/inspect.json` (derived from `config::Config`),
     /// for a `"$schema"` reference / editor autocomplete. See `schema/README.md`.
     Schema {
         /// File to write the schema to. Defaults to stdout.
@@ -137,7 +137,7 @@ enum PluginAction {
     Remove {
         #[arg(value_parser = plugin::PluginName::parse)]
         name: plugin::PluginName,
-        /// Proceed even if a local `.claude/inspect.json` check still references this
+        /// Proceed even if a local `.kibitzer/inspect.json` check still references this
         /// plugin by name.
         #[arg(long)]
         force: bool,
@@ -269,10 +269,10 @@ enum CheckCommand {
     /// Run a whole-repo architecture/declaration checker (see
     /// `architecture_checks::registry()`/`declaration_checks::registry()`, resolved via
     /// `check::lookup_any_architecture_checker`) directly against a directory, without
-    /// needing a `.claude/inspect.json` check entry for it.
+    /// needing a `.kibitzer/inspect.json` check entry for it.
     Architecture { name: String, dir: PathBuf },
     /// List natively implemented checkers available to reference from
-    /// `.claude/inspect.json`'s `checker` field.
+    /// `.kibitzer/inspect.json`'s `checker` field.
     List,
     /// Cross-file (repo-wide) duplicate-code detection — see #28. `duplicate-code`
     /// (the `Checker` registered under that name) only compares a file against
@@ -598,10 +598,10 @@ fn format_plugin_status_line(report: &plugin::PluginStatusReport) -> String {
 }
 
 /// `kibitzer check architecture <name> <dir>` (Story 1.2.2): runs one whole-repo
-/// architecture/declaration checker directly against `dir`, bypassing `.claude/inspect.json`'s
+/// architecture/declaration checker directly against `dir`, bypassing `.kibitzer/inspect.json`'s
 /// `checks` list entirely — `name` only needs to be registered in
 /// `architecture_checks::registry()`/`declaration_checks::registry()`, not referenced by
-/// any configured check. `dir`'s own `.claude/inspect.json` (if any) still supplies the
+/// any configured check. `dir`'s own `.kibitzer/inspect.json` (if any) still supplies the
 /// `ArchitectureConfig` (`components`/`dependency_rules`/etc.) the checker runs against,
 /// same as batch mode; an absent config just means an empty one (most checkers report no
 /// findings against zero declared components/rules).
@@ -929,7 +929,7 @@ mod architecture_cli_tests {
         let repo = TempRepo::new("naming-rules");
         repo.write("go.mod", "module kibitzer.example/namingtest\n\ngo 1.21\n");
         repo.write(
-            ".claude/inspect.json",
+            ".kibitzer/inspect.json",
             r#"{"architecture": {"components": [{"name": "infra", "paths": ["**/infra", "**/infra/**"]}], "naming_rules": [{"component": "infra", "kind": "struct", "pattern": "^.*(Repository|Client)$"}]}}"#,
         );
         repo.write(

@@ -110,7 +110,7 @@ grep -n "toolu_XXXX" "$f"
   exact filter concluded kibitzer "never ran" in a session where it had
   actually fired.
 - A hook invocation that finds zero applicable checks for the edited file
-  (e.g. editing `.claude/inspect.json` itself, which no configured check's
+  (e.g. editing `.kibitzer/inspect.json` itself, which no configured check's
   `scope` covers) prints nothing and exits 0 — Claude Code does not log a
   transcript attachment for that silent no-op run at all. "No hit in the
   transcript" for a given edit means either the hook didn't fire *or* it

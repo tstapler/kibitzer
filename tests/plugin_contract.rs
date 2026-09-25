@@ -110,9 +110,9 @@ impl TempRepo {
     }
 
     fn write_inspect_json(&self, value: serde_json::Value) {
-        std::fs::create_dir_all(self.dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(self.dir.join(".kibitzer")).unwrap();
         std::fs::write(
-            self.dir.join(".claude").join("inspect.json"),
+            self.dir.join(".kibitzer").join("inspect.json"),
             serde_json::to_string(&value).unwrap(),
         )
         .unwrap();
@@ -592,7 +592,7 @@ fn remove_plugin_refuses_when_referenced_by_local_inspect_json_check() {
 
 /// REQ-4.1.1c / REQ-5.1.1 (Epic 4.1, Epic 5.1): proves an installed plugin's check
 /// surfaces through the full CLI/config stack — `kibitzer plugin install` followed by a
-/// plain `kibitzer run`, with no `.claude/inspect.json` anywhere in the repo — using the
+/// plain `kibitzer run`, with no `.kibitzer/inspect.json` anywhere in the repo — using the
 /// real, compiled `crates/kibitzer-stub-plugin` binary (`sibling_workspace_binary`, above)
 /// rather than a hand-rolled shell-script stand-in, per ADR-001's rationale for that crate
 /// existing at all.
@@ -614,7 +614,7 @@ fn remove_plugin_refuses_when_referenced_by_local_inspect_json_check() {
 /// status`), (2) that installed binary is genuinely the one built from
 /// `crates/kibitzer-stub-plugin` — invoking it directly still emits the real canned SARIF
 /// finding — and (3) `kibitzer run` auto-injects and executes that check with no
-/// `.claude/inspect.json` anywhere, surfacing its finding in normal check output exactly as
+/// `.kibitzer/inspect.json` anywhere, surfacing its finding in normal check output exactly as
 /// the feature's success metric states, without ever being reported `[skipped]` (the
 /// signal a *missing* plugin binary produces instead, per
 /// `run_checks_over_mcp_reports_skipped_not_blocking_when_plugin_binary_missing` below).
@@ -659,7 +659,7 @@ fn plugin_install_register_run_end_to_end_surfaces_stub_finding() {
 
     std::fs::write(repo.path("target.txt"), "irrelevant content").unwrap();
 
-    // No .claude/inspect.json exists anywhere above `repo.dir` — the plugin's check must
+    // No .kibitzer/inspect.json exists anywhere above `repo.dir` — the plugin's check must
     // still be auto-injected and actually invoked (not merely present in the registry),
     // and its finding must appear in kibitzer's normal check output — the feature's
     // stated success metric, proven literally rather than only at the registry/status
@@ -773,7 +773,7 @@ fn two_independently_registered_plugins_remain_distinct_end_to_end() {
 
     std::fs::write(repo.path("target.txt"), "irrelevant content").unwrap();
 
-    // No .claude/inspect.json anywhere — both checks must be auto-injected from the
+    // No .kibitzer/inspect.json anywhere — both checks must be auto-injected from the
     // registry's two independent entries, both surface distinctly, and neither collides
     // with or silently replaces the other.
     let (code, stdout, stderr) = repo.run(&["run", ".", "--trigger", "batch"]);

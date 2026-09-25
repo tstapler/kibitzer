@@ -13,7 +13,7 @@ pub const ACCEPTED_FINDINGS_DIR: &str = ".kibitzer/accepted";
 /// One deliberately-accepted finding: a specific checker rule firing correctly at a
 /// specific line, kept on purpose rather than fixed or globally suppressed. Distinct
 /// from both `docs/reporting-false-positives.md` (for a checker misfiring, not a real
-/// hit) and `.claude/inspect.json`'s `disabled`/`scope` (whole-checker granularity,
+/// hit) and `.kibitzer/inspect.json`'s `disabled`/`scope` (whole-checker granularity,
 /// no reason required) — see `docs/accepting-findings.md`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcceptedFinding {

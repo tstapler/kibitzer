@@ -17,7 +17,7 @@ const EM_DASH_THRESHOLD: usize = 3;
 /// one included) use em dashes constantly, following a Pinker/Google-style-guide voice.
 /// That means this check has a real risk of flagging good human writing, not just AI
 /// writing, and it is intentionally **not** wired into [`crate::config::default_checks`].
-/// It's opt-in only, via a project's `.claude/inspect.json`. Before anyone enables it
+/// It's opt-in only, via a project's `.kibitzer/inspect.json`. Before anyone enables it
 /// project-wide, backtest it carefully against real corpora — including this very repo's
 /// own doc comments, which is expected to be a stress test and likely source of false
 /// positives.

@@ -26,7 +26,7 @@ const MAX_COEFFICIENT_OF_VARIATION: f64 = 0.2;
 /// that all land within a narrow band reads as mechanical even when no single sentence is
 /// individually wrong. Purely structural/mechanical (word counts only, no word lists), but
 /// NOT wired into `config::default_checks` — opt-in only, via a repo's
-/// `.claude/inspect.json`. Backtesting against kubernetes/website found this heuristic
+/// `.kibitzer/inspect.json`. Backtesting against kubernetes/website found this heuristic
 /// flagging a deliberately parallel enumeration ("Signers must not... Signers should...
 /// Signers should...") with "vary sentence length," which would have actively broken the
 /// intentional parallelism — a real false-positive risk in exactly the kind of structured

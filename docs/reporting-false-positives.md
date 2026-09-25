@@ -94,6 +94,6 @@ Do not remove an entry just because:
 This is not a suppression mechanism — filing a report does not silence the
 check for anyone, including you, on a future run. If a finding is blocking
 real work right now, that's a separate conversation with whoever owns the
-project's `.claude/inspect.json` (see `docs/suppressing-checks.md`), or —
+project's `.kibitzer/inspect.json` (see `docs/suppressing-checks.md`), or —
 for one specific, correctly-flagged finding you want to keep rather than
 fix — `docs/accepting-findings.md`.

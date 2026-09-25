@@ -165,7 +165,7 @@ there's no per-rule scoping today), or `docs/accepting-findings.md`'s
 `.kibitzer/accepted/` for keeping one specific, deliberately-repeated literal with a
 written reason (`"rule": "replace-magic-literal"`).
 
-## Wiring into `.claude/inspect.json`
+## Wiring into `.kibitzer/inspect.json`
 
 ```json
 {

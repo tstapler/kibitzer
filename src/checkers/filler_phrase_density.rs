@@ -43,7 +43,7 @@ const FILLER_PHRASE_THRESHOLD: usize = 2;
 /// phrase is filler in context is more subjective and domain-dependent than the purely
 /// structural checks in [`crate::repetitive_sentences`] and [`crate::paragraph_breaks`],
 /// so this is intentionally NOT wired into `config::default_checks` — it's opt-in only,
-/// via a repo's `.claude/inspect.json`.
+/// via a repo's `.kibitzer/inspect.json`.
 pub struct FillerPhraseDensityChecker;
 
 impl Checker for FillerPhraseDensityChecker {

@@ -13,7 +13,7 @@ use crate::checker::{CheckContext, Checker, Finding, Language};
 /// uses several of these words on their own merits ("robust", "leverage", "utilize"
 /// all have ordinary, non-AI-tell uses in engineering prose). That's why this checker
 /// is intentionally NOT wired into `config::default_checks()`: it's opt-in only, added
-/// to a repo's `.claude/inspect.json` when that repo's authors want the extra scrutiny.
+/// to a repo's `.kibitzer/inspect.json` when that repo's authors want the extra scrutiny.
 const AI_VOCAB: &[&str] = &[
     "leverage",
     "tapestry",
@@ -80,7 +80,7 @@ static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Za-z']+\b")
 /// ("robust", "leverage", "utilize") are perfectly ordinary in technical writing on
 /// their own. Deliberately scoped to `Tag::Paragraph` text outside any list, matching
 /// [`crate::repetitive_sentences`] and [`crate::paragraph_breaks`]. Not wired into
-/// `config::default_checks()` — opt-in only via a repo's `.claude/inspect.json`,
+/// `config::default_checks()` — opt-in only via a repo's `.kibitzer/inspect.json`,
 /// since the false-positive rate on legitimate domain writing is too high to run
 /// everywhere by default.
 pub struct AiVocabularyDensityChecker;
