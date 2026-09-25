@@ -282,19 +282,11 @@ pub(crate) struct LangRuleConfig {
     /// referenced by name elsewhere in the file, is excluded from
     /// `replace-magic-literal` (see `resolve_excluded_constants`).
     binding_finder: for<'a> fn(Node<'a>, &'a [u8]) -> Option<ConstBinding<'a>>,
-    /// One step of `hide-delegate`'s chain walk: given a node, returns `None` if it
-    /// doesn't participate in a method/field-access chain at all, or
-    /// `Some((next, is_hop, call_has_args))` if it does — `next` is the node to
-    /// continue unwrapping into (the callee/receiver), `is_hop` is true if this node
-    /// itself represents one `.member` dot-access (a call node that's merely a
-    /// transparent wrapper around its callee, e.g. Go/TS/Rust's `call_expression`,
-    /// reports `false`; a call node that also carries the access itself, e.g. Java's
-    /// `method_invocation`, reports `true`), and `call_has_args` is true if this node
-    /// is a call carrying at least one argument — the fluent-builder exclusion signal
-    /// (`walk_chains` skips a chain where any hop passed an argument, since a Law-of-
-    /// Demeter-violating accessor chain is near-universally zero-arg `getX()`/`getY()`
-    /// calls, while a fluent/builder/stream chain almost always threads an argument
-    /// through at least one hop — `.filter(pred).map(f)` vs `.getB().getC()`).
+    /// One step of `hide-delegate`'s chain walk (see `docs/syntax-rules.md`): `None` if
+    /// `node` doesn't participate in a chain, else `Some((next, is_hop, call_has_args))`
+    /// — `next` is the callee/receiver to continue into, `is_hop` is true if `node`
+    /// itself is one `.member` dot-access, and `call_has_args` is true if `node` is a
+    /// call passing >= 1 argument (the fluent-builder exclusion signal).
     chain_unwrap: fn(Node) -> Option<(Node, bool, bool)>,
 }
 
@@ -920,12 +912,8 @@ fn java_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
 }
 
 /// Kotlin exposes no field names on either node (same positional shape as
-/// `kotlin_body`/`kotlin_params`). Verified via `to_sexp()`:
-/// `a.getB().getC()` nests `call_expression(navigation_expression(call_expression(
-/// navigation_expression(identifier, identifier), value_arguments), identifier),
-/// value_arguments)` — each node's first named child is the callee/receiver to
-/// unwrap into, and `call_expression`'s remaining named children include
-/// `value_arguments` only when the call passes arguments.
+/// `kotlin_body`/`kotlin_params`) — each node's first named child is the
+/// callee/receiver to unwrap into, verified via `to_sexp()`.
 fn kotlin_chain_unwrap(node: Node) -> Option<(Node, bool, bool)> {
     match KotlinKind::of(node) {
         KotlinKind::CallExpression => {
@@ -1338,39 +1326,29 @@ fn walk_blocks(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<
     }
 }
 
-/// Base identifiers `walk_chains` never flags a chain from, regardless of depth: a
-/// chain reaching through the enclosing method's own receiver (`self.a.b.c()` in
-/// Rust/Python, `this.a.b.c()` in Java/JS/TS/Kotlin) isn't a Law of Demeter violation
-/// at all — Demeter is specifically about reaching through a *collaborator* object's
-/// internals, not a type's own encapsulated state, and this pattern is exactly how
-/// idiomatic code accesses a nested config/state field it already owns. Confirmed via
-/// real-world backtest (`docs/backtest-repos.md`'s `BurntSushi/ripgrep`): 179 of 212
-/// raw findings (84%) were `self.`-rooted before this exclusion existed. Go has no
-/// equivalent fixed keyword (a receiver can be named anything), so this gap is
-/// accepted there rather than guessed at.
+/// Base identifiers `walk_chains` never flags a chain from: reaching through the
+/// enclosing method's own receiver (`self.a.b.c()`/`this.a.b.c()`) isn't a Law of
+/// Demeter violation — Demeter targets a *collaborator's* internals, not a type's own
+/// state. Go has no fixed receiver keyword, so this gap is accepted there. Backtest
+/// evidence and numbers: `docs/syntax-rules.md`'s `hide-delegate` row.
 const CHAIN_SELF_LIKE_BASE_NAMES: &[&str] = &["self", "this"];
 
-/// True if `text` looks like a type/namespace name rather than an object-instance
-/// variable — PascalCase-by-convention in every language this catalog covers (Go
-/// exported identifiers/package aliases, Java/Kotlin/TS/JS classes, Python classes;
-/// Rust modules/types are the one partial exception, but a capitalized Rust base is
-/// still virtually always a type, never a local binding). A chain rooted at one, e.g.
-/// Java's `MonotonicClock.Global.approxTime.now()`, is namespace/singleton-qualified
-/// *naming* of a single value, not navigation through an object graph — nothing here
-/// is a "collaborator" whose internals are being improperly exposed, so Demeter simply
-/// doesn't apply. Confirmed via real-world backtest (`docs/backtest-repos.md`'s
-/// `apache/cassandra`): this pattern was the dominant remaining false-positive class
-/// after the `self`/`this` exclusion.
+/// True if `text` looks like a type/namespace reference rather than an object
+/// instance — PascalCase by convention in every language here. A chain rooted at one
+/// (`MonotonicClock.Global.approxTime.now()`) names a single static value, not an
+/// object graph, so Demeter doesn't apply. Known gap: a lowercase Rust module path
+/// (`std::io::stdout()...`) parses as a `scoped_identifier`, not an `identifier` —
+/// `chain_unwrap` can't walk through it, and this heuristic can't recognize it as
+/// namespace-qualified either, same accepted-gap treatment as Go's receiver keyword
+/// above. See `docs/syntax-rules.md` for backtest evidence.
 fn looks_like_type_or_namespace(text: &str) -> bool {
     text.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
-/// Recurses over the whole tree (not just function bodies — a Law-of-Demeter chain can
-/// appear anywhere an expression can, including a top-level `var`/`const` initializer)
-/// looking for `hide-delegate` candidates. Only tests `is_chain_root` nodes: a node
-/// that's itself the callee/receiver consumed by an enclosing chain node is skipped
-/// here since `chain_metrics` on its root ancestor already accounts for it — this is
-/// what keeps a 5-hop chain from producing 5 overlapping findings.
+/// Recurses the whole tree (not just function bodies) looking for `hide-delegate`
+/// candidates. Only tests `is_chain_root` nodes — a node consumed by an enclosing
+/// chain node is skipped since `chain_metrics` on its root ancestor already accounts
+/// for it, keeping a 5-hop chain from producing 5 overlapping findings.
 fn walk_chains(node: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
     if (cfg.chain_unwrap)(node).is_some() && is_chain_root(node, cfg) {
         let (depth, any_hop_has_args, base) = chain_metrics(node, cfg);
@@ -3969,5 +3947,69 @@ mod tests {
             "package m\nfunc f() {\n\ta.DoThing(x.GetY().GetZ().DoOther())\n}\n",
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn kotlin_argument_chain_is_evaluated_independently_of_its_enclosing_call() {
+        // Same case as `go_argument_chain_is_evaluated_independently_of_its_enclosing_call`,
+        // but for Kotlin's positional (not field-based) `chain_unwrap` shape — the one
+        // most likely to accidentally merge an outer call's argument list into "the
+        // next unwrap step" if this ever regressed.
+        let findings = check_chains(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f() {\n  a.doThing(x.getY().getZ().doOther())\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_excludes_chain_rooted_at_self() {
+        let findings = check_chains(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "impl S {\n    fn f(&self) {\n        self.get_b().get_c().do_thing();\n    }\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn python_excludes_chain_rooted_at_self() {
+        let findings = check_chains(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "class C:\n    def f(self):\n        self.get_b().get_c().do_thing()\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn java_excludes_chain_rooted_at_this() {
+        let findings = check_chains(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  this.getB().getC().doThing();\n} }\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn typescript_excludes_chain_rooted_at_this() {
+        let findings = check_chains(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "class C { f() {\n  this.getB().getC().doThing();\n} }\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn kotlin_excludes_chain_rooted_at_this() {
+        let findings = check_chains(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "class C {\n  fun f() {\n    this.getB().getC().doThing()\n  }\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
     }
 }
