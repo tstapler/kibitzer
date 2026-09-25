@@ -5,7 +5,7 @@ Advisory, diff-aware code/doc quality checks for AI agents, CI, and local dev.
 ## Default check catalog
 
 `config::default_checks()` (`src/config.rs`) runs everywhere by default,
-pylint-style — no `.claude/inspect.json` required. This is the standard: a
+pylint-style — no `.kibitzer/inspect.json` required. This is the standard: a
 new native per-file checker that doesn't need repo-specific setup (an
 architecture model, a `command` a project must supply) goes in
 `default_checks()` as part of landing it, not as a follow-up someone has to
@@ -17,7 +17,7 @@ this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 markdown-prose checks `repetitive-sentence-structure`/`missing-paragraph-break`
 (see `docs/prose-checks.md`, which also covers five backtested-but-opt-in
 prose checks and how to wire in Vale for configurable, project-specific
-style rules). A local `.claude/inspect.json` overlays the defaults rather
+style rules). A local `.kibitzer/inspect.json` overlays the defaults rather
 than replacing them — see `docs/suppressing-checks.md` for how a repo
 disables or scopes one. A separately installed checker (`kibitzer plugin
 install|list|remove|status`) is chained in alongside these defaults the

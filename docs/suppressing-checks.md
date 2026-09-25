@@ -1,12 +1,12 @@
 # Suppressing a check
 
 kibitzer runs a built-in default catalog everywhere — pylint-style, no
-`.claude/inspect.json` required (`config::default_checks()` in `src/config.rs`;
+`.kibitzer/inspect.json` required (`config::default_checks()` in `src/config.rs`;
 the full list is in `docs/syntax-rules.md` and `docs/comment-quality.md`, plus
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
 `duplicate-code-cross-file`, `file-complexity`, `go-blank-imports`,
 `go-ignored-error`, `go-error-context`). A local
-`.claude/inspect.json`
+`.kibitzer/inspect.json`
 overlays that catalog rather than replacing it — see
 `config::find_effective_config`. There is no inline/per-line suppression
 comment (`// kibitzer:disable ...`, `# noqa`, etc.) — the per-finding lever
@@ -16,7 +16,7 @@ levers in this doc are all config-based.
 
 ## Turn a default check off entirely
 
-Add its `name` to `disabled` in the repo's `.claude/inspect.json`:
+Add its `name` to `disabled` in the repo's `.kibitzer/inspect.json`:
 
 ```json
 {

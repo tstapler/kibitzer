@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::{Cache, default_cache_path};
 use crate::check::{CheckResult, run_checks_for_trigger};
-use crate::config::{CONFIG_DIR, CONFIG_FILENAME, find_effective_config};
+use crate::config::{find_effective_config, resolve_config_path};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -148,7 +148,7 @@ fn handle_run_checks(
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
     let (config, repo_root) = find_effective_config(cwd)?;
-    let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
+    let config_path = resolve_config_path(&repo_root);
 
     // Cached entries aren't keyed by changed_lines — only bypass the cache lookup when a
     // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
@@ -345,7 +345,7 @@ fn run_uncached(
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Result<Vec<CheckResult>> {
     let (config, repo_root) = find_effective_config(cwd)?;
-    let config_path = repo_root.join(CONFIG_DIR).join(CONFIG_FILENAME);
+    let config_path = resolve_config_path(&repo_root);
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
     let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
     let mut results = run_checks_for_trigger(

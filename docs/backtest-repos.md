@@ -42,7 +42,7 @@ find ~/code/github.com/kubernetes/kubernetes -name '*.go' -print0 \
   | xargs -0 -n1 kibitzer check native syntax-rules
 
 # Every checker `kibitzer run` knows about (uses default_checks(), no
-# .claude/inspect.json needed) against one repo:
+# .kibitzer/inspect.json needed) against one repo:
 kibitzer run ~/code/github.com/BurntSushi/ripgrep
 ```
 

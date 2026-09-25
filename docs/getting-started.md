@@ -12,7 +12,7 @@ See the README's [Install](../README.md#install) section (Homebrew or
 `config::default_checks()` (`src/config.rs`) ships a full catalog —
 markdown link integrity, per-language file-size/comment-quality/syntax
 checks, duplicate-code detection, and more — that runs with no
-`.claude/inspect.json` at all:
+`.kibitzer/inspect.json` at all:
 
 ```bash
 kibitzer run . --trigger batch
@@ -26,11 +26,17 @@ $ kibitzer run . --trigger batch
 ./README.md:3: #does-not-exist -> no such heading in this doc
 ```
 
-A `.claude/inspect.json` is only needed to *customize* this — add
+A `.kibitzer/inspect.json` is only needed to *customize* this — add
 architecture checks (component dependency rules, naming rules), suppress a
 specific default, or shell out to a project-local linter. See
 `kibitzer schema` and `docs/suppressing-checks.md` for that; skip it if the
 defaults already cover what you need.
+
+> **Migrating from an older kibitzer**: the config file used to live at
+> `.claude/inspect.json`, which collided with Claude Code's own `.claude/`
+> directory. `.claude/inspect.json` is still read as a deprecated fallback
+> (kibitzer prints a one-time warning) — move it to `.kibitzer/inspect.json`
+> when convenient; there's no hard cutover date.
 
 ## 3. Register the `PostToolUse` hook
 

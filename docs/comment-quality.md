@@ -4,7 +4,7 @@
 registered once per language (Go, TypeScript, TSX, JavaScript, Python, Java,
 Kotlin), that flags comments working against their own purpose instead of
 for it. It's one of kibitzer's built-in defaults (`config::default_checks()`)
-— it runs everywhere, no `.claude/inspect.json` required; see
+— it runs everywhere, no `.kibitzer/inspect.json` required; see
 `docs/suppressing-checks.md` to disable or scope it.
 
 It reuses `rules::lang_config()`'s per-language function/body node-kind table
@@ -31,7 +31,7 @@ built on.
 | `[commented-out-code]` | A comment line looks like dead code rather than prose — ends in `;`/`{`, is a bare `}`, or looks like a call/assignment expression (`strip_comment_markers` + `looks_like_code`, deliberately conservative: biased toward missing real dead code over flagging prose). |
 | `[over-commented]` | A declaration's total comment lines (leading doc comment plus any comments inside its body) are both at least `MIN_COMMENT_LINES_FOR_RATIO` (4) and at least `COMMENT_TO_CODE_RATIO` (2.0×) the body's code-line count — tuned so a well-justified "why" comment as long as the function it documents (ratio ~1.0) does *not* fire; see `examples/*/comment-good.*`. |
 
-## Wiring into `.claude/inspect.json`
+## Wiring into `.kibitzer/inspect.json`
 
 Runs by default already — an explicit entry is only needed to change its
 severity or scope for one repo (see `docs/suppressing-checks.md`):

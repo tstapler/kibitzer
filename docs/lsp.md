@@ -22,7 +22,7 @@ as a custom server (it isn't one of lspconfig's built-in server definitions) via
 vim.lsp.config.kibitzer = {
   cmd = { "kibitzer", "lsp" },
   filetypes = { "go", "rust", "python", "lua", "markdown" }, -- match your repo's checks
-  root_markers = { ".claude/inspect.json", ".git" },
+  root_markers = { ".kibitzer/inspect.json", ".git" },
 }
 vim.lsp.enable("kibitzer")
 ```
@@ -36,7 +36,7 @@ vim.api.nvim_create_autocmd("FileType", {
     vim.lsp.start({
       name = "kibitzer",
       cmd = { "kibitzer", "lsp" },
-      root_dir = vim.fs.dirname(vim.fs.find({ ".claude/inspect.json", ".git" }, { upward = true })[1]),
+      root_dir = vim.fs.dirname(vim.fs.find({ ".kibitzer/inspect.json", ".git" }, { upward = true })[1]),
     })
   end,
 })
@@ -71,7 +71,7 @@ a dedicated one exists.
 
 Whichever client you use, the `filetypes`/`languageId` list is a client-side
 optimization (only start/attach the server for files you care about) — it's
-independent of `.claude/inspect.json`'s own `scope` globs (see
+independent of `.kibitzer/inspect.json`'s own `scope` globs (see
 [`docs/suppressing-checks.md`](suppressing-checks.md)), which control which
 *checks* run against a given file once kibitzer is already attached. Mismatch
 between the two isn't harmful, just redundant: e.g. attaching kibitzer to every
@@ -81,7 +81,7 @@ scoped-out files simply produce no diagnostics.
 ## What it does
 
 - On `textDocument/didOpen`, `didChange`, and `didSave`, it looks up the nearest
-  `.claude/inspect.json` via `config::find_config` and runs every in-scope check
+  `.kibitzer/inspect.json` via `config::find_config` and runs every in-scope check
   against the file with `check::run_checks_for_trigger` — the same check-running
   core used by the `hook` and `run` subcommands — under the `lsp` trigger.
 - Each `CheckResult` becomes zero or more `Diagnostic`s:

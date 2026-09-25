@@ -141,7 +141,7 @@ first.
   `kibitzer check duplicates <dir>` (`find_cross_file_duplicates` in
   `src/duplicate_code.rs`) — a dedicated batch/CLI subcommand rather than a
   new `Checker`/`ArchitectureChecker` registration, since it needs neither a
-  single-file `PostToolUse` hook nor a `.claude/inspect.json` architecture
+  single-file `PostToolUse` hook nor a `.kibitzer/inspect.json` architecture
   model, just a directory to scan. Expanded from its initial Go-only v1 scope
   to every language `duplicate-code` covers, and the diff-aware "does this
   edit duplicate something elsewhere in the repo" mode the issue also

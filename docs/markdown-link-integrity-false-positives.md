@@ -1,7 +1,7 @@
 # `markdown-link-integrity` / `doc-structure-report` checks — known false positives
 
 Tracks confirmed false-positive firings of the two blocking markdown checks wired up
-per-project via `.claude/inspect.json` (`markdown-link-integrity` running
+per-project via `.kibitzer/inspect.json` (`markdown-link-integrity` running
 `markdownlint-cli2 {file}`, `doc-structure-report` running `python3
 scripts/doc_report.py`) on every `Edit|Write` to a `**/*.md` file. Check new occurrences
 against this list before re-investigating a firing from scratch.
@@ -132,7 +132,7 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   calls `root.glob("*/README.md")` with no CLI-argument handling at all — confirmed by
   reading the script directly) means it would have re-surfaced this same violation
   regardless of which file in the repo the triggering edit touched; `markdown-link-integrity`
-  here is `markdownlint-cli2 {file}` (per this repo's `.claude/inspect.json`) — file-scoped,
+  here is `markdownlint-cli2 {file}` (per this repo's `.kibitzer/inspect.json`) — file-scoped,
   not the native grace-period checker described in the Resolution section below, since
   this repo hasn't migrated off the shelled-out setup.
 - **Not a pure deletion**: net shrink (`290` → `279`), but irrelevant here — the point
@@ -393,7 +393,7 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
 
 `markdown-link-integrity` is no longer a `markdownlint-cli2`/`doc_report.py`
 shell-command check — it's a native Rust `Checker` (`src/markdown_link_integrity.rs`),
-wired via `checker: "markdown-link-integrity"` in `.claude/inspect.json` (see
+wired via `checker: "markdown-link-integrity"` in `.kibitzer/inspect.json` (see
 `README.md`'s Usage section for the migration). The whole-file-vs-diff mismatch
 described above still exists in principle (the checker still reads the whole file),
 but the specific failure mode this doc logs — a valid multi-step edit getting blocked

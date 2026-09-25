@@ -26,7 +26,7 @@ unless a repo explicitly adds them:
 | `sentence-length-uniformity` | 6+ consecutive sentences with very low length variation | Backtesting found this flagging a deliberately parallel enumeration in real Kubernetes docs ("Signers must not... Signers should... Signers should...") with "vary sentence length" — actively wrong advice, since the parallelism was intentional |
 | `em-dash-overuse` | 3+ em dashes (`—`) in one paragraph | Heavy em-dash use is also a deliberate style choice in well-edited technical writing — this repo's own doc comments trip it (confirmed: 5 hits across `docs/*.md` in this very repo) |
 
-Enable one by adding it to `.claude/inspect.json`'s `checks` array (see
+Enable one by adding it to `.kibitzer/inspect.json`'s `checks` array (see
 `docs/suppressing-checks.md` for the general pattern):
 
 ```json

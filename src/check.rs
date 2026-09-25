@@ -557,7 +557,7 @@ fn run_checker_against_source(
 
 /// Native per-file checks skip any file at or above this size rather than parsing it.
 /// Now that [`crate::config::default_checks`] turns every native checker on for every
-/// repo with no `.claude/inspect.json` of its own, this is what keeps that on-by-default
+/// repo with no `.kibitzer/inspect.json` of its own, this is what keeps that on-by-default
 /// behavior cheap: vendored bundles, generated code, and minified assets can be
 /// megabytes, and every native checker pays a full read plus (for most of them) a
 /// tree-sitter parse. `PostToolUse` runs this path on every single edit, so a file this

@@ -6,7 +6,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILENAME: &str = "inspect.json";
-pub const CONFIG_DIR: &str = ".claude";
+/// Current config directory. Renamed from `.claude` (see `LEGACY_CONFIG_DIR`) because
+/// that path collided with Claude Code's own `.claude/` directory (skills, settings,
+/// hooks) — a repo's kibitzer config and its Claude Code config lived in the same
+/// directory with no relation to each other.
+pub const CONFIG_DIR: &str = ".kibitzer";
+/// Deprecated config directory, still read as a fallback (with a one-time warning) when
+/// `CONFIG_DIR` has no config — see `find_config`.
+pub const LEGACY_CONFIG_DIR: &str = ".claude";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -494,16 +501,52 @@ pub fn find_repo_root(start: &Path) -> PathBuf {
     }
 }
 
-/// Walk upward from `start` looking for `.claude/inspect.json`, returning the parsed
-/// config and the directory it was found in (the repo root, by convention). Returns
-/// `None` when no such file exists anywhere above `start` — this is the raw lookup;
-/// most callers that actually run checks want `find_effective_config` instead, which
-/// never returns "nothing to do" (see its doc comment for why).
+/// Resolve the config file kibitzer would read for a directory that stands in as a repo
+/// root: `CONFIG_DIR` if it has one, else the deprecated `LEGACY_CONFIG_DIR` (warning once
+/// per process the first time that fallback fires). Doesn't require either file to exist —
+/// callers that only need a cache/fingerprint path (`daemon.rs`) can use the result
+/// unconditionally once `find_config`/`find_effective_config` has already resolved `dir`.
+pub fn resolve_config_path(dir: &Path) -> PathBuf {
+    let current = dir.join(CONFIG_DIR).join(CONFIG_FILENAME);
+    if current.is_file() {
+        return current;
+    }
+    let legacy = dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME);
+    if legacy.is_file() {
+        warn_deprecated_config_dir_once(&legacy);
+    }
+    legacy
+}
+
+static WARNED_DEPRECATED_CONFIG_DIR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Emits the "`.claude/inspect.json` is deprecated" notice at most once per process —
+/// `resolve_config_path` is called on every check run in the daemon's lifetime, and this
+/// keeps a long-running daemon from repeating the warning on every request.
+fn warn_deprecated_config_dir_once(legacy_path: &Path) {
+    use std::sync::atomic::Ordering;
+    if !WARNED_DEPRECATED_CONFIG_DIR.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[kibitzer] {} is deprecated; move it to {}/{} (see docs/getting-started.md)",
+            legacy_path.display(),
+            CONFIG_DIR,
+            CONFIG_FILENAME
+        );
+    }
+}
+
+/// Walk upward from `start` looking for `.kibitzer/inspect.json` (falling back to the
+/// deprecated `.claude/inspect.json` at each directory level — see `LEGACY_CONFIG_DIR`),
+/// returning the parsed config and the directory it was found in (the repo root, by
+/// convention). Returns `None` when neither exists anywhere above `start` — this is the
+/// raw lookup; most callers that actually run checks want `find_effective_config`
+/// instead, which never returns "nothing to do" (see its doc comment for why).
 pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     let mut dir = start_dir(start);
 
     loop {
-        let candidate = dir.join(CONFIG_DIR).join(CONFIG_FILENAME);
+        let candidate = resolve_config_path(&dir);
         if candidate.is_file() {
             let raw = std::fs::read_to_string(&candidate)
                 .with_context(|| format!("reading {}", candidate.display()))?;
@@ -844,7 +887,7 @@ mod tests {
 
     fn parse(json: &str) -> Result<Config> {
         let config: Config = serde_json::from_str(json)?;
-        validate(&config, Path::new(".claude/inspect.json"))?;
+        validate(&config, Path::new(".kibitzer/inspect.json"))?;
         Ok(config)
     }
 
@@ -1099,7 +1142,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            ".claude/inspect.json: architecture rule references undefined component 'hanlders' \
+            ".kibitzer/inspect.json: architecture rule references undefined component 'hanlders' \
              — declared components are: handlers (did you mean 'handlers'?)"
         );
     }
@@ -1367,6 +1410,72 @@ mod tests {
             let default_names: Vec<&str> = defaults.iter().map(|c| c.name.as_str()).collect();
             assert_eq!(names, default_names);
         });
+    }
+
+    #[test]
+    fn find_config_prefers_new_dir_over_legacy_when_both_exist() {
+        let dir = tmp_dir("prefer-new");
+        std::fs::create_dir_all(dir.join(CONFIG_DIR)).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_DIR).join(CONFIG_FILENAME),
+            r#"{"disabled": ["primitive-obsession"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join(LEGACY_CONFIG_DIR)).unwrap();
+        std::fs::write(
+            dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME),
+            r#"{"disabled": ["comment-quality-go"]}"#,
+        )
+        .unwrap();
+
+        let (config, root) = find_config(&dir).unwrap().expect("config found");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+        assert_eq!(config.disabled, vec!["primitive-obsession".to_string()]);
+    }
+
+    #[test]
+    fn find_config_falls_back_to_legacy_dir_when_new_dir_absent() {
+        let dir = tmp_dir("legacy-fallback");
+        std::fs::create_dir_all(dir.join(LEGACY_CONFIG_DIR)).unwrap();
+        std::fs::write(
+            dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME),
+            r#"{"disabled": ["primitive-obsession"]}"#,
+        )
+        .unwrap();
+
+        let (config, root) = find_config(&dir).unwrap().expect("config found");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(root, dir);
+        assert_eq!(config.disabled, vec!["primitive-obsession".to_string()]);
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_new_dir() {
+        let dir = tmp_dir("resolve-prefers-new");
+        std::fs::create_dir_all(dir.join(CONFIG_DIR)).unwrap();
+        std::fs::write(dir.join(CONFIG_DIR).join(CONFIG_FILENAME), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(LEGACY_CONFIG_DIR)).unwrap();
+        std::fs::write(dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME), "{}").unwrap();
+
+        let resolved = resolve_config_path(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(resolved, dir.join(CONFIG_DIR).join(CONFIG_FILENAME));
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_legacy_dir() {
+        let dir = tmp_dir("resolve-falls-back");
+        std::fs::create_dir_all(dir.join(LEGACY_CONFIG_DIR)).unwrap();
+        std::fs::write(dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME), "{}").unwrap();
+
+        let resolved = resolve_config_path(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(resolved, dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME));
     }
 
     #[test]

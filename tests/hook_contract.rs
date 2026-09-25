@@ -34,10 +34,10 @@ impl TempRepo {
         let dir = std::env::temp_dir().join(format!("kibitzer-hook-contract-{unique}"));
         let cache_dir = std::env::temp_dir().join(format!("kibitzer-hook-cache-{unique}"));
         let runtime_dir = std::env::temp_dir().join(format!("kibitzer-hook-runtime-{unique}"));
-        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
         std::fs::create_dir_all(&runtime_dir).unwrap();
         std::fs::write(
-            dir.join(".claude").join("inspect.json"),
+            dir.join(".kibitzer").join("inspect.json"),
             serde_json::to_string(&json!({ "checks": [check_json] })).unwrap(),
         )
         .unwrap();

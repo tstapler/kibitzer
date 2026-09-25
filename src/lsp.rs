@@ -13,7 +13,7 @@ use crate::checker::GrammarCache;
 use crate::config::{Severity, find_effective_config};
 use crate::symbol_extract::extract_symbols_for_file;
 
-/// Trigger name checks opt into via `.claude/inspect.json`'s `triggers` field to run under
+/// Trigger name checks opt into via `.kibitzer/inspect.json`'s `triggers` field to run under
 /// `kibitzer lsp` specifically; a check with no `triggers` runs under every trigger,
 /// including this one, same as "PostToolUse" and "batch".
 const LSP_TRIGGER: &str = "lsp";

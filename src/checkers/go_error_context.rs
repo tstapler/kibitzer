@@ -12,7 +12,7 @@ use crate::checkers::file_size::is_generated;
 /// whether the project wraps errors at all, so staying silent avoids false positives
 /// in codebases that intentionally propagate errors unwrapped.
 ///
-/// Advisory by default (wire it up with `"severity": "advisory"` in `.claude/inspect.json`):
+/// Advisory by default (wire it up with `"severity": "advisory"` in `.kibitzer/inspect.json`):
 /// this is a style nudge, not a correctness bug, and the heuristic is intentionally
 /// narrow — see `docs/go-error-context-false-positives.md` for the documented scope
 /// gaps (sentinel comparisons, errors.Is/As chains, defer-based handling, named

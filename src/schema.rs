@@ -1,4 +1,4 @@
-//! `kibitzer schema` — emits the JSON Schema for `.claude/inspect.json`, generated from
+//! `kibitzer schema` — emits the JSON Schema for `.kibitzer/inspect.json`, generated from
 //! `config::Config`'s own type definitions via `schemars` so it can't drift from what
 //! kibitzer actually parses. Field doc comments on `Config`/`Check`/etc. become the
 //! schema's per-property `description`, making this the single source of truth for both.

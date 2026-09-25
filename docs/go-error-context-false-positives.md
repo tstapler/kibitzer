@@ -3,7 +3,7 @@
 Tracks confirmed false-positive firings of the `go-error-context` kibitzer
 check (`src/go_error_context.rs`), wired up via `kibitzer check native
 go-error-context {file}`. Advisory by default (`"severity": "advisory"` in
-`.claude/inspect.json`) — this is a style nudge, not a correctness bug. Check
+`.kibitzer/inspect.json`) — this is a style nudge, not a correctness bug. Check
 new occurrences against this list before re-investigating a firing from
 scratch.
 

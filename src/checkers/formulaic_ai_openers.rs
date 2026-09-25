@@ -32,7 +32,7 @@ const AI_OPENERS: &[&str] = &[
 /// occurrence is enough to flag — there's no run-of-3+ threshold here.
 ///
 /// Intentionally NOT wired into `config::default_checks()`; opt in via
-/// `.claude/inspect.json`. A formulaic opener can appear in legitimate human writing too
+/// `.kibitzer/inspect.json`. A formulaic opener can appear in legitimate human writing too
 /// (e.g. "In summary, the results support..."), so this has a higher false-positive rate
 /// than requiring a 3+ run the way `repetitive_sentences` does.
 pub struct FormulaicAiOpenersChecker;

@@ -137,7 +137,7 @@ Kotlin/Go/Rust, which have no ternary, are `None`).
 Thresholds are fixed constants in `src/rules.rs` for now; per-rule
 configurability is a natural follow-up, not required for the initial catalog.
 
-## Wiring into `.claude/inspect.json`
+## Wiring into `.kibitzer/inspect.json`
 
 ```json
 {

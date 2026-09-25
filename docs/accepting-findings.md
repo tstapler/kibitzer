@@ -5,7 +5,7 @@ kibitzer's other two levers for a finding don't cover this case:
 - **`docs/reporting-false-positives.md`** is for a checker *misfiring* — a finding
   that doesn't actually apply to the code it's pointing at. It's explicitly not a
   suppression mechanism: filing a report never silences the check.
-- **`docs/suppressing-checks.md`**'s `.claude/inspect.json` (`disabled`, or a
+- **`docs/suppressing-checks.md`**'s `.kibitzer/inspect.json` (`disabled`, or a
   `checks` entry's `scope`) silences a whole checker, or a whole file/directory for
   that checker — not one specific, correctly-flagged line.
 
@@ -61,14 +61,14 @@ it however makes the entry easy to find later, e.g. `flag-argument-main-rs-42.js
   empty `reason`) is a hard error on the next check run, not a silent no-op — the
   whole point of this directory over `disabled` is that the tradeoff gets written down.
 
-Walked upward from the checked file the same way `.claude/inspect.json` is (so one
+Walked upward from the checked file the same way `.kibitzer/inspect.json` is (so one
 `.kibitzer/accepted/` at the repo root covers the whole tree).
 
 ## Scope
 
 Applies to **native per-file checkers only** (the ones invoked via `kibitzer check
 native <name> <file>` — `default_checks()`'s catalog plus anything you've added to
-`.claude/inspect.json`'s `checks` with a `checker` field). A shell-out (`command`)
+`.kibitzer/inspect.json`'s `checks` with a `checker` field). A shell-out (`command`)
 check's pass/fail comes from its process exit code, not from whether its output text
 is empty, so accepting away one of its output lines can't safely flip that check to
 "passed" the way it can for a native one — out of scope for now. Whole-repo

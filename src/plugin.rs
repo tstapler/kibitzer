@@ -168,7 +168,7 @@ pub fn default_registry_path() -> PathBuf {
 /// Synthesizes one [`Check`] per installed plugin (Task 4.1.1a), in the same
 /// `command`-with-`{file}`-substitution shape `config::native_check()` produces for a
 /// hand-authored default — `find_effective_config` chains these in alongside
-/// `default_checks()` so an installed plugin runs without editing `.claude/inspect.json`.
+/// `default_checks()` so an installed plugin runs without editing `.kibitzer/inspect.json`.
 /// An empty/missing [`Registry`] (the common case: no plugins installed) yields an empty
 /// `Vec`, leaving `default_checks()`'s catalog completely unchanged.
 pub fn registered_plugin_checks() -> Vec<Check> {
@@ -605,7 +605,7 @@ pub fn install_plugin(name: &PluginName, source: &str, force: bool) -> Result<Ex
     );
     println!("[kibitzer] {name} now runs as a check in every repo on this machine.");
     println!(
-        "  - disable it for one repo: add \"disabled\": [\"{name}\"] to that repo's .claude/inspect.json"
+        "  - disable it for one repo: add \"disabled\": [\"{name}\"] to that repo's .kibitzer/inspect.json"
     );
     println!("  - remove it everywhere:    kibitzer plugin remove {name}");
 
@@ -661,7 +661,7 @@ pub fn plugin_status(name: &PluginName) -> Result<PluginStatusReport> {
 }
 
 /// The uninstall lifecycle (Task 3.3.2a/b): refuses (unless `force`) when the current
-/// repo's *local* `.claude/inspect.json` (`config::find_config`, not
+/// repo's *local* `.kibitzer/inspect.json` (`config::find_config`, not
 /// `find_effective_config` — which would already include the plugin's own synthesized
 /// `Check`) still references `name` by a hand-authored check entry; otherwise (or with
 /// `force`) deletes the plugin's binary directory and its `Registry` entry.
@@ -671,7 +671,7 @@ pub fn remove_plugin(name: &PluginName, force: bool) -> Result<ExitCode> {
         && let Some(check) = local_config.checks.iter().find(|c| c.name == name.as_ref())
     {
         anyhow::bail!(
-            "'{name}' is referenced by check '{}' in .claude/inspect.json\nremove that check entry first, or rerun with --force (the check will then report\nplugin-not-installed instead of running — see `kibitzer plugin status`).",
+            "'{name}' is referenced by check '{}' in .kibitzer/inspect.json\nremove that check entry first, or rerun with --force (the check will then report\nplugin-not-installed instead of running — see `kibitzer plugin status`).",
             check.name
         );
     }
@@ -689,7 +689,7 @@ pub fn remove_plugin(name: &PluginName, force: bool) -> Result<ExitCode> {
     Registry::save(&registry_path, &registry)?;
 
     if force {
-        println!("[kibitzer] removed {name} (--force: .claude/inspect.json still references it)");
+        println!("[kibitzer] removed {name} (--force: .kibitzer/inspect.json still references it)");
     } else {
         println!("[kibitzer] removed {name}");
     }
