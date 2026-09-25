@@ -30,6 +30,19 @@ const MIN_COMMENT_LINES_FOR_RATIO: usize = 4;
 const PARAM_COUNT_RATIO_BONUS: f64 = 0.25;
 const PARAM_COUNT_RATIO_BASELINE: usize = 2;
 
+/// `comment-too-long` fires when a declaration's leading doc comment alone (not
+/// counting scattered inline comments inside the body) exceeds this many lines,
+/// regardless of how large the function it documents is. Independent of
+/// `COMMENT_TO_CODE_RATIO`, which only catches a comment that's large *relative to a
+/// small function* — a comment can clear this absolute bound while still being
+/// "proportionate" to a large function body, which is exactly the shape that let three
+/// multi-paragraph WHY comments ship on a real PR undetected (see
+/// docs/comment-quality-false-positives.md). Set to 5 to match the ceiling already
+/// enforced by `/code:review`'s Code Quality Agent and CLAUDE.md's "Short beats long"
+/// rule, so a comment that passes here won't get bounced by a human/LLM reviewer for
+/// length alone.
+const MAX_LEADING_COMMENT_LINES: usize = 5;
+
 /// Marketing filler, hedge words, and invented-rationale phrases that add nothing a
 /// reader couldn't already see, plus the task/fix/caller-referencing anti-pattern
 /// (comments should describe the code, not the change that produced it — those belong
@@ -197,8 +210,9 @@ impl Checker for CommentQualityChecker {
     }
 
     fn description(&self) -> &str {
-        "flags verbose/marketing comment language, commented-out code, and comments \
-         disproportionate to the code they annotate (see docs/comment-quality.md)"
+        "flags verbose/marketing comment language, commented-out code, comments \
+         disproportionate to the code they annotate, and leading comments that are too \
+         long in absolute terms regardless of proportion (see docs/comment-quality.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -458,11 +472,12 @@ fn check_proportionality(
     let leading_nodes = leading_comment_nodes(decl, comment_kinds, src);
     let leading_rows = leading_comment_rows(&leading_nodes);
     let leading_start_line = leading_rows.iter().next().map(|row| row + 1);
+    let leading_comment_lines = leading_rows.len();
 
-    let total_comment_lines = body_comment_lines + leading_rows.len();
+    let total_comment_lines = body_comment_lines + leading_comment_lines;
     let body_code_lines = body_total_lines.saturating_sub(body_comment_lines);
 
-    if total_comment_lines < MIN_COMMENT_LINES_FOR_RATIO || body_code_lines == 0 {
+    if total_comment_lines == 0 || body_code_lines == 0 {
         return;
     }
     if is_delegating_single_statement_body(body, src) {
@@ -474,27 +489,45 @@ fn check_proportionality(
         // `self.node.first_child_ref().map(Into::into)`. The comment in every case
         // documented behavior that lives in the callee/constructed type, or an
         // invariant the signature can't express — never a restatement of the one
-        // line actually visible here, no matter how long the comment ran.
-        return;
-    }
-    let param_count = (cfg.params_finder)(decl)
-        .map(|params| (cfg.param_counter)(params))
-        .unwrap_or(0);
-    let effective_ratio = COMMENT_TO_CODE_RATIO
-        + PARAM_COUNT_RATIO_BONUS * param_count.saturating_sub(PARAM_COUNT_RATIO_BASELINE) as f64;
-    if (total_comment_lines as f64) < effective_ratio * (body_code_lines as f64) {
+        // line actually visible here, no matter how long the comment ran. Exempts
+        // both findings below: a genuinely long justified comment over a trivial
+        // delegating body isn't restating the code either way it's measured.
         return;
     }
     if has_safety_section(&leading_nodes, src) {
+        // A `# Safety` block justifying every unsafe invariant can legitimately run
+        // long regardless of the function's size — exempt both findings below, same
+        // rationale as the delegating-body case above.
         return;
     }
 
-    findings.push(Finding {
-        line: leading_start_line.unwrap_or(decl.start_position().row + 1),
-        message: format!(
-            "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
-        ),
-    });
+    let finding_line = leading_start_line.unwrap_or(decl.start_position().row + 1);
+
+    if leading_comment_lines > MAX_LEADING_COMMENT_LINES {
+        findings.push(Finding {
+            line: finding_line,
+            message: format!(
+                "[comment-too-long] leading comment is {leading_comment_lines} lines, over the {MAX_LEADING_COMMENT_LINES}-line ceiling — split into root cause / accepted tradeoff / pointer to a test, or trim to the one fact a reviewer would ask for"
+            ),
+        });
+    }
+
+    if total_comment_lines >= MIN_COMMENT_LINES_FOR_RATIO {
+        let param_count = (cfg.params_finder)(decl)
+            .map(|params| (cfg.param_counter)(params))
+            .unwrap_or(0);
+        let effective_ratio = COMMENT_TO_CODE_RATIO
+            + PARAM_COUNT_RATIO_BONUS
+                * param_count.saturating_sub(PARAM_COUNT_RATIO_BASELINE) as f64;
+        if (total_comment_lines as f64) >= effective_ratio * (body_code_lines as f64) {
+            findings.push(Finding {
+                line: finding_line,
+                message: format!(
+                    "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
+                ),
+            });
+        }
+    }
 }
 
 /// Whether `body` (already known non-empty by the caller) contains exactly one
@@ -733,6 +766,40 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// A 7-line WHY comment over an 8-line body has ratio ~0.9 — well under
+    /// `COMMENT_TO_CODE_RATIO` — so `[over-commented]` correctly stays silent. This is
+    /// the real gap `[comment-too-long]` closes: a comment can be perfectly
+    /// "proportionate" to its function and still be too long on its own terms.
+    #[test]
+    fn flags_absolute_length_even_when_proportionate() {
+        let src = "package main\n\n// ProcessBatch runs validation before writing, because the legacy importer\n// upstream sometimes emits rows with a trailing null byte that corrupts the\n// downstream parser if written as-is. We considered stripping it at the\n// source instead, but that importer is owned by another team and a fix\n// there would take a full quarter to land, so this is the accepted\n// workaround until that migration completes.\nfunc ProcessBatch(rows []string) []string {\n\tout := make([]string, 0, len(rows))\n\tfor _, r := range rows {\n\t\tif r == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\tout = append(out, r)\n\t}\n\treturn out\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[comment-too-long]")),
+            "findings: {findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_five_line_comment() {
+        let src = "package main\n\n// Retry calls fn up to attempts times, waiting delay between failures.\n// Returns the first successful result, or the last error if every attempt\n// fails — callers that need cancellation should wrap fn themselves, since\n// Retry does not accept a context, delay is not jittered, and there is no\n// backoff between attempts.\nfunc Retry(fn func() (int, error)) (int, error) {\n\tresult, err := fn()\n\treturn result, err\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[comment-too-long]")),
             "findings: {findings:?}"
         );
     }
