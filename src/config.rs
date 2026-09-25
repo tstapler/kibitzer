@@ -502,33 +502,70 @@ pub fn find_repo_root(start: &Path) -> PathBuf {
 }
 
 /// Resolve the config file kibitzer would read for a directory that stands in as a repo
-/// root: `CONFIG_DIR` if it has one, else the deprecated `LEGACY_CONFIG_DIR` (warning once
-/// per process the first time that fallback fires). Doesn't require either file to exist —
-/// callers that only need a cache/fingerprint path (`daemon.rs`) can use the result
-/// unconditionally once `find_config`/`find_effective_config` has already resolved `dir`.
+/// root. Three cases:
+///
+/// - Both `CONFIG_DIR` and `LEGACY_CONFIG_DIR` have a config file: `CONFIG_DIR`'s is used
+///   and `LEGACY_CONFIG_DIR`'s is ignored *entirely* — the two are never merged — with a
+///   one-time warning per process, since a check that only exists in the shadowed legacy
+///   file would otherwise silently stop firing.
+/// - Only `LEGACY_CONFIG_DIR` has one: it's used, with a one-time deprecation warning.
+/// - Neither exists: returns the `CONFIG_DIR` path anyway (even though nothing is there
+///   yet), since that's where a new config belongs — never `LEGACY_CONFIG_DIR`.
+///
+/// Doesn't require either file to exist — callers that only need a cache/fingerprint path
+/// (`daemon.rs`) can use the result unconditionally once `find_config`/`find_effective_config`
+/// has already resolved `dir`.
 pub fn resolve_config_path(dir: &Path) -> PathBuf {
     let current = dir.join(CONFIG_DIR).join(CONFIG_FILENAME);
+    let legacy = dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME);
     if current.is_file() {
+        if legacy.is_file() {
+            warn_legacy_shadowed_once(&legacy);
+        }
         return current;
     }
-    let legacy = dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME);
     if legacy.is_file() {
         warn_deprecated_config_dir_once(&legacy);
+        return legacy;
     }
-    legacy
+    current
 }
 
 static WARNED_DEPRECATED_CONFIG_DIR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static WARNED_LEGACY_SHADOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True the first time this is called for a given `flag`, false every time after —
+/// extracted from the two `warn_*_once` functions below so the "fires exactly once"
+/// logic is testable with a local `AtomicBool` instead of the process-global statics
+/// (which can only ever fire once across a whole `cargo test` binary).
+fn should_warn_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Emits the "`.claude/inspect.json` is deprecated" notice at most once per process —
 /// `resolve_config_path` is called on every check run in the daemon's lifetime, and this
 /// keeps a long-running daemon from repeating the warning on every request.
 fn warn_deprecated_config_dir_once(legacy_path: &Path) {
-    use std::sync::atomic::Ordering;
-    if !WARNED_DEPRECATED_CONFIG_DIR.swap(true, Ordering::Relaxed) {
+    if should_warn_once(&WARNED_DEPRECATED_CONFIG_DIR) {
         eprintln!(
             "[kibitzer] {} is deprecated; move it to {}/{} (see docs/getting-started.md)",
+            legacy_path.display(),
+            CONFIG_DIR,
+            CONFIG_FILENAME
+        );
+    }
+}
+
+/// Warns that `legacy_path` is present but being fully ignored — `CONFIG_DIR` takes
+/// priority wholesale, its content is never merged with the legacy file's (see
+/// `resolve_config_path`'s doc comment).
+fn warn_legacy_shadowed_once(legacy_path: &Path) {
+    if should_warn_once(&WARNED_LEGACY_SHADOWED) {
+        eprintln!(
+            "[kibitzer] {} is ignored — {}/{} takes priority and its contents are not merged \
+             with the legacy file (see docs/getting-started.md)",
             legacy_path.display(),
             CONFIG_DIR,
             CONFIG_FILENAME
@@ -1476,6 +1513,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(resolved, dir.join(LEGACY_CONFIG_DIR).join(CONFIG_FILENAME));
+    }
+
+    #[test]
+    fn resolve_config_path_points_at_current_dir_when_neither_exists() {
+        let dir = tmp_dir("resolve-neither-exists");
+        let resolved = resolve_config_path(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(resolved, dir.join(CONFIG_DIR).join(CONFIG_FILENAME));
+    }
+
+    #[test]
+    fn should_warn_once_fires_only_the_first_time() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(should_warn_once(&flag));
+        assert!(!should_warn_once(&flag));
     }
 
     #[test]
