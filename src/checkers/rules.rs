@@ -2028,6 +2028,14 @@ mod tests {
     }
 
     #[test]
+    fn description_lists_the_catalog_without_the_reverted_hide_delegate_rule() {
+        let checker = SyntaxRulesChecker::new(Language::Rust);
+        let description = checker.description();
+        assert!(description.contains("replace-magic-literal"));
+        assert!(!description.contains("hide-delegate"));
+    }
+
+    #[test]
     fn flags_replace_magic_literal() {
         let findings = magic_literal_findings(
             Language::Go,
