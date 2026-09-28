@@ -130,6 +130,19 @@ pub trait Checker {
     fn file_globs(&self) -> &[&str];
     /// Run the check against `file`'s already-loaded `ctx`.
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>>;
+
+    /// Reconfigures this checker using a project's per-check `options` object
+    /// (`config::Check::options`, from `.kibitzer/inspect.json`). The default,
+    /// inherited by every checker that doesn't override it, ignores `options` and
+    /// returns `Ok(None)` — callers keep running the checker as looked up. A checker
+    /// that supports customization overrides this to parse `options` and return
+    /// `Ok(Some(...))` wrapping a freshly built instance with the overridden fields (an
+    /// absent field in `options` keeps that field's own default). Returns `Err` on a
+    /// malformed `options` shape — `config::validate` calls this at config-load time
+    /// specifically so a typo fails loudly there instead of silently at check time.
+    fn configure(&self, _options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
+        Ok(None)
+    }
 }
 
 /// One native checker's self-registration into [`registry`]. A checker's own module
@@ -172,24 +185,37 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
     registry().into_iter().find(|c| c.name() == name)
 }
 
-/// Parses `source` with `checker_name`'s declared grammar (if any) and runs it,
-/// returning raw [`Finding`]s. The shared entry point for anything that needs a
-/// checker's structured findings against arbitrary text — `check.rs`'s live
-/// dispatch (which then formats findings as `{file}:{line}: {message}` for its
-/// diff-scoping/baseline machinery) and `backtest.rs`'s reconstructed-history runs
-/// (which need the structured line/message, not that string form) both call this
-/// instead of duplicating the parse-then-check sequence.
-pub fn run_checker(checker_name: &str, file: &Path, source: &str) -> Result<Vec<Finding>> {
+/// Parses `source` with `checker_name`'s declared grammar (if any), reconfigures the
+/// checker via [`Checker::configure`] when `options` is set, and runs it — returning raw
+/// [`Finding`]s. The shared entry point for anything that needs a checker's structured
+/// findings against arbitrary text — `check.rs`'s live per-file dispatch, which has the
+/// triggering `Check`'s `options` in scope, calls this instead of duplicating the
+/// lookup-then-configure-then-parse-then-check sequence. Other callers with no
+/// per-project `Check` in scope (`backtest.rs`'s reconstructed-history runs, most tests)
+/// use [`run_checker_with_cache`] directly instead, passing `None`-equivalent behavior by
+/// simply not calling `configure` at all.
+pub fn run_checker_configured(
+    checker_name: &str,
+    file: &Path,
+    source: &str,
+    options: Option<&serde_json::Value>,
+) -> Result<Vec<Finding>> {
     let checker = lookup(checker_name)
         .ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
+    let checker: Box<dyn Checker> = match options {
+        Some(opts) => checker.configure(opts)?.unwrap_or(checker),
+        None => checker,
+    };
     let cache = GrammarCache::new();
     run_checker_with_cache(checker.as_ref(), file, source, &cache)
 }
 
-/// Same as [`run_checker`], but parses through a [`GrammarCache`] the caller already
-/// owns instead of a fresh one-shot cache. Lets a caller running several checkers
-/// against the *same* `(file, source)` pair — as `backtest.rs` does, once per
-/// reconstructed snapshot — share one parse per language across all of them instead
+/// The parse-then-check step [`run_checker_configured`] delegates to once it has a
+/// concrete `&dyn Checker` in hand — this fn skips the name lookup and `configure` step
+/// entirely, taking the checker directly. Also parses through a [`GrammarCache`] the
+/// caller already owns instead of a fresh one-shot cache, so a caller running several
+/// checkers against the *same* `(file, source)` pair — as `backtest.rs` does, once per
+/// reconstructed snapshot — can share one parse per language across all of them instead
 /// of each checker re-parsing it from scratch.
 pub fn run_checker_with_cache(
     checker: &dyn Checker,

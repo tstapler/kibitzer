@@ -857,12 +857,14 @@ impl KibitzerServer {
         }
 
         for checker_name in SYNTAX_RULES_CHECKERS {
-            let severity = config
+            let matching_check = config
                 .checks
                 .iter()
-                .find(|c| c.checker.as_deref() == Some(*checker_name))
+                .find(|c| c.checker.as_deref() == Some(*checker_name));
+            let severity = matching_check
                 .map(|c| c.severity)
                 .unwrap_or(Severity::Advisory);
+            let options = matching_check.and_then(|c| c.options.clone());
             let synthetic = Check {
                 name: (*checker_name).to_string(),
                 command: None,
@@ -873,6 +875,7 @@ impl KibitzerServer {
                 triggers: vec![],
                 message: None,
                 output_format: None,
+                options,
             };
             // `synthetic.checker` is always `Some` here, so `run_check` takes the native-
             // checker path and never consults the registry — an empty one avoids an

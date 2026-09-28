@@ -453,21 +453,22 @@ fn run_native_check(
     // propagating, matching the shell-out path above where a command's own failure is
     // captured as `passed_raw = false` rather than aborting the whole batch — a single
     // bad file shouldn't kill every other check/file in the run.
-    let (mut combined, passed_raw) = match run_checker_against_file(checker_name, file_path) {
-        Ok(result) => result,
-        Err(err) => {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!("{err:#}"),
-                message: check.message.clone(),
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-            });
-        }
-    };
+    let (mut combined, passed_raw) =
+        match run_checker_against_file(checker_name, file_path, check.options.as_ref()) {
+            Ok(result) => result,
+            Err(err) => {
+                return Ok(CheckResult {
+                    check_name: check.name.clone(),
+                    severity: check.severity,
+                    passed: false,
+                    output: format!("{err:#}"),
+                    message: check.message.clone(),
+                    command: cmd_str,
+                    findings: Vec::new(),
+                    plugin_missing: false,
+                });
+            }
+        };
 
     let passed = if let Some(ranges) = changed_lines {
         let (scoped, scoped_passed) =
@@ -491,8 +492,13 @@ fn run_native_check(
     let mut message = check.message.clone();
 
     if !passed && severity == Severity::Blocking {
-        let baseline =
-            check_native_against_git_head(checker_name, repo_root, file_path, changed_lines);
+        let baseline = check_native_against_git_head(
+            checker_name,
+            repo_root,
+            file_path,
+            changed_lines,
+            check.options.as_ref(),
+        );
         if let Some(false) = baseline {
             severity = Severity::Advisory;
             message = Some(format!(
@@ -544,8 +550,10 @@ fn run_checker_against_source(
     checker_name: &str,
     file_path: &Path,
     source: &str,
+    options: Option<&serde_json::Value>,
 ) -> anyhow::Result<(String, bool)> {
-    let findings = crate::checker::run_checker(checker_name, file_path, source)?;
+    let findings =
+        crate::checker::run_checker_configured(checker_name, file_path, source, options)?;
     let passed = findings.is_empty();
     let combined = findings
         .iter()
@@ -568,6 +576,7 @@ const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
 fn run_checker_against_file(
     checker_name: &str,
     file_path: &Path,
+    options: Option<&serde_json::Value>,
 ) -> anyhow::Result<(String, bool)> {
     if let Ok(metadata) = std::fs::metadata(file_path)
         && metadata.len() > MAX_NATIVE_CHECK_BYTES
@@ -576,7 +585,7 @@ fn run_checker_against_file(
     }
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("reading {}", file_path.display()))?;
-    run_checker_against_source(checker_name, file_path, &source)
+    run_checker_against_source(checker_name, file_path, &source, options)
 }
 
 /// Native-checker counterpart to [`check_against_git_head`]: same git-HEAD comparison, but
@@ -587,6 +596,7 @@ fn check_native_against_git_head(
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
+    options: Option<&serde_json::Value>,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
     let show = Command::new("git")
@@ -610,7 +620,7 @@ fn check_native_against_git_head(
 
     let source = String::from_utf8(show.stdout).ok()?;
     let (combined, passed_raw) =
-        run_checker_against_source(checker_name, file_path, &source).ok()?;
+        run_checker_against_source(checker_name, file_path, &source, options).ok()?;
 
     let passed = if let Some(ranges) = &head_ranges {
         let (_, scoped_passed) =
@@ -922,7 +932,13 @@ pub(crate) fn check_predates_git_head(
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
     if let Some(checker_name) = &check.checker {
-        return check_native_against_git_head(checker_name, repo_root, file_path, changed_lines);
+        return check_native_against_git_head(
+            checker_name,
+            repo_root,
+            file_path,
+            changed_lines,
+            check.options.as_ref(),
+        );
     }
     let command = check.command.as_deref()?;
     command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
@@ -1619,6 +1635,7 @@ mod sarif_run_check_tests {
             triggers: vec![],
             message: Some("linter found issues".to_string()),
             output_format: Some(OutputFormat::Sarif),
+            options: None,
         }
     }
 
@@ -1684,6 +1701,7 @@ mod timeout_tests {
             triggers: vec![],
             message: Some("command check".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -1785,6 +1803,7 @@ mod plugin_missing_tests {
                 triggers: vec![],
                 message: None,
                 output_format: None,
+                options: None,
             };
 
             let registry = Registry::load(&crate::plugin::default_registry_path());
@@ -1954,6 +1973,7 @@ mod git_head_integration_tests {
             triggers: vec![],
             message: Some("found BAD marker".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -1970,6 +1990,7 @@ mod git_head_integration_tests {
             triggers: vec![],
             message: Some("found BAD marker in repo".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2194,6 +2215,7 @@ mod git_head_integration_tests {
             triggers: vec![],
             message: Some("content rule violation".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2274,6 +2296,7 @@ mod git_head_integration_tests {
             triggers: vec![],
             message: Some("naming rule violation".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2320,6 +2343,7 @@ mod git_head_integration_tests {
             triggers: vec![],
             message: Some("instability violation".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2378,6 +2402,7 @@ mod git_head_integration_tests {
             triggers: vec![],
             message: Some("layering violation".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2433,6 +2458,7 @@ mod native_check_tests {
             triggers: vec![],
             message: Some("primitive obsession".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2501,6 +2527,7 @@ mod native_check_tests {
             triggers: vec![],
             message: Some("blank import".to_string()),
             output_format: None,
+            options: None,
         }
     }
 
@@ -2550,6 +2577,7 @@ mod native_check_tests {
             triggers: vec![],
             message: None,
             output_format: None,
+            options: None,
         };
 
         let result = run_check(
@@ -2795,6 +2823,68 @@ mod native_check_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn ai_vocabulary_density_check(options: Option<serde_json::Value>) -> Check {
+        Check {
+            name: "native".to_string(),
+            command: None,
+            checker: Some("ai-vocabulary-density".to_string()),
+            architecture_checker: None,
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: None,
+            output_format: None,
+            options,
+        }
+    }
+
+    /// Without `options`, `ai-vocabulary-density`'s default 3-word threshold doesn't
+    /// fire on a single buzzword occurrence.
+    #[test]
+    fn unconfigured_checker_uses_its_own_default_threshold() {
+        let dir = tmp_dir("checker-options-default");
+        let file = dir.join("doc.md");
+        std::fs::write(&file, "We should leverage this system.\n").unwrap();
+
+        let result = run_check(
+            &ai_vocabulary_density_check(None),
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
+        assert!(result.passed, "output: {}", result.output);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end proof that `Check::options` reaches the native checker: lowering the
+    /// threshold to 1 via `options` makes the same file fail, through the exact
+    /// `run_check` -> `run_native_check` path production uses.
+    #[test]
+    fn check_options_reach_the_configured_native_checker() {
+        let dir = tmp_dir("checker-options-configured");
+        let file = dir.join("doc.md");
+        std::fs::write(&file, "We should leverage this system.\n").unwrap();
+
+        let check = ai_vocabulary_density_check(Some(serde_json::json!({ "threshold": 1 })));
+        let result = run_check(
+            &check,
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
+        assert!(!result.passed, "output: {}", result.output);
+        assert!(result.output.contains("leverage"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Closes the gap this fix is for: `ArchFinding.severity_override` was set correctly by
@@ -2819,6 +2909,7 @@ mod findings_wiring_tests {
             triggers: vec![],
             message: None,
             output_format: None,
+            options: None,
         }
     }
 

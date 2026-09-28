@@ -82,6 +82,14 @@ pub struct Check {
     /// checkers already report structured findings. See `docs/output-formats.md`.
     #[serde(default)]
     pub output_format: Option<OutputFormat>,
+    /// Free-form per-checker configuration, passed to `checker`'s `Checker::configure`
+    /// at dispatch time. Shape is checker-specific — see each checker's own doc comment
+    /// (e.g. `ai-vocabulary-density`'s `words`/`threshold`). Only meaningful alongside
+    /// `checker`; a `command`/`architecture_checker` check takes its own parameters
+    /// inline instead (`command`'s `{file}` substitution, `ArchitectureConfig` for
+    /// `architecture_checker`).
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
 }
 
 /// How a [`Check`] is dispatched: once per triggering file, or once per whole-repo
@@ -472,15 +480,34 @@ fn validate(config: &Config, config_path: &Path) -> Result<()> {
                 check.name
             );
         }
-        if let Some(checker_name) = &check.checker
-            && crate::checker::lookup(checker_name).is_none()
-        {
+        if let Some(checker_name) = &check.checker {
+            match crate::checker::lookup(checker_name) {
+                None => anyhow::bail!(
+                    "{}: check '{}' references unknown checker '{}' — run `kibitzer check list` \
+                     for available checkers",
+                    config_path.display(),
+                    check.name,
+                    checker_name
+                ),
+                Some(checker) => {
+                    if let Some(options) = &check.options {
+                        checker.configure(options).with_context(|| {
+                            format!(
+                                "{}: check '{}' (checker '{}') has invalid `options`",
+                                config_path.display(),
+                                check.name,
+                                checker_name
+                            )
+                        })?;
+                    }
+                }
+            }
+        } else if check.options.is_some() {
             anyhow::bail!(
-                "{}: check '{}' references unknown checker '{}' — run `kibitzer check list` \
-                 for available checkers",
+                "{}: check '{}' sets `options` without `checker` — options only apply to \
+                 native checkers",
                 config_path.display(),
-                check.name,
-                checker_name
+                check.name
             );
         }
         if let Some(arch_name) = &check.architecture_checker {
@@ -671,6 +698,7 @@ fn native_check(name: &str, severity: Severity, scope: &[&str]) -> Check {
         ],
         message: None,
         output_format: None,
+        options: None,
     }
 }
 
@@ -689,6 +717,7 @@ fn whole_repo_check(name: &str, architecture_checker: &str) -> Check {
         triggers: vec!["batch".to_string()],
         message: None,
         output_format: None,
+        options: None,
     }
 }
 
@@ -1039,6 +1068,48 @@ mod tests {
     }
 
     #[test]
+    fn accepts_valid_options_for_a_configurable_checker() {
+        let config = parse(
+            r#"{"checks": [{"name": "n", "checker": "ai-vocabulary-density", "severity": "advisory", "options": {"threshold": 1}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.checks[0].options,
+            Some(serde_json::json!({"threshold": 1}))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_options_for_a_configurable_checker() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "checker": "ai-vocabulary-density", "severity": "advisory", "options": {"threshold": "not-a-number"}}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid `options`"));
+    }
+
+    #[test]
+    fn rejects_options_without_checker() {
+        let err = parse(
+            r#"{"checks": [{"name": "n", "command": "true {file}", "severity": "advisory", "options": {"threshold": 1}}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("`options` without `checker`"));
+    }
+
+    #[test]
+    fn accepts_options_for_a_checker_that_ignores_them() {
+        // `primitive-obsession` doesn't override `Checker::configure` — the default
+        // no-op accepts any `options` value rather than erroring, since a checker with
+        // no configurable surface has nothing to validate against.
+        let config = parse(
+            r#"{"checks": [{"name": "n", "checker": "primitive-obsession", "severity": "advisory", "options": {"anything": true}}]}"#,
+        )
+        .unwrap();
+        assert!(config.checks[0].options.is_some());
+    }
+
+    #[test]
     fn accepts_architecture_checker_with_batch_trigger() {
         let config = parse(
             r#"{"checks": [{"name": "n", "architecture_checker": "import-cycles", "severity": "advisory", "triggers": ["batch"]}]}"#,
@@ -1344,7 +1415,7 @@ mod tests {
     fn default_config_flags_repeated_literal_with_no_inspect_json() {
         // `default_checks()` is what a repo with no `.claude/inspect.json` gets — this
         // exercises `replace-magic-literal` through the actual config-layer dispatch
-        // (`Check::checker` -> `checker::run_checker`) rather than calling
+        // (`Check::checker` -> `checker::run_checker_configured`) rather than calling
         // `SyntaxRulesChecker::check()` directly the way `rules.rs`'s own module tests do.
         let defaults = default_checks();
         let check = defaults
@@ -1355,10 +1426,11 @@ mod tests {
             .checker
             .as_deref()
             .expect("syntax-rules-go must dispatch via a native checker");
-        let findings = crate::checker::run_checker(
+        let findings = crate::checker::run_checker_configured(
             checker_name,
             Path::new("fixture.go"),
             "package main\nfunc f() {\n\ta := 42\n\tb := 42\n\tc := 42\n}\n",
+            None,
         )
         .unwrap();
         assert!(

@@ -42,9 +42,40 @@ Enable one by adding it to `.kibitzer/inspect.json`'s `checks` array (see
 }
 ```
 
-All five word/phrase lists are hardcoded per-checker (no per-project
-word-list customization yet — see "Bring your own style rules" below for
-today's alternative if a project needs that).
+### Customizing a checker's word list/thresholds
+
+Every checker in the table above reads its word/phrase list and thresholds
+from a `Check.options` object, falling back to its own hardcoded defaults for
+anything `options` doesn't set — no code change needed to add a house-style
+word or tune a threshold for one project. See each checker's own module doc
+comment (`src/checkers/*.rs`) for its exact `options` shape; for example:
+
+```json
+{
+  "checks": [
+    {
+      "name": "ai-vocabulary-density",
+      "checker": "ai-vocabulary-density",
+      "severity": "advisory",
+      "scope": ["**/*.md"],
+      "options": { "words": ["synergy", "circle back"], "threshold": 2 }
+    },
+    {
+      "name": "sentence-length-uniformity",
+      "checker": "sentence-length-uniformity",
+      "severity": "advisory",
+      "scope": ["**/*.md"],
+      "options": { "min_sentences": 10 }
+    }
+  ]
+}
+```
+
+`options` is validated at config-load time (`kibitzer run`/`kibitzer check`
+fails immediately with the config path and check name, not a silent
+fallback) — a typo like `"threshold": "two"` is caught before any check
+actually runs. A checker with nothing to configure (e.g. the two default,
+non-opt-in checks above) ignores `options` entirely rather than erroring.
 
 ## Bring your own style rules: Vale
 

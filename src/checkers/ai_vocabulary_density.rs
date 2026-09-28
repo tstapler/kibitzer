@@ -74,16 +74,41 @@ const AI_VOCAB_THRESHOLD: usize = 3;
 
 static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Za-z']+\b").unwrap());
 
-/// Flags a paragraph whose count of AI-buzzword-list words meets
-/// [`AI_VOCAB_THRESHOLD`] — a mechanical proxy for "this reads like unedited LLM
-/// output" rather than a judgment on any individual word, several of which
-/// ("robust", "leverage", "utilize") are perfectly ordinary in technical writing on
-/// their own. Deliberately scoped to `Tag::Paragraph` text outside any list, matching
-/// [`crate::repetitive_sentences`] and [`crate::paragraph_breaks`]. Not wired into
-/// `config::default_checks()` — opt-in only via a repo's `.kibitzer/inspect.json`,
-/// since the false-positive rate on legitimate domain writing is too high to run
-/// everywhere by default.
-pub struct AiVocabularyDensityChecker;
+/// Flags a paragraph whose count of AI-buzzword-list words meets [`threshold`]. A
+/// mechanical proxy for "this reads like unedited LLM output" rather than a judgment
+/// on any individual word, several of which ("robust", "leverage", "utilize") are
+/// perfectly ordinary in technical writing on their own. Deliberately scoped to
+/// `Tag::Paragraph` text outside any list, matching [`crate::repetitive_sentences`] and
+/// [`crate::paragraph_breaks`]. Not wired into `config::default_checks()` — opt-in only
+/// via a repo's `.kibitzer/inspect.json`, since the false-positive rate on legitimate
+/// domain writing is too high to run everywhere by default.
+///
+/// [`AI_VOCAB`]/[`AI_VOCAB_THRESHOLD`] are the defaults; a project can override either
+/// via this check's `options` (see [`Checker::configure`]):
+/// ```json
+/// { "checker": "ai-vocabulary-density", "options": { "words": ["synergy"], "threshold": 2 } }
+/// ```
+pub struct AiVocabularyDensityChecker {
+    words: Vec<String>,
+    threshold: usize,
+}
+
+impl Default for AiVocabularyDensityChecker {
+    fn default() -> Self {
+        AiVocabularyDensityChecker {
+            words: AI_VOCAB.iter().map(|w| w.to_string()).collect(),
+            threshold: AI_VOCAB_THRESHOLD,
+        }
+    }
+}
+
+/// Per-project override shape for [`AiVocabularyDensityChecker::configure`]. Both
+/// fields optional — an absent one keeps that field's own default.
+#[derive(serde::Deserialize)]
+struct Options {
+    words: Option<Vec<String>>,
+    threshold: Option<usize>,
+}
 
 impl Checker for AiVocabularyDensityChecker {
     fn name(&self) -> &str {
@@ -103,47 +128,63 @@ impl Checker for AiVocabularyDensityChecker {
     }
 
     fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        Ok(check_source(ctx.source))
+        Ok(self.check_source(ctx.source))
+    }
+
+    fn configure(&self, options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
+        let opts: Options = serde_json::from_value(options.clone())?;
+        Ok(Some(Box::new(AiVocabularyDensityChecker {
+            words: opts.words.unwrap_or_else(|| self.words.clone()),
+            threshold: opts.threshold.unwrap_or(self.threshold),
+        })))
     }
 }
 
 inventory::submit! {
-    crate::checker::CheckerFactory(|| vec![Box::new(AiVocabularyDensityChecker)])
+    crate::checker::CheckerFactory(|| vec![Box::new(AiVocabularyDensityChecker::default())])
 }
 
-pub fn check_source(body: &str) -> Vec<Finding> {
-    crate::markdown_text::check_paragraphs(body, check_paragraph)
-}
-
-/// One paragraph's worth of flattened text, checked for AI-buzzword-list density.
-/// Returns a finding listing the matched words in the order they appeared once the
-/// count reaches [`AI_VOCAB_THRESHOLD`].
-fn check_paragraph(line: usize, text: &str) -> Option<Finding> {
-    let matches: Vec<&str> = WORD_RE
-        .find_iter(text)
-        .filter_map(|m| {
-            let lower = m.as_str().to_lowercase();
-            AI_VOCAB.iter().find(|w| **w == lower).copied()
-        })
-        .collect();
-
-    if matches.len() < AI_VOCAB_THRESHOLD {
-        return None;
+impl AiVocabularyDensityChecker {
+    fn check_source(&self, body: &str) -> Vec<Finding> {
+        crate::markdown_text::check_paragraphs(body, |line, text| self.check_paragraph(line, text))
     }
 
-    Some(Finding {
-        line,
-        message: format!(
-            "paragraph uses {} AI-buzzword-list words ({}) — consider more direct language",
-            matches.len(),
-            matches.join(", ")
-        ),
-    })
+    /// One paragraph's worth of flattened text, checked for AI-buzzword-list density.
+    /// Returns a finding listing the matched words in the order they appeared once the
+    /// count reaches `self.threshold`.
+    fn check_paragraph(&self, line: usize, text: &str) -> Option<Finding> {
+        let matches: Vec<&str> = WORD_RE
+            .find_iter(text)
+            .filter_map(|m| {
+                let lower = m.as_str().to_lowercase();
+                self.words.iter().find(|w| **w == lower).map(|w| w.as_str())
+            })
+            .collect();
+
+        if matches.len() < self.threshold {
+            return None;
+        }
+
+        Some(Finding {
+            line,
+            message: format!(
+                "paragraph uses {} AI-buzzword-list words ({}) — consider more direct language",
+                matches.len(),
+                matches.join(", ")
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the default word list/threshold — the shorthand every non-`configure_*`
+    /// test below uses instead of spelling out `AiVocabularyDensityChecker::default()`.
+    fn check_source(body: &str) -> Vec<Finding> {
+        AiVocabularyDensityChecker::default().check_source(body)
+    }
 
     #[test]
     fn flags_paragraph_with_three_or_more_buzzwords() {
@@ -167,5 +208,41 @@ mod tests {
     fn ignores_list_items() {
         let body = "- We leverage a robust and seamless system here.\n- Another robust leverage seamless line.\n";
         assert!(check_source(body).is_empty());
+    }
+
+    #[test]
+    fn configure_overrides_word_list_and_threshold() {
+        let configured = AiVocabularyDensityChecker::default()
+            .configure(&serde_json::json!({ "words": ["banana"], "threshold": 1 }))
+            .unwrap()
+            .unwrap();
+        let ctx = CheckContext {
+            source: "One banana in this otherwise ordinary paragraph.\n",
+            tree: None,
+        };
+        let findings = configured.check(Path::new("doc.md"), &ctx).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("banana"));
+    }
+
+    #[test]
+    fn configure_keeps_default_word_list_when_only_threshold_is_overridden() {
+        let configured = AiVocabularyDensityChecker::default()
+            .configure(&serde_json::json!({ "threshold": 1 }))
+            .unwrap()
+            .unwrap();
+        let ctx = CheckContext {
+            source: "We should leverage this system.\n",
+            tree: None,
+        };
+        let findings = configured.check(Path::new("doc.md"), &ctx).unwrap();
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn configure_rejects_malformed_options() {
+        let err = AiVocabularyDensityChecker::default()
+            .configure(&serde_json::json!({ "threshold": "not-a-number" }));
+        assert!(err.is_err());
     }
 }
