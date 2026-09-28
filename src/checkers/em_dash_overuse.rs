@@ -23,10 +23,7 @@ const EM_DASH_THRESHOLD: usize = 3;
 /// positives.
 ///
 /// [`EM_DASH_THRESHOLD`] is the default; a project can raise or lower it via this
-/// check's `options` (see [`Checker::configure`]):
-/// ```json
-/// { "checker": "em-dash-overuse", "options": { "threshold": 5 } }
-/// ```
+/// check's `options` (see [`Checker::configure`] and `docs/prose-checks.md`).
 pub struct EmDashOveruseChecker {
     threshold: usize,
 }
@@ -39,8 +36,11 @@ impl Default for EmDashOveruseChecker {
     }
 }
 
-/// Per-project override shape for [`EmDashOveruseChecker::configure`].
+/// Per-project override shape for [`EmDashOveruseChecker::configure`]. Unknown fields
+/// are rejected (rather than silently ignored) so a typo like `"thresold"` fails loudly
+/// at config-load time instead of running with an untouched default.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Options {
     threshold: Option<usize>,
 }
@@ -162,6 +162,12 @@ mod tests {
     fn configure_rejects_malformed_options() {
         let err =
             EmDashOveruseChecker::default().configure(&serde_json::json!({ "threshold": -1 }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn configure_rejects_unknown_option_key() {
+        let err = EmDashOveruseChecker::default().configure(&serde_json::json!({ "thresold": 5 }));
         assert!(err.is_err());
     }
 }

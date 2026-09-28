@@ -46,10 +46,8 @@ const FILLER_PHRASE_THRESHOLD: usize = 2;
 /// repo's `.kibitzer/inspect.json`.
 ///
 /// [`FILLER_PHRASES`]/[`FILLER_PHRASE_THRESHOLD`] are the defaults; a project can
-/// override either via this check's `options` (see [`Checker::configure`]):
-/// ```json
-/// { "checker": "filler-phrase-density", "options": { "phrases": ["circle back"], "threshold": 1 } }
-/// ```
+/// override either via this check's `options` (see [`Checker::configure`] and
+/// `docs/prose-checks.md`).
 pub struct FillerPhraseDensityChecker {
     phrases: Vec<String>,
     threshold: usize,
@@ -65,8 +63,10 @@ impl Default for FillerPhraseDensityChecker {
 }
 
 /// Per-project override shape for [`FillerPhraseDensityChecker::configure`]. Both
-/// fields optional — an absent one keeps that field's own default.
+/// fields optional — an absent one keeps that field's own default. Unknown fields are
+/// rejected so a typo fails loudly at config-load time instead of running silently.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Options {
     phrases: Option<Vec<String>>,
     threshold: Option<usize>,
@@ -207,6 +207,13 @@ mod tests {
     fn configure_rejects_malformed_options() {
         let err = FillerPhraseDensityChecker::default()
             .configure(&serde_json::json!({ "threshold": "not-a-number" }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn configure_rejects_unknown_option_key() {
+        let err = FillerPhraseDensityChecker::default()
+            .configure(&serde_json::json!({ "phrasess": ["circle back"] }));
         assert!(err.is_err());
     }
 }

@@ -37,10 +37,7 @@ const AI_OPENERS: &[&str] = &[
 /// than requiring a 3+ run the way `repetitive_sentences` does.
 ///
 /// [`AI_OPENERS`] is the default list; a project can override it via this check's
-/// `options` (see [`Checker::configure`]):
-/// ```json
-/// { "checker": "formulaic-ai-openers", "options": { "openers": ["all in all"] } }
-/// ```
+/// `options` (see [`Checker::configure`] and `docs/prose-checks.md`).
 pub struct FormulaicAiOpenersChecker {
     openers: Vec<String>,
 }
@@ -53,8 +50,11 @@ impl Default for FormulaicAiOpenersChecker {
     }
 }
 
-/// Per-project override shape for [`FormulaicAiOpenersChecker::configure`].
+/// Per-project override shape for [`FormulaicAiOpenersChecker::configure`]. Unknown
+/// fields are rejected so a typo fails loudly at config-load time instead of running
+/// silently.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Options {
     openers: Option<Vec<String>>,
 }
@@ -179,6 +179,13 @@ mod tests {
     fn configure_rejects_malformed_options() {
         let err = FormulaicAiOpenersChecker::default()
             .configure(&serde_json::json!({ "openers": "not-a-list" }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn configure_rejects_unknown_option_key() {
+        let err = FormulaicAiOpenersChecker::default()
+            .configure(&serde_json::json!({ "openerz": ["all in all"] }));
         assert!(err.is_err());
     }
 }
