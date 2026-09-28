@@ -35,11 +35,7 @@ const MAX_COEFFICIENT_OF_VARIATION: f64 = 0.2;
 ///
 /// [`MIN_SENTENCES`]/[`MIN_MEAN_WORDS`]/[`MAX_COEFFICIENT_OF_VARIATION`] are the
 /// defaults; a project can override any of them via this check's `options` (see
-/// [`Checker::configure`]) — e.g. to raise `min_sentences` and cut down on false
-/// positives against short, deliberately parallel enumerations:
-/// ```json
-/// { "checker": "sentence-length-uniformity", "options": { "min_sentences": 10 } }
-/// ```
+/// [`Checker::configure`] and `docs/prose-checks.md`).
 pub struct SentenceLengthUniformityChecker {
     min_sentences: usize,
     min_mean_words: f64,
@@ -57,8 +53,10 @@ impl Default for SentenceLengthUniformityChecker {
 }
 
 /// Per-project override shape for [`SentenceLengthUniformityChecker::configure`]. Every
-/// field optional — an absent one keeps that field's own default.
+/// field optional — an absent one keeps that field's own default. Unknown fields are
+/// rejected so a typo fails loudly at config-load time instead of running silently.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Options {
     min_sentences: Option<usize>,
     min_mean_words: Option<f64>,
@@ -228,6 +226,13 @@ mod tests {
     fn configure_rejects_malformed_options() {
         let err = SentenceLengthUniformityChecker::default()
             .configure(&serde_json::json!({ "min_sentences": "not-a-number" }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn configure_rejects_unknown_option_key() {
+        let err = SentenceLengthUniformityChecker::default()
+            .configure(&serde_json::json!({ "min_sentence": 10 }));
         assert!(err.is_err());
     }
 }

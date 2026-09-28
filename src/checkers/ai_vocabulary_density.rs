@@ -83,11 +83,8 @@ static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Za-z']+\b")
 /// via a repo's `.kibitzer/inspect.json`, since the false-positive rate on legitimate
 /// domain writing is too high to run everywhere by default.
 ///
-/// [`AI_VOCAB`]/[`AI_VOCAB_THRESHOLD`] are the defaults; a project can override either
-/// via this check's `options` (see [`Checker::configure`]):
-/// ```json
-/// { "checker": "ai-vocabulary-density", "options": { "words": ["synergy"], "threshold": 2 } }
-/// ```
+/// [`AI_VOCAB`]/[`AI_VOCAB_THRESHOLD`] are the defaults; a project can override either via
+/// this check's `options` (see [`Checker::configure`] and `docs/prose-checks.md`).
 pub struct AiVocabularyDensityChecker {
     words: Vec<String>,
     threshold: usize,
@@ -103,8 +100,10 @@ impl Default for AiVocabularyDensityChecker {
 }
 
 /// Per-project override shape for [`AiVocabularyDensityChecker::configure`]. Both
-/// fields optional — an absent one keeps that field's own default.
+/// fields optional — an absent one keeps that field's own default. Unknown fields are
+/// rejected so a typo fails loudly at config-load time instead of running silently.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Options {
     words: Option<Vec<String>>,
     threshold: Option<usize>,
@@ -243,6 +242,13 @@ mod tests {
     fn configure_rejects_malformed_options() {
         let err = AiVocabularyDensityChecker::default()
             .configure(&serde_json::json!({ "threshold": "not-a-number" }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn configure_rejects_unknown_option_key() {
+        let err = AiVocabularyDensityChecker::default()
+            .configure(&serde_json::json!({ "wrods": ["synergy"] }));
         assert!(err.is_err());
     }
 }
