@@ -173,15 +173,19 @@ fn check_proportionality(
     let leading_nodes = leading_comment_nodes(decl, comment_kinds, src);
     let counts = comment_line_counts(decl, body, comment_kinds, &leading_nodes);
 
-    if counts.total_comment_lines == 0 || counts.body_code_lines == 0 {
-        return;
-    }
-
     // Delegating bodies only exempt the ratio check (near-zero denominator); `# Safety`
     // exempts both, since that kind of comment can legitimately run long regardless of size.
     let safety_exempt = has_safety_section(&leading_nodes, src);
     if !safety_exempt {
         check_absolute_length(counts.leading_comment_lines, counts.finding_line, findings);
+    }
+
+    // The ratio check's denominator goes degenerate at zero comments/zero code lines
+    // (e.g. a one-line body sharing its line with a comment, making body_code_lines 0
+    // via saturating_sub) — [comment-too-long] above has no such degenerate case, so
+    // it must not share this guard.
+    if counts.total_comment_lines == 0 || counts.body_code_lines == 0 {
+        return;
     }
     if safety_exempt || is_delegating_single_statement_body(body, src) {
         return;

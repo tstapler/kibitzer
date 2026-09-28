@@ -305,3 +305,13 @@ fn low_parameter_count_does_not_get_a_ratio_bonus() {
     let findings = run(Language::Go, src);
     assert_has_finding(&findings, FINDING_OVER_COMMENTED);
 }
+
+/// A one-line body sharing its line with an inline comment makes `body_code_lines`
+/// compute to 0 (`saturating_sub` of equal totals) — that must not exempt
+/// `[comment-too-long]`, whose whole point is being independent of body size.
+#[test]
+fn zero_body_code_lines_does_not_exempt_comment_too_long() {
+    let src = "// F does something, for reasons that take more than five lines to explain.\n// Line two of the rationale.\n// Line three of the rationale.\n// Line four of the rationale.\n// Line five of the rationale.\n// Line six of the rationale, which pushes this over the ceiling.\nfunc F() { /* trivial */ }\n";
+    let findings = run(Language::Go, src);
+    assert_has_finding(&findings, FINDING_COMMENT_TOO_LONG);
+}
