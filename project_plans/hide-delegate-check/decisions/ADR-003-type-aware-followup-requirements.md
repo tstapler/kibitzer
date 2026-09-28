@@ -1,7 +1,7 @@
 # ADR-003: Requirements for a Third `hide-delegate` Attempt (Type-Aware, Not Syntactic)
 
 **Date**: 2026-09-28
-**Status**: Proposed — not yet started, no owner
+**Status**: Rejected — killed by its own validation gate (see Decision), no resolver built
 **Related**: ADR-001 (allowlist proxy, killed), ADR-002 (root-cause analysis, killed the check
 entirely), a third independent implementation (PR #106) that reproduced the same failure mode
 under different exclusion heuristics and was reverted (PR #111) after cross-checking it against
@@ -109,11 +109,32 @@ signal against ADR-002's own triage data before writing the chain-flagging logic
 
 ## Decision
 
-Not started. This ADR exists so a fourth attempt begins from this evidence and this gate, instead
-of re-discovering ADR-001 through ADR-003's dead ends a third and fourth time. No owner, no
-timeline — pick this up only if/when the return-type capability described above is worth building
-for its own sake (e.g. another checker needs it), since building it purely to validate one rule idea
-that may still fail step 3 above is a large investment for an uncertain payoff.
+**Killed by its own validation gate (2026-09-28), before any resolver was built.** A manual
+spot-check against the 786-record triage corpus — no code, just reading the existing category
+tags plus source at a dozen sampled lines via the `/tmp/{ripgrep,k8s}-fp-check` worktrees — found
+that condition 3 ("different package") would **not** exclude a large majority of confirmed false
+positives, not a tail case:
+
+- `client-go-typed-clientset` + `informer-factory-accessor-chain` + `lister-get-list-chain`
+  (281/786, 36%) are exactly the client-go shape this ADR's "Known risk" section already predicted
+  wouldn't resolve — each hop's return type genuinely is a distinct type in a distinct sub-package.
+- A follow-up sample of 4 more records from the untagged/misc grab-bag, read at the source
+  (not just the note text), all crossed a package boundary too: `metrics.PodPendingResizes.WithLabelValues(...)`
+  (into prometheus's own package), `acc.details.CPUsInNUMANodes(numa).Size()` (into
+  `k8s.io/utils/cpuset`), `self.dent.path().strip_prefix(...)` and `self.wtr.borrow().supports_color()`
+  (both into Rust's `std`).
+
+The pattern: "different package" fires on nearly every real multi-hop chain, because idiomatic
+Go/Rust constantly calls into stdlib types, small utility crates, or a library's own sub-packages.
+That's not a Demeter violation — it's just how non-trivial code is organized. Condition 3 doesn't
+distinguish that from "reaching into an unrelated collaborator's internals," which is the same
+unbounded-vocabulary failure ADR-002 diagnosed, just moved from method names to package names.
+
+**No return-type resolver was built.** The gate this ADR itself mandated (step 3: "if it's not
+dramatically better... stop here") caught this before any `ArchModel` work started, which is the
+gate doing its job. `hide-delegate` stays dead per ADR-002. A fifth attempt would need a genuinely
+different signal — not a variant of "the syntax/type crosses some boundary" — and there's no
+candidate for one right now.
 
 ## Evidence
 
