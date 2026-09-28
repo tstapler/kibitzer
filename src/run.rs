@@ -322,6 +322,7 @@ mod tests {
             triggers: vec![],
             message: None,
             output_format: None,
+            options: None,
         }
     }
 

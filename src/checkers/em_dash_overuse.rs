@@ -21,7 +21,29 @@ const EM_DASH_THRESHOLD: usize = 3;
 /// project-wide, backtest it carefully against real corpora — including this very repo's
 /// own doc comments, which is expected to be a stress test and likely source of false
 /// positives.
-pub struct EmDashOveruseChecker;
+///
+/// [`EM_DASH_THRESHOLD`] is the default; a project can raise or lower it via this
+/// check's `options` (see [`Checker::configure`]):
+/// ```json
+/// { "checker": "em-dash-overuse", "options": { "threshold": 5 } }
+/// ```
+pub struct EmDashOveruseChecker {
+    threshold: usize,
+}
+
+impl Default for EmDashOveruseChecker {
+    fn default() -> Self {
+        EmDashOveruseChecker {
+            threshold: EM_DASH_THRESHOLD,
+        }
+    }
+}
+
+/// Per-project override shape for [`EmDashOveruseChecker::configure`].
+#[derive(serde::Deserialize)]
+struct Options {
+    threshold: Option<usize>,
+}
 
 impl Checker for EmDashOveruseChecker {
     fn name(&self) -> &str {
@@ -41,34 +63,51 @@ impl Checker for EmDashOveruseChecker {
     }
 
     fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        Ok(check_source(ctx.source))
+        Ok(self.check_source(ctx.source))
+    }
+
+    fn configure(&self, options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
+        let opts: Options = serde_json::from_value(options.clone())?;
+        Ok(Some(Box::new(EmDashOveruseChecker {
+            threshold: opts.threshold.unwrap_or(self.threshold),
+        })))
     }
 }
 
 inventory::submit! {
-    crate::checker::CheckerFactory(|| vec![Box::new(EmDashOveruseChecker)])
+    crate::checker::CheckerFactory(|| vec![Box::new(EmDashOveruseChecker::default())])
 }
 
-pub fn check_source(body: &str) -> Vec<Finding> {
-    crate::markdown_text::check_paragraphs(body, check_paragraph)
-}
-
-/// Counts em dashes (U+2014 only — a hyphen or en-dash doesn't count) in one paragraph's
-/// flattened text and flags it once the count reaches [`EM_DASH_THRESHOLD`].
-fn check_paragraph(line: usize, text: &str) -> Option<Finding> {
-    let count = text.chars().filter(|&c| c == '\u{2014}').count();
-    if count < EM_DASH_THRESHOLD {
-        return None;
+impl EmDashOveruseChecker {
+    fn check_source(&self, body: &str) -> Vec<Finding> {
+        crate::markdown_text::check_paragraphs(body, |line, text| self.check_paragraph(line, text))
     }
-    Some(Finding {
-        line,
-        message: format!("paragraph uses {count} em dashes — vary punctuation/sentence structure"),
-    })
+
+    /// Counts em dashes (U+2014 only — a hyphen or en-dash doesn't count) in one
+    /// paragraph's flattened text and flags it once the count reaches `self.threshold`.
+    fn check_paragraph(&self, line: usize, text: &str) -> Option<Finding> {
+        let count = text.chars().filter(|&c| c == '\u{2014}').count();
+        if count < self.threshold {
+            return None;
+        }
+        Some(Finding {
+            line,
+            message: format!(
+                "paragraph uses {count} em dashes — vary punctuation/sentence structure"
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the default threshold — the shorthand every non-`configure_*` test below
+    /// uses instead of spelling out `EmDashOveruseChecker::default()`.
+    fn check_source(body: &str) -> Vec<Finding> {
+        EmDashOveruseChecker::default().check_source(body)
+    }
 
     #[test]
     fn flags_three_or_more_em_dashes() {
@@ -98,5 +137,31 @@ mod tests {
     fn ignores_list_items() {
         let body = "- This — has — three — dashes\n- Another — item — here — too\n";
         assert!(check_source(body).is_empty());
+    }
+
+    #[test]
+    fn configure_overrides_threshold() {
+        let configured = EmDashOveruseChecker::default()
+            .configure(&serde_json::json!({ "threshold": 5 }))
+            .unwrap()
+            .unwrap();
+        let ctx = CheckContext {
+            source: "This is one — this is two — this is three — and this is four.\n",
+            tree: None,
+        };
+        // Only 3 dashes here — below the raised threshold of 5.
+        assert!(
+            configured
+                .check(Path::new("doc.md"), &ctx)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configure_rejects_malformed_options() {
+        let err =
+            EmDashOveruseChecker::default().configure(&serde_json::json!({ "threshold": -1 }));
+        assert!(err.is_err());
     }
 }

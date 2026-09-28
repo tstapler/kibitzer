@@ -128,6 +128,10 @@
         "name": {
           "type": "string"
         },
+        "options": {
+          "description": "Free-form per-checker configuration, passed to `checker`'s `Checker::configure` at dispatch time. Shape is checker-specific — see each checker's own doc comment (e.g. `ai-vocabulary-density`'s `words`/`threshold`). Only meaningful alongside `checker`; a `command`/`architecture_checker` check takes its own parameters inline instead (`command`'s `{file}` substitution, `ArchitectureConfig` for `architecture_checker`).",
+          "default": null
+        },
         "output_format": {
           "description": "A structured shape kibitzer should parse from `command`'s stdout instead of treating the check as pure exit-code pass/fail. Requires `command` — native checkers already report structured findings. See `docs/output-formats.md`.",
           "default": null,

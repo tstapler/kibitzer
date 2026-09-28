@@ -185,6 +185,7 @@ pub fn registered_plugin_checks() -> Vec<Check> {
             triggers: p.triggers,
             message: None,
             output_format: Some(p.output_format),
+            options: None,
         })
         .collect()
 }

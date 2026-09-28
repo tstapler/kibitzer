@@ -35,7 +35,29 @@ const AI_OPENERS: &[&str] = &[
 /// `.kibitzer/inspect.json`. A formulaic opener can appear in legitimate human writing too
 /// (e.g. "In summary, the results support..."), so this has a higher false-positive rate
 /// than requiring a 3+ run the way `repetitive_sentences` does.
-pub struct FormulaicAiOpenersChecker;
+///
+/// [`AI_OPENERS`] is the default list; a project can override it via this check's
+/// `options` (see [`Checker::configure`]):
+/// ```json
+/// { "checker": "formulaic-ai-openers", "options": { "openers": ["all in all"] } }
+/// ```
+pub struct FormulaicAiOpenersChecker {
+    openers: Vec<String>,
+}
+
+impl Default for FormulaicAiOpenersChecker {
+    fn default() -> Self {
+        FormulaicAiOpenersChecker {
+            openers: AI_OPENERS.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+}
+
+/// Per-project override shape for [`FormulaicAiOpenersChecker::configure`].
+#[derive(serde::Deserialize)]
+struct Options {
+    openers: Option<Vec<String>>,
+}
 
 impl Checker for FormulaicAiOpenersChecker {
     fn name(&self) -> &str {
@@ -55,40 +77,56 @@ impl Checker for FormulaicAiOpenersChecker {
     }
 
     fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        Ok(check_source(ctx.source))
+        Ok(self.check_source(ctx.source))
+    }
+
+    fn configure(&self, options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
+        let opts: Options = serde_json::from_value(options.clone())?;
+        Ok(Some(Box::new(FormulaicAiOpenersChecker {
+            openers: opts.openers.unwrap_or_else(|| self.openers.clone()),
+        })))
     }
 }
 
 inventory::submit! {
-    crate::checker::CheckerFactory(|| vec![Box::new(FormulaicAiOpenersChecker)])
+    crate::checker::CheckerFactory(|| vec![Box::new(FormulaicAiOpenersChecker::default())])
 }
 
-pub fn check_source(body: &str) -> Vec<Finding> {
-    crate::markdown_text::check_paragraphs(body, check_paragraph)
-}
+impl FormulaicAiOpenersChecker {
+    fn check_source(&self, body: &str) -> Vec<Finding> {
+        crate::markdown_text::check_paragraphs(body, |line, text| self.check_paragraph(line, text))
+    }
 
-/// Checks only the paragraph's first sentence — a formulaic opener buried later in the
-/// paragraph isn't this defect, since the paragraph didn't *open* with it.
-fn check_paragraph(line: usize, text: &str) -> Option<Finding> {
-    let first_sentence = split_sentences(text)
-        .into_iter()
-        .next()?
-        .trim()
-        .to_lowercase();
-    let phrase = AI_OPENERS
-        .iter()
-        .find(|opener| first_sentence.starts_with(**opener))?;
-    Some(Finding {
-        line,
-        message: format!(
-            "paragraph opens with a formulaic AI-writing transition (\"{phrase}\") — start with the actual point instead"
-        ),
-    })
+    /// Checks only the paragraph's first sentence — a formulaic opener buried later in
+    /// the paragraph isn't this defect, since the paragraph didn't *open* with it.
+    fn check_paragraph(&self, line: usize, text: &str) -> Option<Finding> {
+        let first_sentence = split_sentences(text)
+            .into_iter()
+            .next()?
+            .trim()
+            .to_lowercase();
+        let phrase = self
+            .openers
+            .iter()
+            .find(|opener| first_sentence.starts_with(opener.as_str()))?;
+        Some(Finding {
+            line,
+            message: format!(
+                "paragraph opens with a formulaic AI-writing transition (\"{phrase}\") — start with the actual point instead"
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the default opener list — the shorthand every non-`configure_*` test below
+    /// uses instead of spelling out `FormulaicAiOpenersChecker::default()`.
+    fn check_source(body: &str) -> Vec<Finding> {
+        FormulaicAiOpenersChecker::default().check_source(body)
+    }
 
     #[test]
     fn flags_formulaic_opener() {
@@ -108,5 +146,39 @@ mod tests {
     fn ignores_list_items() {
         let body = "- In conclusion, this is a.\n- Moreover, this is b.\n";
         assert!(check_source(body).is_empty());
+    }
+
+    #[test]
+    fn configure_overrides_opener_list() {
+        let configured = FormulaicAiOpenersChecker::default()
+            .configure(&serde_json::json!({ "openers": ["all in all"] }))
+            .unwrap()
+            .unwrap();
+        let ctx = CheckContext {
+            source: "All in all, the results were clear. It worked well.\n",
+            tree: None,
+        };
+        let findings = configured.check(Path::new("doc.md"), &ctx).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("\"all in all\""));
+
+        // The default opener no longer fires once the list is overridden.
+        let ctx = CheckContext {
+            source: "In conclusion, the results were clear. It worked well.\n",
+            tree: None,
+        };
+        assert!(
+            configured
+                .check(Path::new("doc.md"), &ctx)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configure_rejects_malformed_options() {
+        let err = FormulaicAiOpenersChecker::default()
+            .configure(&serde_json::json!({ "openers": "not-a-list" }));
+        assert!(err.is_err());
     }
 }
