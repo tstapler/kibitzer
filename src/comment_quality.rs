@@ -43,132 +43,20 @@ const PARAM_COUNT_RATIO_BASELINE: usize = 2;
 /// length alone.
 const MAX_LEADING_COMMENT_LINES: usize = 5;
 
-/// Marketing filler, hedge words, and invented-rationale phrases that add nothing a
-/// reader couldn't already see, plus the task/fix/caller-referencing anti-pattern
-/// (comments should describe the code, not the change that produced it — those belong
-/// in the commit message instead, where they don't rot as the code moves on).
-/// Matched case-insensitively as a substring, so keep entries lowercase.
-const BANNED_PHRASES: &[(&str, &str)] = &[
-    (
-        "seamlessly",
-        "state the fact instead of reaching for marketing language",
-    ),
-    (
-        "powerful",
-        "state the fact instead of reaching for marketing language",
-    ),
-    (
-        "robust",
-        "state the fact instead of reaching for marketing language",
-    ),
-    (
-        "enterprise-grade",
-        "state the fact instead of reaching for marketing language",
-    ),
-    // The next two roots' inflected forms are listed as separate entries rather than
-    // matched by a stem, per `contains_whole_phrase`'s word-boundary check below — a
-    // real backtest finding: whole-word matching (needed so a short attribution
-    // phrase doesn't fire inside an unrelated longer word) would otherwise also
-    // reject a common third-person present-tense phrasing as "root plus more
-    // letters," losing a legitimate hit.
-    (
-        "leverage",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "leverages",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "leveraging",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "leveraged",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "utilize",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "utilizes",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "utilizing",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "utilized",
-        "say what actually happens instead of a vaguer synonym",
-    ),
-    (
-        "it's worth noting",
-        "cut the filler and state the fact directly",
-    ),
-    (
-        "as mentioned above",
-        "cut the filler and state the fact directly",
-    ),
-    ("note that", "cut the filler and state the fact directly"),
-    (
-        "needless to say",
-        "cut the filler and state the fact directly",
-    ),
-    (
-        "designed to improve",
-        "only document what the code actually does, not the intent behind it",
-    ),
-    (
-        "supports future",
-        "only document what the code actually does, not speculative future use",
-    ),
-    (
-        "used by",
-        "this belongs in the commit message, not a comment that outlives its caller",
-    ),
-    (
-        "added for the",
-        "this belongs in the commit message, not a comment describing why it was added",
-    ),
-    (
-        "this fix",
-        "this belongs in the commit message, not a comment referencing the change",
-    ),
-    (
-        "this pr",
-        "this belongs in the commit message, not a comment referencing the change",
-    ),
-    (
-        "handles the case from issue",
-        "this belongs in the commit message, not a comment referencing an issue",
-    ),
-    // Bureaucratic wordy-filler phrases below, hand-picked from Vale's write-good
-    // `TooWordy.yml` style pack (https://vale.sh/, vale-styles/write-good) — only the
-    // unambiguous multi-word constructs that have no legitimate short form in a
-    // technical comment. Deliberately NOT importing that pack's full list (or its
-    // `Weasel.yml`): both are calibrated for narrative/bureaucratic prose and flag
-    // ordinary technical vocabulary ("eliminate", "employ", "currently", "correctly")
-    // that reads fine in a code comment — wholesale import would trade precision for
-    // coverage in the wrong direction for this checker.
-    (
-        "in order to",
-        "say \"to\" instead — \"in order to\" is always wordy filler",
-    ),
-    ("due to the fact that", "say \"because\" instead"),
-    ("because of the fact that", "say \"because\" instead"),
-    ("by virtue of the fact that", "say \"because\" instead"),
-    ("in spite of the fact that", "say \"although\" instead"),
-    ("in the event that", "say \"if\" instead"),
-    ("with regard to", "say \"about\" instead"),
-    ("with regards to", "say \"about\" instead"),
-    ("for the purpose of", "say \"to\" or \"for\" instead"),
-    (
-        "it is important to note that",
-        "cut the filler and state the fact directly",
-    ),
-];
+const FINDING_VERBOSE_COMMENT: &str = "[verbose-comment]";
+const FINDING_COMMENTED_OUT_CODE: &str = "[commented-out-code]";
+const FINDING_OVER_COMMENTED: &str = "[over-commented]";
+const FINDING_COMMENT_TOO_LONG: &str = "[comment-too-long]";
+
+#[path = "comment_quality_phrases.rs"]
+mod phrases;
+
+#[path = "comment_quality_detectors.rs"]
+mod detectors;
+use detectors::{
+    FenceState, check_commented_out_code, check_verbose_phrases, collect_comments, looks_like_code,
+    strip_comment_markers,
+};
 
 fn comment_kinds(lang: Language) -> &'static [&'static str] {
     match lang {
@@ -236,11 +124,11 @@ impl Checker for CommentQualityChecker {
         // a fenced code example spanning several consecutive single-line nodes — Rust's
         // `///` lines are each their own node, verified via `to_sexp()` — is tracked as
         // one fence, not re-opened/closed per line. See `check_commented_out_code`.
-        let mut in_fence = false;
+        let mut fence = FenceState::Outside;
         for comment in &comments {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
             check_verbose_phrases(*comment, text, &mut findings);
-            in_fence = check_commented_out_code(*comment, text, in_fence, &mut findings);
+            fence = check_commented_out_code(*comment, text, fence, &mut findings);
         }
 
         let cfg = rules::lang_config(self.lang);
@@ -254,187 +142,6 @@ impl Checker for CommentQualityChecker {
 
         Ok(findings)
     }
-}
-
-fn collect_comments<'a>(node: Node<'a>, kinds: &[&str], out: &mut Vec<Node<'a>>) {
-    if kinds.contains(&node.kind()) {
-        out.push(node);
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_comments(child, kinds, out);
-    }
-}
-
-/// Whether `haystack` contains `needle` as a whole word/phrase, not merely as a
-/// substring — a real backtest finding (docs/comment-quality-false-positives.md): the
-/// short banned phrase `"this pr"` matched inside ordinary words like "this
-/// **pr**events"/"this **pr**operly"/"this **pr**ocess" with a plain `.contains()`.
-/// Only the two outer boundaries are checked (not `needle`'s internal spaces), so a
-/// multi-word phrase still matches as a unit.
-fn contains_whole_phrase(haystack: &str, needle: &str) -> bool {
-    let mut search_start = 0;
-    while let Some(rel_pos) = haystack.get(search_start..).and_then(|s| s.find(needle)) {
-        let pos = search_start + rel_pos;
-        let before_ok = haystack[..pos]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric());
-        let after_ok = haystack[pos + needle.len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric());
-        if before_ok && after_ok {
-            return true;
-        }
-        search_start = pos + 1;
-    }
-    false
-}
-
-fn check_verbose_phrases(comment: Node, text: &str, findings: &mut Vec<Finding>) {
-    let lower = text.to_lowercase();
-    for (phrase, reason) in BANNED_PHRASES {
-        if contains_whole_phrase(&lower, phrase) {
-            findings.push(Finding {
-                line: comment.start_position().row + 1,
-                message: format!("[verbose-comment] contains \"{phrase}\" — {reason}"),
-            });
-        }
-    }
-}
-
-/// Scans one comment node's lines for dead code, skipping anything inside a fenced
-/// (```` ``` ````) code example — a real backtest finding: Rust doc comments routinely
-/// embed real, intentional usage examples this way, which `looks_like_code` is
-/// (correctly, for its actual purpose) built to recognize as code-shaped. `in_fence`
-/// carries the fence state in from the previous comment node and returns the state
-/// after this one, so a fence spanning several consecutive single-line nodes (Rust's
-/// `///` lines are each their own node) is tracked as one fence, not reset per node.
-fn check_commented_out_code(
-    comment: Node,
-    text: &str,
-    in_fence: bool,
-    findings: &mut Vec<Finding>,
-) -> bool {
-    let start_row = comment.start_position().row;
-    let mut in_fence = in_fence;
-    for (offset, raw_line) in text.lines().enumerate() {
-        let stripped = strip_comment_markers(raw_line);
-        if stripped.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence || stripped.is_empty() {
-            continue;
-        }
-        if looks_like_code(stripped) {
-            findings.push(Finding {
-                line: start_row + offset + 1,
-                message: "[commented-out-code] this line looks like dead code, not a comment — delete it or explain why it's kept".to_string(),
-            });
-        }
-    }
-    in_fence
-}
-
-/// Strips the leading comment-marker noise (`//`, `///`, `//!`, `#`, `/*`, `*/`, a
-/// continuation `*`) so the remaining text can be judged as prose vs. code on its own.
-fn strip_comment_markers(line: &str) -> &str {
-    let mut s = line.trim();
-    for prefix in ["///", "//!", "//", "/**", "/*", "*/", "#!", "#"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.trim();
-            break;
-        }
-    }
-    if let Some(rest) = s.strip_prefix('*') {
-        // Javadoc/KDoc-style continuation line (`* foo`) — but not a `**foo` operator
-        // line, which would already have been caught by the `/**` prefix above.
-        s = rest.trim();
-    }
-    s.trim_end_matches("*/").trim()
-}
-
-/// Conservative code-shape heuristic: a brace terminator, a semicolon terminator
-/// alongside punctuation no ordinary English clause would carry, or a call/assignment
-/// expression with no spaces where a sentence would have them. Deliberately biased
-/// toward missing real commented-out code over flagging prose (see
-/// `docs/reporting-false-positives.md` for how to report a miss the other way).
-///
-/// A bare `ends_with(';')` check (SonarQube's S125 has the same documented gap) treats
-/// any semicolon-terminated clause as code, so a doc comment written as a semicolon-
-/// separated bullet list ("- validates input;") reads as "ends in `;`" and misfires —
-/// see docs/comment-quality-false-positives.md. Requiring an unambiguous code-only
-/// punctuation character alongside the trailing `;` (not `.`/`,`, both common in prose)
-/// narrows that, but a real-world backtest (see docs/comment-quality-false-positives.md)
-/// found `(`/`)` and `<`/`>` are *not* unambiguous either: an Apache license header
-/// ("Licensed under ... (the \"License\");") and a spec-quoting blockquote ("> ... the
-/// command;") both carry those characters in ordinary prose. Only `{}[]=+*/&|!` survive
-/// as the punctuation set — narrower still, at the further cost of no longer flagging a
-/// punctuation-free statement like a bare `return;`/`break;`, or a real call expression
-/// mentioned only via this branch (already independently caught by
-/// `is_call_expression`'s stricter shape check below, so nothing is actually lost there).
-fn looks_like_code(text: &str) -> bool {
-    if text.ends_with('{') || text == "}" || text.ends_with("});") {
-        return true;
-    }
-    if text.ends_with(';') && text.chars().any(|c| "{}[]=+*/&|!".contains(c)) {
-        return true;
-    }
-    is_call_expression(text) || is_assignment(text)
-}
-
-fn is_call_expression(text: &str) -> bool {
-    let core = text.strip_suffix(';').unwrap_or(text);
-    let Some(open) = core.find('(') else {
-        return false;
-    };
-    if !core.ends_with(')') {
-        return false;
-    }
-    let name = &core[..open];
-    !name.is_empty()
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphabetic() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-}
-
-fn is_assignment(text: &str) -> bool {
-    let Some(pos) = text.find('=') else {
-        return false;
-    };
-    let bytes = text.as_bytes();
-    let before = pos.checked_sub(1).and_then(|i| bytes.get(i));
-    let after = bytes.get(pos + 1);
-    // Exclude `==`, `!=`, `<=`, `>=`, `=>` — comparisons/arrows, not assignments.
-    if matches!(after, Some(b'=' | b'>')) || matches!(before, Some(b'=' | b'!' | b'<' | b'>')) {
-        return false;
-    }
-    let lhs = text[..pos].trim();
-    let rhs = text[pos + 1..].trim();
-    !lhs.is_empty()
-        && !lhs.contains(' ')
-        && lhs
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
-        && lhs
-            .chars()
-            .all(|c| c.is_alphanumeric() || "_.[]$".contains(c))
-        && !rhs.is_empty()
-        // A real single-statement assignment's RHS doesn't itself contain another bare
-        // `=` — a second one signals a narrative computation explanation instead (a
-        // real backtest finding: "FQDN=15 + 1(dot) + 55 = 71 chars" and
-        // "OOMScoreAdj = 1000 - (...) = 869" both have a valid-looking `lhs`, but their
-        // `rhs` re-derives a value through a second `=`, which no single Go/Rust/etc.
-        // assignment statement does).
-        && !rhs.contains('=')
 }
 
 fn walk_declarations_for_proportionality(
@@ -537,7 +244,7 @@ fn check_absolute_length(
         findings.push(Finding {
             line: finding_line,
             message: format!(
-                "[comment-too-long] leading comment is {leading_comment_lines} lines, over the {MAX_LEADING_COMMENT_LINES}-line ceiling — split into root cause / accepted tradeoff / pointer to a test, or trim to the one fact a reviewer would ask for"
+                "{FINDING_COMMENT_TOO_LONG} leading comment is {leading_comment_lines} lines, over the {MAX_LEADING_COMMENT_LINES}-line ceiling — split into root cause / accepted tradeoff / pointer to a test, or trim to the one fact a reviewer would ask for"
             ),
         });
     }
@@ -566,19 +273,16 @@ fn check_comment_to_code_ratio(
     findings.push(Finding {
         line: finding_line,
         message: format!(
-            "[over-commented] {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
+            "{FINDING_OVER_COMMENTED} {total_comment_lines} comment lines over a {body_code_lines}-line function body — looks like the comment restates the code instead of explaining why"
         ),
     });
 }
 
 /// Whether `body` (already known non-empty by the caller) contains exactly one
-/// statement, and that statement delegates elsewhere (a call, a method chain, or a
-/// struct/object construction) rather than being a self-contained computation over
-/// the function's own parameters (`a + b`, `x > 0`). AST-based (named-child count),
-/// not line-count-based — a line-count check would only catch a body crammed onto one
-/// source line (Go's `func F() { return G() }` style) and miss the far more common
-/// "brace on its own line" formatting, which is exactly the shape most of the real
-/// false positives this exists to fix are written in.
+/// statement that delegates elsewhere (a call, method chain, or struct construction)
+/// rather than a self-contained computation (`a + b`). AST-based (named-child count),
+/// not line-count-based, so it also catches the common "brace on its own line" style,
+/// not just a body crammed onto one source line.
 fn is_delegating_single_statement_body(body: Node, src: &[u8]) -> bool {
     let container = statement_container(body);
     if container.named_child_count() != 1 {
@@ -593,17 +297,10 @@ fn is_delegating_single_statement_body(body: Node, src: &[u8]) -> bool {
     is_delegating_text(text)
 }
 
-/// Descends through pure single-child "statement container" wrapper nodes to the
-/// level that actually holds the function's statement(s) as named children — two
-/// grammars here wrap differently, both verified via `to_sexp()`: Go's `block` always
-/// wraps a `statement_list` one level down (verified for both a one- and a
-/// two-statement body: `(block (statement_list (expression_statement ...)
-/// (expression_statement ...)))`), and Kotlin's `function_body` (unlike every other
-/// grammar here) wraps a `block` one level down rather than being the statement
-/// container itself (see `rules.rs::kotlin_body`'s doc comment for the same
-/// positional-vs-field-based grammar quirk this mirrors). Every other grammar's body
-/// node already holds its statement(s) as direct named children, so this is a no-op
-/// for them.
+/// Descends through single-child "statement container" wrapper nodes (Go's `block`
+/// wraps a `statement_list`, Kotlin's `function_body` wraps a `block` — see
+/// `rules.rs::kotlin_body`) to the level holding the function's statements as named
+/// children. A no-op for every other grammar, whose body node already holds them.
 fn statement_container(mut node: Node) -> Node {
     loop {
         if node.named_child_count() != 1 {
@@ -645,13 +342,9 @@ fn has_safety_section(leading_nodes: &[Node], src: &[u8]) -> bool {
     })
 }
 
-/// A single-line comment's `end_position()` sometimes lands at column 0 of the row
-/// *after* its own last line, rather than the end of its own line — verified for
-/// tree-sitter-rust's `line_comment`, whose reported span runs through its trailing
-/// newline (unlike every other grammar this checker covers, where a single-line
-/// comment's end position stays on its own row). Normalizing back to the comment's own
-/// last row keeps the row-adjacency math below (used to detect a contiguous leading
-/// comment block, and to count comment lines inside a body) grammar-independent.
+/// tree-sitter-rust's `line_comment` span runs through its trailing newline, unlike
+/// every other grammar here, so its `end_position()` lands one row past its own last
+/// line. Normalizing that back keeps the row-adjacency math below grammar-independent.
 fn comment_end_row(node: Node) -> usize {
     let end = node.end_position();
     if end.column == 0 && end.row > node.start_position().row {
@@ -674,12 +367,11 @@ fn collect_comment_rows(node: Node, comment_kinds: &[&str], rows: &mut BTreeSet<
     }
 }
 
-/// Comment nodes immediately preceding `decl` with no blank-line gap, walked backward
-/// while each one stays contiguous with the one after it — stopping (without including
-/// the code-like one) at a block whose own text looks like commented-out code rather
-/// than documentation. A real backtest finding: a run of leftover commented-out
-/// function stubs immediately before a real, unrelated function was getting folded
-/// into that function's "leading doc comment," inflating its comment-to-code ratio.
+/// Comment nodes immediately preceding `decl` with no blank-line gap, walked backward,
+/// stopping (without including the code-like one) at a block that looks like
+/// commented-out code rather than documentation — otherwise a run of leftover dead-code
+/// stubs before a real function gets folded into that function's ratio (a real
+/// backtest finding).
 fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8]) -> Vec<Node<'a>> {
     let mut nodes = Vec::new();
     let mut next_start_row = decl.start_position().row;
@@ -718,416 +410,5 @@ fn leading_comment_rows(leading_nodes: &[Node]) -> BTreeSet<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::checker::{GrammarCache, run_checker_with_cache};
-    use std::path::PathBuf;
-
-    fn run(lang: Language, source: &str) -> Vec<Finding> {
-        let checker = CommentQualityChecker::new(lang);
-        let cache = GrammarCache::new();
-        run_checker_with_cache(&checker, &PathBuf::from("f"), source, &cache).unwrap()
-    }
-
-    fn assert_has_finding(findings: &[Finding], marker: &str) {
-        assert!(
-            findings.iter().any(|f| f.message.contains(marker)),
-            "expected {marker} in findings: {findings:?}"
-        );
-    }
-
-    fn assert_no_finding(findings: &[Finding], marker: &str) {
-        assert!(
-            !findings.iter().any(|f| f.message.contains(marker)),
-            "unexpected {marker} in findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn flags_marketing_language() {
-        let src = "package main\n\n// leverage this seamlessly\nfunc F() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[verbose-comment]") && f.message.contains("leverage"))
-        );
-    }
-
-    #[test]
-    fn flags_wordy_filler_phrase() {
-        let src = "package main\n\n// We check this in order to validate the input.\nfunc F() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[verbose-comment]")
-                    && f.message.contains("in order to")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn flags_commented_out_code() {
-        let src = "package main\n\nfunc F() {\n\t// x = doSomething(1, 2);\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]"))
-        );
-    }
-
-    /// Regression guard for docs/comment-quality-false-positives.md's first entry:
-    /// SonarQube's S125 has the same documented gap (a bare `ends_with(';')` treats any
-    /// semicolon-terminated clause as code), and a semicolon-separated bullet list is a
-    /// common real doc-comment style.
-    #[test]
-    fn does_not_flag_a_semicolon_terminated_bullet_list() {
-        let src = "package main\n\n// Normalize does three things:\n// - validates input;\n// - normalizes casing;\n// - returns the result;\nfunc Normalize(s string) string {\n\treturn s\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn does_not_flag_ordinary_prose_comment() {
-        let src = "package main\n\n// Parse validates the input and returns an error if it's malformed.\nfunc Parse() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
-    }
-
-    #[test]
-    fn flags_over_commented_function() {
-        let src = "package main\n\n// This function adds two numbers together.\n// It takes a and b as parameters.\n// It returns the sum of a and b.\n// It never returns anything else.\n// It has no side effects.\n// There is nothing more to say about it.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn does_not_flag_proportionate_explanation_over_short_body() {
-        let src = "package main\n\n// Retry calls fn up to attempts times, waiting delay between failures.\n// Returns the first successful result, or the last error if every attempt\n// fails — callers that need cancellation should wrap fn themselves, since\n// Retry does not accept a context.\nfunc Retry(fn func() (int, error)) (int, error) {\n\tresult, err := fn()\n\treturn result, err\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    /// A 7-line WHY comment over an 8-line body has ratio ~0.9 — well under
-    /// `COMMENT_TO_CODE_RATIO` — so `[over-commented]` correctly stays silent. This is
-    /// the real gap `[comment-too-long]` closes: a comment can be perfectly
-    /// "proportionate" to its function and still be too long on its own terms.
-    #[test]
-    fn flags_absolute_length_even_when_proportionate() {
-        let src = "package main\n\n// ProcessBatch runs validation before writing, because the legacy importer\n// upstream sometimes emits rows with a trailing null byte that corrupts the\n// downstream parser if written as-is. We considered stripping it at the\n// source instead, but that importer is owned by another team and a fix\n// there would take a full quarter to land, so this is the accepted\n// workaround until that migration completes.\nfunc ProcessBatch(rows []string) []string {\n\tout := make([]string, 0, len(rows))\n\tfor _, r := range rows {\n\t\tif r == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\tout = append(out, r)\n\t}\n\treturn out\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[comment-too-long]")),
-            "findings: {findings:?}"
-        );
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn does_not_flag_a_five_line_comment() {
-        let src = "package main\n\n// Retry calls fn up to attempts times, waiting delay between failures.\n// Returns the first successful result, or the last error if every attempt\n// fails — callers that need cancellation should wrap fn themselves, since\n// Retry does not accept a context, delay is not jittered, and there is no\n// backoff between attempts.\nfunc Retry(fn func() (int, error)) (int, error) {\n\tresult, err := fn()\n\treturn result, err\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[comment-too-long]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn rust_flags_marketing_language() {
-        let src = "/// This seamlessly leverages a robust approach.\nfn f() {}\n";
-        let findings = run(Language::Rust, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[verbose-comment]") && f.message.contains("leverage")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn rust_flags_commented_out_code() {
-        let src = "fn f() {\n    // x = do_something(1, 2);\n}\n";
-        let findings = run(Language::Rust, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn rust_does_not_flag_ordinary_prose_comment() {
-        let src = "/// Parses the input and returns an error if it's malformed.\nfn parse() {}\n";
-        let findings = run(Language::Rust, src);
-        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
-    }
-
-    #[test]
-    fn rust_flags_over_commented_function() {
-        let src = "/// This function adds two numbers together.\n/// It takes a and b as parameters.\n/// It returns the sum of a and b.\n/// It never returns anything else.\n/// It has no side effects.\n/// There is nothing more to say about it.\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
-        let findings = run(Language::Rust, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn rust_checks_impl_methods_too() {
-        let src =
-            "struct S;\nimpl S {\n    /// This seamlessly does the thing.\n    fn m(&self) {}\n}\n";
-        let findings = run(Language::Rust, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[verbose-comment]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    // --- Regression tests from the 2026-09-06 Kubernetes/Cassandra/Servo backtest ---
-
-    #[test]
-    fn short_banned_phrase_does_not_match_inside_an_unrelated_longer_word() {
-        let src = "// This prevents the race and properly handles the process.\nfunc f() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings.iter().any(|f| f.message.contains("\"this pr\"")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn short_banned_phrase_still_matches_as_its_own_word() {
-        let src = "// For purpose of this PR, report only the failure count.\nfunc f() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings.iter().any(|f| f.message.contains("\"this pr\"")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn license_header_style_comment_is_not_flagged_as_commented_out_code() {
-        let src = "// Licensed under the Apache License, Version 2.0 (the \"License\");\npackage main\n\nfunc f() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn spec_quoting_blockquote_ending_in_semicolon_is_not_flagged_as_commented_out_code() {
-        let src = "// > or if the command is the fontSize command;\nfunc f() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn narrative_arithmetic_comment_is_not_flagged_as_commented_out_code() {
-        let src = "// FQDN=15 + 1(dot) + 55 = 71 chars\nfunc f() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn fenced_doc_comment_code_example_is_not_flagged_as_commented_out_code() {
-        let src = "/// Example:\n///\n/// ```\n/// let x = f(1, 2);\n/// ```\nfunc f() {}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn adjacent_commented_out_stub_is_not_folded_into_the_next_functions_ratio() {
-        // The two `//`-commented function stubs immediately above `Real` look like
-        // dead code, not `Real`'s own leading doc comment — they must not inflate
-        // `Real`'s comment-to-code ratio (a real backtest finding against Servo).
-        let src = "// fn Dead1() { return 1; }\n// fn Dead2() { return 2; }\nfunc Real() int {\n\treturn 3\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn rust_safety_doc_section_is_exempt_from_over_commented() {
-        let src = "/// Derefs a raw pointer.\n///\n/// # Safety\n///\n/// The caller must ensure the pointer is non-null, properly aligned, and\n/// points to a live, initialized value of type `T` for the duration of the\n/// borrow — violating any of these is immediate undefined behavior.\npub unsafe fn deref<T>(p: *const T) -> &'static T {\n    &*p\n}\n";
-        let findings = run(Language::Rust, src);
-        assert_no_finding(&findings, "[over-commented]");
-        // This comment is 7 lines — past MAX_LEADING_COMMENT_LINES (5) — so it also
-        // proves the `# Safety` exemption covers `[comment-too-long]`, not just the ratio.
-        assert_no_finding(&findings, "[comment-too-long]");
-    }
-
-    /// The delegating-single-statement-body exemption only excuses the *ratio* check
-    /// (`[over-commented]`) — its rationale is the near-zero denominator for a one-line
-    /// body, which says nothing about absolute comment length. A long comment over a
-    /// delegating body must still trigger `[comment-too-long]`.
-    #[test]
-    fn delegating_body_does_not_exempt_comment_too_long() {
-        let src = "// LimitWriter is a copy of the standard library ioutils.LimitReader,\n// applied to the writer interface. LimitWriter returns a Writer that\n// writes to w but stops with EOF after n bytes. The underlying\n// implementation is a *LimitedWriter, which tracks remaining capacity\n// and returns io.EOF once that capacity is exhausted, matching the\n// semantics callers already expect from LimitReader on the read side.\nfunc LimitWriter(w Writer, n int64) Writer { return &LimitedWriter{w, n} }\n";
-        let findings = run(Language::Go, src);
-        assert_no_finding(&findings, "[over-commented]");
-        assert_has_finding(&findings, "[comment-too-long]");
-    }
-
-    #[test]
-    fn flags_a_six_line_comment() {
-        let src = "package main\n\n// Retry calls fn up to attempts times, waiting delay between failures.\n// Returns the first successful result, or the last error if every attempt\n// fails — callers that need cancellation should wrap fn themselves, since\n// Retry does not accept a context, delay is not jittered, there is no\n// backoff between attempts, and errors are not wrapped with attempt\n// count context for callers that want to log it.\nfunc Retry(fn func() (int, error)) (int, error) {\n\tresult, err := fn()\n\treturn result, err\n}\n";
-        let findings = run(Language::Go, src);
-        assert_has_finding(&findings, "[comment-too-long]");
-    }
-
-    // --- Regression tests for the two 2026-09-06 backtest-informed enforcements:
-    // delegating-single-statement-body exemption, and parameter-count-scaled ratio ---
-
-    #[test]
-    fn delegating_body_with_struct_construction_is_exempt_from_over_commented() {
-        // Mirrors kubernetes/kubernetes's pkg/kubelet/util/ioutils/ioutils.go
-        // LimitWriter almost verbatim.
-        let src = "// LimitWriter is a copy of the standard library ioutils.LimitReader,\n// applied to the writer interface.\n// LimitWriter returns a Writer that writes to w\n// but stops with EOF after n bytes.\n// The underlying implementation is a *LimitedWriter.\nfunc LimitWriter(w Writer, n int64) Writer { return &LimitedWriter{w, n} }\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn delegating_body_with_qualified_multi_arg_call_is_exempt_from_over_commented() {
-        // Mirrors apache/cassandra's ColumnFamilyStore.sstablesRewrite: several
-        // opaque boolean/numeric parameters, a thorough per-parameter explanation,
-        // over a body that's one delegating call — spread across multiple lines
-        // (unlike the crammed-one-line test above) to prove the exemption is
-        // AST-based (named-child count), not line-count-based.
-        let src = "// Rewrite rewrites all SSTables according to specified parameters.\n//\n// skipIfCurrentVersion, if true, rewrites only SSTables older than current.\n// skipIfNewerThanTimestamp excludes SSTables created after this timestamp.\n// skipIfCompressionMatches, if true, rewrites only SSTables whose compression differs.\nfunc Rewrite(skipIfCurrentVersion bool, skipIfNewerThanTimestamp int64, skipIfCompressionMatches bool, jobs int) error {\n\treturn other.PerformRewrite(skipIfCurrentVersion, skipIfNewerThanTimestamp, skipIfCompressionMatches, jobs)\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn rust_delegating_method_chain_is_exempt_from_over_commented() {
-        // Mirrors servo/servo's ServoLayoutNode::dangerous_first_child: a method
-        // chain (not a bare call or brace construction) as the sole statement.
-        let src = "/// Get the first child of this node.\n///\n/// This node should never be exposed directly to the layout interface, as\n/// that may allow mutating a node that is being laid out on another thread.\npub(super) unsafe fn dangerous_first_child(&self) -> Option<Self> {\n    self.node.first_child_ref().map(Into::into)\n}\n";
-        let findings = run(Language::Rust, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn multi_statement_body_is_not_exempt_even_when_the_last_statement_delegates() {
-        // Mirrors apache/cassandra's ColumnFamilyStore.addSSTable: a precondition
-        // check PLUS a delegating call is two statements, not one — the
-        // single-statement gate must not treat this as "just a delegation" the way
-        // it correctly does for a bare one-statement body.
-        // Body is 4 lines (open-brace-with-signature, two statements, close brace),
-        // so 8 comment lines are needed to clear the flat 2x ratio (8 >= 2.0*4).
-        let src = "// Add validates and adds the given item to the store.\n// This should be called after ensuring the item's checksum matches, since\n// items with mismatched checksums silently corrupt the on-disk index and\n// there is no way to detect this after the fact — the corruption surfaces\n// only much later, in an unrelated request against unrelated data, by\n// which point the original cause is impossible to trace back.\n// This line and the next exist only to reach the required comment count.\n// Final padding line.\nfunc Add(item Item) {\n\tvalidate(item)\n\tstore.Add(item)\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn higher_parameter_count_raises_the_over_commented_threshold() {
-        // 6 parameters, a single non-delegating statement (plain arithmetic — no
-        // call/construction shape, so the delegating-body exemption correctly
-        // doesn't apply here). At the flat 2x ratio this would fire, since 7
-        // comment lines over a 3-line body clears a 2x threshold of 6. Scaled for
-        // 6 params (2 plus a 0.25 bonus per param over the baseline of 2, giving
-        // 3x here) it must not, since 7 no longer clears a 3x threshold of 9.
-        // Body is 3 lines (open-brace-with-signature, one return, close brace); 7
-        // comment lines clear the flat 2x threshold of 6 but not the scaled 3x
-        // threshold of 9.
-        let src = "// f validates a, b, c, d, e, and g against their expected ranges before use,\n// since callers frequently pass swapped or stale values here and the\n// resulting corruption is silent until much later in an unrelated request.\n// This line and the next two exist only to reach the required comment count.\n// Padding line two.\n// Padding line three.\n// Padding line four.\nfunc f(a, b, c, d, e, g int) int {\n\treturn a + b + c + d + e + g\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            !findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn low_parameter_count_does_not_get_a_ratio_bonus() {
-        // Same shape as the test above but with only 2 parameters (at the
-        // baseline, so no bonus applies) and the same comment/body line counts —
-        // this must still fire at the plain 2.0x ratio.
-        let src = "// f validates a and b against their expected ranges before use,\n// since callers frequently pass swapped or stale values here and the\n// resulting corruption is silent until much later in an unrelated request.\n// This line and the next two exist only to reach the required comment count.\n// Padding line two.\n// Padding line three.\n// Padding line four.\nfunc f(a, b int) int {\n\treturn a + b + a + b + a + b\n}\n";
-        let findings = run(Language::Go, src);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.message.contains("[over-commented]")),
-            "findings: {findings:?}"
-        );
-    }
-}
+#[path = "comment_quality_tests.rs"]
+mod tests;
