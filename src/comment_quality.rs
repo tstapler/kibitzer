@@ -469,11 +469,17 @@ fn check_proportionality(
     if counts.total_comment_lines == 0 || counts.body_code_lines == 0 {
         return;
     }
-    if is_exempt_from_proportionality_checks(body, &leading_nodes, src) {
+
+    // Delegating bodies only exempt the ratio check (near-zero denominator); `# Safety`
+    // exempts both, since that kind of comment can legitimately run long regardless of size.
+    let safety_exempt = has_safety_section(&leading_nodes, src);
+    if !safety_exempt {
+        check_absolute_length(counts.leading_comment_lines, counts.finding_line, findings);
+    }
+    if safety_exempt || is_delegating_single_statement_body(body, src) {
         return;
     }
 
-    check_absolute_length(counts.leading_comment_lines, counts.finding_line, findings);
     check_comment_to_code_ratio(
         decl,
         cfg,
@@ -481,15 +487,6 @@ fn check_proportionality(
         counts.finding_line,
         findings,
     );
-}
-
-/// A declaration is exempt from both `[comment-too-long]` and `[over-commented]`: a
-/// delegating single-statement body's comment documents the callee, not this line (see
-/// `is_delegating_single_statement_body`'s own doc comment, and
-/// docs/comment-quality-false-positives.md), and a `# Safety` block justifying unsafe
-/// invariants can legitimately run long regardless of function size.
-fn is_exempt_from_proportionality_checks(body: Node, leading_nodes: &[Node], src: &[u8]) -> bool {
-    is_delegating_single_statement_body(body, src) || has_safety_section(leading_nodes, src)
 }
 
 struct CommentLineCounts {
@@ -997,6 +994,48 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+        // This comment is 7 lines — past MAX_LEADING_COMMENT_LINES (5) — so it also
+        // proves the `# Safety` exemption covers `[comment-too-long]`, not just the ratio.
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[comment-too-long]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    /// The delegating-single-statement-body exemption only excuses the *ratio* check
+    /// (`[over-commented]`) — its rationale is the near-zero denominator for a one-line
+    /// body, which says nothing about absolute comment length. A long comment over a
+    /// delegating body must still trigger `[comment-too-long]`.
+    #[test]
+    fn delegating_body_does_not_exempt_comment_too_long() {
+        let src = "// LimitWriter is a copy of the standard library ioutils.LimitReader,\n// applied to the writer interface. LimitWriter returns a Writer that\n// writes to w but stops with EOF after n bytes. The underlying\n// implementation is a *LimitedWriter, which tracks remaining capacity\n// and returns io.EOF once that capacity is exhausted, matching the\n// semantics callers already expect from LimitReader on the read side.\nfunc LimitWriter(w Writer, n int64) Writer { return &LimitedWriter{w, n} }\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[comment-too-long]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn flags_a_six_line_comment() {
+        let src = "package main\n\n// Retry calls fn up to attempts times, waiting delay between failures.\n// Returns the first successful result, or the last error if every attempt\n// fails — callers that need cancellation should wrap fn themselves, since\n// Retry does not accept a context, delay is not jittered, there is no\n// backoff between attempts, and errors are not wrapped with attempt\n// count context for callers that want to log it.\nfunc Retry(fn func() (int, error)) (int, error) {\n\tresult, err := fn()\n\treturn result, err\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[comment-too-long]")),
             "findings: {findings:?}"
         );
     }
