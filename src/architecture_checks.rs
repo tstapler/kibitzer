@@ -509,6 +509,13 @@ pub trait ArchModelChecker {
         model: &crate::arch_model::ArchModel,
         config: &ArchitectureConfig,
     ) -> Vec<ArchFinding>;
+
+    /// `build_arch_model_for_check` prunes unexported symbols by default, matching every
+    /// existing `ArchModelChecker`'s exported-surface-only scope. Override to `true` for a
+    /// checker whose subject is unexported symbols (e.g. `UnreferencedPrivateSymbolChecker`).
+    fn needs_private_symbols(&self) -> bool {
+        false
+    }
 }
 
 pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
@@ -518,6 +525,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(LcomChecker),
         Box::new(crate::god_class::GodClassChecker),
         Box::new(crate::isp_fat_interface::IspFatInterfaceChecker),
+        Box::new(crate::unreferenced_symbols::UnreferencedPrivateSymbolChecker),
     ]
 }
 

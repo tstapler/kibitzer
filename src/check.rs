@@ -1136,11 +1136,12 @@ pub fn lookup_any_architecture_checker(name: &str) -> Option<AnyArchitectureChec
 pub(crate) fn build_arch_model_for_check(
     repo_root: &Path,
     files: &[PathBuf],
+    include_private: bool,
 ) -> anyhow::Result<crate::arch_model::ArchModel> {
     crate::arch_model::build_model_from_files(
         repo_root,
         files,
-        &crate::arch_model::PruneConfig::default(),
+        &crate::arch_model::PruneConfig { include_private },
     )
 }
 
@@ -1189,10 +1190,12 @@ pub fn run_architecture_check(
             checker.check(&graph, arch_config)
         }
         AnyArchitectureChecker::Model(checker) => {
-            let model = match build_arch_model_for_check(repo_root, files) {
-                Ok(model) => model,
-                Err(err) => return Ok(error_result(format!("{err:#}"))),
-            };
+            let model =
+                match build_arch_model_for_check(repo_root, files, checker.needs_private_symbols())
+                {
+                    Ok(model) => model,
+                    Err(err) => return Ok(error_result(format!("{err:#}"))),
+                };
             checker.check(&model, arch_config)
         }
         AnyArchitectureChecker::Declaration(checker) => {
@@ -1315,9 +1318,11 @@ fn check_native_against_git_head_repo(
                 .ok()
                 .map(|graph| checker.check(&graph, arch_config).is_empty())
         }
-        AnyArchitectureChecker::Model(checker) => build_arch_model_for_check(&snapshot_dir, &files)
-            .ok()
-            .map(|model| checker.check(&model, arch_config).is_empty()),
+        AnyArchitectureChecker::Model(checker) => {
+            build_arch_model_for_check(&snapshot_dir, &files, checker.needs_private_symbols())
+                .ok()
+                .map(|model| checker.check(&model, arch_config).is_empty())
+        }
         AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             crate::declarations::build(&snapshot_dir, &files, &components)

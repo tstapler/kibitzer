@@ -43,6 +43,7 @@ mod task_stop;
 mod test_support;
 mod tree_walk;
 mod union_find;
+mod unreferenced_symbols;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -628,8 +629,11 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
             checker.check(&graph, &arch_config)
         }
         check::AnyArchitectureChecker::Model(checker) => {
-            let model = check::build_arch_model_for_check(dir, &files)
-                .with_context(|| format!("building architecture model for {}", dir.display()))?;
+            let model =
+                check::build_arch_model_for_check(dir, &files, checker.needs_private_symbols())
+                    .with_context(|| {
+                        format!("building architecture model for {}", dir.display())
+                    })?;
             checker.check(&model, &arch_config)
         }
         check::AnyArchitectureChecker::Declaration(checker) => {
