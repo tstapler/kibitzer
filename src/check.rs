@@ -2396,6 +2396,53 @@ mod git_head_integration_tests {
         assert!(result.message.unwrap().contains("predates your edits"));
     }
 
+    fn unreferenced_private_symbol_check() -> Check {
+        Check {
+            name: "unreferenced-private-symbol".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("unreferenced-private-symbol".to_string()),
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("unreferenced private symbol".to_string()),
+            output_format: None,
+            options: None,
+        }
+    }
+
+    /// Regression guard for `ArchModelChecker::needs_private_symbols()`: this checker's
+    /// whole subject is unexported symbols, so it only works at all if
+    /// `run_architecture_check` actually builds its `ArchModel` with
+    /// `PruneConfig { include_private: true }` rather than the default `false` every other
+    /// `ArchModelChecker` gets. Every unit test in `unreferenced_symbols.rs` calls the
+    /// module-private finder function directly against a hand-built model with
+    /// `include_private: true` hardcoded — none of them would catch a regression where
+    /// `checker.needs_private_symbols()` stopped being threaded through to
+    /// `build_arch_model_for_check` here, which would silently prune every private symbol
+    /// before the checker ever saw one and leave it permanently finding nothing in real use.
+    #[test]
+    fn unreferenced_private_symbol_checker_sees_private_symbols_through_run_architecture_check() {
+        let repo = TempRepo::new("unreferenced-private-symbol-wiring");
+        repo.write_and_commit(
+            "pkg/a.go",
+            "package pkg\n\nfunc dead() {}\n\nfunc Live() {}\n",
+            "init",
+        );
+
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+        let result = run_architecture_check(
+            &unreferenced_private_symbol_check(),
+            &repo.dir,
+            &files,
+            &crate::config::ArchitectureConfig::default(),
+        )
+        .unwrap();
+
+        assert!(!result.passed, "got: {result:?}");
+        assert!(result.output.contains("`dead`"), "got: {result:?}");
+    }
+
     fn layering_check() -> Check {
         Check {
             name: "layering".to_string(),

@@ -48,11 +48,9 @@
 //!   under-flag (an unrelated identically-named identifier elsewhere in the repo silences a
 //!   real dead symbol) but never over-flags — the same false-negative-over-false-positive
 //!   bias as the ambiguous-name fallback above. **Cost**: this re-reads every scanned file
-//!   from disk a second time (`ArchModel` doesn't retain source text after parsing) — on a
-//!   multi-thousand-file repo (`tstapler/stapler-squad`, ~9k files counting nested worktree
-//!   checkouts) this run took ~10 minutes wall clock, almost all disk I/O rather than CPU.
-//!   Fine for an opt-in, periodic/CI whole-repo check; not something to wire into a
-//!   per-edit hook.
+//!   from disk a second time (`ArchModel` doesn't retain source text after parsing) —
+//!   confirmed expensive enough on a large real-world monorepo (`tstapler/stapler-squad`)
+//!   that this is opt-in/periodic-CI only, not something to wire into a per-edit hook.
 //! - **Malformed-name guard.** A handful of JS/TS extraction edge cases (a computed/
 //!   string-quoted object-literal method key, e.g. ESLint visitor rules'
 //!   `{"FunctionDeclaration:exit"(n){}}`) produce a `SymbolNode::name` that isn't a real
@@ -216,15 +214,91 @@ mod tests {
         .unwrap()
     }
 
+    /// Writes real files to a temp dir and builds a real `ArchModel` from disk (unlike
+    /// `model_from`'s fake, unreadable paths) — needed whenever a test's assertion depends
+    /// on `build_word_occurrence_counts`'s `std::fs::read_to_string` actually reading
+    /// something, not silently no-op'ing on a path that was never written.
+    fn model_from_disk(label: &str, files: Vec<(&str, &str)>) -> ArchModel {
+        let dir = crate::test_support::unique_temp_dir(label);
+        let paths: Vec<PathBuf> = files
+            .into_iter()
+            .map(|(name, src)| {
+                let path = dir.join(name);
+                std::fs::write(&path, src).unwrap();
+                path
+            })
+            .collect();
+        crate::arch_model::build_model_from_files(
+            &dir,
+            &paths,
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn flags_an_unreferenced_private_function() {
-        let model = model_from(vec![(
-            "/repo/pkg/a.go",
-            "package pkg\n\nfunc dead() {}\n\nfunc Live() {}\n",
-        )]);
+        // Uses a real file on disk (not `model_from`'s fake paths) so the raw-text
+        // fallback's word count for "dead" is the real value (1, its own declaration)
+        // rather than `model_from`'s always-0 (unreadable path) — the `<= 1` boundary in
+        // `unreferenced_findings_for_model` is only actually exercised this way.
+        let model = model_from_disk(
+            "unreferenced-symbols-flags-function",
+            vec![("a.go", "package pkg\n\nfunc dead() {}\n\nfunc Live() {}\n")],
+        );
+        let findings = unreferenced_findings_for_model(&model);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("private function `dead`"));
+    }
+
+    #[test]
+    fn flags_an_unreferenced_private_method() {
+        let model = model_from_disk(
+            "unreferenced-symbols-flags-method",
+            vec![(
+                "a.go",
+                "package pkg\n\ntype T struct{}\n\nfunc (t T) dead() {}\n\nfunc Live() {}\n",
+            )],
+        );
+        let findings = unreferenced_findings_for_model(&model);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("private method `dead`"));
+    }
+
+    #[test]
+    fn discriminates_a_dead_symbol_from_a_live_one_in_the_same_file() {
+        let model = model_from_disk(
+            "unreferenced-symbols-discriminate",
+            vec![(
+                "a.go",
+                "package pkg\n\nfunc dead() {}\n\nfunc used() {}\n\nfunc Live() {\n\tused()\n}\n",
+            )],
+        );
         let findings = unreferenced_findings_for_model(&model);
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert!(findings[0].message.contains("`dead`"));
+    }
+
+    #[test]
+    fn sorts_findings_by_file_then_line() {
+        let model = model_from_disk(
+            "unreferenced-symbols-sort",
+            vec![
+                ("b.go", "package pkg\n\nfunc deadB() {}\n"),
+                (
+                    "a.go",
+                    "package pkg\n\nfunc deadA1() {}\n\nfunc deadA2() {}\n",
+                ),
+            ],
+        );
+        let findings = unreferenced_findings_for_model(&model);
+        assert_eq!(findings.len(), 3, "got: {findings:?}");
+        let locations: Vec<_> = findings.iter().map(|f| (f.file.clone(), f.line)).collect();
+        let mut sorted = locations.clone();
+        sorted.sort();
+        assert_eq!(locations, sorted, "got: {findings:?}");
     }
 
     #[test]
@@ -296,11 +370,8 @@ mod tests {
                 "package c\n\nfunc Dispatch(x interface{ run() }) {\n\tx.run()\n}\n",
             ),
         ]);
-        assert!(
-            unreferenced_findings_for_model(&model).is_empty(),
-            "got: {:?}",
-            unreferenced_findings_for_model(&model)
-        );
+        let findings = unreferenced_findings_for_model(&model);
+        assert!(findings.is_empty(), "got: {findings:?}");
     }
 
     #[test]
@@ -323,34 +394,21 @@ mod tests {
         // Go's dominant net/http idiom: the handler is registered by name
         // (`mux.HandleFunc(pattern, h.handleFoo)`), never actually called as
         // `h.handleFoo(...)` anywhere the call graph would see it. Confirmed as a real
-        // false-positive class backtesting against tstapler/stapler-squad. Needs real
-        // files on disk (not the in-memory `model_from` fixtures above) so the raw-text
-        // fallback's `std::fs::read_to_string` has something to read.
-        let dir = crate::test_support::unique_temp_dir("unreferenced-symbols-bare-value");
-        let file = dir.join("handler.go");
-        std::fs::write(
-            &file,
-            "package pkg\n\n\
-             type Handler struct{}\n\n\
-             func (h *Handler) Register(mux *http.ServeMux) {\n\
-             \tmux.HandleFunc(\"/x\", h.handleFoo)\n\
-             }\n\n\
-             func (h *Handler) handleFoo(w http.ResponseWriter, r *http.Request) {}\n",
-        )
-        .unwrap();
-        let model = crate::arch_model::build_model_from_files(
-            &dir,
-            &[file],
-            &PruneConfig {
-                include_private: true,
-            },
-        )
-        .unwrap();
-        assert!(
-            unreferenced_findings_for_model(&model).is_empty(),
-            "got: {:?}",
-            unreferenced_findings_for_model(&model)
+        // false-positive class backtesting against tstapler/stapler-squad.
+        let model = model_from_disk(
+            "unreferenced-symbols-bare-value",
+            vec![(
+                "handler.go",
+                "package pkg\n\n\
+                 type Handler struct{}\n\n\
+                 func (h *Handler) Register(mux *http.ServeMux) {\n\
+                 \tmux.HandleFunc(\"/x\", h.handleFoo)\n\
+                 }\n\n\
+                 func (h *Handler) handleFoo(w http.ResponseWriter, r *http.Request) {}\n",
+            )],
         );
+        let findings = unreferenced_findings_for_model(&model);
+        assert!(findings.is_empty(), "got: {findings:?}");
     }
 
     #[test]
