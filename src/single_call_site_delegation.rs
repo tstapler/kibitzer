@@ -1,38 +1,15 @@
 //! Fowler's **Inline Function**: a function/method whose entire body is one delegating
 //! statement (a bare call, or `return <call>`) and which has exactly one resolved caller
-//! in the whole repo — the indirection adds no organizing value over calling the callee
-//! directly (issue #48). Needs #33's call-graph edges (`ArchModel::call_edges`) for the
-//! caller count, and `symbol_extract::is_pure_delegation_body`'s single-statement-body
-//! detection (computed at extraction time into `SymbolNode::is_pure_delegation`) for the
-//! shape match — a whole-repo checker can't re-parse every function body itself without
-//! `ArchModel` retaining source text past the initial scan, so the AST-level judgment call
-//! has to happen upstream, in `symbol_extract.rs`, alongside the call graph it depends on.
+//! in the whole repo (issue #48). The AST-shape judgment (`is_pure_delegation`) happens
+//! upstream in `symbol_extract.rs`, not here — `ArchModel` drops source/AST after the
+//! initial scan, so a whole-repo checker can't re-derive it at check time.
 //!
-//! Deliberately narrow in scope, mirroring `unreferenced_symbols`'s precedent for the same
-//! `call_edges`-derived signal:
-//! - **Exported symbols are never candidates.** An exported symbol may have a caller
-//!   outside this repo the call graph can't see, so a "one caller" count here is a
-//!   undercount, not a fact — same carve-out `unreferenced_symbols` and the issue's own
-//!   scope notes both use.
-//! - **A symbol with zero resolved callers is not a candidate either.** That's dead code
-//!   (`unreferenced-private-symbol`'s territory, for the unexported case), a different
-//!   smell with a different fix (delete it, not inline it) — this checker only flags
-//!   *exactly* one caller.
-//! - **Go/TypeScript/Tsx/JavaScript only.** Same `symbol_extract::call_graph_supports`
-//!   gate as `unreferenced_symbols` and `is_pure_delegation` itself — a symbol in an
-//!   uncovered language never has `is_pure_delegation: true` set on it in the first place
-//!   (see `symbol_extract::classify_node`), so this checker's candidate filter is really
-//!   just reading that flag, not re-deriving language coverage.
-//! - **No interface-implementation carve-out (accepted scope gap).** The issue's own scope
-//!   notes ask to exclude a method that implements an interface (today's single call site
-//!   may not be the only one once a second implementer/caller shows up) unless the type
-//!   has a single implementation *and* the interface has a single implementer. `ArchModel`
-//!   has no type-implements-interface edge at all (confirmed: no such structure exists
-//!   anywhere in `arch_model.rs`) — there is no data this checker could use to tell a
-//!   plain method from an interface implementation, so the exclusion can't be implemented
-//!   without adding that edge first. Accepted as a known false-positive source; the
-//!   issue itself flags this checker as "advisory-only" for exactly this kind of judgment
-//!   call.
+//! Scope mirrors `unreferenced_symbols`'s precedent for the same `call_edges`-derived
+//! signal: exported symbols and zero-caller symbols (dead code, a different smell) are
+//! never candidates, and only `symbol_extract::call_graph_supports` languages apply.
+//! No interface-implementation carve-out yet (a single call site today may not be the
+//! only one once a second implementer/caller appears) — `ArchModel` has no
+//! type-implements-interface edge to detect it with; tracked as #117.
 
 use std::collections::HashMap;
 
@@ -209,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn flags_a_typescript_method_delegating_to_a_call_with_one_caller() {
+    fn flags_a_typescript_function_delegating_to_a_call_with_one_caller() {
         let model = model_from(vec![(
             "/repo/src/a.ts",
             "function helper(x: number) { return x; }\n\n\
@@ -219,6 +196,30 @@ mod tests {
         let findings = single_call_site_delegation_findings(&model);
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert!(findings[0].message.contains("`thin`"));
+    }
+
+    #[test]
+    fn flags_a_go_method_delegating_to_a_call_with_one_caller() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.go",
+            "package pkg\n\ntype T struct{}\n\nfunc (t T) thin() {\n\thelper()\n}\n\n\
+             func helper() {}\n\nfunc Live() {\n\tvar t T\n\tt.thin()\n}\n",
+        )]);
+        let findings = single_call_site_delegation_findings(&model);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("method `thin`"));
+    }
+
+    #[test]
+    fn does_not_flag_a_function_with_an_empty_body() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.go",
+            "package pkg\n\nfunc thin() {}\n\nfunc Live() {\n\tthin()\n}\n",
+        )]);
+        assert!(
+            single_call_site_delegation_findings(&model).is_empty(),
+            "an empty body has no delegating statement to flag"
+        );
     }
 
     #[test]
