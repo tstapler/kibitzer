@@ -539,6 +539,12 @@ fn classify_node(
     })
 }
 
+// SEAM(typed-node-kind-migration): `body_statements` compares raw `.kind()` strings
+// against Go's `"block"`/`"statement_list"`/`"comment"` and (by falling through the
+// `_` arm) TS/JS's `"statement_block"` — shared cross-grammar vocabulary the same way
+// `walk_calls`' `call_expression`/`function_kinds` checks are, deliberately excluded
+// per ADR-001's Option C — see ADR-001.
+///
 /// A body's non-comment statements — Go's `block` wraps them in an inner
 /// `statement_list` (absent entirely for an empty `{}` body); TS/JS's `statement_block`
 /// holds them directly. `"comment"` is filtered out here rather than relied on to be
@@ -570,6 +576,12 @@ fn body_statements<'a>(body: Node<'a>) -> Vec<Node<'a>> {
 /// repeat the raw string.
 const CALL_EXPRESSION_KIND: &str = "call_expression";
 
+// SEAM(typed-node-kind-migration): `is_pure_delegation_body` compares raw `.kind()`
+// strings against Go/TS/JS's shared `"expression_statement"`/`"return_statement"`/
+// `"expression_list"` vocabulary and `CALL_EXPRESSION_KIND` — same cross-grammar-union
+// shape as `callee_text_for`'s `selector_expression`/`member_expression` match arm,
+// deliberately excluded per ADR-001's Option C — see ADR-001.
+///
 /// True iff `body` (a Go `block` or TS/JS `statement_block`) is exactly one statement
 /// that's a bare call (`f()`) or `return f()` — Fowler's *Inline Function* shape. Go
 /// wraps a `return`'s value(s) in an `expression_list`; TS/JS's `return_statement` holds
