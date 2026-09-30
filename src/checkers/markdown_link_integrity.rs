@@ -225,6 +225,19 @@ fn reference_style_flags(link_type: LinkType) -> (bool, bool) {
     (is_reference_style, is_dangling)
 }
 
+/// `- [x] done`-style GFM task-list checkboxes are only recognized as `TaskListMarker`
+/// events when at the very start of a list item (`ENABLE_TASKLISTS` above); the same
+/// `[x]`/`[X]` mid-sentence — e.g. "Marked [x]." in a status note — has no such special
+/// case and parses as a plain shortcut reference-style link with label "x", which almost
+/// never has (or is meant to have) a `[x]: target` definition. Scoped to exactly the
+/// checkbox-mark label on a `Shortcut`/`ShortcutUnknown` link (never `Reference`/
+/// `Collapsed`, which require the author to type an explicit `[label][ref]`/`[label][]`
+/// — unambiguous link intent), so a genuine broken shortcut reference whose label isn't
+/// "x" is still flagged.
+fn is_inline_checkbox_mark(link_type: LinkType, normalized_label: &str) -> bool {
+    matches!(link_type, LinkType::Shortcut | LinkType::ShortcutUnknown) && normalized_label == "x"
+}
+
 /// Handles one `Link`/`Image` start event: records a dangling reference-style use as a
 /// finding, tracks every reference label used (regardless of whether it's dangling, so
 /// [`unused_definition_findings`] doesn't flag a definition backing only an image), and
@@ -245,7 +258,11 @@ fn record_link_or_image(
         // unrelated failure mode from a broken doc cross-reference — matching the prior
         // doc_report.py-based checker, which never flagged these. It still counts as a
         // "use" above so a definition backing only an image isn't flagged unused.
-        if is_dangling && !is_image && !normalized.starts_with('^') {
+        if is_dangling
+            && !is_image
+            && !normalized.starts_with('^')
+            && !is_inline_checkbox_mark(link_type, &normalized)
+        {
             parsed.findings.push(Finding {
                 line: line_for_offset(line_starts, range.start),
                 message: format!("[{id}] used but never defined"),

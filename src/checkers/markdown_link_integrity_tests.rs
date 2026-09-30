@@ -236,6 +236,27 @@ fn ignores_github_task_list_markers() {
 }
 
 #[test]
+fn ignores_a_checkbox_mark_mid_sentence_outside_a_task_list_item() {
+    // ENABLE_TASKLISTS only recognizes `[x]`/`[ ]` as a TaskListMarker at the very
+    // start of a list item — the same mark used informally mid-sentence (e.g. a
+    // status note's "Marked [x].") falls back to a plain shortcut reference link
+    // with label "x", which almost never has (or needs) a `[x]: target` definition.
+    let body = "- Iteration 2 — Gate 2: fixed and re-verified. Marked [x].\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
+fn still_flags_a_genuinely_dangling_shortcut_reference_that_is_not_a_checkbox_mark() {
+    let findings = check_source(&path(), "See [thing] for details.\n").unwrap();
+    assert_eq!(findings.len(), 1, "got: {findings:?}");
+    assert!(
+        findings[0]
+            .message
+            .contains("[thing] used but never defined")
+    );
+}
+
+#[test]
 fn fully_consistent_document_has_zero_findings() {
     let body = "# Heading One\n\nSee [the site][site-ref] and [Heading One](#heading-one).\n\n[site-ref]: https://example.com\n";
     assert!(check_source(&path(), body).unwrap().is_empty());
