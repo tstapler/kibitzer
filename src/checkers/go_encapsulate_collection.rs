@@ -261,7 +261,18 @@ mod tests {
         let src = "package p\n\ntype S struct {\n\tindex map[string]int\n}\n\nfunc (s *S) Index() map[string]int {\n\treturn s.index\n}\n";
         let findings = go_findings(src);
         assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("`Index`"));
+        assert!(findings[0].message.contains("`index`"));
         assert!(findings[0].message.contains("map"));
+    }
+
+    #[test]
+    fn flags_a_value_receiver_getter_returning_a_slice_field_directly() {
+        // receiver_type_name's non-pointer branch — the pointer-receiver tests above don't
+        // exercise this path.
+        let src = "package p\n\ntype S struct {\n\titems []int\n}\n\nfunc (s S) Items() []int {\n\treturn s.items\n}\n";
+        let findings = go_findings(src);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
     }
 
     #[test]
