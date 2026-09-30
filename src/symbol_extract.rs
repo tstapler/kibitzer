@@ -596,7 +596,7 @@ pub struct RawCallSite {
 /// Call-graph extraction is scoped to Go and TS/JS for v1 (see the issue's "reuse
 /// existing per-language coverage" note) — every other `Language` variant returns no
 /// call sites here even though `symbol_extract_for_file` already covers it.
-fn call_graph_supports(language: Language) -> bool {
+pub(crate) fn call_graph_supports(language: Language) -> bool {
     matches!(
         language,
         Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript

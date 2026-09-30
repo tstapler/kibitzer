@@ -1136,11 +1136,12 @@ pub fn lookup_any_architecture_checker(name: &str) -> Option<AnyArchitectureChec
 pub(crate) fn build_arch_model_for_check(
     repo_root: &Path,
     files: &[PathBuf],
+    include_private: bool,
 ) -> anyhow::Result<crate::arch_model::ArchModel> {
     crate::arch_model::build_model_from_files(
         repo_root,
         files,
-        &crate::arch_model::PruneConfig::default(),
+        &crate::arch_model::PruneConfig { include_private },
     )
 }
 
@@ -1189,10 +1190,12 @@ pub fn run_architecture_check(
             checker.check(&graph, arch_config)
         }
         AnyArchitectureChecker::Model(checker) => {
-            let model = match build_arch_model_for_check(repo_root, files) {
-                Ok(model) => model,
-                Err(err) => return Ok(error_result(format!("{err:#}"))),
-            };
+            let model =
+                match build_arch_model_for_check(repo_root, files, checker.needs_private_symbols())
+                {
+                    Ok(model) => model,
+                    Err(err) => return Ok(error_result(format!("{err:#}"))),
+                };
             checker.check(&model, arch_config)
         }
         AnyArchitectureChecker::Declaration(checker) => {
@@ -1315,9 +1318,11 @@ fn check_native_against_git_head_repo(
                 .ok()
                 .map(|graph| checker.check(&graph, arch_config).is_empty())
         }
-        AnyArchitectureChecker::Model(checker) => build_arch_model_for_check(&snapshot_dir, &files)
-            .ok()
-            .map(|model| checker.check(&model, arch_config).is_empty()),
+        AnyArchitectureChecker::Model(checker) => {
+            build_arch_model_for_check(&snapshot_dir, &files, checker.needs_private_symbols())
+                .ok()
+                .map(|model| checker.check(&model, arch_config).is_empty())
+        }
         AnyArchitectureChecker::Declaration(checker) => {
             let components = arch_config.effective_components();
             crate::declarations::build(&snapshot_dir, &files, &components)
@@ -2389,6 +2394,53 @@ mod git_head_integration_tests {
         assert!(result.output.contains("[instability]"));
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
+    }
+
+    fn unreferenced_private_symbol_check() -> Check {
+        Check {
+            name: "unreferenced-private-symbol".to_string(),
+            command: None,
+            checker: None,
+            architecture_checker: Some("unreferenced-private-symbol".to_string()),
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: Some("unreferenced private symbol".to_string()),
+            output_format: None,
+            options: None,
+        }
+    }
+
+    /// Regression guard for `ArchModelChecker::needs_private_symbols()`: this checker's
+    /// whole subject is unexported symbols, so it only works at all if
+    /// `run_architecture_check` actually builds its `ArchModel` with
+    /// `PruneConfig { include_private: true }` rather than the default `false` every other
+    /// `ArchModelChecker` gets. Every unit test in `unreferenced_symbols.rs` calls the
+    /// module-private finder function directly against a hand-built model with
+    /// `include_private: true` hardcoded — none of them would catch a regression where
+    /// `checker.needs_private_symbols()` stopped being threaded through to
+    /// `build_arch_model_for_check` here, which would silently prune every private symbol
+    /// before the checker ever saw one and leave it permanently finding nothing in real use.
+    #[test]
+    fn unreferenced_private_symbol_checker_sees_private_symbols_through_run_architecture_check() {
+        let repo = TempRepo::new("unreferenced-private-symbol-wiring");
+        repo.write_and_commit(
+            "pkg/a.go",
+            "package pkg\n\nfunc dead() {}\n\nfunc Live() {}\n",
+            "init",
+        );
+
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+        let result = run_architecture_check(
+            &unreferenced_private_symbol_check(),
+            &repo.dir,
+            &files,
+            &crate::config::ArchitectureConfig::default(),
+        )
+        .unwrap();
+
+        assert!(!result.passed, "got: {result:?}");
+        assert!(result.output.contains("`dead`"), "got: {result:?}");
     }
 
     fn layering_check() -> Check {
