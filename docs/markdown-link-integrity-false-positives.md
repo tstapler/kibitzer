@@ -388,6 +388,11 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   edit and no suppression was in place — worked around rather than fixed at the
   source, logged here per this doc's own instruction not to just note a false positive
   in passing.
+- **Related, narrower fix landed separately**: `is_bracketed_checkbox_mark`
+  (`src/checkers/markdown_link_integrity.rs`) suppresses the single-character `[x]`/`[X]`
+  case of this same mechanism (a checkbox mark used mid-sentence, outside GFM task-list
+  position). It's a point-patch for one specific label, not the general slug-shape
+  heuristic this entry's fix direction proposes — this entry stays open.
 
 ## Resolution: native `markdown-link-integrity` checker + grace period
 

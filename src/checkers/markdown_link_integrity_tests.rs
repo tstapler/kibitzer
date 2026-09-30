@@ -246,6 +246,19 @@ fn ignores_a_checkbox_mark_mid_sentence_outside_a_task_list_item() {
 }
 
 #[test]
+fn ignores_an_uppercase_checkbox_mark_mid_sentence() {
+    // normalize_label lowercases before the "x" comparison — regression insurance so a
+    // future change to that normalization can't silently un-suppress this case.
+    assert!(check_source(&path(), "Marked [X].\n").unwrap().is_empty());
+}
+
+#[test]
+fn ignores_a_checkbox_mark_inside_a_table_cell() {
+    let body = "| Task | Status |\n|---|---|\n| Frobnicate | [x] |\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
 fn still_flags_a_genuinely_dangling_shortcut_reference_that_is_not_a_checkbox_mark() {
     let findings = check_source(&path(), "See [thing] for details.\n").unwrap();
     assert_eq!(findings.len(), 1, "got: {findings:?}");

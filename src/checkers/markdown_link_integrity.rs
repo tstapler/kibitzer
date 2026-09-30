@@ -225,16 +225,12 @@ fn reference_style_flags(link_type: LinkType) -> (bool, bool) {
     (is_reference_style, is_dangling)
 }
 
-/// `- [x] done`-style GFM task-list checkboxes are only recognized as `TaskListMarker`
-/// events when at the very start of a list item (`ENABLE_TASKLISTS` above); the same
-/// `[x]`/`[X]` mid-sentence — e.g. "Marked [x]." in a status note — has no such special
-/// case and parses as a plain shortcut reference-style link with label "x", which almost
-/// never has (or is meant to have) a `[x]: target` definition. Scoped to exactly the
-/// checkbox-mark label on a `Shortcut`/`ShortcutUnknown` link (never `Reference`/
-/// `Collapsed`, which require the author to type an explicit `[label][ref]`/`[label][]`
-/// — unambiguous link intent), so a genuine broken shortcut reference whose label isn't
-/// "x" is still flagged.
-fn is_inline_checkbox_mark(link_type: LinkType, normalized_label: &str) -> bool {
+/// A `[x]`/`[X]` mark used mid-sentence (outside `ENABLE_TASKLISTS`' leading-list-item
+/// position) parses as a shortcut reference-style link labeled "x", almost never backed
+/// by a `[x]: target` def. Scoped to `Shortcut`/`ShortcutUnknown` only — `Reference`/
+/// `Collapsed` require an explicit `[label][ref]`/`[label][]`, still flagged. Related
+/// open case: `docs/markdown-link-integrity-false-positives.md`'s `[SEVERITY: High]` entry.
+fn is_bracketed_checkbox_mark(link_type: LinkType, normalized_label: &str) -> bool {
     matches!(link_type, LinkType::Shortcut | LinkType::ShortcutUnknown) && normalized_label == "x"
 }
 
@@ -261,7 +257,7 @@ fn record_link_or_image(
         if is_dangling
             && !is_image
             && !normalized.starts_with('^')
-            && !is_inline_checkbox_mark(link_type, &normalized)
+            && !is_bracketed_checkbox_mark(link_type, &normalized)
         {
             parsed.findings.push(Finding {
                 line: line_for_offset(line_starts, range.start),
