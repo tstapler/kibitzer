@@ -225,6 +225,15 @@ fn reference_style_flags(link_type: LinkType) -> (bool, bool) {
     (is_reference_style, is_dangling)
 }
 
+/// A `[x]`/`[X]` mark used mid-sentence (outside `ENABLE_TASKLISTS`' leading-list-item
+/// position) parses as a shortcut reference-style link labeled "x", almost never backed
+/// by a `[x]: target` def. Scoped to `Shortcut`/`ShortcutUnknown` only — `Reference`/
+/// `Collapsed` require an explicit `[label][ref]`/`[label][]`, still flagged. Related
+/// open case: `docs/markdown-link-integrity-false-positives.md`'s `[SEVERITY: High]` entry.
+fn is_bracketed_checkbox_mark(link_type: LinkType, normalized_label: &str) -> bool {
+    matches!(link_type, LinkType::Shortcut | LinkType::ShortcutUnknown) && normalized_label == "x"
+}
+
 /// Handles one `Link`/`Image` start event: records a dangling reference-style use as a
 /// finding, tracks every reference label used (regardless of whether it's dangling, so
 /// [`unused_definition_findings`] doesn't flag a definition backing only an image), and
@@ -245,7 +254,11 @@ fn record_link_or_image(
         // unrelated failure mode from a broken doc cross-reference — matching the prior
         // doc_report.py-based checker, which never flagged these. It still counts as a
         // "use" above so a definition backing only an image isn't flagged unused.
-        if is_dangling && !is_image && !normalized.starts_with('^') {
+        if is_dangling
+            && !is_image
+            && !normalized.starts_with('^')
+            && !is_bracketed_checkbox_mark(link_type, &normalized)
+        {
             parsed.findings.push(Finding {
                 line: line_for_offset(line_starts, range.start),
                 message: format!("[{id}] used but never defined"),
