@@ -2,6 +2,7 @@ pub mod ai_vocabulary_density;
 pub mod comment_quality;
 pub mod complexity;
 pub mod duplicate_code;
+pub mod duplicate_code_fuzzy;
 pub mod duplicate_cross_file_checker;
 pub mod em_dash_overuse;
 pub mod file_size;
