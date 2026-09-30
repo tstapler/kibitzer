@@ -13,9 +13,7 @@ use crate::checkers::file_size::is_generated;
 pub(crate) const MIN_BLOCK_LINES: usize = 6;
 /// Minimum combined trimmed-line length a block must have, filtering out blocks that
 /// are mostly blank or single-token lines shared by coincidence rather than by copying.
-/// `pub(crate)`: shared with `duplicate_code_fuzzy`, which applies the same bar before
-/// normalizing literals.
-pub(crate) const MIN_BLOCK_CHARS: usize = 60;
+const MIN_BLOCK_CHARS: usize = 60;
 /// Minimum number of times a block must occur before flagging. A backtest against a
 /// real transcript corpus showed two occurrences alone produces mostly benign,
 /// individually-defensible repetition (e.g. a handful of near-identical test-fixture

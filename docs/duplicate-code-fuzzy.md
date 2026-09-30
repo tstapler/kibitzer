@@ -46,6 +46,42 @@ itself has; (2) Go test-support files that don't follow the strict
 `_test.go` suffix (`allocator_testing.go`, `store_tests.go`, `testcase.go`)
 still carry table-driven-style literal variation. Neither is fixed here.
 
+## Backtest (real transcripts, `kibitzer check backtest`)
+
+Also ran the mandatory transcript-based leg (`docs/backtesting.md`) against
+this machine's own `~/.claude/projects` history, per this repo's "both
+required, not either/or" policy for landing a new checker.
+`kibitzer check backtest duplicate-code-fuzzy --only-new` started at 155
+findings; almost all of the worst offenders were this checker's own blind
+spot for *Rust*, whose test-file conventions don't match the filename-suffix
+heuristic `is_test_file` was built around:
+
+- **Inline `#[cfg(test)]` modules.** Unlike every other supported language,
+  Rust keeps test code in the same file as production code
+  (`#[cfg(test)] mod tests { ... }`), so there's no separate filename to
+  exclude. Fixed by truncating the scanned line range at the first
+  `#[cfg(test)]` line (`trimmed_lines_before_rust_test_module`) — this
+  checker's own table-driven fixture arrays (`src/java_swallowed_interrupt.rs`
+  and siblings in this very repo) were the single largest false-positive
+  source before the fix.
+- **`tests/` integration-test directories.** Rust integration tests
+  (`crates/*/tests/*.rs`) and some JS/TS suites (`__tests__/`) live in a
+  directory by convention, not a filename suffix. Confirmed via a real hit
+  (`crates/cli/tests/browser_session.rs`, from another of Tyler's repos) and
+  fixed by adding a path-component check to `is_test_file`.
+
+After both fixes and clearing the stale `~/.cache/kibitzer/backtest-cache.json`
+(the cache keys on checker *name*, not code version, so a local rebuild
+doesn't invalidate it — re-run with a fresh cache after any checker-logic
+change), the same command dropped to **84 findings**. The remainder is a mix
+of genuine near-duplicates worth flagging (a CLI subcommand-registration
+table in `landing.rs`, a Go workflow-state struct literal in
+`create_workflow.go`) and lower-value hits on dense literal arrays/word
+lists (`comment_quality.rs`'s word list, and even this checker's own
+`is_test_file` extension-suffix array) — the same "arrays of short literals
+window-match each other" limitation the exact-match `duplicate-code` checker
+already has, not something newly introduced here.
+
 Enable it via `.kibitzer/inspect.json` (see `docs/suppressing-checks.md`):
 
 ```json
