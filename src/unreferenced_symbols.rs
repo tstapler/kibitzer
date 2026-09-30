@@ -61,9 +61,13 @@
 //!   `getDerivedStateFromError`, and the rest of `FRAMEWORK_LIFECYCLE_METHOD_NAMES` are
 //!   invoked by React itself via a reserved method name on a `Component` subclass — never
 //!   from a call site this repo's call graph could ever see. Confirmed as a real false
-//!   positive backtesting against `stapler-squad`'s `ErrorBoundary.tsx`. Same "runtime
-//!   invokes this by convention, not by any call site" reasoning as the `main`/`init`
-//!   carve-out above, just scoped to a name list instead of a language convention.
+//!   positive backtesting against `stapler-squad`'s `ErrorBoundary.tsx`. Matched by name
+//!   only, in any call-graph-covered language, not gated on file type or an `extends
+//!   Component` check (`SymbolNode` carries no inheritance edge to check against) — so a
+//!   non-React private method sharing one of these names is suppressed too. Accepted for
+//!   14 of the 15 names (React-coined, effectively collision-free elsewhere); `render` is
+//!   the one genuinely generic name in the list and carries materially higher false-negative
+//!   risk (see `does_not_flag_a_dead_private_method_that_happens_to_be_named_render`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -382,6 +386,23 @@ mod tests {
         assert!(
             unreferenced_findings_for_model(&model).is_empty(),
             "React lifecycle methods are invoked by the runtime, never a call site"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_dead_private_method_that_happens_to_be_named_render() {
+        // "render" is the one entry in FRAMEWORK_LIFECYCLE_METHOD_NAMES that isn't
+        // React-coined — a truly dead, unrelated private `render` method (e.g. a
+        // hand-rolled template renderer, no React involved) is now silently exempt.
+        // Documented as an accepted false negative, consistent with this checker's
+        // false-negative-over-false-positive bias (see module doc).
+        let model = model_from(vec![(
+            "/repo/src/widget.ts",
+            "class Widget {\n\tprivate render() {}\n}\n",
+        )]);
+        assert!(
+            unreferenced_findings_for_model(&model).is_empty(),
+            "accepted false negative: render collides with the React lifecycle carve-out"
         );
     }
 
