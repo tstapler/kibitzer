@@ -152,10 +152,7 @@ fn is_candidate(symbol: &SymbolNode) -> bool {
 }
 
 fn finding_for(symbol: &SymbolNode) -> ArchFinding {
-    let kind = match symbol.kind {
-        SymbolKind::Method => "method",
-        _ => "function",
-    };
+    let kind = symbol.kind.function_or_method_word();
     ArchFinding {
         file: Some(symbol.file.clone()),
         line: Some(symbol.line),

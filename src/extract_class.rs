@@ -356,6 +356,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: Some(type_name.to_string()),
+            is_pure_delegation: false,
         }
     }
 

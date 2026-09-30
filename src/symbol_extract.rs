@@ -404,6 +404,7 @@ fn go_type_declaration_symbols(
             line,
             exported,
             parent: None,
+            is_pure_delegation: false,
         });
     }
 }
@@ -520,6 +521,12 @@ fn classify_node(
 
     let id = build_id(package_path, parent.as_deref(), &name);
 
+    let is_pure_delegation = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+        && call_graph_supports(language)
+        && node
+            .child_by_field_name("body")
+            .is_some_and(is_pure_delegation_body);
+
     Some(SymbolNode {
         id,
         name,
@@ -528,7 +535,74 @@ fn classify_node(
         line,
         exported,
         parent,
+        is_pure_delegation,
     })
+}
+
+/// A body's non-comment statements — Go's `block` wraps them in an inner
+/// `statement_list` (absent entirely for an empty `{}` body); TS/JS's `statement_block`
+/// holds them directly. `"comment"` is filtered out here rather than relied on to be
+/// absent: it's a named node in both grammars (verified via `to_sexp()`), so a
+/// one-statement function with a leading body comment would otherwise miscount as two
+/// statements and lose its delegation match.
+fn body_statements<'a>(body: Node<'a>) -> Vec<Node<'a>> {
+    let list = match body.kind() {
+        "block" => {
+            let mut cursor = body.walk();
+            match body
+                .children(&mut cursor)
+                .find(|c| c.kind() == "statement_list")
+            {
+                Some(list) => list,
+                None => return Vec::new(),
+            }
+        }
+        _ => body,
+    };
+    let mut cursor = list.walk();
+    list.children(&mut cursor)
+        .filter(|c| c.is_named() && c.kind() != "comment")
+        .collect()
+}
+
+/// Shared node kind for a function/method call, across Go and TS/JS alike (verified via
+/// `to_sexp()`) — named so the handful of comparisons below (and `walk_calls`') don't
+/// repeat the raw string.
+const CALL_EXPRESSION_KIND: &str = "call_expression";
+
+/// True iff `body` (a Go `block` or TS/JS `statement_block`) is exactly one statement
+/// that's a bare call (`f()`) or `return f()` — Fowler's *Inline Function* shape. Go
+/// wraps a `return`'s value(s) in an `expression_list`; TS/JS's `return_statement` holds
+/// the expression directly — both are checked since `call_graph_supports` (this
+/// function's only caller) covers both language families.
+fn is_pure_delegation_body(body: Node) -> bool {
+    let stmts = body_statements(body);
+    let [stmt] = stmts.as_slice() else {
+        return false;
+    };
+    match stmt.kind() {
+        "expression_statement" => stmt
+            .named_child(0)
+            .is_some_and(|c| c.kind() == CALL_EXPRESSION_KIND),
+        "return_statement" => {
+            let mut cursor = stmt.walk();
+            let values: Vec<Node> = stmt
+                .children(&mut cursor)
+                .filter(|c| c.is_named())
+                .collect();
+            match values.as_slice() {
+                [value] if value.kind() == CALL_EXPRESSION_KIND => true,
+                [value] if value.kind() == "expression_list" => {
+                    let mut c2 = value.walk();
+                    let exprs: Vec<Node> =
+                        value.children(&mut c2).filter(|c| c.is_named()).collect();
+                    matches!(exprs.as_slice(), [expr] if expr.kind() == CALL_EXPRESSION_KIND)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn walk(

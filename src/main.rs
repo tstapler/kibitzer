@@ -36,6 +36,7 @@ mod plugin;
 mod root_cause_clusters;
 mod run;
 mod schema;
+mod single_call_site_delegation;
 mod status;
 mod symbol_extract;
 mod task_stop;

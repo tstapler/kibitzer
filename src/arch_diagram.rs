@@ -226,6 +226,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: parent.map(str::to_string),
+            is_pure_delegation: false,
         }
     }
 

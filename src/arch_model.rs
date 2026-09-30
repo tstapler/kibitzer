@@ -32,6 +32,20 @@ pub enum SymbolKind {
     Method,
 }
 
+impl SymbolKind {
+    /// `"method"`/`"function"` for finding messages — shared by
+    /// `unreferenced_symbols`/`single_call_site_delegation`, whose findings both read as
+    /// "this {kind} ...". `Type`/`Interface` fall back to `"function"` since neither
+    /// checker ever calls this for those kinds (both filter to `Function`/`Method`
+    /// candidates only).
+    pub fn function_or_method_word(self) -> &'static str {
+        match self {
+            SymbolKind::Method => "method",
+            _ => "function",
+        }
+    }
+}
+
 /// How deep a consumer wants to look: package/component granularity, or down to
 /// individual symbols. Threaded through every consumer's "how deep" parameter (CLI
 /// `--level`, MCP `level` field, diagram renderer) instead of each interface inventing
@@ -60,6 +74,18 @@ pub struct SymbolNode {
     /// Set for methods: the name of the owning type. `None` for types, interfaces, and
     /// free functions.
     pub parent: Option<String>,
+    /// True iff this `Function`/`Method`'s entire body is one statement that's a bare
+    /// call or `return <call>` — Fowler's *Inline Function* shape (see
+    /// `unreferenced_symbols::UnreferencedPrivateSymbolChecker`'s sibling checker,
+    /// `single_call_site_delegation::SingleCallSiteDelegationChecker`, issue #48). Only
+    /// ever `true` for a language `symbol_extract::call_graph_supports` covers (Go/TS/
+    /// Tsx/JS) — every other language's symbols get `false` unconditionally, same
+    /// "no evidence, not zero usage" stance as `call_edges` itself. Always `false` for
+    /// `Type`/`Interface` symbols. `#[serde(default)]` so a `SymbolNode` cached to
+    /// `cache.json` before this field existed still deserializes (same additive-field
+    /// precedent as `ArchFinding::severity_override`).
+    #[serde(default)]
+    pub is_pure_delegation: bool,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -1178,6 +1204,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         }
     }
 
@@ -1318,6 +1345,7 @@ mod tests {
             line: 12,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2081,6 +2109,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2091,6 +2120,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
 
         let mut packages = BTreeMap::new();
@@ -2125,6 +2155,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2160,6 +2191,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2430,6 +2462,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2445,6 +2478,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2494,6 +2528,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2534,6 +2569,7 @@ mod tests {
             line: 1,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         });
         packages.insert("app".to_string(), pkg);
 
