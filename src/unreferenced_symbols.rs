@@ -57,6 +57,13 @@
 //!   identifier — confirmed against `stapler-squad`'s `eslint-plugin-analytics` rules.
 //!   `is_plausible_identifier` filters these out rather than reporting the extractor's own
 //!   confusion as a dead-code finding.
+//! - **React class-component lifecycle methods are never candidates.** `componentDidCatch`,
+//!   `getDerivedStateFromError`, and the rest of `FRAMEWORK_LIFECYCLE_METHOD_NAMES` are
+//!   invoked by React itself via a reserved method name on a `Component` subclass — never
+//!   from a call site this repo's call graph could ever see. Confirmed as a real false
+//!   positive backtesting against `stapler-squad`'s `ErrorBoundary.tsx`. Same "runtime
+//!   invokes this by convention, not by any call site" reasoning as the `main`/`init`
+//!   carve-out above, just scoped to a name list instead of a language convention.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -71,6 +78,28 @@ use crate::config::ArchitectureConfig;
 /// Runtime entrypoints that are unexported by language convention but never explicitly
 /// called from anywhere this repo's call graph could observe.
 const ENTRYPOINT_NAMES: &[&str] = &["main", "init"];
+
+/// React class-component lifecycle methods — reserved names the React runtime calls
+/// directly on a `Component` subclass. `render`/`componentDidMount`/etc. never appear as
+/// a call expression or bare-value reference anywhere in application code, so neither of
+/// this checker's two usage signals can ever see a caller for them.
+const FRAMEWORK_LIFECYCLE_METHOD_NAMES: &[&str] = &[
+    "render",
+    "componentDidMount",
+    "componentDidUpdate",
+    "componentDidCatch",
+    "componentWillUnmount",
+    "shouldComponentUpdate",
+    "getSnapshotBeforeUpdate",
+    "getDerivedStateFromProps",
+    "getDerivedStateFromError",
+    "componentWillMount",
+    "componentWillReceiveProps",
+    "componentWillUpdate",
+    "UNSAFE_componentWillMount",
+    "UNSAFE_componentWillReceiveProps",
+    "UNSAFE_componentWillUpdate",
+];
 
 pub struct UnreferencedPrivateSymbolChecker;
 
@@ -113,6 +142,7 @@ fn is_candidate(symbol: &SymbolNode) -> bool {
     !symbol.exported
         && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
         && !ENTRYPOINT_NAMES.contains(&symbol.name.as_str())
+        && !FRAMEWORK_LIFECYCLE_METHOD_NAMES.contains(&symbol.name.as_str())
         && is_plausible_identifier(&symbol.name)
         && has_call_graph_coverage(&symbol.file)
 }
@@ -334,6 +364,24 @@ mod tests {
         assert!(
             unreferenced_findings_for_model(&model).is_empty(),
             "main/init are runtime entrypoints, never explicitly called"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_react_lifecycle_method() {
+        // componentDidCatch/getDerivedStateFromError are invoked by the React runtime on
+        // an ErrorBoundary subclass, never by application call sites — confirmed as a
+        // real false positive backtesting against stapler-squad's ErrorBoundary.tsx.
+        let model = model_from(vec![(
+            "/repo/src/ErrorBoundary.tsx",
+            "class ErrorBoundary extends Component {\n\
+             \tcomponentDidCatch(error, info) {}\n\
+             \tstatic getDerivedStateFromError(error) {}\n\
+             }\n",
+        )]);
+        assert!(
+            unreferenced_findings_for_model(&model).is_empty(),
+            "React lifecycle methods are invoked by the runtime, never a call site"
         );
     }
 
