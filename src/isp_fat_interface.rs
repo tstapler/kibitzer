@@ -374,6 +374,7 @@ mod tests {
             line,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         }
     }
 
@@ -386,6 +387,7 @@ mod tests {
             line,
             exported: true,
             parent: None,
+            is_pure_delegation: false,
         }
     }
 

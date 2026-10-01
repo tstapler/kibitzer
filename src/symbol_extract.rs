@@ -404,6 +404,7 @@ fn go_type_declaration_symbols(
             line,
             exported,
             parent: None,
+            is_pure_delegation: false,
         });
     }
 }
@@ -520,6 +521,12 @@ fn classify_node(
 
     let id = build_id(package_path, parent.as_deref(), &name);
 
+    let is_pure_delegation = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+        && call_graph_supports(language)
+        && node
+            .child_by_field_name("body")
+            .is_some_and(is_pure_delegation_body);
+
     Some(SymbolNode {
         id,
         name,
@@ -528,7 +535,79 @@ fn classify_node(
         line,
         exported,
         parent,
+        is_pure_delegation,
     })
+}
+
+// SEAM(typed-node-kind-migration): raw `.kind()` comparisons against Go's
+// `"block"`/`"statement_list"` and TS/JS's shared `"statement_block"`/`"comment"` —
+// cross-grammar vocabulary, deliberately excluded per ADR-001's Option C.
+///
+/// A body's non-comment statements. Go wraps them in an inner `statement_list`
+/// (absent for an empty `{}` body); TS/JS's `statement_block` holds them directly.
+/// `"comment"` is filtered explicitly since it's a named node in both grammars, or a
+/// one-statement function with a leading comment would miscount as two statements.
+fn body_statements<'a>(body: Node<'a>) -> Vec<Node<'a>> {
+    let list = match body.kind() {
+        "block" => {
+            let mut cursor = body.walk();
+            match body
+                .children(&mut cursor)
+                .find(|c| c.kind() == "statement_list")
+            {
+                Some(list) => list,
+                None => return Vec::new(),
+            }
+        }
+        _ => body,
+    };
+    let mut cursor = list.walk();
+    list.children(&mut cursor)
+        .filter(|c| c.is_named() && c.kind() != "comment")
+        .collect()
+}
+
+/// Shared node kind for a function/method call, across Go and TS/JS alike (verified via
+/// `to_sexp()`) — named so the handful of comparisons below (and `walk_calls`') don't
+/// repeat the raw string.
+const CALL_EXPRESSION_KIND: &str = "call_expression";
+
+// SEAM(typed-node-kind-migration): raw `.kind()` comparisons against Go/TS/JS's shared
+// `"expression_statement"`/`"return_statement"`/`"expression_list"` vocabulary —
+// cross-grammar, deliberately excluded per ADR-001's Option C.
+///
+/// True iff `body` is exactly one statement that's a bare call or `return <call>` —
+/// Fowler's *Inline Function* shape. Go wraps a `return`'s value(s) in an
+/// `expression_list` (so `return a(), b()` correctly doesn't match); TS/JS's
+/// `return_statement` holds the call directly.
+fn is_pure_delegation_body(body: Node) -> bool {
+    let stmts = body_statements(body);
+    let [stmt] = stmts.as_slice() else {
+        return false;
+    };
+    match stmt.kind() {
+        "expression_statement" => stmt
+            .named_child(0)
+            .is_some_and(|c| c.kind() == CALL_EXPRESSION_KIND),
+        "return_statement" => {
+            let mut cursor = stmt.walk();
+            let values: Vec<Node> = stmt
+                .children(&mut cursor)
+                .filter(|c| c.is_named())
+                .collect();
+            match values.as_slice() {
+                [value] if value.kind() == CALL_EXPRESSION_KIND => true,
+                [value] if value.kind() == "expression_list" => {
+                    let mut c2 = value.walk();
+                    let exprs: Vec<Node> =
+                        value.children(&mut c2).filter(|c| c.is_named()).collect();
+                    matches!(exprs.as_slice(), [expr] if expr.kind() == CALL_EXPRESSION_KIND)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn walk(
@@ -2598,5 +2677,100 @@ mod tests {
         assert_eq!(find("Animal").kind_hint, Some(TypeRelationKind::Extends));
         assert_eq!(find("Runnable").kind_hint, None);
         assert_eq!(find("Named").kind_hint, None);
+    }
+
+    // --- Issue #48: `is_pure_delegation` (single-call-site-delegation checker's shape
+    // signal) — exercised directly here rather than only indirectly through the
+    // checker's own tests, so an AST-shape regression can be localized without also
+    // touching caller-counting/export-filtering.
+
+    #[test]
+    fn is_pure_delegation_true_for_a_go_bare_call_body() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\nfunc thin() {\n\thelper()\n}\n",
+            "pkg",
+        );
+        assert!(find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_true_for_a_go_return_call_body() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\nfunc thin(x int) int {\n\treturn helper(x)\n}\n",
+            "pkg",
+        );
+        assert!(find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_true_for_a_go_method() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype T struct{}\n\nfunc (t T) thin() {\n\thelper()\n}\n",
+            "pkg",
+        );
+        assert!(find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_false_for_a_go_multi_value_return() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\nfunc thin() (int, int) {\n\treturn a(), b()\n}\n",
+            "pkg",
+        );
+        assert!(
+            !find_by_name(&symbols, "thin").is_pure_delegation,
+            "a multi-value return isn't a single delegating call"
+        );
+    }
+
+    #[test]
+    fn is_pure_delegation_false_for_an_empty_body() {
+        let symbols = extract(Language::Go, "package pkg\n\nfunc thin() {}\n", "pkg");
+        assert!(!find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_false_for_a_multi_statement_body() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\nfunc notThin() {\n\tlogSomething()\n\thelper()\n}\n",
+            "pkg",
+        );
+        assert!(!find_by_name(&symbols, "notThin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_true_for_a_go_body_with_a_leading_comment() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\nfunc thin() {\n\t// comment\n\thelper()\n}\n",
+            "pkg",
+        );
+        assert!(
+            find_by_name(&symbols, "thin").is_pure_delegation,
+            "a leading comment must not miscount as a second statement"
+        );
+    }
+
+    #[test]
+    fn is_pure_delegation_true_for_a_typescript_return_call_body() {
+        let symbols = extract(
+            Language::TypeScript,
+            "function thin(x: number) { return helper(x); }\n",
+            "pkg",
+        );
+        assert!(find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_false_for_rust_even_with_a_single_call_body() {
+        // Rust isn't in `call_graph_supports` — `is_pure_delegation` must stay false
+        // regardless of body shape, since there's no call-graph signal to pair it with.
+        let symbols = extract(Language::Rust, "fn thin() {\n\thelper();\n}\n", "pkg");
+        assert!(!find_by_name(&symbols, "thin").is_pure_delegation);
     }
 }

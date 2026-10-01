@@ -707,6 +707,7 @@ mod tests {
                 line: 1,
                 exported: true,
                 parent: None,
+                is_pure_delegation: false,
             });
         }
         let mut packages = std::collections::BTreeMap::new();
