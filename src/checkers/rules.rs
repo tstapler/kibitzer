@@ -1184,7 +1184,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal, extract-variable (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -1206,10 +1206,10 @@ impl Checker for SyntaxRulesChecker {
         walk_blocks(tree.root_node(), &cfg, src, &mut findings);
         // Generated files (protobuf/openapi/deepcopy codegen, etc.) are dense, mechanical,
         // and by construction full of repeated literals and long generated conditionals —
-        // more exposed to these 2 rules than the other 4 (ADR-001, pitfalls.md §2/§5;
+        // more exposed to these 2 rules than the other 5 (ADR-001, pitfalls.md §2/§5;
         // confirmed for `extract-variable` by a `kubernetes/kubernetes` corpus backtest,
         // where `zz_generated.*.go`/`generated.pb.go` dominated the raw finding count).
-        // Scoped to just these 2 passes; the other 4 rules are untouched.
+        // Scoped to just these 2 passes; the other 5 rules are untouched.
         if !file_size::is_generated(ctx.source) {
             walk_dense_expressions(tree.root_node(), &cfg, &mut findings);
             let mut collector = LiteralCollector::default();
@@ -1715,21 +1715,16 @@ fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
 /// function body.
 // SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn walk_dense_expressions(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<Finding>) {
-    let dense = if node.kind() == cfg.if_kind || Some(node.kind()) == cfg.ternary_kind {
+    let dense = if is_branching_node(node, cfg) {
         node.child_by_field_name("condition")
             .map(|condition| ("condition", condition))
-    } else if node.kind() == cfg.return_kind && !return_value_is_if_or_ternary(node, cfg) {
-        // A return statement whose entire value is an if/ternary expression (Kotlin/Rust's
-        // `return if ... else ...`, TS/JS/Java's `return cond ? a : b`) would otherwise be
-        // flagged twice for the same underlying expression — once here, once when the walk
-        // reaches that nested if/ternary node itself. Deferring to the nested check keeps
-        // one dense expression to one finding.
+    } else if node.kind() == cfg.return_kind {
         Some(("return", node))
     } else {
         None
     };
     if let Some((position, expr)) = dense {
-        let density = expression_density(expr, cfg);
+        let density = expression_density(expr, expr, cfg);
         if density >= EXTRACT_VARIABLE_DENSITY_THRESHOLD {
             findings.push(Finding {
                 line: node.start_position().row + 1,
@@ -1747,27 +1742,24 @@ fn walk_dense_expressions(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<F
     }
 }
 
-/// True if `return_node` (a `return_kind` node) has a direct named child that is itself
-/// an `if_kind`/`ternary_kind` node — i.e. the entire return value is that expression,
-/// not just a sub-part of it. Only relevant where a grammar's if/ternary can appear as
-/// an expression in return position at all: TS/JS/Java's ternary (their `if_statement`
-/// is never a valid return value) and Kotlin/Rust's `if_expression` (neither has a
-/// ternary) — Go and Python match neither `if_kind` nor `ternary_kind` here since
-/// Go has no ternary and both languages' `if` is statement-only.
-fn return_value_is_if_or_ternary(return_node: Node, cfg: &LangRuleConfig) -> bool {
-    let mut cursor = return_node.walk();
-    return_node
-        .named_children(&mut cursor)
-        .any(|c| c.kind() == cfg.if_kind || Some(c.kind()) == cfg.ternary_kind)
+/// An `if`/`elif`/ternary node, i.e. one carrying its own `condition` field that
+/// `walk_dense_expressions` checks independently.
+fn is_branching_node(node: Node, cfg: &LangRuleConfig) -> bool {
+    node.kind() == cfg.if_kind
+        || cfg.chain_kinds.contains(&node.kind())
+        || Some(node.kind()) == cfg.ternary_kind
 }
 
 /// Count of [`LangRuleConfig::operator_kinds`] and [`LangRuleConfig::call_kinds`] nodes
-/// anywhere under `node` — `extract-variable`'s expression-complexity proxy. Not scope-
-/// limited (a nested closure's own operators/calls count toward the enclosing
-/// expression's density too, same simplicity tradeoff as `collect_identifiers`):
-/// mechanical and low-false-positive by design, not a precise cost model.
-fn expression_density(node: Node, cfg: &LangRuleConfig) -> usize {
-    if cfg.density_boundary_kinds.contains(&node.kind()) {
+/// under `node` — `extract-variable`'s expression-complexity proxy. Does not descend into
+/// `density_boundary_kinds` (closures, literals) or into a nested if/ternary other than
+/// `root`: a nested branch's own condition is checked separately, so counting it here
+/// too would report the same text twice (e.g. `return (a ? b : c)`). The cost is that a
+/// dense `return cond ? dense_a : dense_b` arm goes uncounted — accepted, low-frequency.
+fn expression_density(node: Node, root: Node, cfg: &LangRuleConfig) -> usize {
+    if cfg.density_boundary_kinds.contains(&node.kind())
+        || (node.id() != root.id() && is_branching_node(node, cfg))
+    {
         return 0;
     }
     let mut count = usize::from(
@@ -1775,7 +1767,7 @@ fn expression_density(node: Node, cfg: &LangRuleConfig) -> usize {
     );
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count += expression_density(child, cfg);
+        count += expression_density(child, root, cfg);
     }
     count
 }
@@ -2169,6 +2161,7 @@ mod tests {
         let checker = SyntaxRulesChecker::new(Language::Rust);
         let description = checker.description();
         assert!(description.contains("replace-magic-literal"));
+        assert!(description.contains("extract-variable"));
         assert!(!description.contains("hide-delegate"));
     }
 
@@ -3759,7 +3752,7 @@ mod tests {
         let findings = extract_variable_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
-            "fn f() -> bool {\n    a.foo() && b.bar()\n}\n",
+            "fn f() -> bool {\n    return a.foo() && b.bar();\n}\n",
         );
         assert!(findings.is_empty(), "findings: {findings:?}");
     }
@@ -3770,6 +3763,97 @@ mod tests {
             .map(|i| format!("\t\tif a.F{i}() && b.G{i}() {{ }}\n"))
             .collect::<String>();
         let src = format!("package m\nfunc f() func() {{\n\treturn func() {{\n{body}\t}}\n}}\n");
+        let findings =
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    fn calls(n: usize, sep: &str) -> String {
+        (1..=n)
+            .map(|i| format!("a.f{i}()"))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    #[test]
+    fn density_threshold_boundary_is_nine_vs_ten() {
+        // n calls joined by && = n calls + (n-1) operators.
+        let go = |cond: String| {
+            let src = format!("package m\nfunc f() {{\n\tif {cond} {{\n\t}}\n}}\n");
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src)
+        };
+        assert!(go(calls(5, " && ")).is_empty(), "density 9 must not fire");
+        assert_eq!(
+            go(format!("{} && c", calls(5, " && "))).len(),
+            1,
+            "density 10 must fire"
+        );
+    }
+
+    #[test]
+    fn closure_bodies_do_not_count_toward_density_in_other_languages() {
+        let dense = calls(6, " && ");
+        let cases: Vec<(Language, tree_sitter::Language, String)> = vec![
+            (
+                Language::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                format!("function f() {{\n  return () => {dense};\n}}\n"),
+            ),
+            (
+                Language::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                format!("def f():\n    return lambda: {}\n", calls(6, " and ")),
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                format!("class C {{ Object f() {{\n  return () -> {dense};\n}} }}\n"),
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                format!("fn f() {{\n    return || {dense};\n}}\n"),
+            ),
+        ];
+        for (lang, ts, src) in cases {
+            let findings = extract_variable_findings(lang, ts, &src);
+            assert!(findings.is_empty(), "{lang:?}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn python_flags_dense_elif_condition() {
+        let src = format!(
+            "def f():\n    if x:\n        pass\n    elif {}:\n        pass\n",
+            calls(6, " and ")
+        );
+        let findings =
+            extract_variable_findings(Language::Python, tree_sitter_python::LANGUAGE.into(), &src);
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("condition"));
+    }
+
+    #[test]
+    fn typescript_parenthesized_return_ternary_reports_once_at_the_condition() {
+        let src = format!(
+            "function f() {{\n  return ({} ? 1 : 2);\n}}\n",
+            calls(6, " && ")
+        );
+        let findings = extract_variable_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &src,
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("condition"));
+    }
+
+    #[test]
+    fn extract_variable_skips_generated_files() {
+        let src = format!(
+            "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage m\nfunc f() {{\n\tif {} {{\n\t}}\n}}\n",
+            calls(6, " && ")
+        );
         let findings =
             extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
         assert!(findings.is_empty(), "findings: {findings:?}");
