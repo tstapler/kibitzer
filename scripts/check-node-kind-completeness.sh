@@ -29,8 +29,9 @@
 #    introduced one that needs the same treatment.
 # 2. Seam-comment/seam-line invariant: the count of
 #    `// SEAM(typed-node-kind-migration):` banners in src/checkers/rules.rs
-#    and src/symbol_extract.rs must match EXPECTED_SEAM_COUNT below (15 as of
-#    issue #48's single-call-site-delegation checker: 8 in rules.rs, 7 in
+#    and src/symbol_extract.rs must match EXPECTED_SEAM_COUNT below (16 as of
+#    issue #49's extract-variable rule, +1 in rules.rs; before it, issue #48's
+#    single-call-site-delegation checker: 8 in rules.rs, 7 in
 #    symbol_extract.rs — the 5 confirmed at Story 4.1.1's completion plus 2
 #    added for `body_statements`/`is_pure_delegation_body`'s cross-grammar
 #    statement-shape comparisons). If a future edit changes one of these pinned
@@ -98,7 +99,7 @@ EXPLAIN_MARKER='typed-node-kind[- ]migration|SEAM\(|anonymous (token|punctuation
 # its explaining comment. Sized with headroom above that.
 CONTEXT_WINDOW=40
 SEAM_FILES=(src/checkers/rules.rs src/symbol_extract.rs)
-EXPECTED_SEAM_COUNT=15
+EXPECTED_SEAM_COUNT=16
 
 fail=0
 
