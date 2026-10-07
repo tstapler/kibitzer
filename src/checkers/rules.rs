@@ -37,6 +37,12 @@ const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// in the allow-list anyway as defense-in-depth for any future grammar/version where it
 /// might be.
 const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
+/// An `if`/`return`/ternary expression whose nested binary/logical-operator and
+/// function-call count reaches this is flagged by `extract-variable`. Set from a
+/// `kubernetes/kubernetes` backtest (non-vendor Go, generated files excluded): at 4-8 the
+/// samples were ordinary readable `&&` chains and string concatenation; at 10+ they were
+/// genuinely long conditions. Lower only with a fresh backtest (#49's false-positive note).
+const EXTRACT_VARIABLE_DENSITY_THRESHOLD: usize = 10;
 
 // `replace-magic-literal`'s per-language `literal_kinds`/`numeric_literal_kinds` node-kind
 // tables, hoisted to named constants (rather than inline in each `*_lang_config()`) so
@@ -142,6 +148,12 @@ pub const CATALOG: &[RuleMeta] = &[
         id: "replace-magic-literal",
         category: "duplication",
         description: "A non-trivial numeric or string literal is repeated 2+ times in one file with no bound named constant — Fowler's Replace Magic Literal.",
+        default_severity: Severity::Advisory,
+    },
+    RuleMeta {
+        id: "extract-variable",
+        category: "readability",
+        description: "An if/return/ternary expression nests 10+ binary/logical operators and function calls — Fowler's Extract Variable.",
         default_severity: Severity::Advisory,
     },
 ];
@@ -269,6 +281,26 @@ pub(crate) struct LangRuleConfig {
     /// referenced by name elsewhere in the file, is excluded from
     /// `replace-magic-literal` (see `resolve_excluded_constants`).
     binding_finder: for<'a> fn(Node<'a>, &'a [u8]) -> Option<ConstBinding<'a>>,
+    /// The return-statement/expression node kind for `extract-variable` — `"return_statement"`
+    /// everywhere except Kotlin/Rust's `"return_expression"`. Matches `terminal_kinds`'
+    /// first entry for every grammar here, but kept as its own named field (like `if_kind`)
+    /// rather than an implicit `terminal_kinds[0]` index.
+    return_kind: &'static str,
+    /// Call-expression node kinds `extract-variable` counts toward an expression's
+    /// density — `"call_expression"` everywhere except Python's `"call"` and Java's
+    /// `"method_invocation"`.
+    call_kinds: &'static [&'static str],
+    /// Binary/logical-operator node kinds `extract-variable` counts toward an
+    /// expression's density — one unified `"binary_expression"` everywhere except
+    /// Python, which splits `and`/`or` into `"boolean_operator"`, comparisons into
+    /// `"comparison_operator"`, and arithmetic into `"binary_operator"` (verified via
+    /// `to_sexp()`: none of the other 7 grammars split this way).
+    operator_kinds: &'static [&'static str],
+    /// Closure and composite-literal node kinds `extract-variable`'s density walk does not
+    /// descend into: a closure body or struct/map literal is its own scope with its own
+    /// statements, not part of the surrounding expression's readability cost (found by a
+    /// `kubernetes/kubernetes` backtest where `return func(...) {...}` scored 93).
+    density_boundary_kinds: &'static [&'static str],
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -876,6 +908,10 @@ fn go_lang_config() -> LangRuleConfig {
         literal_kinds: GO_LITERAL_KINDS,
         numeric_literal_kinds: GO_NUMERIC_LITERAL_KINDS,
         binding_finder: go_const_binding,
+        return_kind: "return_statement",
+        call_kinds: &["call_expression"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &["func_literal", "composite_literal"],
     }
 }
 
@@ -915,6 +951,16 @@ fn typescript_lang_config() -> LangRuleConfig {
         literal_kinds: &["number", "string"],
         numeric_literal_kinds: &["number"],
         binding_finder: ts_js_const_binding,
+        return_kind: "return_statement",
+        call_kinds: &["call_expression"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &[
+            "arrow_function",
+            "function_expression",
+            "object",
+            "array",
+            "class_body",
+        ],
     }
 }
 
@@ -976,6 +1022,10 @@ fn python_lang_config() -> LangRuleConfig {
         literal_kinds: PYTHON_LITERAL_KINDS,
         numeric_literal_kinds: PYTHON_NUMERIC_LITERAL_KINDS,
         binding_finder: py_screaming_snake_binding,
+        return_kind: "return_statement",
+        call_kinds: &["call"],
+        operator_kinds: &["boolean_operator", "comparison_operator"],
+        density_boundary_kinds: &["lambda", "dictionary", "list", "set", "tuple"],
     }
 }
 
@@ -1011,6 +1061,10 @@ fn java_lang_config() -> LangRuleConfig {
         literal_kinds: JAVA_LITERAL_KINDS,
         numeric_literal_kinds: JAVA_NUMERIC_LITERAL_KINDS,
         binding_finder: java_final_binding,
+        return_kind: "return_statement",
+        call_kinds: &["method_invocation"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &["lambda_expression", "array_initializer", "class_body"],
     }
 }
 
@@ -1057,6 +1111,10 @@ fn kotlin_lang_config() -> LangRuleConfig {
         literal_kinds: KOTLIN_LITERAL_KINDS,
         numeric_literal_kinds: KOTLIN_NUMERIC_LITERAL_KINDS,
         binding_finder: kotlin_val_binding,
+        return_kind: "return_expression",
+        call_kinds: &["call_expression"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &["lambda_literal", "anonymous_function"],
     }
 }
 
@@ -1105,6 +1163,14 @@ fn rust_lang_config() -> LangRuleConfig {
         literal_kinds: RUST_LITERAL_KINDS,
         numeric_literal_kinds: RUST_NUMERIC_LITERAL_KINDS,
         binding_finder: rust_const_binding,
+        return_kind: "return_expression",
+        call_kinds: &["call_expression"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &[
+            "closure_expression",
+            "struct_expression",
+            "array_expression",
+        ],
     }
 }
 
@@ -1124,7 +1190,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal, extract-variable (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -1144,10 +1210,14 @@ impl Checker for SyntaxRulesChecker {
         let src = ctx.source.as_bytes();
         walk_declarations(tree.root_node(), &cfg, src, &mut findings);
         walk_blocks(tree.root_node(), &cfg, src, &mut findings);
-        // Generated files are dense, mechanical, and by construction full of repeated
-        // literals — more exposed to this rule than any of the other 4 (ADR-001,
-        // pitfalls.md §2/§5). Scoped to just this pass; the other 4 rules are untouched.
+        // Generated files (protobuf/openapi/deepcopy codegen, etc.) are dense, mechanical,
+        // and by construction full of repeated literals and long generated conditionals —
+        // more exposed to these 2 rules than the other 5 (ADR-001, pitfalls.md §2/§5;
+        // confirmed for `extract-variable` by a `kubernetes/kubernetes` corpus backtest,
+        // where `zz_generated.*.go`/`generated.pb.go` dominated the raw finding count).
+        // Scoped to just these 2 passes; the other 5 rules are untouched.
         if !file_size::is_generated(ctx.source) {
+            walk_dense_expressions(tree.root_node(), &cfg, &mut findings);
             let mut collector = LiteralCollector::default();
             walk_literals(tree.root_node(), &cfg, src, &mut collector);
             let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
@@ -1643,6 +1713,87 @@ fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
     max_depth
 }
 
+/// Recurses the whole tree looking for an `if`/ternary condition or a `return` value
+/// whose [`expression_density`] reaches [`EXTRACT_VARIABLE_DENSITY_THRESHOLD`] —
+/// Fowler's *Extract Variable* (née Introduce Explaining Variable), per #49. Each
+/// qualifying expression gets its own finding, anchored at its own line (not the
+/// enclosing declaration's), since a dense expression can appear anywhere in a
+/// function body.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
+fn walk_dense_expressions(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<Finding>) {
+    let dense = if is_branching_node(node, cfg) {
+        node.child_by_field_name("condition")
+            .map(|condition| ("condition", condition))
+    } else if node.kind() == cfg.return_kind {
+        Some(("return", node))
+    } else {
+        None
+    };
+    if let Some((position, expr)) = dense {
+        let density = expression_density(expr, expr, cfg);
+        if density >= EXTRACT_VARIABLE_DENSITY_THRESHOLD {
+            findings.push(Finding {
+                line: node.start_position().row + 1,
+                message: format!(
+                    "[extract-variable] {position} expression nests {density} operators/calls \
+                     (at or over {EXTRACT_VARIABLE_DENSITY_THRESHOLD}) — consider Fowler's Extract Variable \
+                     (https://refactoring.com/catalog/extractVariable.html)"
+                ),
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_dense_expressions(child, cfg, findings);
+    }
+}
+
+/// An `if`/`elif`/ternary node, i.e. one carrying its own `condition` field that
+/// `walk_dense_expressions` checks independently.
+fn is_branching_node(node: Node, cfg: &LangRuleConfig) -> bool {
+    node.kind() == cfg.if_kind
+        || cfg.chain_kinds.contains(&node.kind())
+        || Some(node.kind()) == cfg.ternary_kind
+}
+
+/// Count of [`LangRuleConfig::operator_kinds`] and [`LangRuleConfig::call_kinds`] nodes
+/// under `node` — `extract-variable`'s expression-complexity proxy. Does not descend into
+/// `density_boundary_kinds` (closures, literals) or into a nested if/ternary other than
+/// `root`: a nested branch's own condition is checked separately, so counting it here
+/// too would report the same text twice (e.g. `return (a ? b : c)`). The cost is that a
+/// dense `return cond ? dense_a : dense_b` arm goes uncounted — accepted, low-frequency.
+fn expression_density(node: Node, root: Node, cfg: &LangRuleConfig) -> usize {
+    if cfg.density_boundary_kinds.contains(&node.kind())
+        || (node.id() != root.id() && is_branching_node(node, cfg))
+    {
+        return 0;
+    }
+    let counts = (cfg.operator_kinds.contains(&node.kind()) && !is_arithmetic_operator(node))
+        || cfg.call_kinds.contains(&node.kind());
+    let mut count = usize::from(counts);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count += expression_density(child, root, cfg);
+    }
+    count
+}
+
+/// True for a binary node whose operator token is arithmetic/bitwise. Not counted toward
+/// `extract-variable` density: without types a `+` can't be told apart from string
+/// concatenation, and a Java/Kotlin concatenation chain read fine in a `cassandra` backtest
+/// where it dominated findings. Python's arithmetic `binary_operator` is simply left out
+/// of its `operator_kinds`.
+fn is_arithmetic_operator(binary: Node) -> bool {
+    let mut cursor = binary.walk();
+    binary.children(&mut cursor).any(|c| {
+        !c.is_named()
+            && matches!(
+                c.kind(),
+                "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^"
+            )
+    })
+}
+
 inventory::submit! {
     crate::checker::CheckerFactory(|| {
         Language::ALL
@@ -2032,6 +2183,7 @@ mod tests {
         let checker = SyntaxRulesChecker::new(Language::Rust);
         let description = checker.description();
         assert!(description.contains("replace-magic-literal"));
+        assert!(description.contains("extract-variable"));
         assert!(!description.contains("hide-delegate"));
     }
 
@@ -3518,5 +3670,273 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[flag-argument]"))
         );
+    }
+
+    fn extract_variable_findings(
+        lang: Language,
+        ts_lang: tree_sitter::Language,
+        src: &str,
+    ) -> Vec<Finding> {
+        check_full(lang, ts_lang, src)
+            .into_iter()
+            .filter(|f| f.message.contains("[extract-variable]"))
+            .collect()
+    }
+
+    #[test]
+    fn go_flags_dense_if_condition() {
+        // density 11: 5 calls + 6 operators.
+        let findings = extract_variable_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\tif a.F1() && a.F2() && a.F3() && a.F4() && a.F5() && c > 1 {\n\t}\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("condition"));
+    }
+
+    #[test]
+    fn go_allows_simple_if_condition() {
+        // density 3 (`user.isActive() && user.hasPermission(p)` from #49's scope note):
+        // 2 calls + 1 operator, deliberately still under threshold.
+        let findings = extract_variable_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\tif user.IsActive() && user.HasPermission(p) {\n\t}\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn go_flags_dense_return_expression() {
+        let findings = extract_variable_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() bool {\n\treturn a.F1() && a.F2() && a.F3() && a.F4() && a.F5() && c > 1\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("return"));
+    }
+
+    #[test]
+    fn typescript_flags_dense_ternary_condition() {
+        let findings = extract_variable_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  return a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1 ? 1 : 2;\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn python_flags_dense_condition_across_operator_kinds() {
+        // density 11: 5 calls + 5 boolean_operator + 1 comparison_operator.
+        let findings = extract_variable_findings(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    if a.f1() and a.f2() and a.f3() and a.f4() and a.f5() and c < 2:\n        pass\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn java_flags_dense_if_condition() {
+        let findings = extract_variable_findings(
+            Language::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            "class C { void f() {\n  if (a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1) {}\n} }\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn kotlin_flags_dense_return_expression() {
+        let findings = extract_variable_findings(
+            Language::Kotlin,
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun f(): Boolean {\n  return a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_flags_dense_if_condition() {
+        let findings = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    if a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1 {\n    }\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_allows_simple_return_expression() {
+        let findings = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() -> bool {\n    return a.foo() && b.bar();\n}\n",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn go_closure_body_does_not_count_toward_density() {
+        let body = (1..=6)
+            .map(|i| format!("\t\tif a.F{i}() && b.G{i}() {{ }}\n"))
+            .collect::<String>();
+        let src = format!("package m\nfunc f() func() {{\n\treturn func() {{\n{body}\t}}\n}}\n");
+        let findings =
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    fn calls(n: usize, sep: &str) -> String {
+        (1..=n)
+            .map(|i| format!("a.f{i}()"))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    #[test]
+    fn density_threshold_boundary_is_nine_vs_ten() {
+        // n calls joined by && = n calls + (n-1) operators.
+        let go = |cond: String| {
+            let src = format!("package m\nfunc f() {{\n\tif {cond} {{\n\t}}\n}}\n");
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src)
+        };
+        assert!(go(calls(5, " && ")).is_empty(), "density 9 must not fire");
+        assert_eq!(
+            go(format!("{} && c", calls(5, " && "))).len(),
+            1,
+            "density 10 must fire"
+        );
+    }
+
+    #[test]
+    fn closure_bodies_do_not_count_toward_density_in_other_languages() {
+        let dense = calls(6, " && ");
+        let cases: Vec<(Language, tree_sitter::Language, String)> = vec![
+            (
+                Language::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                format!("function f() {{\n  return () => {dense};\n}}\n"),
+            ),
+            (
+                Language::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                format!("def f():\n    return lambda: {}\n", calls(6, " and ")),
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                format!("class C {{ Object f() {{\n  return () -> {dense};\n}} }}\n"),
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                format!("fn f() {{\n    return || {dense};\n}}\n"),
+            ),
+        ];
+        for (lang, ts, src) in cases {
+            let findings = extract_variable_findings(lang, ts, &src);
+            assert!(findings.is_empty(), "{lang:?}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn python_flags_dense_elif_condition() {
+        let src = format!(
+            "def f():\n    if x:\n        pass\n    elif {}:\n        pass\n",
+            calls(6, " and ")
+        );
+        let findings =
+            extract_variable_findings(Language::Python, tree_sitter_python::LANGUAGE.into(), &src);
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("condition"));
+    }
+
+    #[test]
+    fn typescript_parenthesized_return_ternary_reports_once_at_the_condition() {
+        let src = format!(
+            "function f() {{\n  return ({} ? 1 : 2);\n}}\n",
+            calls(6, " && ")
+        );
+        let findings = extract_variable_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &src,
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("condition"));
+    }
+
+    #[test]
+    fn extract_variable_skips_generated_files() {
+        let src = format!(
+            "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage m\nfunc f() {{\n\tif {} {{\n\t}}\n}}\n",
+            calls(6, " && ")
+        );
+        let findings =
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn arithmetic_and_string_concatenation_do_not_count_toward_density() {
+        let concat = (1..=14)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let cases: Vec<(Language, tree_sitter::Language, String)> = vec![
+            (
+                Language::Go,
+                tree_sitter_go::LANGUAGE.into(),
+                format!("package m\nfunc f() string {{\n\treturn {concat}\n}}\n"),
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                format!("class C {{ String f() {{\n  return {concat};\n}} }}\n"),
+            ),
+            (
+                Language::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                format!("def f():\n    return {concat}\n"),
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                format!("fn f() -> i32 {{\n    return {concat};\n}}\n"),
+            ),
+        ];
+        for (lang, ts, src) in cases {
+            let findings = extract_variable_findings(lang, ts, &src);
+            assert!(findings.is_empty(), "{lang:?}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn java_anonymous_class_body_does_not_count_toward_density() {
+        let methods = (1..=6)
+            .map(|i| format!("    void m{i}() {{ if (a.f{i}() && b.g{i}()) {{}} }}\n"))
+            .collect::<String>();
+        let src =
+            format!("class C {{ Object f() {{\n  return new Object() {{\n{methods}  }};\n}} }}\n");
+        let findings =
+            extract_variable_findings(Language::Java, tree_sitter_java::LANGUAGE.into(), &src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn rust_return_if_expression_is_not_double_counted() {
+        // The return value is entirely the if_expression — should fire once (as the
+        // if-condition), not twice (once for "return", once for the nested if).
+        let findings = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() -> i32 {\n    return if a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1 { 1 } else { 2 };\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("condition"));
     }
 }
