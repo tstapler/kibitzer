@@ -954,7 +954,13 @@ fn typescript_lang_config() -> LangRuleConfig {
         return_kind: "return_statement",
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
-        density_boundary_kinds: &["arrow_function", "function_expression", "object", "array"],
+        density_boundary_kinds: &[
+            "arrow_function",
+            "function_expression",
+            "object",
+            "array",
+            "class_body",
+        ],
     }
 }
 
@@ -1018,7 +1024,7 @@ fn python_lang_config() -> LangRuleConfig {
         binding_finder: py_screaming_snake_binding,
         return_kind: "return_statement",
         call_kinds: &["call"],
-        operator_kinds: &["boolean_operator", "comparison_operator", "binary_operator"],
+        operator_kinds: &["boolean_operator", "comparison_operator"],
         density_boundary_kinds: &["lambda", "dictionary", "list", "set", "tuple"],
     }
 }
@@ -1058,7 +1064,7 @@ fn java_lang_config() -> LangRuleConfig {
         return_kind: "return_statement",
         call_kinds: &["method_invocation"],
         operator_kinds: &["binary_expression"],
-        density_boundary_kinds: &["lambda_expression", "array_initializer"],
+        density_boundary_kinds: &["lambda_expression", "array_initializer", "class_body"],
     }
 }
 
@@ -1762,14 +1768,30 @@ fn expression_density(node: Node, root: Node, cfg: &LangRuleConfig) -> usize {
     {
         return 0;
     }
-    let mut count = usize::from(
-        cfg.operator_kinds.contains(&node.kind()) || cfg.call_kinds.contains(&node.kind()),
-    );
+    let counts = (cfg.operator_kinds.contains(&node.kind()) && !is_arithmetic_operator(node))
+        || cfg.call_kinds.contains(&node.kind());
+    let mut count = usize::from(counts);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         count += expression_density(child, root, cfg);
     }
     count
+}
+
+/// True for a binary node whose operator token is arithmetic/bitwise. Not counted toward
+/// `extract-variable` density: without types a `+` can't be told apart from string
+/// concatenation, and a Java/Kotlin concatenation chain read fine in a `cassandra` backtest
+/// where it dominated findings. Python's arithmetic `binary_operator` is simply left out
+/// of its `operator_kinds`.
+fn is_arithmetic_operator(binary: Node) -> bool {
+    let mut cursor = binary.walk();
+    binary.children(&mut cursor).any(|c| {
+        !c.is_named()
+            && matches!(
+                c.kind(),
+                "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^"
+            )
+    })
 }
 
 inventory::submit! {
@@ -3856,6 +3878,52 @@ mod tests {
         );
         let findings =
             extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn arithmetic_and_string_concatenation_do_not_count_toward_density() {
+        let concat = (1..=14)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let cases: Vec<(Language, tree_sitter::Language, String)> = vec![
+            (
+                Language::Go,
+                tree_sitter_go::LANGUAGE.into(),
+                format!("package m\nfunc f() string {{\n\treturn {concat}\n}}\n"),
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                format!("class C {{ String f() {{\n  return {concat};\n}} }}\n"),
+            ),
+            (
+                Language::Python,
+                tree_sitter_python::LANGUAGE.into(),
+                format!("def f():\n    return {concat}\n"),
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                format!("fn f() -> i32 {{\n    return {concat};\n}}\n"),
+            ),
+        ];
+        for (lang, ts, src) in cases {
+            let findings = extract_variable_findings(lang, ts, &src);
+            assert!(findings.is_empty(), "{lang:?}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn java_anonymous_class_body_does_not_count_toward_density() {
+        let methods = (1..=6)
+            .map(|i| format!("    void m{i}() {{ if (a.f{i}() && b.g{i}()) {{}} }}\n"))
+            .collect::<String>();
+        let src =
+            format!("class C {{ Object f() {{\n  return new Object() {{\n{methods}  }};\n}} }}\n");
+        let findings =
+            extract_variable_findings(Language::Java, tree_sitter_java::LANGUAGE.into(), &src);
         assert!(findings.is_empty(), "findings: {findings:?}");
     }
 

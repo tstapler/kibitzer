@@ -173,11 +173,15 @@ call shape and every binary/logical operator (arithmetic, comparison, `&&`/`||` 
 Java uses `method_invocation`/`binary_expression`; Python is the one grammar that splits
 its operators into three distinct kinds — `boolean_operator` (`and`/`or`),
 `comparison_operator` (`==`, `<`, etc.), and `binary_operator` (arithmetic) — and uses
-`call` rather than `call_expression`. The density count stops at closures and struct/map/array literals
+`call` rather than `call_expression`. The density count ignores arithmetic/bitwise operators (without types a `+` can't be told
+apart from string concatenation, which dominated an Apache Cassandra backtest), and stops
+at closures, anonymous-class bodies, and struct/map/array literals
 (`density_boundary_kinds`) and at any nested `if`/`elif`/ternary, whose own condition is
 checked separately — so `return (a ? b : c)` reports once, at the ternary. Like
 `replace-magic-literal`, the rule skips files carrying a `Code generated ... DO NOT EDIT`
 header (Go-style marker only; other languages' generated-file headers aren't recognized).
+Known remaining false-positive shape: a `return` of one call with many nested-call
+arguments (e.g. a multi-argument factory call) can still reach the threshold.
 
 ## Wiring into `.kibitzer/inspect.json`
 
