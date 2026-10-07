@@ -33,6 +33,7 @@ kinds each language's `lang_config()` entry checks against differ:
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
 | `unreachable-code`     | dead-code  | advisory          | n/a                    | A statement follows an unconditional `return`/`break`/`continue`/panic-call in the same `{ ... }` block — Fowler's *Remove Dead Code*. Only the first dead statement in a block is flagged (everything after it is dead by construction). Doesn't descend into `switch`/`match`/`when` case bodies. Go's `panic(...)` and Rust's `panic!`/`unreachable!`/`todo!`/`unimplemented!` count as diverging calls; other languages have no such built-in and are return/break/continue-only. Kotlin is return-only — `tree-sitter-kotlin-ng` 1.1.0 has no dedicated node kind for a bare `break`/`continue` (it parses as a plain identifier). |
 | `replace-magic-literal` | duplication | advisory        | >= 3 occurrences       | A non-trivial numeric or string literal (not `0`, `1`, `-1`, `""`, or an empty collection literal) repeats at least this many times in one file with no bound named constant — Fowler's *Replace Magic Literal*. Excludes a literal that's the direct initializer of a `const`/`final`/`val`-style binding (Python: `SCREAMING_SNAKE_CASE`) referenced elsewhere by name; a `let`/non-const binding does not qualify. Bumped from AC2's literal `2` to `3` per a corpus backtest against a pre-committed 40% false-positive bar — see `project_plans/replace-magic-literal/decisions/ADR-001-magic-literal-exclusion-and-threshold-strategy.md`. |
+| `extract-variable`     | readability | advisory          | >= 10 operators/calls  | An `if`/ternary condition, or a `return`'s value, nests this many binary/logical operators and function calls — Fowler's *Extract Variable* (née Introduce Explaining Variable). `user.isActive() && user.hasPermission(p)` (density 3) is deliberately far under this; the threshold came from a `kubernetes/kubernetes` backtest where 4-8 were mostly readable `&&` chains. Closure bodies and struct/map/array literals inside the expression are not counted. A `return` whose entire value is itself an if/ternary expression (Kotlin/Rust's `return if ... else ...`, TS/JS/Java's `return cond ? a : b`) is flagged once, at the nested if/ternary, not twice. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
 each grammar's real `to_sexp()` output:
@@ -164,6 +165,18 @@ entire `syntax-rules-*` checker for that path, not just `replace-magic-literal` 
 there's no per-rule scoping today), or `docs/accepting-findings.md`'s
 `.kibitzer/accepted/` for keeping one specific, deliberately-repeated literal with a
 written reason (`"rule": "replace-magic-literal"`).
+
+`extract-variable`'s call/operator node kinds per language (`call_kinds`/`operator_kinds`
+in `src/rules.rs`), verified against each grammar's real `to_sexp()` output: Go/TS/TSX/JS/
+Kotlin/Rust all use one unified `call_expression`/`binary_expression` pair for every
+call shape and every binary/logical operator (arithmetic, comparison, `&&`/`||` alike);
+Java uses `method_invocation`/`binary_expression`; Python is the one grammar that splits
+its operators into three distinct kinds — `boolean_operator` (`and`/`or`),
+`comparison_operator` (`==`, `<`, etc.), and `binary_operator` (arithmetic) — and uses
+`call` rather than `call_expression`. The density count isn't scope-limited to the
+immediate expression — a nested closure's own operators/calls count toward the
+enclosing expression's total too, the same simplicity tradeoff `flag-argument`'s
+condition-identifier walk makes.
 
 ## Wiring into `.kibitzer/inspect.json`
 
