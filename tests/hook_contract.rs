@@ -232,6 +232,10 @@ fn blocking_check_gets_one_edit_of_grace_then_blocks_with_exit_code_2() {
     assert!(stdout.is_empty());
     assert!(stderr.contains("no-bad-marker"));
     assert!(stderr.contains("blocking"));
+    assert!(
+        stderr.contains("kibitzer:ignore <rule> -- <why>"),
+        "plain exit-2 stderr must teach the ignore syntax: {stderr}"
+    );
 }
 
 /// Regression test for docs/markdown-link-integrity-false-positives.md's `dcb5a7eb`
@@ -384,4 +388,33 @@ fn blocking_exit_also_prints_ignore_syntax_repair_from_inline_ignore_result() {
     assert!(stderr.contains("no-bad-marker"), "stderr: {stderr}");
     assert!(stderr.contains("[ignore-syntax]"), "stderr: {stderr}");
     assert!(stderr.contains("kibitzer:ignore"), "stderr: {stderr}");
+}
+
+const FLAG_FUNC: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+
+#[test]
+fn hook_should_OmitCoveredFinding_When_InlineIgnoreAboveIt() {
+    let repo = TempRepo::new(
+        "inline-covered",
+        json!({
+            "name": "syntax-rules-go",
+            "checker": "syntax-rules",
+            "severity": "advisory",
+        }),
+    );
+    let uncovered = format!("package main\n\n{FLAG_FUNC}");
+    let covered = format!(
+        "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\n{FLAG_FUNC}"
+    );
+
+    let (code, stdout, stderr) = repo.run_hook("control.go", &uncovered);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("[flag-argument]"),
+        "control must report the finding: {stdout}"
+    );
+
+    let (code, stdout, stderr) = repo.run_hook("covered.go", &covered);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stdout.contains("[flag-argument]"), "stdout: {stdout}");
 }
