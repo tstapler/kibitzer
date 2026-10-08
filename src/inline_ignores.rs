@@ -150,6 +150,8 @@ pub enum MalformedReason {
     NotAtCommentStart,
     EmDashSeparator,
     BadRuleList,
+    /// A comma element that is not lowercase ASCII letters, digits, and `-` (uppercase, non-ASCII).
+    BadRuleChar,
 }
 
 /// Result of parsing one comment line. A malformed directive never suppresses.
@@ -261,7 +263,13 @@ fn parse_rule_list(text: &str) -> Result<Option<Vec<RuleId>>, MalformedReason> {
     }
     let mut rules: Vec<RuleId> = Vec::new();
     for element in text.split(',') {
-        let rule = RuleId::new(element).ok_or(MalformedReason::BadRuleList)?;
+        let rule = RuleId::new(element).ok_or_else(|| {
+            if element.is_empty() || element.contains(char::is_whitespace) {
+                MalformedReason::BadRuleList
+            } else {
+                MalformedReason::BadRuleChar
+            }
+        })?;
         if !rules.contains(&rule) {
             rules.push(rule);
         }
@@ -1091,6 +1099,17 @@ mod tests {
             let line =
                 format!("// kibitzer:ignore flag-argument {dash} legacy API, callers pinned");
             assert_eq!(malformed(&line), MalformedReason::EmDashSeparator, "{dash}");
+        }
+    }
+
+    #[test]
+    fn parse_comment_line_should_ReturnBadRuleChar_When_UppercaseOrNonAscii() {
+        for bad in ["Flag-Argument", "r\u{00e8}gle"] {
+            assert_eq!(
+                malformed(&format!("// kibitzer:ignore {bad} -- legacy api pinned")),
+                MalformedReason::BadRuleChar,
+                "{bad}"
+            );
         }
     }
 

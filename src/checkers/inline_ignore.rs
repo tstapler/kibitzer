@@ -132,6 +132,9 @@ fn malformed_message(reason: MalformedReason, line: &str) -> String {
         MalformedReason::EmDashSeparator => format!(
             "use ASCII '--' (two hyphens) between the rule and the reason, not an em dash. Write: kibitzer:ignore {rules} -- <why>"
         ),
+        MalformedReason::BadRuleChar => format!(
+            "rule ids use only lowercase ASCII letters, digits and '-'. Write: kibitzer:ignore {rules} -- <why>"
+        ),
         MalformedReason::BadRuleList => format!(
             "rule list must be comma-separated with no spaces. Write: kibitzer:ignore {rules} -- <why>"
         ),
@@ -266,6 +269,14 @@ mod tests {
             );
             assert!(!out[0].contains("no reason"));
         }
+    }
+
+    #[test]
+    fn inline_ignore_should_NotClaimCommaProblem_When_RuleHasUppercase() {
+        let out = go("// kibitzer:ignore Flag-Argument -- legacy api pinned");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("lowercase ASCII"), "{out:?}");
+        assert!(!out[0].contains("comma-separated"), "{out:?}");
     }
 
     #[test]
