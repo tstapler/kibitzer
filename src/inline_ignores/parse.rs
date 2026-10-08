@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::sanitize::{MAX_RULE_ID_CHARS, MAX_RULES_PER_DIRECTIVE};
 use super::types::*;
 
 const LEADERS: &[&str] = &["<!--", "///", "//!", "//", "/**", "/*", "#", "*"];
@@ -102,11 +103,20 @@ fn parse_rule_list(text: &str) -> Result<Option<Vec<RuleId>>, MalformedReason> {
     if text.is_empty() {
         return Err(MalformedReason::MissingRule);
     }
+    if text.split(',').take(MAX_RULES_PER_DIRECTIVE + 1).count() > MAX_RULES_PER_DIRECTIVE {
+        return Err(MalformedReason::TooManyRules);
+    }
     let mut rules: Vec<RuleId> = Vec::new();
     for element in text.split(',') {
         let rule = RuleId::new(element).ok_or_else(|| {
             if element.is_empty() || element.contains(char::is_whitespace) {
                 MalformedReason::BadRuleList
+            } else if element.len() > MAX_RULE_ID_CHARS
+                && element
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                MalformedReason::RuleTooLong
             } else {
                 MalformedReason::BadRuleChar
             }
@@ -176,6 +186,7 @@ fn directive_with_reason(rules: Vec<RuleId>, reason_text: &str) -> DirectivePars
                 .map_or(Malformed(MalformedReason::MissingRule), Valid)
         }
         Err(ReasonError::Blank) => Malformed(MalformedReason::MissingReason),
+        Err(ReasonError::TooLong) => Malformed(MalformedReason::ReasonTooLong),
         Err(ReasonError::Weak(kind)) => Malformed(MalformedReason::WeakReason(kind)),
     }
 }

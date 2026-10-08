@@ -1318,3 +1318,57 @@ fn rule_id_should_RoundTripThroughSerde_When_BuiltFromOddCheckerName() {
         );
     }
 }
+
+#[test]
+fn rule_id_new_should_RejectOverLong_When_Over64Chars() {
+    assert!(RuleId::new(&"a".repeat(64)).is_some());
+    assert!(RuleId::new(&"a".repeat(65)).is_none());
+    assert!(serde_json::from_str::<RuleId>(&format!("\"{}\"", "a".repeat(65))).is_err());
+}
+
+#[test]
+fn reason_new_should_RejectOverLong_When_Over300Chars() {
+    let ok = format!("{} b", "a".repeat(296));
+    assert!(Reason::new(&ok, &[]).is_ok());
+    let long = format!("{} b", "a".repeat(400));
+    assert_eq!(Reason::new(&long, &[]), Err(ReasonError::TooLong));
+}
+
+#[test]
+fn parse_comment_line_should_BeMalformedAndFast_When_RuleIdIsHuge() {
+    let started = std::time::Instant::now();
+    let huge = format!(
+        "// kibitzer:ignore {} -- some real reason",
+        "a".repeat(1_500_000)
+    );
+    assert_eq!(malformed(&huge), MalformedReason::RuleTooLong);
+    assert!(started.elapsed().as_secs() < 5);
+}
+
+#[test]
+fn parse_comment_line_should_BeMalformed_When_ReasonIsHuge() {
+    let huge = format!(
+        "// kibitzer:ignore flag-argument -- {}",
+        "word ".repeat(100_000)
+    );
+    assert_eq!(malformed(&huge), MalformedReason::ReasonTooLong);
+}
+
+#[test]
+fn parse_comment_line_should_BeMalformedAndFast_When_ThousandsOfRules() {
+    let many: Vec<String> = (0..50_000).map(|i| format!("r{i}")).collect();
+    let line = format!("// kibitzer:ignore {} -- some real reason", many.join(","));
+    assert_eq!(malformed(&line), MalformedReason::TooManyRules);
+}
+
+#[test]
+fn did_you_mean_should_ReturnNone_When_InputExceedsRuleIdCap() {
+    assert_eq!(did_you_mean(&"a".repeat(10_000)), None);
+}
+
+#[test]
+fn unused_ignore_unknown_rule_should_TruncateAndStripControls_When_RuleTextIsHostile() {
+    let message = super::unused::unknown_rule_message(&format!("x\u{1b}[31m{}", "a".repeat(500)));
+    assert!(!message.contains('\u{1b}'), "{message:?}");
+    assert!(message.len() < 300, "{} bytes", message.len());
+}

@@ -1,6 +1,7 @@
 //! Judging which directive rules suppress nothing, and the repair messages for them.
 
 use super::rules::{did_you_mean, has_owner, known_rule, owner_matches, rule_matches};
+use super::sanitize::{ECHO_RULE_TEXT_CHARS, echo};
 use super::types::*;
 
 /// Row of the raw finding `rule` answers to that lies nearest `from` (earlier row on a tie).
@@ -151,7 +152,8 @@ fn remove_it_message(rule: &str) -> String {
     format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it")
 }
 
-fn unknown_rule_message(rule: &str) -> String {
+pub(super) fn unknown_rule_message(rule: &str) -> String {
+    let rule = echo(rule, ECHO_RULE_TEXT_CHARS);
     format!(
         "[unused-ignore] '{rule}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
     )

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::sanitize::{MAX_REASON_CHARS, MAX_RULE_ID_CHARS};
 use super::scan::ScanMemo;
 use crate::config::Severity;
 
@@ -40,7 +41,8 @@ impl Line {
     }
 }
 
-/// A rule a directive names; `[a-z0-9-]+`, so a doc placeholder like `<rule>` is rejected.
+/// A rule a directive names; `[a-z0-9-]+` up to `MAX_RULE_ID_CHARS`, so a doc placeholder like
+/// `<rule>` and a megabyte of text are both rejected.
 /// Validated by `new`, and by `Deserialize` through it, so a corrupt cache value is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -66,7 +68,8 @@ impl RuleId {
     }
 
     pub fn new(text: &str) -> Option<Self> {
-        (!text.is_empty() && text.chars().all(is_rule_char)).then(|| RuleId(text.to_string()))
+        (!text.is_empty() && text.len() <= MAX_RULE_ID_CHARS && text.chars().all(is_rule_char))
+            .then(|| RuleId(text.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -78,7 +81,12 @@ impl TryFrom<String> for RuleId {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, String> {
-        RuleId::new(&text).ok_or_else(|| format!("invalid rule id {text:?}: expected [a-z0-9-]+"))
+        RuleId::new(&text).ok_or_else(|| {
+            format!(
+                "invalid rule id ({} chars): expected [a-z0-9-]+, at most {MAX_RULE_ID_CHARS}",
+                text.len()
+            )
+        })
     }
 }
 
@@ -97,6 +105,7 @@ pub enum WeakReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonError {
     Blank,
+    TooLong,
     Weak(WeakReason),
 }
 
@@ -104,6 +113,7 @@ impl std::fmt::Display for ReasonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReasonError::Blank => f.write_str("blank"),
+            ReasonError::TooLong => f.write_str("too long"),
             ReasonError::Weak(WeakReason::TooShort) => f.write_str("too short"),
             ReasonError::Weak(WeakReason::RuleEcho) => f.write_str("repeats the rule id"),
         }
@@ -133,6 +143,9 @@ impl Reason {
         if text.is_empty() {
             return Err(ReasonError::Blank);
         }
+        if text.len() > MAX_REASON_CHARS * 4 || text.chars().count() > MAX_REASON_CHARS {
+            return Err(ReasonError::TooLong);
+        }
         let folded = fold_for_echo(text);
         if rules.iter().any(|r| fold_for_echo(r.as_str()) == folded) {
             return Err(ReasonError::Weak(WeakReason::RuleEcho));
@@ -152,7 +165,7 @@ impl TryFrom<String> for Reason {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, String> {
-        Reason::new(&text, &[]).map_err(|err| format!("invalid reason {text:?}: {err}"))
+        Reason::new(&text, &[]).map_err(|err| format!("invalid reason: {err}"))
     }
 }
 
@@ -222,6 +235,10 @@ pub enum MalformedReason {
     BadRuleList,
     /// A comma element that is not lowercase ASCII letters, digits, and `-` (uppercase, non-ASCII).
     BadRuleChar,
+    /// A well-formed rule id longer than `MAX_RULE_ID_CHARS`.
+    RuleTooLong,
+    TooManyRules,
+    ReasonTooLong,
 }
 
 /// Result of parsing one comment line. A malformed directive never suppresses.

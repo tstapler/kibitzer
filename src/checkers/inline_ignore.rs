@@ -7,6 +7,10 @@ use std::sync::LazyLock;
 use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::inline_ignores::sanitize::{
+    ECHO_REASON_CHARS, ECHO_RULE_TEXT_CHARS, MAX_REASON_CHARS, MAX_RULE_ID_CHARS,
+    MAX_RULES_PER_DIRECTIVE, echo,
+};
 use crate::inline_ignores::{
     DirectiveParse, MalformedReason, RuleId, ScanMemo, WeakReason, did_you_mean, echo_parts,
     known_rule, near_miss_text,
@@ -128,6 +132,8 @@ fn syntax_finding(line: usize, message: String) -> Finding {
 /// ASCII-only repair text for one malformed directive; the offending line supplies the echo.
 fn malformed_message(reason: MalformedReason, line: &str) -> String {
     let (rules, written_reason) = echo_parts(line);
+    let rules = echo(&rules, ECHO_RULE_TEXT_CHARS);
+    let written_reason = echo(&written_reason, ECHO_REASON_CHARS);
     let rules = if rules.is_empty() {
         "<rule>".to_string()
     } else {
@@ -148,7 +154,10 @@ fn malformed_message(reason: MalformedReason, line: &str) -> String {
         ),
         MalformedReason::NearMissMarker => format!(
             "'{}' not recognized; use 'kibitzer:ignore'",
-            near_miss_text(line).unwrap_or("kibitzer:")
+            echo(
+                near_miss_text(line).unwrap_or("kibitzer:"),
+                ECHO_RULE_TEXT_CHARS
+            )
         ),
         MalformedReason::NotAtCommentStart => format!(
             "kibitzer:ignore must start the comment; it was found after other text and suppresses nothing. Write it as its own comment: kibitzer:ignore {rules} -- <why>"
@@ -158,6 +167,15 @@ fn malformed_message(reason: MalformedReason, line: &str) -> String {
         ),
         MalformedReason::BadRuleChar => format!(
             "rule ids use only lowercase ASCII letters, digits and '-'. Write: kibitzer:ignore {rules} -- <why>"
+        ),
+        MalformedReason::RuleTooLong => format!(
+            "rule ids are at most {MAX_RULE_ID_CHARS} characters. Write: kibitzer:ignore <rule> -- <why>"
+        ),
+        MalformedReason::TooManyRules => format!(
+            "name at most {MAX_RULES_PER_DIRECTIVE} rules per directive. Write: kibitzer:ignore <rule> -- <why>"
+        ),
+        MalformedReason::ReasonTooLong => format!(
+            "reason is longer than {MAX_REASON_CHARS} characters; state the constraint in one sentence. Write: kibitzer:ignore {rules} -- <why>"
         ),
         MalformedReason::BadRuleList => format!(
             "rule list must be comma-separated with no spaces. Write: kibitzer:ignore {rules} -- <why>"
@@ -482,5 +500,55 @@ mod tests {
             go_with_directives(4, 40)
         );
         assert!(volume_findings(&source).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod sanitize_tests {
+    use super::*;
+
+    fn messages(comment: &str) -> Vec<String> {
+        let src = format!("package main\n\n{comment}\nfunc f(b bool) {{}}\n");
+        let ctx = CheckContext {
+            source: &src,
+            tree: None,
+        };
+        InlineIgnoreChecker
+            .check(Path::new("x.go"), &ctx)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.message)
+            .collect()
+    }
+
+    #[test]
+    fn inline_ignore_should_EchoSanitizedRules_When_RuleListHasEscapeAndBidi() {
+        let out = messages("// kibitzer:ignore flag\u{1b}[31m\u{202E}x -- some real reason");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(!out[0].contains(['\u{1b}', '\u{202E}']), "{:?}", out[0]);
+        assert!(out[0].contains("lowercase ASCII"), "{}", out[0]);
+    }
+
+    #[test]
+    fn inline_ignore_should_ReportAndBoundEcho_When_RuleIdIs100kChars() {
+        let out = messages(&format!(
+            "// kibitzer:ignore {} -- some real reason",
+            "a".repeat(100_000)
+        ));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("at most 64 characters"), "{}", out[0]);
+        assert!(out[0].len() < 400, "{} bytes", out[0].len());
+    }
+
+    #[test]
+    fn inline_ignore_should_ReportReasonTooLong_When_ReasonOver300Chars() {
+        let out = messages(&format!(
+            "// kibitzer:ignore flag-argument -- {}",
+            "word ".repeat(200)
+        ));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("longer than 300"), "{}", out[0]);
+        assert!(out[0].len() < 400, "{} bytes", out[0].len());
     }
 }

@@ -419,3 +419,42 @@ fn hook_should_OmitCoveredFinding_When_InlineIgnoreAboveIt() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(!stdout.contains("[flag-argument]"), "stdout: {stdout}");
 }
+
+#[test]
+fn hook_strips_terminal_escapes_and_carriage_returns_when_check_output_is_hostile() {
+    let blocking = TempRepo::new(
+        "hostile-blocking",
+        json!({
+            "name": "hostile",
+            "command": "printf 'ok\\033[31m red\\r[kibitzer] forged line\\342\\200\\256evil\\n'; exit 1",
+            "severity": "blocking",
+            "message": "hostile output",
+        }),
+    );
+    // The first failure of a blocking check is a grace-period advisory; the second blocks.
+    blocking.run_hook("foo.txt", "x\n");
+    let (code, _stdout, stderr) = blocking.run_hook("foo.txt", "x\n");
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(!stderr.contains(['\u{1b}', '\r', '\u{202E}']), "{stderr:?}");
+    assert!(stderr.contains("ok[31m red"), "{stderr:?}");
+
+    let advisory = TempRepo::new(
+        "hostile-advisory",
+        json!({
+            "name": "hostile",
+            "command": "printf 'ok\\033[31m red\\r[kibitzer] forged line\\342\\200\\256evil\\n'; exit 1",
+            "severity": "advisory",
+            "message": "hostile output",
+        }),
+    );
+    let (code, stdout, _stderr) = advisory.run_hook("foo.txt", "x\n");
+    assert_eq!(code, 0);
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let context = payload["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !context.contains(['\u{1b}', '\r', '\u{202E}']),
+        "{context:?}"
+    );
+}

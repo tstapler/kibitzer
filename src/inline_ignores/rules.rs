@@ -159,6 +159,9 @@ const MIN_PREFIX_SUGGESTION_LEN: usize = 4;
 /// The closest known name within edit distance 2, or one the unknown text is a prefix of
 /// (`flag-arg` for `flag-argument`; truncation is too far away for edit distance alone).
 pub(crate) fn did_you_mean(unknown: &str) -> Option<&'static str> {
+    if unknown.len() > super::sanitize::MAX_RULE_ID_CHARS {
+        return None;
+    }
     SUGGESTION_NAMES
         .iter()
         .filter_map(|name| {

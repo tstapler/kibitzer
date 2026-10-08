@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, Severity};
+use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo, quote_reason};
 use crate::inline_ignores::{
     Directive, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind, owned_by,
     rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
@@ -84,7 +85,8 @@ fn first_pass(results: &[CheckResult]) -> FirstPass<'_> {
 
 /// `{file}:{row}: {message}`, the line shape every advisory shares.
 fn located(file_path: &Path, row: Line, message: &str) -> String {
-    format!("{}:{}: {message}", file_path.display(), row.get())
+    let path = echo(&file_path.display().to_string(), ECHO_PATH_CHARS);
+    format!("{path}:{}: {message}", row.get())
 }
 
 /// `kibitzer run` audit: reports only unknown-rule verdicts, from first-pass data with no
@@ -166,7 +168,7 @@ impl BlockingSuppression {
         let message = format!(
             "[blocking-suppressed] {} finding silenced inline (reason: {}); tell the user you silenced a blocking check and why, so they can confirm it",
             rules.join(", "),
-            self.reason.as_str()
+            quote_reason(self.reason.as_str())
         );
         located(file_path, self.row, &message)
     }

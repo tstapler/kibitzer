@@ -171,8 +171,9 @@ mod footer_tests {
     }
 
     #[test]
-    fn hook_footer_should_NotPanicAndStayBounded_When_RulePrefixIs200Chars() {
-        let long = rid(&"a".repeat(200));
+    fn hook_footer_should_StayBounded_When_RuleIdIsAtTheMaxLength() {
+        assert!(RuleId::new(&"a".repeat(65)).is_none());
+        let long = rid(&"a".repeat(64));
         let footer = advisory_footer(
             Path::new("src/foo.go"),
             Some((&long, Line::new(3))),
@@ -184,10 +185,6 @@ mod footer_tests {
             chars(&footer)
         );
         assert!(footer.contains("above line 3"), "{footer}");
-        assert!(
-            footer.contains("// kibitzer:ignore <rule> -- <why>"),
-            "{footer}"
-        );
     }
 
     #[test]

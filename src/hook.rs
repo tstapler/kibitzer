@@ -11,6 +11,7 @@ use crate::config::Severity;
 use crate::daemon::run_checks_smart;
 use crate::hook_footer::advisory_footer;
 use crate::inline_ignores::InlineOutcome;
+use crate::inline_ignores::sanitize::strip_unsafe;
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -196,7 +197,7 @@ pub fn run_hook() -> Result<ExitCode> {
             eprintln!(
                 "[kibitzer] {} (blocking): {}",
                 result.check_name,
-                result.describe()
+                strip_unsafe(&result.describe())
             );
         }
         // A malformed or misplaced ignore on the blocked file would otherwise stay invisible
@@ -204,7 +205,10 @@ pub fn run_hook() -> Result<ExitCode> {
         for result in failures.iter().filter(|r| {
             r.check_name == crate::checkers::inline_ignore::NAME && r.severity != Severity::Blocking
         }) {
-            eprintln!("[kibitzer] inline-ignore: {}", result.describe());
+            eprintln!(
+                "[kibitzer] inline-ignore: {}",
+                strip_unsafe(&result.describe())
+            );
         }
         eprintln!(
             "[kibitzer] to dismiss a judged finding, add `kibitzer:ignore <rule> -- <why>`; to \
@@ -230,7 +234,7 @@ pub fn run_hook() -> Result<ExitCode> {
     let payload = json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": context,
+            "additionalContext": strip_unsafe(&context),
         }
     });
     println!("{payload}");

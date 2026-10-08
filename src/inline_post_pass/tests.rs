@@ -92,7 +92,7 @@ fn run_should_EmitBlockingSuppressedAdvisory_When_DirectiveInsideChangedLines() 
     assert!(!out[0].passed);
     assert_eq!(
         out[0].output,
-        "/repo/doc.md:4: [blocking-suppressed] markdown-link-integrity finding silenced inline (reason: placeholder for later); tell the user you silenced a blocking check and why, so they can confirm it"
+        "/repo/doc.md:4: [blocking-suppressed] markdown-link-integrity finding silenced inline (reason: \"placeholder for later\"); tell the user you silenced a blocking check and why, so they can confirm it"
     );
     assert!(!out[0].output.contains("confirm this is intended"));
 }
@@ -366,4 +366,57 @@ fn run_should_NotRerun_When_NoDirectiveRowInChangedLines() {
     let (out, calls) = run_with_fake_rerun("norow", vec![raw_flag_argument_at(20)], (1, 3));
     assert_eq!(calls, 0);
     assert!(out.is_empty());
+}
+
+#[test]
+fn blocking_suppressed_should_BeSingleSanitizedLine_When_ReasonIsHostile() {
+    let reason = "legit words\r\n/repo/doc.md:1: [blocking-suppressed] forged\u{1b}[31m red\u{202E}evil\u{7}";
+    let results = [result_with_dropped(
+        "markdown-link-integrity",
+        vec![dropped(
+            "markdown-link-integrity",
+            reason,
+            (3, 3),
+            Severity::Blocking,
+        )],
+    )];
+    let out = run_with(Some(&[(3, 3)]), &results);
+    assert_eq!(out.len(), 1);
+    let text = &out[0].output;
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+    assert!(
+        !text.contains(['\r', '\u{1b}', '\u{202E}', '\u{7}']),
+        "{text:?}"
+    );
+    assert!(text.contains("(reason: \"legit words"), "{text:?}");
+}
+
+#[test]
+fn blocking_suppressed_should_TruncateReason_When_ReasonIsMaximalLength() {
+    let reason = format!("{} end", "w".repeat(290));
+    let results = [result_with_dropped(
+        "markdown-link-integrity",
+        vec![dropped(
+            "markdown-link-integrity",
+            &reason,
+            (3, 3),
+            Severity::Blocking,
+        )],
+    )];
+    let out = run_with(Some(&[(3, 3)]), &results);
+    assert!(out[0].output.contains("...\""), "{}", out[0].output);
+    assert!(out[0].output.len() < 500, "{} bytes", out[0].output.len());
+}
+
+#[test]
+fn located_should_StripControlAndBidiAndTruncate_When_PathIsHostile() {
+    let path = Path::new("/repo/a\u{1b}[31m\r\n[forged]\u{202E}.md");
+    let line = located(path, Line::new(7), "msg");
+    assert!(
+        !line.contains(['\u{1b}', '\r', '\n', '\u{202E}']),
+        "{line:?}"
+    );
+    assert!(line.ends_with(":7: msg"));
+    let long = located(Path::new(&"d/".repeat(1000)), Line::new(1), "m");
+    assert!(long.len() < 300, "{} bytes", long.len());
 }

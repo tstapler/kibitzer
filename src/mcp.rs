@@ -304,7 +304,7 @@ fn render_run_checks_report(results: &[CheckResult], path: &Path) -> String {
         anchor,
         &crate::inline_ignores::InlineOutcome::union_rule_ids(failed.iter().map(|r| &r.inline)),
     ));
-    lines.join("\n")
+    crate::inline_ignores::sanitize::strip_unsafe(&lines.join("\n"))
 }
 
 /// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain

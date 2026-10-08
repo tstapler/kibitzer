@@ -5,6 +5,7 @@ mod apply;
 mod hint;
 mod parse;
 mod rules;
+pub(crate) mod sanitize;
 mod scan;
 mod types;
 mod unused;
