@@ -201,6 +201,7 @@ mod registry_invalidation_tests {
             command: String::new(),
             findings: Vec::new(),
             plugin_missing: false,
+            inline: crate::inline_ignores::InlineOutcome::default(),
         }
     }
 
@@ -290,6 +291,7 @@ mod grace_tests {
             command: String::new(),
             findings: Vec::new(),
             plugin_missing: false,
+            inline: crate::inline_ignores::InlineOutcome::default(),
         }
     }
 

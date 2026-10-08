@@ -586,6 +586,7 @@ mod tests {
             command: "true".to_string(),
             findings: Vec::new(),
             plugin_missing: false,
+            inline: crate::inline_ignores::InlineOutcome::default(),
         }
     }
 

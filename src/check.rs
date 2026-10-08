@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::accepted_findings::{AcceptedFindings, FilterOutcome};
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
+use crate::inline_ignores::InlineOutcome;
 use crate::plugin::Registry;
 
 /// Beyond this many lines, `describe()` truncates the command's raw output and points
@@ -61,6 +62,11 @@ pub struct CheckResult {
     /// `command`/`findings` above.
     #[serde(default)]
     pub plugin_missing: bool,
+    /// What inline `kibitzer:ignore` directives did to this check's native findings.
+    /// Serialized so a cache hit keeps the footer anchor and dropped list; `serde(default)`
+    /// so an older `cache.json` still loads.
+    #[serde(default)]
+    pub inline: InlineOutcome,
 }
 
 impl CheckResult {
@@ -107,6 +113,7 @@ mod describe_tests {
             command: "some-check-command".to_string(),
             findings: Vec::new(),
             plugin_missing: false,
+            inline: InlineOutcome::default(),
         }
     }
 
@@ -222,6 +229,7 @@ fn run_check_with_timeout(
             command: String::new(),
             findings: Vec::new(),
             plugin_missing: false,
+            inline: InlineOutcome::default(),
         });
     }
 
@@ -246,6 +254,7 @@ fn run_check_with_timeout(
             command: String::new(),
             findings: Vec::new(),
             plugin_missing: true,
+            inline: InlineOutcome::default(),
         });
     }
 
@@ -274,6 +283,7 @@ fn run_check_with_timeout(
                 command: cmd_str,
                 findings: Vec::new(),
                 plugin_missing: false,
+                inline: InlineOutcome::default(),
             });
         }
     };
@@ -335,6 +345,7 @@ fn run_check_with_timeout(
         command: cmd_str,
         findings: Vec::new(),
         plugin_missing: false,
+        inline: InlineOutcome::default(),
     })
 }
 
@@ -445,6 +456,7 @@ fn run_native_check(
                 command: cmd_str,
                 findings: Vec::new(),
                 plugin_missing: false,
+                inline: InlineOutcome::default(),
             });
         }
     }
@@ -466,6 +478,7 @@ fn run_native_check(
                     command: cmd_str,
                     findings: Vec::new(),
                     plugin_missing: false,
+                    inline: InlineOutcome::default(),
                 });
             }
         };
@@ -518,6 +531,7 @@ fn run_native_check(
         command: cmd_str,
         findings: Vec::new(),
         plugin_missing: false,
+        inline: InlineOutcome::default(),
     })
 }
 
@@ -1173,6 +1187,7 @@ pub fn run_architecture_check(
         command: cmd_str.clone(),
         findings: Vec::new(),
         plugin_missing: false,
+        inline: InlineOutcome::default(),
     };
 
     let Some(any_checker) = lookup_any_architecture_checker(arch_name) else {
@@ -1243,6 +1258,7 @@ pub fn run_architecture_check(
         command: cmd_str,
         findings,
         plugin_missing: false,
+        inline: InlineOutcome::default(),
     })
 }
 

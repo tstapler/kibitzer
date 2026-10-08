@@ -256,6 +256,7 @@ mod advisory_context_rendering_tests {
             command: String::new(),
             findings: Vec::new(),
             plugin_missing,
+            inline: crate::inline_ignores::InlineOutcome::default(),
         }
     }
 

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tree_sitter::Tree;
 
 use crate::checker::{Finding, GrammarCache, Language};
@@ -23,7 +24,7 @@ use crate::tree_walk::{comment_kinds, walk_preorder};
 const MARKER: &str = "kibitzer:ignore";
 
 /// 1-based line number; tree-sitter's 0-based rows are converted once at the scan boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Line(NonZeroUsize);
 
 impl Line {
@@ -38,7 +39,7 @@ impl Line {
 }
 
 /// A rule a directive names; `[a-z0-9-]+`, so a doc placeholder like `<rule>` is rejected.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuleId(String);
 
 fn is_rule_char(c: char) -> bool {
@@ -70,7 +71,7 @@ pub enum ReasonError {
 /// The justification after ` -- `. The constructor enforces a mechanical floor: not blank,
 /// not an echo of a listed rule id, and more than one word. It stops `-- needed`, not a
 /// determined two-word lie.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reason(String);
 
 fn fold_for_echo(text: &str) -> String {
@@ -505,7 +506,7 @@ impl InlineIgnoreContext {
 }
 
 /// A finding a directive removed, kept so advisories and counters read one source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DroppedFinding {
     pub directive_start: Line,
     pub directive_end: Line,
@@ -513,6 +514,36 @@ pub struct DroppedFinding {
     pub reason: Reason,
     pub finding_line: Line,
     pub severity: Severity,
+}
+
+/// Inline-ignore result carried on `CheckResult`. `shown` lists findings still visible after
+/// scoping and `accepted/` (capped), `kept` every finding that survived inline filtering
+/// (whole file, capped), `dropped` what directives removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineOutcome {
+    #[serde(default)]
+    pub shown: Vec<(RuleId, Line)>,
+    #[serde(default)]
+    pub kept: Vec<(RuleId, Line)>,
+    #[serde(default)]
+    pub dropped: Vec<DroppedFinding>,
+}
+
+impl InlineOutcome {
+    pub fn first_anchor(&self) -> Option<(&RuleId, Line)> {
+        self.shown.first().map(|(r, l)| (r, *l))
+    }
+
+    /// Distinct rule ids of the shown findings, in finding order.
+    pub fn rule_ids(&self) -> Vec<&RuleId> {
+        let mut ids: Vec<&RuleId> = Vec::new();
+        for (rule, _) in &self.shown {
+            if !ids.contains(&rule) {
+                ids.push(rule);
+            }
+        }
+        ids
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1363,6 +1394,43 @@ mod tests {
         assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 3);
         let held = ctx.scan_memo.entry.lock().unwrap();
         assert_eq!(held.as_ref().unwrap().0, PathBuf::from("other.go"));
+    }
+
+    #[test]
+    fn inline_outcome_should_ExposeFirstAnchorAndDistinctRules() {
+        let r = |s: &str| RuleId::new(s).unwrap();
+        let outcome = InlineOutcome {
+            shown: vec![
+                (r("a"), Line::new(5)),
+                (r("b"), Line::new(7)),
+                (r("a"), Line::new(9)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(outcome.first_anchor(), Some((&r("a"), Line::new(5))));
+        assert_eq!(outcome.rule_ids(), vec![&r("a"), &r("b")]);
+        assert_eq!(InlineOutcome::default().first_anchor(), None);
+    }
+
+    #[test]
+    fn inline_outcome_should_RoundTripJson_When_Populated() {
+        let outcome = InlineOutcome {
+            shown: vec![(RuleId::new("a").unwrap(), Line::new(5))],
+            kept: vec![],
+            dropped: vec![DroppedFinding {
+                directive_start: Line::new(4),
+                directive_end: Line::new(4),
+                rule: RuleId::new("a").unwrap(),
+                reason: Reason::new("legacy api pinned", &[]).unwrap(),
+                finding_line: Line::new(5),
+                severity: Severity::Blocking,
+            }],
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(
+            serde_json::from_str::<InlineOutcome>(&json).unwrap(),
+            outcome
+        );
     }
 
     #[test]
