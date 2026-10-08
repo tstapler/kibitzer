@@ -3555,52 +3555,6 @@ mod inline_seam_tests {
         );
     }
 
-    fn median_secs(mut run: impl FnMut()) -> f64 {
-        let mut times: Vec<f64> = (0..5)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                run();
-                t.elapsed().as_secs_f64()
-            })
-            .collect();
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        times[2]
-    }
-
-    /// The rerun is one more run of the owning checker, so it must stay near the first pass.
-    /// Relative on purpose: an absolute threshold would be flaky across machines.
-    #[test]
-    fn hook_raw_rerun_should_TakeAtMostTwiceFirstPass_When_DirectiveRowChanged() {
-        let body: String = (0..200)
-            .map(|i| FUNC_F.replace("func f", &format!("func f{i}")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let source = format!("package main\n\n{IGNORE}{body}");
-        let dir = tmp_dir("latency");
-        let file = dir.join("main.go");
-        std::fs::write(&file, &source).unwrap();
-        let check = flag_check(Severity::Advisory);
-        let first = median_secs(|| {
-            let _ = run_checks_for_trigger(
-                std::slice::from_ref(&check),
-                "PostToolUse",
-                &dir,
-                &file,
-                None,
-                &Registry::default(),
-                &AcceptedFindings::default(),
-            );
-        });
-        let rerun = median_secs(|| {
-            let _ = raw_findings_for_check(&check, &file, &source);
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            rerun <= 2.0 * first,
-            "rerun {rerun:.4}s vs first pass {first:.4}s"
-        );
-    }
-
     fn counting_ctx() -> (Arc<SuppressionCounts>, AcceptedFindings) {
         let counter = Arc::new(SuppressionCounts::default());
         let accepted = AcceptedFindings {

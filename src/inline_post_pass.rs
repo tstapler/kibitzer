@@ -4,8 +4,6 @@
 
 use std::path::Path;
 
-use std::sync::atomic::Ordering;
-
 use crate::accepted_findings::AcceptedFindings;
 use crate::check::{CheckResult, MAX_NATIVE_CHECK_BYTES, raw_findings_for_check};
 use crate::config::{Check, Severity};
@@ -247,12 +245,13 @@ fn rerun_owning_checks(
     });
     let mut raw = Vec::new();
     for check in owners {
+        #[cfg(test)]
         input
             .accepted
             .inline
             .scan_memo
             .raw_reruns
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A failing checker was already reported by the first pass.
         if let Ok(found) = raw_findings_for_check(check, input.file_path, source) {
             raw.extend(found);
@@ -371,9 +370,10 @@ fn advisory_result(output: &str) -> CheckResult {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
-    use crate::plugin::Registry;
     use crate::config::Severity;
     use crate::inline_ignores::{DroppedFinding, InlineOutcome, Line, Reason, RuleId};
+    use crate::plugin::Registry;
+    use std::sync::atomic::Ordering;
 
     pub(super) fn result_with_dropped(
         check_name: &str,

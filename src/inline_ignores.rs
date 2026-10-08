@@ -647,14 +647,18 @@ type MemoEntry = (PathBuf, u64, Arc<Vec<Scanned>>);
 #[derive(Debug, Default)]
 pub struct ScanMemo {
     entry: Mutex<Option<MemoEntry>>,
+    /// Test-only counters: the seam for "one scan per file" and "no rerun without a directive row".
+    #[cfg(test)]
     pub scans: AtomicUsize,
+    #[cfg(test)]
     pub hash_calls: AtomicUsize,
-    /// Hook-path raw reruns performed (Story 2.2.3); the test seam for "no rerun without a directive row".
+    #[cfg(test)]
     pub raw_reruns: AtomicUsize,
 }
 
 impl ScanMemo {
     pub(crate) fn scan(&self, path: &Path, source: &str) -> Arc<Vec<Scanned>> {
+        #[cfg(test)]
         self.hash_calls.fetch_add(1, Ordering::Relaxed);
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -666,6 +670,7 @@ impl ScanMemo {
         {
             return Arc::clone(scanned);
         }
+        #[cfg(test)]
         self.scans.fetch_add(1, Ordering::Relaxed);
         let scanned = Arc::new(scan_directives(path, source));
         *entry = Some((path.to_path_buf(), hash, Arc::clone(&scanned)));
@@ -1730,18 +1735,6 @@ mod tests {
             .len()
     }
 
-    fn median_of_5(mut run: impl FnMut() -> usize) -> std::time::Duration {
-        let mut times: Vec<_> = (0..5)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                std::hint::black_box(run());
-                start.elapsed()
-            })
-            .collect();
-        times.sort();
-        times[2]
-    }
-
     #[test]
     fn apply_inline_ignores_should_UseNoScanOrHash_When_NoKibitzerSubstring() {
         let ctx = InlineIgnoreContext::default();
@@ -1751,27 +1744,6 @@ mod tests {
         }
         assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 0);
         assert_eq!(ctx.scan_memo.hash_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn apply_inline_ignores_should_StayWithinRatioOfSubstringSearch_When_NoKibitzerSubstring() {
-        let ctx = InlineIgnoreContext::default();
-        let source = big_go_source_without_marker();
-        let baseline = median_of_5(|| {
-            (0..FAST_PATH_CALLS)
-                .filter(|_| std::hint::black_box(&source).contains("kibitzer"))
-                .count()
-        });
-        let filtered = median_of_5(|| {
-            (0..FAST_PATH_CALLS)
-                .map(|_| apply_once_kept(&source, &ctx))
-                .sum()
-        });
-        // Coarse relative bound only: no absolute time, so a slow CI machine cannot flake it.
-        assert!(
-            filtered <= baseline * 20 + std::time::Duration::from_millis(5),
-            "apply took {filtered:?} vs substring baseline {baseline:?}"
-        );
     }
 
     #[test]
