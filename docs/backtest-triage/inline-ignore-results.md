@@ -152,11 +152,11 @@ exercises exactly the new checker on every in-scope file, with no time cap hit.
 
 | Repo | In-scope files | Output lines | Error lines | Wall time |
 |---|---|---|---|---|
-| denoland/deno | 6,227 | **0** | 24 (4 non-UTF-8 files, 6 lines each) | 14 s |
+| denoland/deno | 6,227 | **0** | 24 (6 non-UTF-8 files, 4 lines each) | 14 s |
 | kubernetes/website | 8,316 | **0** | 0 | 60 s |
 | apache/cassandra | 6,480 | **0** | 0 | 33 s |
 | microsoft/vscode | 14,968 | **0** | 0 | 52 s |
-| servo/servo | 68,719 | **0** | 36 (6 non-UTF-8 files, 6 lines each) | 245 s |
+| servo/servo | 68,719 | **0** | 36 (9 non-UTF-8 files, 4 lines each) | 245 s |
 | mdn/content | 14,651 | **0** | 0 | 28 s |
 | gitlabhq/gitlabhq | 15,366 | **0** | 0 | 44 s |
 | tstapler/stapler-squad (`~/code` checkout) | 7,475 | **0** | 0 | 17 s |
