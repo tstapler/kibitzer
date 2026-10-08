@@ -478,6 +478,77 @@ pub(crate) fn anchor_rule(checker_name: &str, finding: &Finding) -> RuleId {
         .unwrap_or_else(by_name)
 }
 
+/// How a comment is written in a file type: text before and after the directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommentLeader {
+    pub open: &'static str,
+    pub close: &'static str,
+}
+
+/// Leader by grammar language, `.md`, else `#` (the fallback scanner accepts it).
+pub(crate) fn comment_leader(path: &Path) -> CommentLeader {
+    let (open, close) = match Language::for_path(path) {
+        Some(Language::Python) => ("#", ""),
+        Some(_) => ("//", ""),
+        None if path.extension().is_some_and(|e| e == "md") => ("<!--", " -->"),
+        None => ("#", ""),
+    };
+    CommentLeader { open, close }
+}
+
+const HINT_RULE_LIMIT: usize = 6;
+
+/// The footer's one-line syntax teaching. `anchor` is the first shown finding; without it the
+/// generic `<rule>` form is rendered and `rule_ids` is ignored.
+pub(crate) fn syntax_hint(
+    path: &Path,
+    anchor: Option<(&RuleId, Line)>,
+    rule_ids: &[&RuleId],
+) -> String {
+    syntax_hint_limited(path, anchor, rule_ids, HINT_RULE_LIMIT)
+}
+
+/// As `syntax_hint`, listing at most `max_rules` ids (then `...`); the footer budget shrinks it.
+pub(crate) fn syntax_hint_limited(
+    path: &Path,
+    anchor: Option<(&RuleId, Line)>,
+    rule_ids: &[&RuleId],
+    max_rules: usize,
+) -> String {
+    let leader = comment_leader(path);
+    let rule_text = anchor.map_or("<rule>", |(rule, _)| rule.as_str());
+    let mut hint = format!(
+        "Dismiss a judged finding: {} kibitzer:ignore {rule_text} -- <why>{}, ",
+        leader.open, leader.close
+    );
+    match anchor {
+        Some((rule, line)) if FILE_SCOPE_RULES.contains(&rule.as_str()) => hint.push_str(&format!(
+            "in the first {FILE_HEAD_LINES} lines or on the anchor line (line {})",
+            line.get()
+        )),
+        Some((_, line)) => hint.push_str(&format!(
+            "on its own line directly above line {} (or at its end)",
+            line.get()
+        )),
+        None => hint.push_str("on its own line directly above the flagged line (or at its end)"),
+    }
+    hint.push('.');
+    if anchor.is_some() && !rule_ids.is_empty() {
+        let shown: Vec<&str> = rule_ids
+            .iter()
+            .take(max_rules.max(1))
+            .map(|r| r.as_str())
+            .collect();
+        let more = if rule_ids.len() > shown.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        hint.push_str(&format!(" Rules: {}{more}.", shown.join(", ")));
+    }
+    hint
+}
+
 /// Rule ids that appear as `[id]` message prefixes. Advisory only: it feeds the unknown-rule
 /// suggestion and never decides suppression, so a stale entry costs a hint, not an ignore.
 /// `known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources` guards drift.
@@ -1917,5 +1988,84 @@ mod tests {
         let d = directive_at(&["file-size"], 1, 1, true);
         let f = raw("go-file-size", "file-size", 900, "[file-size] big");
         assert!(unused_ignores(&[d], &[f], &["go-file-size"], None).is_empty());
+    }
+
+    fn rid(name: &str) -> RuleId {
+        RuleId::new(name).unwrap()
+    }
+
+    #[test]
+    fn syntax_hint_should_UseFileLeader_When_NoAnchor() {
+        let go = syntax_hint(Path::new("src/foo.go"), None, &[]);
+        assert!(go.contains("// kibitzer:ignore <rule> -- <why>"), "{go}");
+        let py = syntax_hint(Path::new("x.py"), None, &[]);
+        assert!(py.contains("# kibitzer:ignore <rule> -- <why>"), "{py}");
+        let md = syntax_hint(Path::new("notes.md"), None, &[]);
+        assert!(
+            md.contains("<!-- kibitzer:ignore <rule> -- <why> -->"),
+            "{md}"
+        );
+        let other = syntax_hint(Path::new("Makefile"), None, &[]);
+        assert!(other.contains("# kibitzer:ignore <rule>"), "{other}");
+        assert!(!go.contains("Rules:"), "{go}");
+    }
+
+    #[test]
+    fn syntax_hint_should_NameExactRow_When_AnchorGiven() {
+        let rule = rid("flag-argument");
+        let hint = syntax_hint(
+            Path::new("src/foo.go"),
+            Some((&rule, Line::new(20))),
+            &[&rule],
+        );
+        assert!(hint.contains("above line 20"), "{hint}");
+        assert!(
+            hint.contains("// kibitzer:ignore flag-argument -- <why>"),
+            "{hint}"
+        );
+        assert!(!hint.contains("false-positive"), "{hint}");
+    }
+
+    #[test]
+    fn syntax_hint_should_SayFileHead_When_FileScopeRule() {
+        let rule = rid("file-size");
+        let hint = syntax_hint(Path::new("a.go"), Some((&rule, Line::new(900))), &[&rule]);
+        assert!(
+            hint.contains("in the first 10 lines or on the anchor line"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn syntax_hint_should_ListRulesIncludingPrefixless_When_SecondFindingHasNoPrefix() {
+        let a = rid("flag-argument");
+        let b = rid("primitive-obsession");
+        let hint = syntax_hint(Path::new("a.go"), Some((&a, Line::new(3))), &[&a, &b]);
+        assert!(
+            hint.contains("Rules: flag-argument, primitive-obsession"),
+            "{hint}"
+        );
+        let first_prefixless = syntax_hint(Path::new("a.go"), Some((&b, Line::new(3))), &[&b, &a]);
+        assert!(
+            first_prefixless.contains("kibitzer:ignore primitive-obsession -- <why>"),
+            "{first_prefixless}"
+        );
+    }
+
+    #[test]
+    fn syntax_hint_should_TruncateRules_When_MoreThanSix() {
+        let ids: Vec<RuleId> = (0..8).map(|i| rid(&format!("rule-{i}"))).collect();
+        let refs: Vec<&RuleId> = ids.iter().collect();
+        let hint = syntax_hint(Path::new("a.go"), Some((&ids[0], Line::new(1))), &refs);
+        assert!(hint.contains("rule-5, ..."), "{hint}");
+        assert!(!hint.contains("rule-6"), "{hint}");
+    }
+
+    #[test]
+    fn syntax_hint_limited_should_KeepOneRule_When_LimitIsOne() {
+        let a = rid("flag-argument");
+        let b = rid("file-size");
+        let hint = syntax_hint_limited(Path::new("a.go"), Some((&a, Line::new(3))), &[&a, &b], 1);
+        assert!(hint.contains("Rules: flag-argument, ..."), "{hint}");
     }
 }
