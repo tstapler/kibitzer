@@ -5,6 +5,16 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
+/// Native per-file checks skip any file at or above this size rather than parsing it.
+/// Now that [`crate::config::default_checks`] turns every native checker on for every
+/// repo with no `.kibitzer/inspect.json` of its own, this is what keeps that on-by-default
+/// behavior cheap: vendored bundles, generated code, and minified assets can be
+/// megabytes, and every native checker pays a full read plus (for most of them) a
+/// tree-sitter parse. `PostToolUse` runs this path on every single edit, so a file this
+/// large — which a "long file"/"long function" checker has nothing useful to say about
+/// anyway — is worth skipping outright rather than paying that cost every time.
+pub const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+
 /// A finding a [`Checker`] reports against a specific line of a file. Formatted by
 /// callers as `{file}:{line}: {message}` — the convention `check.rs`'s diff-scoping
 /// parser depends on, so don't change this shape without updating that parser too.

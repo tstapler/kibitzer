@@ -8,6 +8,7 @@ mod backtest;
 mod cache;
 mod change_coupling;
 mod check;
+mod check_result;
 mod checker;
 mod checkers;
 mod config;

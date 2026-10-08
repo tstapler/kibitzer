@@ -5,7 +5,8 @@
 use std::path::Path;
 
 use crate::accepted_findings::AcceptedFindings;
-use crate::check::{CheckResult, MAX_NATIVE_CHECK_BYTES, raw_findings_for_check};
+use crate::check_result::CheckResult;
+use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, Severity};
 use crate::inline_ignores::{
     Directive, DirectiveParse, DroppedFinding, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome,
@@ -14,13 +15,18 @@ use crate::inline_ignores::{
     unused_ignores,
 };
 
-/// Everything the post-pass may read; `checks` and `accepted` feed the unused-ignore rerun.
+/// Reruns one native check against `source` with inline ignores disabled; injected so this
+/// module does not depend on the check pipeline.
+pub(crate) type RawRerun<'a> = &'a dyn Fn(&Check, &Path, &str) -> anyhow::Result<Vec<RawFinding>>;
+
+/// Everything the post-pass may read; `checks`, `accepted` and `raw_rerun` feed the unused-ignore rerun.
 pub(crate) struct PostPassInput<'a> {
     pub checks: &'a [Check],
     pub file_path: &'a Path,
     pub changed_lines: Option<&'a [(usize, usize)]>,
     pub results: &'a [CheckResult],
     pub accepted: &'a AcceptedFindings,
+    pub raw_rerun: RawRerun<'a>,
 }
 
 /// Synthesized `inline-ignore` results to append after the first pass. Empty unless the run
@@ -244,7 +250,7 @@ fn rerun_owning_checks(
             .raw_reruns
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A failing checker was already reported by the first pass.
-        if let Ok(found) = raw_findings_for_check(check, input.file_path, source) {
+        if let Ok(found) = (input.raw_rerun)(check, input.file_path, source) {
             raw.extend(found);
         }
     }
@@ -363,8 +369,6 @@ mod tests {
     use super::*;
     use crate::config::Severity;
     use crate::inline_ignores::{DroppedFinding, InlineOutcome, Line, Reason, RuleId};
-    use crate::plugin::Registry;
-    use std::sync::atomic::Ordering;
 
     pub(super) fn result_with_dropped(
         check_name: &str,
@@ -402,6 +406,10 @@ mod tests {
         }
     }
 
+    fn no_rerun(_: &Check, _: &Path, _: &str) -> anyhow::Result<Vec<RawFinding>> {
+        Ok(Vec::new())
+    }
+
     pub(super) fn run_with(
         changed_lines: Option<&[(usize, usize)]>,
         results: &[CheckResult],
@@ -412,6 +420,7 @@ mod tests {
             changed_lines,
             results,
             accepted: &AcceptedFindings::default(),
+            raw_rerun: &no_rerun,
         })
     }
 
@@ -513,190 +522,6 @@ mod tests {
         assert!(run_with(Some(&[(7, 9)]), &multi).is_empty());
     }
 
-    #[test]
-    fn run_checks_for_trigger_should_EmitBlockingSuppressedAdvisory_When_AddedDirectiveSilencesBlocking()
-     {
-        let dir = std::env::temp_dir().join(format!("kibitzer-post-pass-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("notes.md");
-        std::fs::write(
-            &file,
-            "# T\n\n<!-- kibitzer:ignore markdown-link-integrity -- placeholder for later -->\nSee [foo] here.\n",
-        )
-        .unwrap();
-        let results = crate::check::run_checks_for_trigger(
-            &crate::config::default_checks(),
-            "PostToolUse",
-            &dir,
-            &file,
-            Some(&[(3, 3)]),
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        let advisory = results
-            .iter()
-            .find(|r| r.output.contains("[blocking-suppressed]"))
-            .unwrap_or_else(|| panic!("no advisory in {results:#?}"));
-        assert_eq!(advisory.severity, Severity::Advisory);
-        assert!(
-            advisory
-                .output
-                .contains("notes.md:3: [blocking-suppressed] markdown-link-integrity"),
-            "{}",
-            advisory.output
-        );
-        // The suppressed finding itself must not fail the run.
-        assert!(
-            results
-                .iter()
-                .filter(|r| r.severity == Severity::Blocking)
-                .all(|r| r.passed)
-        );
-    }
-
-    const GO_IGNORE: &str = "// kibitzer:ignore flag-argument -- legacy API, callers pinned\n";
-    const GO_FUNC: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
-
-    /// `package main`, then `directive` on `directive_row` and `func f(b bool)` (a
-    /// `[flag-argument]` finding) on row 20; every other row is blank.
-    fn go_with_directive_at(directive_row: usize, directive: &str) -> String {
-        let mut rows = vec![String::new(); 19];
-        rows[0] = "package main".to_string();
-        rows[directive_row - 1] = directive.trim_end().to_string();
-        format!("{}\n{GO_FUNC}", rows.join("\n"))
-    }
-
-    struct Hook {
-        results: Vec<CheckResult>,
-        accepted: AcceptedFindings,
-    }
-
-    fn run_hook(name: &str, source: &str, changed: Option<&[(usize, usize)]>) -> Hook {
-        let dir =
-            std::env::temp_dir().join(format!("kibitzer-post-pass-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("x.go");
-        std::fs::write(&file, source).unwrap();
-        let accepted = AcceptedFindings::default();
-        let results = crate::check::run_checks_for_trigger(
-            &crate::config::default_checks(),
-            "PostToolUse",
-            &dir,
-            &file,
-            changed,
-            &Registry::default(),
-            &accepted,
-        )
-        .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        Hook { results, accepted }
-    }
-
-    fn unused_lines(h: &Hook) -> Vec<&str> {
-        h.results
-            .iter()
-            .filter(|r| r.output.contains("[unused-ignore]"))
-            .map(|r| r.output.as_str())
-            .collect()
-    }
-
-    fn reruns(h: &Hook) -> usize {
-        h.accepted
-            .inline
-            .scan_memo
-            .raw_reruns
-            .load(Ordering::Relaxed)
-    }
-
-    #[test]
-    fn run_checks_for_trigger_should_EmitUnusedIgnoreWithNearestRow_When_AddedDirectiveOnWrongRow()
-    {
-        let h = run_hook(
-            "wrong",
-            &go_with_directive_at(12, GO_IGNORE),
-            Some(&[(12, 12)]),
-        );
-        let lines = unused_lines(&h);
-        assert_eq!(lines.len(), 1, "{:#?}", h.results);
-        assert!(lines[0].ends_with(
-            "x.go:12: [unused-ignore] kibitzer:ignore flag-argument matches no finding at line 12 or 13; the finding is at line 20. Move the comment to the line directly above line 20 (or the end of line 20)"
-        ), "{}", lines[0]);
-        assert!(!lines[0].contains("line 19"));
-    }
-
-    #[test]
-    fn run_checks_for_trigger_should_EmitNoUnusedIgnore_When_DirectiveCoversFinding() {
-        let h = run_hook(
-            "right",
-            &go_with_directive_at(19, GO_IGNORE),
-            Some(&[(19, 19)]),
-        );
-        assert!(unused_lines(&h).is_empty(), "{:#?}", h.results);
-        assert_eq!(reruns(&h), 1);
-    }
-
-    #[test]
-    fn post_pass_should_NameRowTwenty_When_ChangedLinesIsRowTwelveOnly() {
-        let h = run_hook(
-            "scoped",
-            &go_with_directive_at(12, GO_IGNORE),
-            Some(&[(12, 12)]),
-        );
-        // Diff-scoping hid row 20 from the first pass, yet the advisory still names it.
-        assert!(
-            h.results
-                .iter()
-                .filter(|r| r.check_name == "syntax-rules-go")
-                .all(|r| !r.output.contains("x.go:20:")),
-            "{:#?}",
-            h.results
-        );
-        assert!(unused_lines(&h)[0].contains("the finding is at line 20"));
-    }
-
-    #[test]
-    fn run_checks_for_trigger_should_SkipRawRerun_When_NoDirectiveRowInChangedLines() {
-        let h = run_hook(
-            "norow",
-            &go_with_directive_at(12, GO_IGNORE),
-            Some(&[(1, 3)]),
-        );
-        assert_eq!(reruns(&h), 0);
-        assert!(unused_lines(&h).is_empty());
-    }
-
-    #[test]
-    fn run_checks_for_trigger_should_EmitNoUnusedIgnore_When_ChangedLinesScoped() {
-        let source = format!("package main\n{}\n{GO_IGNORE}{GO_FUNC}", "\n".repeat(47));
-        let h = run_hook("far", &source, Some(&[(1, 3)]));
-        assert!(
-            h.results
-                .iter()
-                .all(|r| !r.output.contains("[unused-ignore]"))
-        );
-        assert_eq!(reruns(&h), 0);
-    }
-
-    #[test]
-    fn run_checks_for_trigger_should_SkipRawRerun_When_FileLacksMarker() {
-        let h = run_hook("nomarker", &go_with_directive_at(12, ""), Some(&[(12, 12)]));
-        assert_eq!(reruns(&h), 0);
-    }
-
-    #[test]
-    fn run_checks_for_trigger_should_PointToHead_When_FileScopeDirectiveBelowRowTen() {
-        let ignore = "// kibitzer:ignore file-size -- generated tables, splitting is churn\n";
-        let h = run_hook(
-            "filescope",
-            &go_with_directive_at(12, ignore),
-            Some(&[(12, 12)]),
-        );
-        let lines = unused_lines(&h);
-        assert_eq!(lines.len(), 1, "{:#?}", h.results);
-        assert!(lines[0].contains("first 10 lines"), "{}", lines[0]);
-    }
     fn directive_for(rule: &str, row: usize) -> Directive {
         Directive::new(
             vec![RuleId::new(rule).unwrap()],
@@ -786,20 +611,15 @@ mod tests {
     }
 
     #[test]
-    fn run_checks_for_trigger_should_EmitUnusedIgnore_When_UnownedRuleOnWrongRowAndSurvivingFindingExists()
-     {
+    fn run_should_EmitUnusedIgnore_When_UnownedRuleOnWrongRowAndSurvivingFindingExists() {
         let dir =
             std::env::temp_dir().join(format!("kibitzer-post-pass-unowned-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("x.go");
-        std::fs::write(
-            &file,
-            go_with_directive_at(
-                12,
-                "// kibitzer:ignore acme-rule -- legacy API, callers pinned",
-            ),
-        )
-        .unwrap();
+        let mut rows = vec![String::new(); 19];
+        rows[0] = "package main".to_string();
+        rows[11] = "// kibitzer:ignore acme-rule -- legacy API, callers pinned".to_string();
+        std::fs::write(&file, rows.join("\n")).unwrap();
         let mut first = result_with_dropped("acme-lint", Vec::new());
         first.inline.kept = vec![kept_at("acme-rule", 20)];
         let out = run(PostPassInput {
@@ -808,6 +628,7 @@ mod tests {
             changed_lines: Some(&[(12, 12)]),
             results: &[first],
             accepted: &AcceptedFindings::default(),
+            raw_rerun: &no_rerun,
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(out.len(), 1, "{out:#?}");
@@ -817,5 +638,87 @@ mod tests {
             out[0].output
         );
         assert!(out[0].output.contains("the finding is at line 20"));
+    }
+
+    fn owning_check(name: &str, checker: &str) -> Check {
+        Check {
+            name: name.to_string(),
+            command: None,
+            checker: Some(checker.to_string()),
+            architecture_checker: None,
+            severity: Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: None,
+            output_format: None,
+            options: None,
+        }
+    }
+
+    fn raw_flag_argument_at(row: usize) -> RawFinding {
+        RawFinding {
+            line: Line::new(row),
+            checker: "syntax-rules-go".to_string(),
+            rule: RuleId::new("flag-argument").unwrap(),
+            message: "[flag-argument] bool parameter".to_string(),
+        }
+    }
+
+    /// Runs the post-pass over a file whose row 12 holds a `flag-argument` directive, with
+    /// `rerun` standing in for the real checker and `reruns` counting its calls.
+    fn run_with_fake_rerun(
+        name: &str,
+        raw: Vec<RawFinding>,
+        changed: (usize, usize),
+    ) -> (Vec<CheckResult>, usize) {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-fake-rerun-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.go");
+        let mut rows = vec![String::new(); 19];
+        rows[0] = "package main".to_string();
+        rows[11] = "// kibitzer:ignore flag-argument -- legacy API, callers pinned".to_string();
+        std::fs::write(&file, rows.join("\n")).unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let rerun = |_: &Check, _: &Path, _: &str| {
+            calls.set(calls.get() + 1);
+            Ok(raw.clone())
+        };
+        let out = run(PostPassInput {
+            checks: &[owning_check("syntax-rules-go", "syntax-rules")],
+            file_path: &file,
+            changed_lines: Some(&[changed]),
+            results: &[result_with_dropped("syntax-rules-go", Vec::new())],
+            accepted: &AcceptedFindings::default(),
+            raw_rerun: &rerun,
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        (out, calls.get())
+    }
+
+    #[test]
+    fn run_should_NameNearestRow_When_InjectedRerunFindsFindingElsewhere() {
+        let (out, calls) = run_with_fake_rerun("wrong", vec![raw_flag_argument_at(20)], (12, 12));
+        assert_eq!(calls, 1);
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert!(
+            out[0].output.contains("the finding is at line 20"),
+            "{}",
+            out[0].output
+        );
+    }
+
+    #[test]
+    fn run_should_StaySilent_When_InjectedRerunFindingIsCoveredByDirective() {
+        let (out, calls) = run_with_fake_rerun("covered", vec![raw_flag_argument_at(13)], (12, 12));
+        assert_eq!(calls, 1);
+        assert!(out.is_empty(), "{out:#?}");
+    }
+
+    #[test]
+    fn run_should_NotRerun_When_NoDirectiveRowInChangedLines() {
+        let (out, calls) = run_with_fake_rerun("norow", vec![raw_flag_argument_at(20)], (1, 3));
+        assert_eq!(calls, 0);
+        assert!(out.is_empty());
     }
 }
