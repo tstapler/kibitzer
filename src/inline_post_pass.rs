@@ -621,6 +621,18 @@ mod tests {
     }
 
     #[test]
+    fn run_checks_for_trigger_should_EmitNoUnusedIgnore_When_ChangedLinesScoped() {
+        let source = format!("package main\n{}\n{GO_IGNORE}{GO_FUNC}", "\n".repeat(47));
+        let h = run_hook("far", &source, Some(&[(1, 3)]));
+        assert!(
+            h.results
+                .iter()
+                .all(|r| !r.output.contains("[unused-ignore]"))
+        );
+        assert_eq!(reruns(&h), 0);
+    }
+
+    #[test]
     fn run_checks_for_trigger_should_SkipRawRerun_When_FileLacksMarker() {
         let h = run_hook("nomarker", &go_with_directive_at(12, ""), Some(&[(12, 12)]));
         assert_eq!(reruns(&h), 0);
