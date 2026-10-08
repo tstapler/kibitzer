@@ -195,3 +195,15 @@ there could only come from a false directive match, and none of the 111 finished
 - Index-based `shown` tracking in `InlineOutcome`.
 - From the plan's Amendment 1: Task 2.2.2b (full `kibitzer run` unused-ignore audit), the run-footer false-positive split,
   the success acknowledgement, and Story 3.2.1.
+
+## Phase 6 round 2
+
+Findings from the idioms, architecture and refactor reviews were addressed in small commits on this branch. Not done as asked:
+
+- `debug_assert` on `Line::new(0)`: skipped. Line 0 ("the checker reports no line") is a documented input, treated as line 1, and `covers_should_TreatLineZeroAsLineOne` exercises it; the assert made that test panic.
+- `passed_raw: bool` in `scope_line_verdicts` as an enum: skipped. It has 18 references across production and tests, so it was not trivial.
+- Trimming the `inline_ignores/mod.rs` re-export facade: skipped. Every non-test re-export has a caller outside the module; the test-only block is already separated.
+- `daemon.rs` double registry-path load: skipped as pre-existing and unrelated to this branch.
+- `mcp.rs` `run_checks` 185-line extraction: skipped; out of the budget for this pass.
+- Cache old-tuple compatibility test: kept on purpose.
+
