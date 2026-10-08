@@ -3392,7 +3392,6 @@ mod inline_seam_tests {
         let accepted = AcceptedFindings {
             accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
             inline: InlineIgnoreContext::disabled(),
-            ..Default::default()
         };
         let result = native(&dir, &go_source(IGNORE, IGNORE), None, &accepted);
         assert!(!result.passed);

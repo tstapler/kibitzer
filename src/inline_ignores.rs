@@ -451,12 +451,15 @@ pub struct SuppressionCounts {
     pub blocking: AtomicUsize,
 }
 
+/// (path, content hash, scan result)
+type MemoEntry = (PathBuf, u64, Arc<Vec<Scanned>>);
+
 /// Single-entry scan cache: checks for one file run back to back, so one entry gives about one
 /// scan per file. Content-hash keyed, so an edited file never returns stale directives.
 /// Per-context (never `static`) so parallel tests, the daemon, and LSP cannot interfere.
 #[derive(Debug, Default)]
 pub struct ScanMemo {
-    entry: Mutex<Option<(PathBuf, u64, Arc<Vec<Scanned>>)>>,
+    entry: Mutex<Option<MemoEntry>>,
     pub scans: AtomicUsize,
     pub hash_calls: AtomicUsize,
 }
@@ -468,10 +471,11 @@ impl ScanMemo {
         source.hash(&mut hasher);
         let hash = hasher.finish();
         let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((p, h, scanned)) = entry.as_ref() {
-            if p == path && *h == hash {
-                return Arc::clone(scanned);
-            }
+        if let Some((p, h, scanned)) = entry.as_ref()
+            && p == path
+            && *h == hash
+        {
+            return Arc::clone(scanned);
         }
         self.scans.fetch_add(1, Ordering::Relaxed);
         let scanned = Arc::new(scan_directives(path, source));

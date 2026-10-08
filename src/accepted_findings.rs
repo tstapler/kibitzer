@@ -188,6 +188,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)]
     fn accepted_findings_should_DeserializeUnchanged_When_InlineFieldSkipped() {
         let parsed: AcceptedFindings =
             serde_json::from_str(r#"{"accepted": [], "inline": {"mode": "Disabled"}}"#).unwrap();
