@@ -476,7 +476,7 @@ fn run_native_check(
         checker_name,
         file_path,
         check.options.as_ref(),
-        INLINE_SEVERITY_PLACEHOLDER,
+        check.severity,
         &accepted.inline,
     ) {
         Ok(result) => result,
@@ -523,7 +523,7 @@ fn run_native_check(
             file_path,
             changed_lines,
             check.options.as_ref(),
-            INLINE_SEVERITY_PLACEHOLDER,
+            check.severity,
             &accepted.inline,
         );
         if let Some(false) = baseline {
@@ -566,9 +566,6 @@ fn run_native_check(
         inline: inline_outcome,
     })
 }
-
-/// Stands in for the check's real severity until Task 1.2.2b2 threads it through.
-const INLINE_SEVERITY_PLACEHOLDER: Severity = Severity::Advisory;
 
 /// Drops accepted findings (`accepted_findings::ACCEPTED_FINDINGS_DIR`) from `combined`, run after
 /// diff-scoping so an untouched line never needs this at all. Native-only: a shell-out
@@ -3169,7 +3166,8 @@ mod findings_wiring_tests {
 mod inline_seam_tests {
     use super::*;
     use crate::accepted_findings::AcceptedFinding;
-    use crate::inline_ignores::RuleId;
+    use crate::inline_ignores::{RuleId, SuppressionCounts};
+    use std::sync::Arc;
 
     const IGNORE: &str = "// kibitzer:ignore flag-argument -- legacy api pinned\n";
     const FUNC_F: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
@@ -3451,6 +3449,84 @@ mod inline_seam_tests {
         )
         .unwrap();
         assert!(results.iter().all(|r| r.passed), "{results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn counting_ctx() -> (Arc<SuppressionCounts>, AcceptedFindings) {
+        let counter = Arc::new(SuppressionCounts::default());
+        let accepted = AcceptedFindings {
+            inline: InlineIgnoreContext {
+                counter: Some(Arc::clone(&counter)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (counter, accepted)
+    }
+
+    #[test]
+    fn run_native_check_should_CountBlockingSeparately_When_SeverityDiffers() {
+        let dir = tmp_dir("counts");
+        let file = dir.join("main.go");
+        std::fs::write(&file, format!("package main\n\n{IGNORE}{FUNC_F}")).unwrap();
+        let (counter, accepted) = counting_ctx();
+        let run = |severity| {
+            run_native_check(
+                &flag_check(severity),
+                "syntax-rules",
+                &dir,
+                &file,
+                None,
+                &accepted,
+            )
+            .unwrap()
+        };
+        let blocking = run(Severity::Blocking);
+        assert_eq!(blocking.inline.dropped[0].severity, Severity::Blocking);
+        let advisory = run(Severity::Advisory);
+        assert_eq!(advisory.inline.dropped[0].severity, Severity::Advisory);
+        assert_eq!(counter.total.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.blocking.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_native_against_git_head_should_NotChangeCounter_When_BaselineReplay() {
+        let dir = tmp_dir("replay-counter");
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        let file = dir.join("main.go");
+        std::fs::write(&file, go_source(IGNORE, "")).unwrap();
+        git(&["add", "main.go"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let (counter, accepted) = counting_ctx();
+        // g's finding stays, so the blocking check fails and triggers the HEAD replay.
+        let result = run_native_check(
+            &flag_check(Severity::Blocking),
+            "syntax-rules",
+            &dir,
+            &file,
+            None,
+            &accepted,
+        )
+        .unwrap();
+        assert!(!result.passed);
+        assert_eq!(
+            counter.total.load(Ordering::Relaxed),
+            1,
+            "replay must not add to the count"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
