@@ -109,6 +109,18 @@ fn run_check_with_timeout(
 .with_plugin_missing());
     }
 
+    run_shell_command_check(check, repo_root, file_path, changed_lines, timeout)
+}
+
+/// The `command`-based path: runs the shell command (killed after `timeout`), renders its
+/// output, diff-scopes it, and downgrades a blocking failure that predates the edit.
+fn run_shell_command_check(
+    check: &Check,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    timeout: Duration,
+) -> anyhow::Result<CheckResult> {
     let command = check
         .command
         .as_deref()
@@ -168,21 +180,10 @@ fn run_check_with_timeout(
         passed_raw
     };
 
-    let mut severity = check.severity;
-    let mut message = check.message.clone();
-
-    if !passed && severity == Severity::Blocking {
-        let baseline =
-            command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines);
-        if let Some(false) = baseline {
-            severity = Severity::Advisory;
-            message = Some(format!(
-                "{} (downgraded: this violation predates your edits — already present \
-                 at the git HEAD commit)",
-                message.unwrap_or_default()
-            ));
-        }
-    }
+    let (severity, message) =
+        downgrade_if_predates(passed, check.severity, check.message.clone(), || {
+            command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+        });
 
     Ok(
         CheckResult::new(check.name.clone(), severity, passed, combined)
@@ -284,10 +285,10 @@ fn run_native_check(
         "kibitzer check native {checker_name} {}",
         file_path.display()
     );
+    let rel_path = relativize(repo_root, file_path);
 
     if let Some(checker) = crate::checker::lookup(checker_name) {
         let globs: Vec<String> = checker.file_globs().iter().map(|g| g.to_string()).collect();
-        let rel_path = relativize(repo_root, file_path);
         if !matches_scope(&rel_path, &globs) {
             return Ok(
                 CheckResult::passing(check.name.clone(), check.severity).with_command(cmd_str)
@@ -302,7 +303,7 @@ fn run_native_check(
     // captured as `passed_raw = false` rather than aborting the whole batch — a single
     // bad file shouldn't kill every other check/file in the run.
     let SourceCheck {
-        mut combined,
+        combined,
         passed: passed_raw,
         findings: kept_findings,
         inline: mut inline_outcome,
@@ -321,60 +322,27 @@ fn run_native_check(
     };
 
     let mut lines = FindingLines::new(&kept_findings, file_path);
-    let passed = match changed_lines {
-        Some(ranges) => match scope_line_verdicts(&lines.texts(), file_path, ranges, passed_raw) {
-            Some(verdicts) => {
-                lines.retain(&verdicts.keep);
-                combined = lines.text();
-                verdicts.passed
-            }
-            None => passed_raw,
-        },
-        None => passed_raw,
-    };
-
-    let passed = if passed {
-        passed
+    let passed = apply_diff_scope(&mut lines, file_path, changed_lines, passed_raw);
+    let passed = passed
+        || apply_accepted(
+            &mut lines,
+            file_path,
+            &rel_path,
+            checker_name,
+            &run_ctx.accepted,
+        );
+    let combined = if lines.is_filtered() {
+        lines.text()
     } else {
-        let rel_file = relativize(repo_root, file_path);
-        let accepted_lines =
-            AcceptedLines::for_file(file_path, &rel_file, checker_name, &run_ctx.accepted);
-        if let Some(accepted_lines) = accepted_lines {
-            let keep: Vec<bool> = lines
-                .texts()
-                .iter()
-                .map(|line| !accepted_lines.is_accepted(line))
-                .collect();
-            lines.retain(&keep);
-            combined = lines.text();
-        }
-        combined.trim().is_empty()
+        combined
     };
 
-    let mut severity = check.severity;
-    let mut message = check.message.clone();
+    let (severity, message) =
+        downgrade_if_predates(passed, check.severity, check.message.clone(), || {
+            check_native_against_git_head(run, repo_root, file_path, changed_lines)
+        });
 
-    if !passed && severity == Severity::Blocking {
-        let baseline = check_native_against_git_head(run, repo_root, file_path, changed_lines);
-        if let Some(false) = baseline {
-            severity = Severity::Advisory;
-            message = Some(format!(
-                "{} (downgraded: this violation predates your edits — already present \
-                 at the git HEAD commit)",
-                message.unwrap_or_default()
-            ));
-        }
-    }
-
-    let visible = lines.visible();
-    inline_outcome.shown = capped_anchors(
-        checker_name,
-        kept_findings
-            .iter()
-            .zip(&visible)
-            .filter_map(|(finding, shown)| shown.then_some(finding)),
-    );
-    inline_outcome.kept = capped_anchors(checker_name, kept_findings.iter());
+    capture_inline_anchors(&mut inline_outcome, checker_name, &kept_findings, &lines);
 
     Ok(
         CheckResult::new(check.name.clone(), severity, passed, combined)
@@ -382,6 +350,92 @@ fn run_native_check(
             .with_command(cmd_str)
             .with_inline(inline_outcome),
     )
+}
+
+/// Drops the lines outside `changed_lines` (when the edit is diff-scoped) and returns whether
+/// the check still passes; output that cannot be scoped is left untouched.
+fn apply_diff_scope(
+    lines: &mut FindingLines,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    passed_raw: bool,
+) -> bool {
+    let Some(ranges) = changed_lines else {
+        return passed_raw;
+    };
+    match scope_line_verdicts(&lines.texts(), file_path, ranges, passed_raw) {
+        Some(verdicts) => {
+            lines.retain(&verdicts.keep);
+            verdicts.passed
+        }
+        None => passed_raw,
+    }
+}
+
+/// Drops the lines an `accepted/` entry covers and returns whether nothing is left.
+fn apply_accepted(
+    lines: &mut FindingLines,
+    file_path: &Path,
+    rel_path: &str,
+    checker_name: &str,
+    accepted: &crate::accepted_findings::AcceptedFindings,
+) -> bool {
+    if let Some(accepted_lines) =
+        AcceptedLines::for_file(file_path, rel_path, checker_name, accepted)
+    {
+        let keep: Vec<bool> = lines
+            .texts()
+            .iter()
+            .map(|line| !accepted_lines.is_accepted(line))
+            .collect();
+        lines.retain(&keep);
+    }
+    lines.text().trim().is_empty()
+}
+
+/// Records which findings were shown (survived scoping and `accepted/`) and kept (survived
+/// inline ignores) as capped anchors, so the footer can name the first one.
+fn capture_inline_anchors(
+    outcome: &mut InlineOutcome,
+    checker_name: &str,
+    kept_findings: &[crate::checker::Finding],
+    lines: &FindingLines,
+) {
+    let visible = lines.visible();
+    outcome.shown = capped_anchors(
+        checker_name,
+        kept_findings
+            .iter()
+            .zip(&visible)
+            .filter_map(|(finding, shown)| shown.then_some(finding)),
+    );
+    outcome.kept = capped_anchors(checker_name, kept_findings.iter());
+}
+
+/// A blocking failure that was already present at the git HEAD commit predates the edit, so it
+/// is reported as advisory. `baseline` runs only for a failing blocking check and reports
+/// whether the check passed at HEAD: `Some(false)` means it already failed there, `None`
+/// means that could not be determined.
+fn downgrade_if_predates(
+    passed: bool,
+    severity: Severity,
+    message: Option<String>,
+    baseline: impl FnOnce() -> Option<bool>,
+) -> (Severity, Option<String>) {
+    if passed || severity != Severity::Blocking {
+        return (severity, message);
+    }
+    match baseline() {
+        Some(false) => (
+            Severity::Advisory,
+            Some(format!(
+                "{} (downgraded: this violation predates your edits — already present \
+                 at the git HEAD commit)",
+                message.unwrap_or_default()
+            )),
+        ),
+        _ => (severity, message),
+    }
 }
 
 /// What one in-process checker run needs besides the file: which checker, its options, the
@@ -1134,20 +1188,10 @@ pub fn run_architecture_check(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let mut severity = check.severity;
-    let mut message = check.message.clone();
-
-    if !passed && severity == Severity::Blocking {
-        let baseline = check_native_against_git_head_repo(arch_name, repo_root, arch_config);
-        if let Some(false) = baseline {
-            severity = Severity::Advisory;
-            message = Some(format!(
-                "{} (downgraded: this violation predates your edits — already present \
-                 at the git HEAD commit)",
-                message.unwrap_or_default()
-            ));
-        }
-    }
+    let (severity, message) =
+        downgrade_if_predates(passed, check.severity, check.message.clone(), || {
+            check_native_against_git_head_repo(arch_name, repo_root, arch_config)
+        });
 
     Ok(
         CheckResult::new(check.name.clone(), severity, passed, combined)

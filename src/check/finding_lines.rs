@@ -9,6 +9,7 @@ use crate::checker::Finding;
 pub(super) struct FindingLines {
     lines: Vec<OwnedLine>,
     finding_count: usize,
+    filtered: bool,
 }
 
 struct OwnedLine {
@@ -40,6 +41,7 @@ impl FindingLines {
         FindingLines {
             lines,
             finding_count: findings.len(),
+            filtered: false,
         }
     }
 
@@ -51,6 +53,12 @@ impl FindingLines {
     pub(super) fn retain(&mut self, keep: &[bool]) {
         let mut flags = keep.iter();
         self.lines.retain(|_| flags.next().copied().unwrap_or(true));
+        self.filtered |= keep.contains(&false);
+    }
+
+    /// Whether any `retain` dropped a line, so `text()` can differ from the original rendering.
+    pub(super) fn is_filtered(&self) -> bool {
+        self.filtered
     }
 
     pub(super) fn text(&self) -> String {
