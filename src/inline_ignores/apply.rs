@@ -121,8 +121,7 @@ pub(crate) fn apply_inline_ignores(
     severity: Severity,
     ctx: &InlineIgnoreContext,
 ) -> AppliedIgnores {
-    if findings.is_empty() || ctx.mode == InlineIgnoreMode::Disabled || !source.contains("kibitzer")
-    {
+    if findings.is_empty() || ctx.mode == InlineIgnoreMode::Disabled || !has_marker(source) {
         return AppliedIgnores {
             kept: findings,
             dropped: Vec::new(),

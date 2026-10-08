@@ -25,7 +25,7 @@ fn strip_comment_syntax(line: &str) -> &str {
 /// Whether any line of the comment `text` begins (after its leader) with `kibitzer:`.
 pub fn is_directive_comment(text: &str) -> bool {
     text.lines()
-        .any(|l| strip_comment_syntax(l).starts_with("kibitzer:"))
+        .any(|l| begins_marker_family(strip_comment_syntax(l)))
 }
 
 static NEAR_MISS_RE: LazyLock<Regex> = LazyLock::new(|| {

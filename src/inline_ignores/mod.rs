@@ -24,7 +24,7 @@ pub use scan::ScanMemo;
 pub use types::{
     Directive, DirectiveParse, InlineOutcome, Line, MalformedReason, Reason, RuleId, WeakReason,
 };
-pub(crate) use types::{LineSpan, RawFinding, rows_intersect, valid_directives};
+pub(crate) use types::{LineSpan, RawFinding, has_marker, rows_intersect, valid_directives};
 pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores};
 
 // Reached through this module only by tests; production code names the submodule item itself.

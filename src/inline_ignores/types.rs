@@ -8,6 +8,20 @@ use crate::config::Severity;
 
 pub(crate) const MARKER: &str = "kibitzer:ignore";
 
+/// The word every directive-like comment starts with (`kibitzer:ignore`, `kibitzer:disable`, ...).
+pub(crate) const MARKER_PREFIX: &str = "kibitzer";
+
+/// Cheap pre-check: a source without the marker word cannot hold a directive, so nothing is parsed.
+pub(crate) fn has_marker(source: &str) -> bool {
+    source.contains(MARKER_PREFIX)
+}
+
+/// Whether `text` begins `kibitzer:`, the start of any directive-family comment.
+pub(crate) fn begins_marker_family(text: &str) -> bool {
+    text.strip_prefix(MARKER_PREFIX)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
 /// 1-based line number; tree-sitter's 0-based rows are converted once at the scan boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Line(NonZeroUsize);

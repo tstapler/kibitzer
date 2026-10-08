@@ -103,7 +103,7 @@ pub fn scan_leading_comments(source: &str) -> Vec<Scanned> {
 
 /// Scans `source` for directives, parsing nothing when it lacks the substring `kibitzer`.
 pub fn scan_directives_with_cache(cache: &GrammarCache, path: &Path, source: &str) -> Vec<Scanned> {
-    if !source.contains("kibitzer") {
+    if !has_marker(source) {
         return Vec::new();
     }
     if let Some(lang) = Language::for_path(path) {
