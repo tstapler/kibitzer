@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
-    fn accepted_findings_should_DeserializeUnchanged_When_InlineFieldSkipped() {
+    fn accepted_findings_should_DeserializeUnchanged_When_UnknownInlineKeyPresent() {
         let parsed: AcceptedFindings =
             serde_json::from_str(r#"{"accepted": [], "inline": {"mode": "Disabled"}}"#).unwrap();
         assert!(parsed.accepted.is_empty());

@@ -14,8 +14,8 @@ use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 use crate::inline_ignores::{
-    InlineIgnoreContext, InlineOutcome, Line, RawFinding, anchor_rule, apply_inline_ignores,
-    capped_anchors,
+    IgnoreTarget, InlineIgnoreContext, InlineOutcome, Line, RawFinding, anchor_rule,
+    apply_inline_ignores, capped_anchors,
 };
 use crate::plugin::Registry;
 use crate::run_context::RunContext;
@@ -487,10 +487,12 @@ fn run_checker_against_source(
     )?;
     let applied = apply_inline_ignores(
         findings,
-        file_path,
-        source,
-        checker_name,
-        severity,
+        IgnoreTarget {
+            file: file_path,
+            source,
+            checker_name,
+            severity,
+        },
         inline_ctx,
     );
     let combined = applied

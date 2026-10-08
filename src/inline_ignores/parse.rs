@@ -120,7 +120,7 @@ fn parse_rule_list(text: &str) -> Result<Option<Vec<RuleId>>, MalformedReason> {
 
 /// Parses one comment line (leader and trailer included or not). The returned directive
 /// carries placeholder positions; scanners place it with its real rows.
-pub fn parse_comment_line(text: &str) -> DirectiveParse {
+pub(crate) fn parse_comment_line(text: &str) -> DirectiveParse {
     let text = strip_comment_syntax(text);
     match text
         .strip_prefix(MARKER)

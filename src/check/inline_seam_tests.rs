@@ -476,10 +476,12 @@ fn apply_inline_ignores_should_Suppress_When_RuleAbsentFromKnownRules() {
     };
     let out = apply_inline_ignores(
         vec![finding],
-        Path::new("x.go"),
-        &source,
-        "native-checker",
-        Severity::Advisory,
+        IgnoreTarget {
+            file: Path::new("x.go"),
+            source: &source,
+            checker_name: "native-checker",
+            severity: Severity::Advisory,
+        },
         &InlineIgnoreContext::default(),
     );
     assert!(out.kept.is_empty(), "{:?}", out.kept);

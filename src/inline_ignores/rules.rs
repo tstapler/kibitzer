@@ -72,22 +72,26 @@ const fn meta_rule(id: &'static str, owner: OwnerMatch) -> RuleInfo {
     }
 }
 
+/// The per-language checker families that own several rule ids each.
+const COMMENT_QUALITY: OwnerMatch = OwnerMatch::Prefix("comment-quality");
+const SYNTAX_RULES: OwnerMatch = OwnerMatch::Prefix("syntax-rules");
+
 /// The one rule table: ids that appear as `[id]` message prefixes, who owns them, and which
 /// are meta. Advisory only: it feeds the unknown-rule suggestion and the unused-ignore rerun
 /// and never decides suppression, so a stale entry costs a hint, not an ignore. A registered
 /// checker absent from the table is still owned by name (see `owner_matches`).
 /// `rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources` guards drift.
 pub(crate) const RULES: &[RuleInfo] = &[
-    rule("commented-out-code", OwnerMatch::Prefix("comment-quality")),
-    rule("over-commented", OwnerMatch::Prefix("comment-quality")),
-    rule("verbose-comment", OwnerMatch::Prefix("comment-quality")),
-    rule("long-function", OwnerMatch::Prefix("syntax-rules")),
-    rule("deep-nesting", OwnerMatch::Prefix("syntax-rules")),
-    rule("long-parameter-list", OwnerMatch::Prefix("syntax-rules")),
-    rule("flag-argument", OwnerMatch::Prefix("syntax-rules")),
-    rule("unreachable-code", OwnerMatch::Prefix("syntax-rules")),
-    rule("replace-magic-literal", OwnerMatch::Prefix("syntax-rules")),
-    rule("extract-variable", OwnerMatch::Prefix("syntax-rules")),
+    rule("commented-out-code", COMMENT_QUALITY),
+    rule("over-commented", COMMENT_QUALITY),
+    rule("verbose-comment", COMMENT_QUALITY),
+    rule("long-function", SYNTAX_RULES),
+    rule("deep-nesting", SYNTAX_RULES),
+    rule("long-parameter-list", SYNTAX_RULES),
+    rule("flag-argument", SYNTAX_RULES),
+    rule("unreachable-code", SYNTAX_RULES),
+    rule("replace-magic-literal", SYNTAX_RULES),
+    rule("extract-variable", SYNTAX_RULES),
     rule("file-size", OwnerMatch::Suffix("file-size")),
     rule("single-call-site-delegation", OwnerMatch::Unowned),
     rule("god-class", OwnerMatch::Unowned),

@@ -42,7 +42,7 @@ fn scan_text_lines(text: &str, first_row: usize, end_row: usize, whole_line: boo
 }
 
 /// Directives in the real comment nodes of a parsed file; string literals never match.
-pub fn scan_code_comments(lang: Language, tree: &Tree, source: &str) -> Vec<Scanned> {
+pub(super) fn scan_code_comments(lang: Language, tree: &Tree, source: &str) -> Vec<Scanned> {
     let kinds = comment_kinds(lang);
     let mut out = Vec::new();
     walk_preorder(tree.root_node(), &mut |node| {
@@ -61,7 +61,7 @@ pub fn scan_code_comments(lang: Language, tree: &Tree, source: &str) -> Vec<Scan
 
 /// Directives in Markdown HTML comments; fenced and indented code arrive as text events,
 /// so quoted examples never match.
-pub fn scan_markdown(source: &str) -> Vec<Scanned> {
+pub(super) fn scan_markdown(source: &str) -> Vec<Scanned> {
     use pulldown_cmark::{Event, Options, Parser};
     let line_starts = line_start_offsets(source);
     let parser = Parser::new_ext(source, Options::ENABLE_TABLES).into_offset_iter();
@@ -82,7 +82,7 @@ static LEADING_COMMENT_RE: LazyLock<Regex> =
 
 /// Whole-line comments only, for files with no grammar: a trailing `echo "# kibitzer:..."`
 /// is code, not a comment.
-pub fn scan_leading_comments(source: &str) -> Vec<Scanned> {
+pub(super) fn scan_leading_comments(source: &str) -> Vec<Scanned> {
     source
         .lines()
         .enumerate()
@@ -102,7 +102,11 @@ pub fn scan_leading_comments(source: &str) -> Vec<Scanned> {
 }
 
 /// Scans `source` for directives, parsing nothing when it lacks the substring `kibitzer`.
-pub fn scan_directives_with_cache(cache: &GrammarCache, path: &Path, source: &str) -> Vec<Scanned> {
+pub(super) fn scan_directives_with_cache(
+    cache: &GrammarCache,
+    path: &Path,
+    source: &str,
+) -> Vec<Scanned> {
     if !has_marker(source) {
         return Vec::new();
     }
@@ -118,7 +122,7 @@ pub fn scan_directives_with_cache(cache: &GrammarCache, path: &Path, source: &st
     scan_leading_comments(source)
 }
 
-pub fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
+pub(crate) fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
     scan_directives_with_cache(&GrammarCache::new(), path, source)
 }
 

@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::checker::{Finding, run_checker_configured};
 use crate::config::{Check, default_checks};
+use crate::inline_ignores::IgnoreTarget;
 use crate::inline_ignores::{
     FILE_SCOPE_RULES, InlineIgnoreContext, anchor_rule, apply_inline_ignores,
 };
@@ -291,10 +292,12 @@ fn expect_dropped(
     let checker = checker_name(check);
     let applied = apply_inline_ignores(
         real_findings(check, path, source),
-        Path::new(path),
-        source,
-        checker,
-        check.severity,
+        IgnoreTarget {
+            file: Path::new(path),
+            source,
+            checker_name: checker,
+            severity: check.severity,
+        },
         &InlineIgnoreContext::default(),
     );
     let dropped = applied
@@ -424,10 +427,12 @@ fn kept_after_apply(
 ) -> Vec<(usize, String)> {
     apply_inline_ignores(
         findings,
-        Path::new(path),
-        source,
-        checker_name(check),
-        check.severity,
+        IgnoreTarget {
+            file: Path::new(path),
+            source,
+            checker_name: checker_name(check),
+            severity: check.severity,
+        },
         &InlineIgnoreContext::default(),
     )
     .kept

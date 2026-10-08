@@ -560,7 +560,16 @@ fn apply(
     severity: Severity,
     ctx: &InlineIgnoreContext,
 ) -> AppliedIgnores {
-    apply_inline_ignores(findings, Path::new("x.go"), source, checker, severity, ctx)
+    apply_inline_ignores(
+        findings,
+        IgnoreTarget {
+            file: Path::new("x.go"),
+            source,
+            checker_name: checker,
+            severity,
+        },
+        ctx,
+    )
 }
 
 #[test]
@@ -802,10 +811,12 @@ fn scan_memo_should_ScanOncePerContentAndPath() {
     assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 2);
     apply_inline_ignores(
         f(),
-        Path::new("other.go"),
-        GO_IGNORE_ABOVE_10,
-        "c",
-        Severity::Advisory,
+        IgnoreTarget {
+            file: Path::new("other.go"),
+            source: GO_IGNORE_ABOVE_10,
+            checker_name: "c",
+            severity: Severity::Advisory,
+        },
         &ctx,
     );
     assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 3);

@@ -14,15 +14,15 @@ mod anchor_tests;
 #[cfg(test)]
 mod tests;
 
-pub use apply::{InlineIgnoreContext, InlineIgnoreMode, SuppressionCounts};
-pub(crate) use apply::{apply_inline_ignores, capped_anchors};
+pub(crate) use apply::{IgnoreTarget, apply_inline_ignores, capped_anchors};
 pub(crate) use hint::{HINT_RULE_LIMIT, batch_syntax_hint, syntax_hint, syntax_hint_limited};
 pub use parse::is_directive_comment;
 pub(crate) use parse::{echo_parts, near_miss_text};
 pub(crate) use rules::{anchor_rule, did_you_mean, known_rule, owned_by};
 pub use scan::ScanMemo;
 pub use types::{
-    Directive, DirectiveParse, InlineOutcome, Line, MalformedReason, Reason, RuleId, WeakReason,
+    Directive, DirectiveParse, InlineIgnoreContext, InlineIgnoreMode, InlineOutcome, Line,
+    MalformedReason, Reason, RuleId, SuppressionCounts, WeakReason,
 };
 pub(crate) use types::{LineSpan, RawFinding, has_marker, rows_intersect, valid_directives};
 pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores};
@@ -31,7 +31,7 @@ pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores}
 #[cfg(test)]
 pub(crate) use parse::parse_comment_line;
 #[cfg(test)]
-pub use scan::scan_directives;
+pub(crate) use scan::scan_directives;
 #[cfg(test)]
 pub use types::Scanned;
 #[cfg(test)]

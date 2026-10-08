@@ -4,7 +4,7 @@ use super::rules::{did_you_mean, has_owner, known_rule, owner_matches, rule_matc
 use super::types::*;
 
 /// Row of the raw finding `rule` answers to that lies nearest `from` (earlier row on a tie).
-pub(crate) fn nearest_finding_line(rule: &RuleId, raw: &[RawFinding], from: Line) -> Option<Line> {
+fn nearest_finding_line(rule: &RuleId, raw: &[RawFinding], from: Line) -> Option<Line> {
     raw.iter()
         .filter(|f| rule_matches(rule, &f.checker, &f.message))
         .map(|f| f.line)

@@ -1,9 +1,12 @@
 //! Directive data model: lines, rule ids, reasons, directives, and the outcomes a check carries.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::scan::ScanMemo;
 use crate::config::Severity;
 
 pub(crate) const MARKER: &str = "kibitzer:ignore";
@@ -97,6 +100,16 @@ pub enum ReasonError {
     Weak(WeakReason),
 }
 
+impl std::fmt::Display for ReasonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReasonError::Blank => f.write_str("blank"),
+            ReasonError::Weak(WeakReason::TooShort) => f.write_str("too short"),
+            ReasonError::Weak(WeakReason::RuleEcho) => f.write_str("repeats the rule id"),
+        }
+    }
+}
+
 /// The justification after ` -- `. The constructor enforces a mechanical floor: not blank,
 /// not an echo of a listed rule id, and more than one word. It stops `-- needed`, not a
 /// determined two-word lie.
@@ -139,7 +152,7 @@ impl TryFrom<String> for Reason {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, String> {
-        Reason::new(&text, &[]).map_err(|err| format!("invalid reason {text:?}: {err:?}"))
+        Reason::new(&text, &[]).map_err(|err| format!("invalid reason {text:?}: {err}"))
     }
 }
 
@@ -341,4 +354,66 @@ impl LineSpan {
 
 pub(crate) fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
     d.span().intersects(ranges)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InlineIgnoreMode {
+    #[default]
+    Apply,
+    /// Raw findings: used by `--no-inline-ignores` and the unused-ignore rerun.
+    Disabled,
+}
+
+/// Findings dropped inline in one run, of which from a blocking check.
+#[derive(Debug, Default)]
+pub struct SuppressionCounts {
+    pub total: AtomicUsize,
+    pub blocking: AtomicUsize,
+}
+
+impl SuppressionCounts {
+    /// Repo-wide summary line, so 1-4 ignores per file across many files still add up to a
+    /// visible total; `None` when nothing was suppressed.
+    pub fn footer(&self) -> Option<String> {
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        let blocking = self.blocking.load(Ordering::Relaxed);
+        let noun = if total == 1 { "finding" } else { "findings" };
+        let blocking_part = if blocking > 0 {
+            format!(" ({blocking} from blocking checks)")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "[kibitzer] {total} {noun} suppressed inline{blocking_part} (rerun with --no-inline-ignores to see them)"
+        ))
+    }
+}
+
+/// How one run applies inline ignores. Cloning shares the counter and memo.
+#[derive(Debug, Clone, Default)]
+pub struct InlineIgnoreContext {
+    pub mode: InlineIgnoreMode,
+    pub counter: Option<Arc<SuppressionCounts>>,
+    pub scan_memo: Arc<ScanMemo>,
+}
+
+impl InlineIgnoreContext {
+    pub fn disabled() -> Self {
+        InlineIgnoreContext {
+            mode: InlineIgnoreMode::Disabled,
+            ..Default::default()
+        }
+    }
+
+    /// Same mode, no counter and a fresh memo: a HEAD-baseline replay scans different
+    /// content for the same path and must neither be counted nor evict the live entry.
+    pub fn without_counter(&self) -> Self {
+        InlineIgnoreContext {
+            mode: self.mode,
+            ..Default::default()
+        }
+    }
 }

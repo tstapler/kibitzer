@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn inline_ignore_should_ScanOnce_When_CheckerAndIgnorePassShareTheMemo() {
-        use crate::inline_ignores::{InlineIgnoreContext, apply_inline_ignores};
+        use crate::inline_ignores::{IgnoreTarget, InlineIgnoreContext, apply_inline_ignores};
         use std::sync::atomic::Ordering;
         let src =
             "package main\n\n// kibitzer:ignore flag-arg -- legacy api pinned\nfunc f(b bool) {}\n";
@@ -212,10 +212,12 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         apply_inline_ignores(
             findings,
-            path,
-            src,
-            NAME,
-            crate::config::Severity::Advisory,
+            IgnoreTarget {
+                file: path,
+                source: src,
+                checker_name: NAME,
+                severity: crate::config::Severity::Advisory,
+            },
             &ctx,
         );
         // Both the checker and the ignore pass asked the memo; only one parsed.
@@ -285,10 +287,12 @@ mod tests {
                 .unwrap();
         let applied = crate::inline_ignores::apply_inline_ignores(
             findings,
-            Path::new("x.go"),
-            src,
-            "syntax-rules",
-            crate::config::Severity::Advisory,
+            crate::inline_ignores::IgnoreTarget {
+                file: Path::new("x.go"),
+                source: src,
+                checker_name: "syntax-rules",
+                severity: crate::config::Severity::Advisory,
+            },
             &crate::inline_ignores::InlineIgnoreContext::default(),
         );
         assert!(applied.kept.is_empty(), "{:?}", applied.kept);
