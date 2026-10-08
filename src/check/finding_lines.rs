@@ -130,55 +130,59 @@ mod tests {
         assert_eq!(lines.visible(), vec![true, true]);
     }
 
-    /// A string literal repeated three times fires `replace-magic-literal` with a message
-    /// that itself spans lines; output must equal what text-level scoping produces.
+    const RUST_CHECKER: &str = "syntax-rules-rust";
+
+    /// Two string literals, each repeated three times, each with a newline inside: two
+    /// `replace-magic-literal` findings whose messages span lines.
+    fn multiline_literals_source() -> String {
+        let body = |lit: &str| format!("fn f() {{\n    let x = {lit};\n}}\n");
+        let (lit1, lit2) = ("\"one\ntwo words\"", "\"three\nfour words\"");
+        [lit1, lit1, lit1, lit2, lit2, lit2]
+            .iter()
+            .map(|lit| body(lit))
+            .collect()
+    }
+
+    fn rust_check() -> crate::config::Check {
+        crate::config::Check {
+            name: RUST_CHECKER.to_string(),
+            command: None,
+            checker: Some(RUST_CHECKER.to_string()),
+            architecture_checker: None,
+            severity: crate::config::Severity::Advisory,
+            scope: vec![],
+            triggers: vec![],
+            message: None,
+            output_format: None,
+            options: None,
+        }
+    }
+
+    /// Output must equal what text-level scoping produces, even when a message spans lines.
     #[test]
     fn run_native_check_should_MatchTextScoping_When_MessageSpansLines() {
         use crate::check::{
             NativeRun, run_checker_against_file, run_native_check, scope_output_to_changed_lines,
         };
-        use crate::config::{Check, Severity};
+        use crate::config::Severity;
         use crate::run_context::RunContext;
         let dir = std::env::temp_dir().join(format!("kibitzer-multiline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.rs");
-        let (lit1, lit2) = ("\"one\ntwo words\"", "\"three\nfour words\"");
-        let body = |lit: &str| format!("fn f() {{\n    let x = {lit};\n}}\n");
-        let source = format!(
-            "{}{}{}{}{}{}",
-            body(lit1),
-            body(lit1),
-            body(lit1),
-            body(lit2),
-            body(lit2),
-            body(lit2)
-        );
-        std::fs::write(&file, &source).unwrap();
+        std::fs::write(&file, multiline_literals_source()).unwrap();
         let ctx = crate::inline_ignores::InlineIgnoreContext::default();
         let run = NativeRun {
-            checker_name: "syntax-rules-rust",
+            checker_name: RUST_CHECKER,
             options: None,
             severity: Severity::Advisory,
             inline_ctx: &ctx,
         };
         let raw = run_checker_against_file(run, &file).unwrap();
         assert!(raw.combined.contains('\n'), "{:?}", raw.combined);
-        let check = Check {
-            name: "syntax-rules-rust".to_string(),
-            command: None,
-            checker: Some("syntax-rules-rust".to_string()),
-            architecture_checker: None,
-            severity: Severity::Advisory,
-            scope: vec![],
-            triggers: vec![],
-            message: None,
-            output_format: None,
-            options: None,
-        };
         let ranges = [(14usize, 14usize)];
         let result = run_native_check(
-            &check,
-            "syntax-rules-rust",
+            &rust_check(),
+            RUST_CHECKER,
             &dir,
             &file,
             Some(&ranges),

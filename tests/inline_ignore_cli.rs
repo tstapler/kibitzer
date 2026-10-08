@@ -289,7 +289,10 @@ fn directive_diagnostics(stdout: &str) -> Vec<&str> {
 fn kibitzer_run_should_NotSuppressOrReport_When_MarkerOnlyInStringLiteralsOfOwnRepo() {
     let dir = temp_dir("self-run");
     for rel in [
-        "src/inline_ignores.rs",
+        "src/inline_ignores/types.rs",
+        "src/inline_ignores/parse.rs",
+        "src/inline_ignores/hint.rs",
+        "src/inline_ignores/tests.rs",
         "src/checkers/inline_ignore.rs",
         "src/hook.rs",
         "src/inline_post_pass.rs",

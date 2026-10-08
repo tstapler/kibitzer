@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::check::CheckResult;
 use crate::config::Severity;
 use crate::daemon::run_checks_smart;
-use crate::inline_ignores::{Line, RuleId, syntax_hint, syntax_hint_limited};
+use crate::inline_ignores::{HINT_RULE_LIMIT, Line, RuleId, syntax_hint, syntax_hint_limited};
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -298,7 +298,7 @@ fn advisory_footer_within(
     }
     let last = TRIM_ORDER[TRIM_ORDER.len() - 1];
     let mut footer = render_footer(last, &full_hint);
-    for limit in (1..rule_ids.len().min(6)).rev() {
+    for limit in (1..rule_ids.len().min(HINT_RULE_LIMIT)).rev() {
         footer = render_footer(last, &syntax_hint_limited(path, anchor, rule_ids, limit));
         if footer.chars().count() <= max_chars {
             break;

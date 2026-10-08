@@ -65,7 +65,7 @@ The requirements ask for: syntax, shared-path filtering, malformed error, false-
 | Term | Definition | Notes |
 |------|-----------|-------|
 | `Line` | 1-based line number newtype (`NonZeroUsize`); the only row type `Directive` and `covers` accept | Converted from tree-sitter's 0-based `start_position().row` at the single scan boundary; `Finding.line == 0` is normalized to `Line(1)` in its one constructor |
-| `Directive` | One parsed ignore comment: kind, non-empty rules, reason, `start_line`/`end_line` (`Line`), `whole_line: bool` (no code precedes the comment on its start row) | Struct in `src/inline_ignores.rs` |
+| `Directive` | One parsed ignore comment: kind, non-empty rules, reason, `start_line`/`end_line` (`Line`), `whole_line: bool` (no code precedes the comment on its start row) | Struct in `src/inline_ignores/` |
 | `Scanned` | `(Line, DirectiveParse)` pair returned by `scan_directives` | Defined next to `Directive` |
 | `DirectiveKind` | REMOVED by Amendment 1 (single marker) | Do not create the type; drop `kind` from `Directive` and `DroppedFinding` |
 | `RuleId` | Rule a directive names; must match `[a-z0-9-]+` (so a doc-comment placeholder like `<rule>` is not a directive). Matches a finding when it equals the finding's checker name, or equals the leading `[x]` prefix and the checker is not in `DYNAMIC_PREFIX_CHECKERS` (see Story 1.2.2) | Newtype over `String`; matching lives in `inline_ignores`, `accepted_findings::extract_rule` (`src/accepted_findings.rs:105`) is not changed |
@@ -95,7 +95,7 @@ The requirements ask for: syntax, shared-path filtering, malformed error, false-
 | Approach | Strength | Weakness |
 |----------|----------|----------|
 | A. Extend text-based `filter_accepted` | Reuses existing path; one filter site | Has no source or tree; would re-read the file and regex-scan raw text (string-literal false matches); finds are already flattened |
-| B. New pure module `inline_ignores.rs` at `run_checker_against_source`, over structured `Vec<Finding>` | Source and findings both in hand; tree-sitter comment nodes defeat string matches; one call site covers hook/MCP/run/daemon/LSP and the HEAD baseline | Needs its own (second) parse when a marker is present |
+| B. New pure module `inline_ignores/` at `run_checker_against_source`, over structured `Vec<Finding>` | Source and findings both in hand; tree-sitter comment nodes defeat string matches; one call site covers hook/MCP/run/daemon/LSP and the HEAD baseline | Needs its own (second) parse when a marker is present |
 | C. Each checker filters its own findings | Anchors exact per checker | ~30 checkers touched; every new checker must remember |
 
 **Chosen: B.** The second parse only happens when `source.contains("kibitzer")` is true, so hook-path cost is a substring search.
@@ -123,7 +123,7 @@ The requirements ask for: syntax, shared-path filtering, malformed error, false-
 
 | Area | Existing Issue | Disposition | Justification |
 |------|----------------|--------------|----------------|
-| `src/check.rs` (3043 lines, ~25 fns) | Large; `run_native_check`/`run_checker_against_source` is the natural but crowded filter site | Isolate via seam | Pure logic lives in `src/inline_ignores.rs`; hook-side post-pass logic lives in `src/inline_post_pass.rs` (Task 2.2.0a). `check.rs` gains one call in `run_checks_for_trigger`, a context argument, a severity argument, a `SourceCheck` return struct, the shown-findings computation in `run_native_check`, and `raw_findings_for_check` (Tasks 1.2.2b1a-b3, 2.2.0a, 2.2.3a) |
+| `src/check.rs` (3043 lines, ~25 fns) | Large; `run_native_check`/`run_checker_against_source` is the natural but crowded filter site | Isolate via seam | Pure logic lives in `src/inline_ignores/`; hook-side post-pass logic lives in `src/inline_post_pass.rs` (Task 2.2.0a). `check.rs` gains one call in `run_checks_for_trigger`, a context argument, a severity argument, a `SourceCheck` return struct, the shown-findings computation in `run_native_check`, and `raw_findings_for_check` (Tasks 1.2.2b1a-b3, 2.2.0a, 2.2.3a) |
 | `src/accepted_findings.rs` `extract_rule` (:105, private) | Rule namespace logic private to one module | Leave unchanged | Inline matching has its own `rule_matches` (it must treat `markdown-link-integrity` ref-id prefixes differently); `accepted/` behavior is untouched |
 | `src/checkers/comment_quality.rs` `comment_kinds` (:173, private) | Needed by a second consumer; widening it would make `inline_ignores` depend on one checker while `comment_quality` depends back on `inline_ignores::is_directive_comment` | Move | Move `comment_kinds` to `src/tree_walk.rs` (shared, next to `walk_preorder`); `comment_quality` and `inline_ignores` both depend downward on it. `comment_quality` gains only a skip for `kibitzer:` comments |
 | `src/mcp.rs` (3350 lines), `src/hook.rs` | Large | Extend as-is | Only a footer string and one instruction sentence (text edits, no new logic) |
@@ -305,28 +305,28 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* a comment on tree-sitter row 6 (0-based), *When* scanned, *Then* `start_line == Line(7)`.
 - `whole_line` is recorded.
   - *Given* `x := f() // kibitzer:ignore a -- b`, *When* scanned, *Then* `whole_line == false`; for a comment alone on its line, `true`.
-**Files**: `src/inline_ignores.rs`, `src/tree_walk.rs`, `src/checkers/comment_quality.rs`, `src/main.rs`
+**Files**: `src/inline_ignores/`, `src/tree_walk.rs`, `src/checkers/comment_quality.rs`, `src/main.rs`
 
 ##### Task 1.1.1a: Module skeleton and visibility (~0.5h)
-- Create `src/inline_ignores.rs` with `Line` (1-based newtype), `Directive` (non-empty `rules`, constructor-checked), `DirectiveKind`, `RuleId` (`[a-z0-9-]+`), `Reason` (validating `new`), `DirectiveParse`, `MalformedReason`, `Scanned`.
+- Create `src/inline_ignores/` with `Line` (1-based newtype), `Directive` (non-empty `rules`, constructor-checked), `DirectiveKind`, `RuleId` (`[a-z0-9-]+`), `Reason` (validating `new`), `DirectiveParse`, `MalformedReason`, `Scanned`.
 - Add `mod inline_ignores;` where sibling modules are declared (`src/main.rs`).
 - Move `fn comment_kinds` (`src/checkers/comment_quality.rs:173`) to `src/tree_walk.rs` as `pub(crate)` and update `comment_quality` to call it there (pure move, no behavior change); this avoids an `inline_ignores` <-> `comment_quality` cycle.
-- Files: `src/inline_ignores.rs`, `src/main.rs`, `src/tree_walk.rs`, `src/checkers/comment_quality.rs`
+- Files: `src/inline_ignores/`, `src/main.rs`, `src/tree_walk.rs`, `src/checkers/comment_quality.rs`
 
 ##### Task 1.1.1b: Directive line grammar (~1.5h)
 - `parse_comment_line(text: &str) -> DirectiveParse`: strip leading `//`, `///`, `//!`, `#`, `/*`, `/**`, `*`, `<!--` and trailing `*/`, `-->`; match `^kibitzer:ignore\s+RULES\s+--\s+REASON$` with `regex` (already a dep); detect near-miss `^kibitzer\s*:\s*(ignore|disable|allow|suppress|false[-_ ]positive)` (anchored to the start of the stripped text, same position as the exact form) that is not exact. Detect `NotAtCommentStart` with the same exact-grammar regex unanchored (`\bkibitzer:(ignore|false-positive)\s+RULES\s+--\s+\S`) run only when the anchored forms did not match, so a prose mention without a rule list and ` -- ` stays `NotADirective`. Trim CR and tabs.
 - Unit tests: valid, comma list, missing rule, missing reason, empty reason after `--`, near-miss, CRLF, tabs, em dash and en dash separators are `Malformed(EmDashSeparator)` (never `MissingReason`), rule-list edge cases (`a,b`, `a,a`, `a, b`, `a,,b`, `a,`), negative prose mentions (`// see kibitzer: allow list`, `// the kibitzer:ignore syntax ...`), rustdoc placeholder `/// kibitzer:ignore <rule> -- <why>`, and the not-at-start positives (`// TODO kibitzer:ignore x -- why here`, `// legacy: kibitzer:ignore x -- why here`) which return `Malformed(NotAtCommentStart)`.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ##### Task 1.1.1c: Tree-sitter comment scan (~1.5h)
 - `scan_code_comments(lang: Language, tree: &Tree, source: &str) -> Vec<(row, DirectiveParse)>` using `crate::tree_walk::comment_kinds(lang)` and `crate::tree_walk::walk_preorder`; split block-comment text per line and compute each line from `comment.start_position().row + 1` (single 0-based to `Line` conversion). Set `whole_line` by checking that only whitespace precedes the comment on its start row.
 - Table-driven test, one fixture per `Language::ALL` (`src/checker.rs:42`), plus the string-literal negative case. Use `GrammarCache::new().parse`.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ##### Task 1.1.1d: `Reason` minimum-quality rule (~0.5h)
 - `Reason::new(text, rules: &[RuleId]) -> Result<Reason, WeakReason>` rejects: empty/blank (that is `MissingReason`), text equal to any listed rule id after lowercasing and folding `-`/`_`/space (`WeakReason::RuleEcho`, tested first), and a single whitespace-separated word (`WeakReason::TooShort`). `parse_comment_line` maps each kind to its own message: `TooShort` -> `[ignore-syntax] reason 'needed' is too short to explain the code. Write: kibitzer:ignore flag-argument -- <the concrete constraint that makes this code acceptable>`; `RuleEcho` -> `[ignore-syntax] reason repeats the rule id instead of saying why the code is acceptable. Write: kibitzer:ignore flag-argument -- <the concrete constraint that makes this code acceptable>`. Neither message states a word count: the two-word floor is a mechanical check, and the message asks for the constraint (what pins the code, e.g. "callers pinned by public API") so an agent does not satisfy the floor with `-- legacy code`. A weak-reason directive never suppresses.
 - Tests: `-- needed` is `TooShort`; `-- flag-argument`, `-- Flag Argument` and a two-word echo are `RuleEcho`; `-- legacy API, callers pinned` accepted; the two messages differ, neither contains `at least two words`, both contain `concrete constraint`, no em dash. Acceptance: Story 1.1.1 AC above.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 #### Story 1.1.2: Markdown and fallback comment scanning
 **As a** doc author, **I want** `<!-- kibitzer:ignore ... -->` honored in Markdown but not in code fences, **so that** `docs/suppressing-checks.md` showing the syntax suppresses nothing.
@@ -339,16 +339,16 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* a `.sh` file line `# kibitzer:ignore file-size -- vendored`, *When* scanned, *Then* one `Directive`; *Given* `echo "# kibitzer:ignore a -- b"`, *Then* zero.
 - Files without the substring `kibitzer` skip all parsing.
   - *Given* source of 10,000 lines with no `kibitzer`, *When* `scan_directives` is called, *Then* it returns empty without constructing a parser (unit test asserts via a `GrammarCache` that was never used, or timing under the Task 4.1.1c budget).
-**Files**: `src/inline_ignores.rs`
+**Files**: `src/inline_ignores/`
 
 ##### Task 1.1.2a: Markdown scan (~1.5h)
 - `scan_markdown(source)` with `pulldown_cmark::Parser::new_ext(..).into_offset_iter()`; consider `Event::Html`/`InlineHtml` whose text is an HTML comment; skip content inside `Tag::CodeBlock`; row from byte offset. Reuse the options the existing markdown checker uses (`src/checkers/markdown_link_integrity.rs:5`).
 - Tests: top-level comment, inline trailing comment in a table row, fenced negative, indented code block negative.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ##### Task 1.1.2b: Fallback and dispatcher (~1.5h)
 - `scan_leading_comments(source)` regex `^\s*(?://|#|;|--)\s*kibitzer:`; `scan_directives(path, source) -> Vec<Scanned>` dispatching by `Language::for_path` (`src/checker.rs:104`) / `.md` / fallback, with the `source.contains("kibitzer")` fast path first. `scan_directives_memoized(ctx, path, source) -> Arc<Vec<Scanned>>` wraps it with the `ScanMemo` owned by `InlineIgnoreContext` (single entry keyed by `(path, content hash)`; a different path or hash replaces it; increments `scans` only on a real scan). The ~30 per-checker calls on one file share one parse because they run consecutively against the same context. No `static`/`thread_local`.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ### Epic 1.2: Matching and application at the seam
 **Goal**: Drop covered findings before they are flattened to text, for every entry point.
@@ -376,19 +376,19 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* `// kibitzer:ignore ignore-syntax -- x` and an `[ignore-syntax]` finding on the next line, *When* applied, *Then* the finding stays.
 - Finding line 0 is normalized to 1 (in the `Line` constructor).
   - *Given* a finding at line 0 and a directive on line 1, *When* `covers`, *Then* true.
-**Files**: `src/inline_ignores.rs`, `src/checkers/complexity.rs` (read only), `src/checkers/markdown_link_integrity.rs` (read only)
+**Files**: `src/inline_ignores/`, `src/checkers/complexity.rs` (read only), `src/checkers/markdown_link_integrity.rs` (read only)
 
 ##### Task 1.2.1a: `covers` and `FILE_SCOPE_RULES` (~1h)
 - `fn rule_matches(directive_rule: &RuleId, checker_name: &str, message: &str) -> bool` per Design Decision 10 (checker name, or leading `[x]` prefix unless `checker_name` is in `DYNAMIC_PREFIX_CHECKERS`); `covers(d: &Directive, finding_line: Line, rule_match: bool) -> bool` with the `whole_line` +1 rule; consts `FILE_SCOPE_RULES = ["file-size", "file-complexity"]`, `FILE_HEAD_LINES = 10`, `META_RULES`, `DYNAMIC_PREFIX_CHECKERS = ["markdown-link-integrity"]`.
 - Unit tests per bullet above, including the trailing-comment and `markdown-link-integrity` cases.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ##### Task 1.2.1b: Anchor conformance test over every default checker (~7h, re-estimated from 3h: about 30 fixtures that make the real checker fire, each needing trial and error, plus a completeness guard)
 - Replaces the hand-picked set. A table-driven test iterates every native per-file checker in `config::default_checks()` (excluding `inline-ignore` itself, which emits only meta rules). For each it needs a fixture source that makes the real checker fire (`run_checker_configured`, real output, not a hand-built `Finding`); fixtures live in one table `ANCHOR_FIXTURES: &[(checker_name, path, source)]`. For each finding the checker reports at line N, the test builds two variants of the source, a whole-line directive on row N-1 and a trailing/same-row directive on row N (head-of-file variants for `FILE_SCOPE_RULES`), runs `apply_inline_ignores`, and asserts that finding is dropped.
 - Completeness guard: a second test asserts every checker name in `default_checks()` either has an `ANCHOR_FIXTURES` entry or is listed in `ANCHOR_EXEMPT` with a reason string (meta checker, no per-file anchor). Adding a default checker without a fixture or an exemption fails the build, which is the point (agents must be able to place the comment on the first try for every checker).
 - A checker whose finding cannot be covered by either variant fails the test; the fix is to document the exception in the Story 1.2.1 anchor table and the head-of-file convention, not to skip it.
 - Keep the awkward-anchor cases from Story 1.2.1 as explicit extra rows (`file-size`, `file-complexity` per-function, `duplicate-code` last occurrence, `duplicate-code-cross-file` per file, `comment-quality-go`, reference-style `markdown-link-integrity`). Use `src/test_support.rs` helpers where they fit.
-- Files: `src/inline_ignores.rs`, `src/test_support.rs` (read)
+- Files: `src/inline_ignores/`, `src/test_support.rs` (read)
 
 #### Story 1.2.2: Apply at `run_checker_against_source`
 **As an** agent, **I want** one comment to dismiss a finding in hook, MCP, `run`, daemon, and LSP output, **so that** I stop re-triaging it.
@@ -415,18 +415,18 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* a blocking-check finding covered by a valid directive at rows 4-4, *When* `apply_inline_ignores` runs, *Then* `AppliedIgnores.dropped` has one `DroppedFinding` with `directive_start == directive_end == Line(4)`, the rule, the kind, the reason, and `severity == Blocking`; `kept` excludes the finding. Story 3.1.2 and the counters consume this; no later signature change.
 - Zero regression for `accepted/`.
   - *Given* the existing `accepted_findings.rs` tests and an `accepted/` entry matching a finding with no inline directive, *When* `cargo test accepted`, *Then* all pass unchanged.
-**Files**: `src/inline_ignores.rs`, `src/check.rs`, `src/accepted_findings.rs`
+**Files**: `src/inline_ignores/`, `src/check.rs`, `src/accepted_findings.rs`
 
 ##### Task 1.2.2a: `apply_inline_ignores` (~1h)
 - `pub(crate) fn apply_inline_ignores(findings: Vec<Finding>, file: &Path, source: &str, checker_name: &str, severity: Severity, ctx: &InlineIgnoreContext) -> AppliedIgnores`: return `AppliedIgnores { kept: findings, dropped: vec![] }` immediately when `findings` is empty, when `ctx.mode == Disabled`, or when `source` lacks `kibitzer` (all three before any hashing or locking); otherwise `scan_directives_memoized(ctx, ..)` and, for each `Valid` directive, move findings where `rule_matches` and `covers` into `dropped` as `DroppedFinding`; add the number dropped to `ctx.counter` if present (`total`; also `blocking` when `severity == Blocking`). The return type is fixed here so Tasks 1.2.2b1b/b2 and 3.1.2a do not re-edit the signature.
 - Also here: `fn anchor_rule(checker_name: &str, finding: &Finding) -> RuleId` (the leading `[x]` prefix unless `checker_name` is in `DYNAMIC_PREFIX_CHECKERS`, else the checker name), shared by `rule_matches` and the hook hint (Task 3.1.1b).
 - No change to `accepted_findings::extract_rule` (`src/accepted_findings.rs:105`) or `accepted/` behavior.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ##### Task 1.2.2b1a: Add `inline` to `CheckResult` and fix every literal (~1h)
 - Add `pub inline: InlineOutcome` to `CheckResult` (`src/check.rs:31`) with `#[serde(default)]` (serialized; see Task 1.2.2b1c) and the `InlineOutcome`/`DroppedFinding` types (derive `Serialize`/`Deserialize`, plus `RuleId`, `Line`, `Reason`, `DirectiveKind`). `CheckResult` has no `Default`, so every struct literal gets `inline: InlineOutcome::default()`. Recounted with `grep -nE 'CheckResult\s*\{' src` (minus struct/impl/fn signature lines): 16 literals in 4 files: `src/check.rs` 10 (:101 test helper, :216, :235, :261, :329, :439, :460, :512, :1167, :1237), `src/cache.rs` 4 (:195, :284, :360, :368, all tests), `src/hook.rs` 1 (:250, test), `src/lsp.rs` 1 (:580, test). The earlier "23 sites in check.rs" claim was wrong.
 - Mechanical, compiles on its own; no behavior change. Test: the existing suite passes unchanged.
-- Files: `src/check.rs`, `src/cache.rs`, `src/hook.rs`, `src/lsp.rs`, `src/inline_ignores.rs` (5 files, at the limit; the three non-check files are one-line test-literal edits)
+- Files: `src/check.rs`, `src/cache.rs`, `src/hook.rs`, `src/lsp.rs`, `src/inline_ignores/` (5 files, at the limit; the three non-check files are one-line test-literal edits)
 
 ##### Task 1.2.2b1b: Context, seam, and shown-findings outcome (~4.5h, re-estimated from 2.5h; Tasks 1.2.2b1a + 1.2.2b1b together are about 5.5h)
 - Add `InlineIgnoreContext` (default `Apply`, no counter, fresh `ScanMemo`) with `#[serde(skip)]` field `inline` on `AcceptedFindings` (`src/accepted_findings.rs:37`); the struct literal `Ok(AcceptedFindings { accepted })` at `:100` becomes `..Default::default()`. Extend `run_checker_against_source` (`src/check.rs:549`, returns `anyhow::Result<(String, bool)>` today) and `run_checker_against_file` (:576) with a `&InlineIgnoreContext` argument and a `severity` argument (placeholder passed through; real threading is Task 1.2.2b2); call `apply_inline_ignores` between `run_checker_configured` and the text flatten. The return becomes `SourceCheck { combined, passed, findings, inline }` (glossary; 4 callers), where `findings` is the kept `Vec<Finding>` (the structured data path; nothing downstream parses text).
@@ -468,8 +468,8 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 **Files**: `src/checkers/comment_quality.rs`, `src/markdown_text.rs`
 
 ##### Task 1.3.1a: Skip in comment-quality (~1h)
-- Add `fn is_directive_comment(text) -> bool` (stripped text starts with `kibitzer:`) in `inline_ignores.rs` (`comment_quality` depends on it; `inline_ignores` no longer depends on `comment_quality` since `comment_kinds` moved to `tree_walk.rs`); skip such nodes in the `check` loop (`comment_quality.rs:~233-244`), `collect_comment_rows`/`leading_comment_rows` used by `check_proportionality` (`:643-700`). Tests per the three comment-quality ACs.
-- Files: `src/checkers/comment_quality.rs`, `src/inline_ignores.rs`
+- Add `fn is_directive_comment(text) -> bool` (stripped text starts with `kibitzer:`) in `inline_ignores/` (`comment_quality` depends on it; `inline_ignores` no longer depends on `comment_quality` since `comment_kinds` moved to `tree_walk.rs`); skip such nodes in the `check` loop (`comment_quality.rs:~233-244`), `collect_comment_rows`/`leading_comment_rows` used by `check_proportionality` (`:643-700`). Tests per the three comment-quality ACs.
+- Files: `src/checkers/comment_quality.rs`, `src/inline_ignores/`
 
 ##### Task 1.3.1b: Markdown prose exemption (~0.5h)
 - Read how `src/markdown_text.rs` handles HTML; strip directive HTML comments if it does not. Add a before/after-equality test.
@@ -510,12 +510,12 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* a binary file (PNG header bytes) and an invalid-UTF-8 `.go` file in a walked directory, *When* `kibitzer run <dir>` runs, *Then* no `inline-ignore` failure or output line appears for either, exit status is unaffected, and no other checker's read-error behavior changed.
 - Scope is narrow.
   - *Given* `default_checks()`, *When* the `inline-ignore` entry is read, *Then* its globs are the `Language::ALL` extensions plus `*.md`, not `**/*`.
-**Files**: `src/checkers/inline_ignore.rs`, `src/checkers/mod.rs`, `src/config.rs`, `src/check.rs`, `src/inline_ignores.rs`
+**Files**: `src/checkers/inline_ignore.rs`, `src/checkers/mod.rs`, `src/config.rs`, `src/check.rs`, `src/inline_ignores/`
 
 ##### Task 2.1.1a: Checker skeleton and rule table (~1.5h)
 - New `src/checkers/inline_ignore.rs` implementing `Checker` (`name() == "inline-ignore"`, `language() == None`, globs = `Language::ALL` extensions plus `*.md`, advisory), registered like its siblings with `inventory::submit!`; `pub mod inline_ignore;` in `src/checkers/mod.rs`. The checker body works on the `source` it is handed; the non-UTF-8 guard is in `run_checker_against_file` (Task 1.2.2b3).
-- In `inline_ignores.rs`: `KNOWN_RULES` (comment-quality ids, syntax-rules ids from `src/checkers/rules.rs`, `file-size`, etc.), `known_rule(rule) -> bool` = `KNOWN_RULES` plus `crate::checker::registry()` names (`src/checker.rs:178`; build the registry name set once per scan, not per call); small in-file Levenshtein for `did_you_mean`. Used only for unknown-rule/suggestion reporting, never to decide suppression. Optional later refinement (not in scope): a `Checker::rule_ids()` method so the table derives from the registry.
-- Files: `src/checkers/inline_ignore.rs`, `src/checkers/mod.rs`, `src/inline_ignores.rs`
+- In `inline_ignores/`: `KNOWN_RULES` (comment-quality ids, syntax-rules ids from `src/checkers/rules.rs`, `file-size`, etc.), `known_rule(rule) -> bool` = `KNOWN_RULES` plus `crate::checker::registry()` names (`src/checker.rs:178`; build the registry name set once per scan, not per call); small in-file Levenshtein for `did_you_mean`. Used only for unknown-rule/suggestion reporting, never to decide suppression. Optional later refinement (not in scope): a `Checker::rule_ids()` method so the table derives from the registry.
+- Files: `src/checkers/inline_ignore.rs`, `src/checkers/mod.rs`, `src/inline_ignores/`
 
 ##### Task 2.1.1b: Messages (~0.5h)
 - Render each `MalformedReason` per the ACs, including the dedicated `EmDashSeparator` and `BadRuleList` messages and the near-match-only `UnknownRule` rule; tests for each, including that no message contains an em dash and that `EmDashSeparator` never renders the missing-reason text.
@@ -524,7 +524,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 ##### Task 2.1.1c: Default-on and drift guard (~1h)
 - Make `Language::extensions` (`src/checker.rs:82`, currently private) `pub(crate)` so `config.rs` can build the glob list (or add a `Language::all_globs()` helper in `checker.rs`). Add `native_check("inline-ignore", Severity::Advisory, <Language::ALL extension globs + "**/*.md">)` to `config::default_checks()` (pattern at `src/config.rs:~782`); add the drift-guard test described above and the binary-file test (Task 1.2.2b3); update the config default-catalog test if one enumerates names. Docs note that `kibitzer check native <name> <file>` (`src/main.rs:384`) runs a checker directly and so bypasses inline ignores (intended for the corpus workflow).
 - `KNOWN_RULES` staleness mitigation: it is advisory only (never gates suppression), so drift costs at most a spurious or missing "did you mean"; the drift-guard test is the backstop, and the unknown-rule finding is emitted only when a near match (edit distance <= 2) exists (pre-mortem #3).
-- Files: `src/config.rs`, `src/checker.rs`, `src/inline_ignores.rs`
+- Files: `src/config.rs`, `src/checker.rs`, `src/inline_ignores/`
 
 #### Story 2.1.2: Volume guardrail (not cuttable, see Scope cut order)
 **As a** maintainer, **I want** heavy ignore use in one file to be visible, **so that** blanket silencing shows up.
@@ -595,11 +595,11 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* a file over `MAX_NATIVE_CHECK_BYTES` (`src/check.rs:572`) or a check excluded by trigger, *When* `kibitzer run`, *Then* no `[unused-ignore]` for rules that checker owns. The "ran" set comes from the first (applied) pass, not from config alone.
 - `markdown-link-integrity` ignores are judged by checker name.
   - *Given* a used `markdown-link-integrity` ignore (reference-style finding), *When* `kibitzer run`, *Then* no `[unused-ignore]`.
-**Files**: `src/inline_ignores.rs`, `src/run.rs`
+**Files**: `src/inline_ignores/`, `src/run.rs`
 
 ##### Task 2.2.2a: `unused_ignores` pure function (shared by Stories 2.2.2 and 2.2.3; stays in the committed slice) (~1.5h)
 - Pure `unused_ignores(directives: &[Directive], raw: &[RawFinding], ran_checkers: &[&str], only_rows: Option<&[(usize, usize)]>) -> Vec<Finding>`. `RawFinding { line: Line, checker, rule: RuleId, message }` (glossary) is built from structured findings by `raw_findings_for_check` (Task 2.2.3a); the function never sees or parses rendered text. Rule-to-checker ownership by `KNOWN_RULES` prefix plus exact checker names; rules with unknown ownership are not judged for "matches nothing" by this function (fail open here), but a rule that fails `known_rule` (neither a `KNOWN_RULES` id nor a registered checker name) is reported with the not-a-known-rule message pointing at `kibitzer check list`. The hook path covers unowned rules with the first-pass fallback in Task 2.2.3c, and `kibitzer run` covers them with Task 2.2.2e. Unit tests per AC, including `only_rows` filtering.
-- Files: `src/inline_ignores.rs`
+- Files: `src/inline_ignores/`
 
 ##### Task 2.2.2b: Run-path wiring (DEFERRED, follow-up PR) (~2h)
 - In `src/run.rs` per file with a `kibitzer` marker: `ran_checkers` is the set of `CheckResult.check_name` values from the first pass's `Vec<CheckResult>` (so a check skipped by size, trigger, or config never appears and its rules are not judged). Then call `raw_findings_for_check` (Task 2.2.3a) for exactly those checks: it returns structured `RawFinding`s from a `Disabled` context and never goes through `run_native_check`, so neither diff-scoping nor `drop_accepted_findings` (`src/check.rs:482-489`) can hide a finding that `accepted/` shadows, which keeps the "shadowed by `accepted/` is not unused" AC true without constructing a second `AcceptedFindings`. Judge with `unused_ignores` (same `rule_matches`/`covers` as the apply path), emit `[unused-ignore]` lines under check name `inline-ignore`. Only for `kibitzer run` (`changed_lines` is `None`, `src/run.rs:147`).
@@ -627,13 +627,13 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* the first AC's setup (directive at row 12, `changed_lines = Some(&[(12,12)])`, finding at row 20), *When* the post-pass runs, *Then* the advisory names row 20, which `scope_output_to_changed_lines` (`src/check.rs:473`) would have removed from any text-level result. Asserted by a test that also asserts the first-pass `combined` for the same call does not contain the row-20 finding.
 - Only owning checkers that ran are judged (same `ran_checkers` rule as Story 2.2.2); the raw rerun happens only when a directive row lies inside `changed_lines`.
   - *Given* an edit that touches no directive row, *Then* no raw rerun is performed (asserted via a rerun counter).
-**Files**: `src/inline_post_pass.rs`, `src/check.rs`, `src/inline_ignores.rs`
+**Files**: `src/inline_post_pass.rs`, `src/check.rs`, `src/inline_ignores/`
 
 ##### Task 2.2.3a: Hook-scoped unused judgement (~5h, re-estimated from 3.5h: raw-rerun orchestration, `ran_checkers`, and the structured raw path)
 - In `src/check.rs` add `pub(crate) fn raw_findings_for_check(check: &Check, file_path: &Path, source: &str) -> anyhow::Result<Vec<RawFinding>>`: it calls `run_checker_against_source` with `InlineIgnoreContext` in `Disabled` mode and no counter and returns `SourceCheck.findings` mapped to `RawFinding` (rule via `anchor_rule`). It **does not call `run_native_check`**, so the `changed_lines` scoping at `src/check.rs:473`, the `accepted/` drop at `:482`, and the HEAD baseline never apply: this is the "changed_lines = None" behavior, achieved by construction rather than by passing `None`. No text is parsed anywhere on this path (round-3 engineering gaps 1 and 2).
 - In `src/inline_post_pass.rs`: when `changed_lines` is `Some` and a directive from the shared `ScanMemo` has rows intersecting it, call `raw_findings_for_check` for the checks that own the directive's rules (owner by Task 2.2.2a; only checks present in the first pass's `CheckResult.check_name` set), pass the result to `unused_ignores(.., only_rows = changed_lines)`, add `nearest_finding_line` for the hint, and return the advisory as an `inline-ignore` result. Skipped entirely when no directive row is in `changed_lines`. This task also provides the changed-lines plumbing in the post-pass that Task 3.1.2a reuses (3.1.2a depends on Task 2.2.0a, not on this task).
 - Tests: the Story 2.2.3 ACs, the unscoped-raw-path assertion (row 20 found although `changed_lines = (12,12)`), rerun counter zero when no directive row changed.
-- Files: `src/check.rs`, `src/inline_post_pass.rs`, `src/inline_ignores.rs`
+- Files: `src/check.rs`, `src/inline_post_pass.rs`, `src/inline_ignores/`
 
 ##### Task 2.2.3d: Hook-latency measurement spike (~1h; runs right after 2.2.3a, before 2.2.3c and 2.2.3b build further)
 - Why here: the 150 ms and 2x budgets are INFERRED and were first measured at Task 4.1.1c, after all of Story 2.2.3 was built; a miss would force rework of a core story late. Measure now, while only 2.2.3a exists.
@@ -648,7 +648,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - Documented limit: an unowned rule whose checker ran, found nothing anywhere in the file, and is not named by a `ran_checkers` check name cannot be told apart from a typo, so it gets the not-a-known-rule wording (which names `kibitzer check list`, so a real id outside `KNOWN_RULES` is quickly recognized); the same case for an owned rule is judged via the rerun.
 - Logic lives in `src/inline_post_pass.rs` as `judge_unowned(directives, dropped, ran_checkers, kept, rows: Option<&[(usize, usize)]>)`; Task 2.2.2e reuses it with `rows = None`.
 - Tests (`src/inline_post_pass.rs`): (a) unowned rule, directive on the wrong row, a kept finding of that rule elsewhere in the file, including one outside `changed_lines`: advisory with the nearest row; (b) unowned rule, directive on the right row (appears in `dropped`): silent; (c) unowned rule, no surviving finding and no matching `ran_checkers` name: the not-a-known-rule advisory pointing at `kibitzer check list` (the documented limit, pinned so it cannot change unnoticed; asserts the text contains `kibitzer check list` and not `remove it`); (d) unowned rule equal to a ran check's name, nothing matched: advisory `suppresses nothing - remove it` (the rule is a real checker name, so "remove it" is the right repair).
-- Files: `src/inline_post_pass.rs`, `src/inline_ignores.rs`
+- Files: `src/inline_post_pass.rs`, `src/inline_ignores/`
 
 ##### Task 2.2.3b: Hook-path negative, rerun-counter, and latency-ratio tests (~1h; encode the Task 2.2.3d decision, so it is written after the spike)
 - Negative test (moved from the former Task 2.2.2c): diff-scoped runs produce no `[unused-ignore]` for directives outside `changed_lines`. Rerun counter: an edit touching no directive row performs zero raw reruns. Latency: assert the raw rerun's wall time for a marker file is at most 2x the same owning checkers' first-pass wall time (median of 5 runs, relative, not an absolute number; see Non-functional budgets).
@@ -686,11 +686,11 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* a blocking `markdown-link-integrity` finding in a file that also has a malformed `// kibitzer:ignore ...` directive (an `[ignore-syntax]` result), a misplaced added directive (`[unused-ignore]`), or a suppressed blocking finding (`[blocking-suppressed]`), *When* hook exits 2, *Then* stderr also contains each of those lines (every failing `inline-ignore` result is printed after the blocking results, whatever its severity), so the agent sees the repair in the same output. Test: `tests/hook_contract.rs`.
 - MCP instructions and `run_checks` output.
   - *Given* the MCP `get_info`, *When* instructions are read (`src/mcp.rs:1429-1440`), *Then* they mention `kibitzer:ignore`; *Given* `run_checks` returns >0 findings, *Then* the last line is the one-line syntax with the file's leader; with 0 findings it is absent.
-**Files**: `src/hook.rs`, `src/mcp.rs`, `src/inline_ignores.rs`, `src/check.rs`, `tests/hook_contract.rs`
+**Files**: `src/hook.rs`, `src/mcp.rs`, `src/inline_ignores/`, `src/check.rs`, `tests/hook_contract.rs`
 
 ##### Task 3.1.1a: `comment_leader(path)` and `syntax_hint(path)` (~0.5h)
-- In `inline_ignores.rs`: leader by `Language::for_path` (`src/checker.rs:104`) / `.md` / fallback `#`; `syntax_hint(path, anchor: Option<(&RuleId, Line)>, rule_ids: &[&RuleId])` renders the generic form when `anchor` is `None` and the compact exact-row form plus the `Rules:` list otherwise, per the Story 3.1.1 AC; unit tests, including a prefix-less first finding and a second prefix-less finding after a prefixed one. (Rule-id visibility is folded into this task and 3.1.1b; its hours are inside their figures.)
-- Files: `src/inline_ignores.rs`
+- In `inline_ignores/`: leader by `Language::for_path` (`src/checker.rs:104`) / `.md` / fallback `#`; `syntax_hint(path, anchor: Option<(&RuleId, Line)>, rule_ids: &[&RuleId])` renders the generic form when `anchor` is `None` and the compact exact-row form plus the `Rules:` list otherwise, per the Story 3.1.1 AC; unit tests, including a prefix-less first finding and a second prefix-less finding after a prefixed one. (Rule-id visibility is folded into this task and 3.1.1b; its hours are inside their figures.)
+- Files: `src/inline_ignores/`
 
 ##### Task 3.1.1b: Hook footer and blocking stderr (~2.5h)
 - Replace the footer text at `src/hook.rs:207-219` to include `syntax_hint` for the edited file. The anchor is `failures.first().inline.first_anchor()` and the rule list is the union of `rule_ids()` over `failures` (structured `InlineOutcome.shown`, populated in Task 1.2.2b1b after scoping and `accepted/`); `hook.rs` does not parse `output`. First step: assert the current footer text length is 423 characters in a test (the previous "about 480" was an estimate), then apply the Story 3.1.1 budget (whole footer at most 640, net added at most 215) and drop order. In the exit-2 branch (`src/hook.rs:192-204`) also print every failing result whose `check_name == "inline-ignore"` after the blocking results, and keep the `kibitzer:ignore` mention in the stderr line. Update existing footer tests (`src/hook.rs:~245`). Tests: footer length in the longest case, the budget drop order, and a `tests/hook_contract.rs` case that an `[ignore-syntax]` result appears in exit-2 stderr.
@@ -701,8 +701,8 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - Files: `src/mcp.rs`
 
 ##### Task 3.1.1d: Footer example parses as a directive (~0.5h)
-- Test `hook_footer_example_should_ParseAsValidDirective_When_PlaceholdersFilled` in `src/hook.rs` (or `inline_ignores.rs`): for each of Go, Python, Markdown, and Rust leaders, extract the example line from the rendered footer, fill `<rule>` and `<why>`, strip the leader, and assert `parse_comment_line` returns `Valid` of the right kind. This is the only automated check that the teaching surface teaches a form the parser accepts; adoption by real agents is measured separately (Task 4.1.1f).
-- Files: `src/hook.rs`, `src/inline_ignores.rs`
+- Test `hook_footer_example_should_ParseAsValidDirective_When_PlaceholdersFilled` in `src/hook.rs` (or `inline_ignores/`): for each of Go, Python, Markdown, and Rust leaders, extract the example line from the rendered footer, fill `<rule>` and `<why>`, strip the leader, and assert `parse_comment_line` returns `Valid` of the right kind. This is the only automated check that the teaching surface teaches a form the parser accepts; adoption by real agents is measured separately (Task 4.1.1f).
+- Files: `src/hook.rs`, `src/inline_ignores/`
 
 #### Story 3.1.2: Hook advisory when an added directive suppresses a blocking finding
 **As a** reviewer, **I want** the agent and the transcript to show each time a directive silences a blocking check, **so that** blocking checks cannot be quietly defeated (ADR-002).
@@ -714,11 +714,11 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - The advisory is not itself suppressible.
   - *Given* `kibitzer:ignore blocking-suppressed -- x y`, *Then* it stays (add `blocking-suppressed` to `META_RULES`).
 - No success acknowledgement (DEFERRED, round-3 UX gap 7). The hook stays silent on a passing run; an agent that wants to confirm an ignore works runs `kibitzer run <file>`. The ack line (about 40 tokens per edit, 1h) was cut as beyond the ask; revisit if the 30-day sample shows agents re-adding directives that already work.
-**Files**: `src/inline_post_pass.rs`, `src/inline_ignores.rs`
+**Files**: `src/inline_post_pass.rs`, `src/inline_ignores/`
 
 ##### Task 3.1.2a: Surface blocking suppressions (~1.5h)
 - Reads `CheckResult.inline.dropped` (the `DroppedFinding` list returned by `apply_inline_ignores` since Task 1.2.2a, filtered to `severity == Blocking`; no signature change). In `src/inline_post_pass.rs` (Task 2.2.0a; **not** `check.rs`), when `changed_lines` is `Some`, emit one `[blocking-suppressed]` advisory result (check name `inline-ignore`, severity Advisory) per such directive whose rows intersect `changed_lines`. `kibitzer run` already carries the repo-level count in its footer (Story 2.2.1). `META_RULES` gains `blocking-suppressed`. Depends on Tasks 1.2.2b2 and 2.2.0a only; it does not need Task 2.2.3a (the changed-lines plumbing lives in the post-pass module from 2.2.0a).
-- Files: `src/inline_post_pass.rs`, `src/inline_ignores.rs`
+- Files: `src/inline_post_pass.rs`, `src/inline_ignores/`
 
 ### Epic 3.2: False-positive worklist (DROPPED 2026-10-07)
 Dropped with the single-marker collapse (gate note `docs/backtest-triage/inline-ignore-gate.md`, Task 0.1.2: class (c) 0 of 4). Story 3.2.1 and Tasks 3.2.1a/3.2.1b (2.5h) are removed; there is no `kibitzer check false-positives list --inline`, and `list` is unchanged. Misfires keep flowing through `report_false_positive`.
@@ -775,7 +775,7 @@ Dropped with the single-marker collapse (gate note `docs/backtest-triage/inline-
   - *Given* the largest source file in this repo with a marker in changed rows, *When* the hook-path raw rerun runs, *Then* the added wall time is recorded in the PR and compared with the Non-functional budgets target (under 150 ms, INFERRED).
 - Binary files in the corpus walk.
   - *Given* a corpus repo containing images or jars, *When* `kibitzer run <repo>`, *Then* zero `inline-ignore` read-error lines.
-**Files**: `docs/backtest-triage/` (results), `src/inline_ignores.rs` (timing test)
+**Files**: `docs/backtest-triage/` (results), `src/inline_ignores/` (timing test)
 
 ##### Task 4.1.1a: Transcript backtest (~0.5h)
 - Run `kibitzer check backtest inline-ignore`; record counts in the PR body.
@@ -787,8 +787,8 @@ Dropped with the single-marker collapse (gate note `docs/backtest-triage/inline-
 - **Phase 4 result**: two plan claims did not hold. (1) A full `kibitzer run <repo>` does not finish for the large repos (deno at 900 s; k8s, cassandra, vscode, servo, mdn, gitlab, stapler-squad at 300 s), so those were covered by a `kibitzer`-string sweep and a non-UTF-8 read-error check instead. (2) None of the 14 public corpus repos contains the string `kibitzer`, so "no false positives on prose or string mentions" was tested on the tstapler repos and the self-run, not on the public corpus. Details: `docs/backtest-triage/inline-ignore-results.md`.
 
 ##### Task 4.1.1c: Fast-path, latency, and footer net-token checks (~1h; the hook-path measurement moved earlier to Task 2.2.3d)
-- Add the structural-counter fast-path test and the relative-ratio sanity check to `src/inline_ignores.rs` (no absolute microsecond threshold). Re-measure the hook-path raw rerun once more on the final code (this repo's largest source file with a marker), compare with the Task 2.2.3d number, and record both in the PR. Measure two alternating marker files through the daemon to see whether the single-entry `ScanMemo` Mutex thrashes (Non-functional budgets). Recompute the footer break-even `p*` with the final measured footer length (Story 4.1.1 AC).
-- Files: `src/inline_ignores.rs`
+- Add the structural-counter fast-path test and the relative-ratio sanity check to `src/inline_ignores/` (no absolute microsecond threshold). Re-measure the hook-path raw rerun once more on the final code (this repo's largest source file with a marker), compare with the Task 2.2.3d number, and record both in the PR. Measure two alternating marker files through the daemon to see whether the single-entry `ScanMemo` Mutex thrashes (Non-functional budgets). Recompute the footer break-even `p*` with the final measured footer length (Story 4.1.1 AC).
+- Files: `src/inline_ignores/`
 
 ##### Task 4.1.1d: End-to-end ship gate (~1h)
 - Before sign-off confirm the Phase 0 gate note is recorded and links the PROCEED/SHRINK decision. Counterfactual coverage check (the pre-ship stand-in for the outcome metric, which transcripts that predate the feature cannot show): for each Phase 0 classified case in classes (b) and (c) whose file content the backtest harness can reconstruct, insert a synthetic directive at the finding's reported row and confirm the finding is dropped; record coverage as n of N. It bounds the achievable reduction, it does not prove adoption. `cargo test`, `cargo clippy`, and a manual end-to-end: add a covering ignore to a fixture Go file, confirm hook (`kibitzer hook` with a PostToolUse payload), `mcp run_checks`, and `kibitzer run` all omit the finding; remove it, confirm it returns.

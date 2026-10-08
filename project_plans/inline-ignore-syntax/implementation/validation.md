@@ -10,7 +10,7 @@ Given a Go file where `kibitzer run` and the PostToolUse hook report a `[flag-ar
 *Anchor test*: `run_checker_against_source_should_DropFinding_When_WholeLineIgnoreAbove` (+ `ignore_should_SurviveEdits_When_LinesInsertedAbove`).
 
 ## Test Stack
-- **Unit**: Rust built-in `#[test]` in `#[cfg(test)] mod tests` (`src/inline_ignores.rs`, `src/checkers/inline_ignore.rs`, `src/check.rs`, `src/hook.rs`, `src/mcp.rs`, `src/config.rs`, `src/accepted_findings.rs`, `src/checkers/comment_quality.rs`), `assert_eq!`, `tempfile` dirs, `GrammarCache::new().parse` for tree-sitter fixtures. Type names follow the plan glossary (`Line`, `Directive`, `DirectiveParse`, `MalformedReason`, `RuleId`, `Reason`, `InlineIgnoreContext`).
+- **Unit**: Rust built-in `#[test]` in `#[cfg(test)] mod tests` (`src/inline_ignores/tests.rs`, `src/checkers/inline_ignore.rs`, `src/check.rs`, `src/hook.rs`, `src/mcp.rs`, `src/config.rs`, `src/accepted_findings.rs`, `src/checkers/comment_quality.rs`), `assert_eq!`, `tempfile` dirs, `GrammarCache::new().parse` for tree-sitter fixtures. Type names follow the plan glossary (`Line`, `Directive`, `DirectiveParse`, `MalformedReason`, `RuleId`, `Reason`, `InlineIgnoreContext`).
 - **Integration**: real checkers via `crate::checker::run_checker_configured` (in-crate), plus binary-level CLI tests in `tests/inline_ignore_cli.rs` (new, same style as `tests/false_positives_cli.rs` and `tests/hook_contract.rs`) spawning `kibitzer run`, `kibitzer hook` against temp repos.
 - **E2E / UX**: manual checklist (Task 4.1.1d). `design/ux.md` is absent (research has `research/ux.md` only), so there is no UX Acceptance table; the user-facing surfaces (hook footer, MCP hint, CLI footer) are covered by the integration rows below.
 
@@ -41,75 +41,75 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | SM-4 | src/check.rs | accepted_entry_should_NotBeAffected_When_InlineDisabled | Unit | Error path: `mode: Disabled` leaves accepted filtering identical |
 | SM-4 | src/accepted_findings.rs | accepted_findings_should_DeserializeUnchanged_When_InlineFieldSkipped | Unit | `#[serde(skip)]` `inline` field does not change JSON load of existing files |
 | SM-4 | tests/inline_ignore_cli.rs | kibitzer_run_should_ApplyBothSuppressors_When_InlineAndAcceptedMatchSameFinding | Integration | Both suppress independently; output clean |
-| CON-1: works for every supported comment syntax | src/inline_ignores.rs | scan_code_comments_should_ParseDirective_When_EachLanguageAllGrammar (table: Go, TS, TSX, JS, Python, Java, Kotlin, Rust; one fixture per `Language::ALL`) | Unit | Happy path per grammar |
-| CON-1 | src/inline_ignores.rs | scan_markdown_should_ParseDirective_When_HtmlCommentOutsideFence | Unit | `<!-- kibitzer:ignore em-dash-overuse -- quoted source -->` at row 5 |
-| CON-1 | src/inline_ignores.rs | scan_leading_comments_should_ParseDirective_When_ShellHashComment | Unit | `.sh` `# kibitzer:ignore file-size -- vendored` |
-| CON-1 | src/inline_ignores.rs | scan_leading_comments_should_ReturnNothing_When_MarkerInsideEchoString | Unit | Error path: `echo "# kibitzer:ignore a -- b"` yields zero |
-| CON-1 | src/inline_ignores.rs | parse_comment_line_should_StripLeader_When_SlashDoc_Hash_BlockStar_HtmlOpen | Unit | `//`, `///`, `//!`, `#`, `/*`, `/**`, `*`, `<!--` and trailing `*/`, `-->` |
-| CON-1 | src/inline_ignores.rs | scan_code_comments_should_ReportBlockCommentLineRow_When_DirectiveOnInnerLine | Unit | Java `/*\n * kibitzer:ignore long-method -- generated\n */` at line 10 gives `start_line == 11` |
-| CON-1 | src/inline_ignores.rs | scan_code_comments_should_ConvertRowsToOneBased_When_TreeSitterRowSix | Unit | tree-sitter row 6 gives `Line(7)` |
-| CON-1 | src/inline_ignores.rs | parse_comment_line_should_Tolerate_When_CrlfAndTabs | Unit | CRLF and tab separators |
-| CON-2: reason is required | src/inline_ignores.rs | parse_comment_line_should_ReturnMalformedMissingReason_When_NoDashDash | Unit | Error path: `// kibitzer:ignore flag-argument` |
-| CON-2 | src/inline_ignores.rs | parse_comment_line_should_ReturnMalformedMissingReason_When_ReasonEmptyAfterSeparator | Unit | Error path: `-- ` with only whitespace |
-| CON-2 | src/inline_ignores.rs | reason_new_should_Reject_When_EmptyOrBlank | Unit | `Reason::new("  ")` errs (parse, don't validate) |
-| CON-2 | src/inline_ignores.rs | parse_comment_line_should_ReturnMalformed_When_EmDashSeparator | Unit | Error path: em dash separator rejected (ASCII `--` only) |
-| CON-2 | src/inline_ignores.rs | parse_comment_line_should_ReturnValid_When_ReasonPresent | Unit | Happy path: reason trimmed, shared across comma list |
+| CON-1: works for every supported comment syntax | src/inline_ignores/tests.rs | scan_code_comments_should_ParseDirective_When_EachLanguageAllGrammar (table: Go, TS, TSX, JS, Python, Java, Kotlin, Rust; one fixture per `Language::ALL`) | Unit | Happy path per grammar |
+| CON-1 | src/inline_ignores/tests.rs | scan_markdown_should_ParseDirective_When_HtmlCommentOutsideFence | Unit | `<!-- kibitzer:ignore em-dash-overuse -- quoted source -->` at row 5 |
+| CON-1 | src/inline_ignores/tests.rs | scan_leading_comments_should_ParseDirective_When_ShellHashComment | Unit | `.sh` `# kibitzer:ignore file-size -- vendored` |
+| CON-1 | src/inline_ignores/tests.rs | scan_leading_comments_should_ReturnNothing_When_MarkerInsideEchoString | Unit | Error path: `echo "# kibitzer:ignore a -- b"` yields zero |
+| CON-1 | src/inline_ignores/tests.rs | parse_comment_line_should_StripLeader_When_SlashDoc_Hash_BlockStar_HtmlOpen | Unit | `//`, `///`, `//!`, `#`, `/*`, `/**`, `*`, `<!--` and trailing `*/`, `-->` |
+| CON-1 | src/inline_ignores/tests.rs | scan_code_comments_should_ReportBlockCommentLineRow_When_DirectiveOnInnerLine | Unit | Java `/*\n * kibitzer:ignore long-method -- generated\n */` at line 10 gives `start_line == 11` |
+| CON-1 | src/inline_ignores/tests.rs | scan_code_comments_should_ConvertRowsToOneBased_When_TreeSitterRowSix | Unit | tree-sitter row 6 gives `Line(7)` |
+| CON-1 | src/inline_ignores/tests.rs | parse_comment_line_should_Tolerate_When_CrlfAndTabs | Unit | CRLF and tab separators |
+| CON-2: reason is required | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnMalformedMissingReason_When_NoDashDash | Unit | Error path: `// kibitzer:ignore flag-argument` |
+| CON-2 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnMalformedMissingReason_When_ReasonEmptyAfterSeparator | Unit | Error path: `-- ` with only whitespace |
+| CON-2 | src/inline_ignores/tests.rs | reason_new_should_Reject_When_EmptyOrBlank | Unit | `Reason::new("  ")` errs (parse, don't validate) |
+| CON-2 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnMalformed_When_EmDashSeparator | Unit | Error path: em dash separator rejected (ASCII `--` only) |
+| CON-2 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnValid_When_ReasonPresent | Unit | Happy path: reason trimmed, shared across comma list |
 | CON-3: native per-file checkers only | src/config.rs | default_checks_should_ScopeInlineIgnoreToGrammarExtensionsAndMd_When_Read | Unit | Globs are `Language::ALL` extensions plus `*.md`, not `**/*` |
 | CON-3 | src/check.rs | run_command_check_should_NotApplyInlineIgnores_When_ShellOutCommandCheck | Unit | Error path: a `command` check's output is not filtered by a covering directive |
 | CON-3 | src/check.rs | architecture_check_should_NotApplyInlineIgnores_When_WholeRepoCheck | Unit | Error path: architecture findings unaffected by an ignore comment |
 | CON-3 | src/check.rs | kibitzer_check_native_should_BypassInlineIgnores_When_RunDirectly | Integration | `kibitzer check native <name> <file>` prints raw finding (corpus workflow), documented |
-| CON-4: suppressions stay reviewable | src/inline_ignores.rs | apply_inline_ignores_should_KeepFinding_When_RuleIsMetRule | Unit | Error path: `kibitzer:ignore ignore-syntax -- x` cannot suppress `[ignore-syntax]` (also `unused-ignore`, `ignore-volume`) |
+| CON-4: suppressions stay reviewable | src/inline_ignores/tests.rs | apply_inline_ignores_should_KeepFinding_When_RuleIsMetRule | Unit | Error path: `kibitzer:ignore ignore-syntax -- x` cannot suppress `[ignore-syntax]` (also `unused-ignore`, `ignore-volume`) |
 | CON-4 | src/checkers/inline_ignore.rs | inline_ignore_should_EmitVolumeFinding_When_FiveValidDirectives | Unit | Happy path: finding at 5th directive row (line 40), message `5 inline ignores in this file tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong` |
 | CON-4 (UX r2 gap 6) | src/checkers/inline_ignore.rs | inline_ignore_should_EmitVolumeOncePerFile_When_SevenValidDirectives | Unit | Exactly one `[ignore-volume]`, at the 5th directive's row; none at the 6th or 7th |
 | CON-4 | src/checkers/inline_ignore.rs | inline_ignore_should_EmitNothing_When_FourValidDirectives | Unit | Error path: below threshold, zero `[ignore-volume]` |
 | CON-4 | src/checkers/inline_ignore.rs | inline_ignore_volume_should_SurviveDiffScoping_When_ChangedLinesIsFifthDirectiveRow | Integration | `changed_lines = Some(&[(40,40)])` keeps the volume finding |
-| CON-4 (P1-2) | src/inline_ignores.rs | reason_new_should_Reject_When_OneWordOrEqualsRuleId | Unit | `-- needed` gives `WeakReason(TooShort)`; `-- flag-argument`, `-- Flag Argument`, and a two-word echo give `WeakReason(RuleEcho)`; none suppress; `-- legacy API, callers pinned` accepted |
+| CON-4 (P1-2) | src/inline_ignores/tests.rs | reason_new_should_Reject_When_OneWordOrEqualsRuleId | Unit | `-- needed` gives `WeakReason(TooShort)`; `-- flag-argument`, `-- Flag Argument`, and a two-word echo give `WeakReason(RuleEcho)`; none suppress; `-- legacy API, callers pinned` accepted |
 | CON-4 (P1-2) | src/checkers/inline_ignore.rs | inline_ignore_should_RenderSeparateMessages_When_ReasonTooShortVersusRuleEcho | Unit | `-- needed` renders `reason 'needed' is too short to explain the code. Write: ... <the concrete constraint that makes this code acceptable>`; `-- flag-argument` renders `reason repeats the rule id instead of saying why ...`; the two strings differ, neither contains `at least two words`, both contain `concrete constraint`, no em dash |
-| CON-4 (P1-2) | src/inline_ignores.rs | apply_inline_ignores_should_CountBlocking_When_BlockingCheckSuppressed | Unit | `SuppressionCounts` total/blocking split |
+| CON-4 (P1-2) | src/inline_ignores/tests.rs | apply_inline_ignores_should_CountBlocking_When_BlockingCheckSuppressed | Unit | `SuppressionCounts` total/blocking split |
 | CON-4 (P1-2) | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintBlockingShareInFooter_When_BlockingFindingSuppressed | Integration | Footer `3 findings suppressed inline (1 from blocking checks) ...`; zero parts omitted; no split |
 | CON-4 (P1-2) | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitBlockingSuppressedAdvisory_When_AddedDirectiveSilencesBlocking | Integration | `.md` directive in `changed_lines` over a `markdown-link-integrity` finding yields `[blocking-suppressed] ...; tell the user you silenced a blocking check and why, so they can confirm it` advisory (text names the user, does not contain `confirm this is intended`), exit code unaffected |
 | CON-4 (P1-2) | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitNoBlockingAdvisory_When_DirectiveOutsideChangedLinesOrAdvisoryCheck | Unit | Error path |
-| CON-4 (P1-2) | src/inline_ignores.rs | apply_inline_ignores_should_KeepFinding_When_RuleIsBlockingSuppressed | Unit | `blocking-suppressed` in `META_RULES` |
+| CON-4 (P1-2) | src/inline_ignores/tests.rs | apply_inline_ignores_should_KeepFinding_When_RuleIsBlockingSuppressed | Unit | `blocking-suppressed` in `META_RULES` |
 | CON-4 (UX r3 gap 7) | n/a | success ack rows removed | n/a | The one-line ack (old `hook_should_EmitOneLineAck_*`, `hook_ack_should_BeBounded_*`, `hook_should_EmitNoAck_*` tests) was DEFERRED as beyond the ask; the hook stays silent on a passing run, covered by `hook_should_EmitNoContext_When_RunPasses` |
-| NFR-1: no measurable slowdown on hook path | src/inline_ignores.rs | apply_inline_ignores_should_UseNoScanOrHash_When_NoKibitzerSubstring | Unit | 5,000-line Go file, 1,000 calls: `scan_memo.scans == 0`, `hash_calls == 0`, no parser constructed (structural, CI-stable) |
+| NFR-1: no measurable slowdown on hook path | src/inline_ignores/tests.rs | apply_inline_ignores_should_UseNoScanOrHash_When_NoKibitzerSubstring | Unit | 5,000-line Go file, 1,000 calls: `scan_memo.scans == 0`, `hash_calls == 0`, no parser constructed (structural, CI-stable) |
 | NFR-1 | n/a | ratio test removed | n/a | Wall-clock ratio tests (this row and the rerun-latency row) were removed after verify as flaky on loaded CI; the counter test above and the Phase 4 measurements in `docs/backtest-triage/inline-ignore-results.md` carry the evidence |
 | NFR-1 (hook-path raw rerun) | src/check.rs | run_checks_for_trigger_should_PerformNoRawRerun_When_EditTouchesNoDirectiveRow | Integration | Rerun counter stays 0 |
-| NFR-1 | src/inline_ignores.rs | apply_inline_ignores_should_NotScan_When_FindingsEmpty | Unit | Checker returned nothing for a file with a marker; scan counter stays 0 |
-| NFR-1 | src/inline_ignores.rs | scan_memo_should_ScanOnce_When_ThirtyCheckersShareOneContext | Integration | One `InlineIgnoreContext`, marker file, 30 consecutive calls with findings; `scan_memo.scans == 1` |
-| NFR-1 | src/inline_ignores.rs | scan_memo_should_Rescan_When_ContentHashChangesOrPathDiffers | Unit | Edited source rescans and no longer suppresses; single entry replaced, never grows |
-| NFR-1 | src/inline_ignores.rs | scan_directives_should_ConstructNoParser_When_SourceLacksKibitzer | Unit | 10,000-line input, unused `GrammarCache` stays unused |
-| IS-1: syntax (rule id, required reason, same/next line, optional marker) | src/inline_ignores.rs | parse_comment_line_should_ReturnIgnoreKind_When_KibitzerIgnore | Unit | Happy path: Go `// kibitzer:ignore flag-argument -- legacy API, callers pinned` at line 7 gives full `Directive` |
-| IS-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnAllRules_When_CommaList | Unit | `a,b -- why` yields two `RuleId`s, one shared reason |
-| IS-1 | src/inline_ignores.rs | rule_id_new_should_Reject_When_PlaceholderOrUppercase | Unit | Error path: `<rule>` and `Foo_Bar` not valid `[a-z0-9-]+` |
-| IS-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnNotADirective_When_RustdocPlaceholder | Unit | `/// kibitzer:ignore <rule> -- <why>` is prose |
-| IS-1 | src/inline_ignores.rs | scan_code_comments_should_ReturnNothing_When_MarkerInStringLiteral | Unit | Error path: `let s = "// kibitzer:ignore x -- y";` yields zero |
-| IS-1 | src/inline_ignores.rs | scan_code_comments_should_RecordWholeLineFalse_When_CommentTrailsCode | Unit | `x := f() // kibitzer:ignore a -- b` gives `whole_line == false` |
-| IS-1 | src/inline_ignores.rs | covers_should_BeTrue_When_FindingOnLineBelowWholeLineDirective | Unit | `end_line: 9`, finding at 10 true, at 11 false |
-| IS-1 | src/inline_ignores.rs | covers_should_BeTrueOnlyOwnRow_When_TrailingComment | Unit | Trailing comment at 9 covers 9, not 10 |
+| NFR-1 | src/inline_ignores/tests.rs | apply_inline_ignores_should_NotScan_When_FindingsEmpty | Unit | Checker returned nothing for a file with a marker; scan counter stays 0 |
+| NFR-1 | src/inline_ignores/tests.rs | scan_memo_should_ScanOnce_When_ThirtyCheckersShareOneContext | Integration | One `InlineIgnoreContext`, marker file, 30 consecutive calls with findings; `scan_memo.scans == 1` |
+| NFR-1 | src/inline_ignores/tests.rs | scan_memo_should_Rescan_When_ContentHashChangesOrPathDiffers | Unit | Edited source rescans and no longer suppresses; single entry replaced, never grows |
+| NFR-1 | src/inline_ignores/tests.rs | scan_directives_should_ConstructNoParser_When_SourceLacksKibitzer | Unit | 10,000-line input, unused `GrammarCache` stays unused |
+| IS-1: syntax (rule id, required reason, same/next line, optional marker) | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnIgnoreKind_When_KibitzerIgnore | Unit | Happy path: Go `// kibitzer:ignore flag-argument -- legacy API, callers pinned` at line 7 gives full `Directive` |
+| IS-1 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnAllRules_When_CommaList | Unit | `a,b -- why` yields two `RuleId`s, one shared reason |
+| IS-1 | src/inline_ignores/tests.rs | rule_id_new_should_Reject_When_PlaceholderOrUppercase | Unit | Error path: `<rule>` and `Foo_Bar` not valid `[a-z0-9-]+` |
+| IS-1 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnNotADirective_When_RustdocPlaceholder | Unit | `/// kibitzer:ignore <rule> -- <why>` is prose |
+| IS-1 | src/inline_ignores/tests.rs | scan_code_comments_should_ReturnNothing_When_MarkerInStringLiteral | Unit | Error path: `let s = "// kibitzer:ignore x -- y";` yields zero |
+| IS-1 | src/inline_ignores/tests.rs | scan_code_comments_should_RecordWholeLineFalse_When_CommentTrailsCode | Unit | `x := f() // kibitzer:ignore a -- b` gives `whole_line == false` |
+| IS-1 | src/inline_ignores/tests.rs | covers_should_BeTrue_When_FindingOnLineBelowWholeLineDirective | Unit | `end_line: 9`, finding at 10 true, at 11 false |
+| IS-1 | src/inline_ignores/tests.rs | covers_should_BeTrueOnlyOwnRow_When_TrailingComment | Unit | Trailing comment at 9 covers 9, not 10 |
 | IS-2: filter in shared path used by all entry points | src/check.rs | run_checker_against_source_should_CallApplyInlineIgnores_When_BetweenCheckerAndFlatten | Unit | Seam applies before text flatten; `Disabled` returns raw (`mode: Disabled` keeps finding) |
 | IS-2 | src/check.rs | run_checker_against_source_should_ReturnRawFindings_When_ModeDisabled | Unit | Error path: opt-out path |
-| IS-2 | src/inline_ignores.rs | apply_inline_ignores_should_ReturnInputUnchanged_When_FindingsEmptyOrNoSubstring | Unit | Early returns |
-| IS-2 | src/inline_ignores.rs | apply_inline_ignores_should_CountDropped_When_CounterPresent | Unit | Counter incremented by dropped count only |
-| IS-2 | src/inline_ignores.rs | inline_ignore_context_should_KeepSeparateCounts_When_TwoRunsConcurrent | Integration | Two contexts cover 2 and 3 findings; counters read 2 and 3 |
+| IS-2 | src/inline_ignores/tests.rs | apply_inline_ignores_should_ReturnInputUnchanged_When_FindingsEmptyOrNoSubstring | Unit | Early returns |
+| IS-2 | src/inline_ignores/tests.rs | apply_inline_ignores_should_CountDropped_When_CounterPresent | Unit | Counter incremented by dropped count only |
+| IS-2 | src/inline_ignores/tests.rs | inline_ignore_context_should_KeepSeparateCounts_When_TwoRunsConcurrent | Integration | Two contexts cover 2 and 3 findings; counters read 2 and 3 |
 | IS-2 | src/check.rs | check_native_against_git_head_should_NotChangeCounter_When_BaselineReplay | Integration | Counter stripped for HEAD replay |
 | IS-2 | src/check.rs | run_checks_for_trigger_should_PickUpFilter_When_DaemonOrLspCall | Integration | Same filter on the daemon/LSP route |
 | IS-3: malformed ignore reported, not a silent no-op | src/checkers/inline_ignore.rs | inline_ignore_should_Report_When_MissingReason | Unit | `8: [ignore-syntax] kibitzer:ignore flag-argument has no reason. Write: kibitzer:ignore flag-argument -- <why this is acceptable>` |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_should_Report_When_MissingRule | Unit | `[ignore-syntax] kibitzer:ignore needs a rule id. Write: kibitzer:ignore <rule> -- <why>` |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_should_SuggestRule_When_UnknownRuleNearKnown | Unit | `unknown rule 'flag-arg' - did you mean 'flag-argument'?` |
-| IS-3 | src/inline_ignores.rs | parse_comment_line_should_ReturnEmDashSeparator_When_EmOrEnDash | Unit | U+2014 and U+2013 give `Malformed(EmDashSeparator)`, never `MissingReason` |
+| IS-3 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnEmDashSeparator_When_EmOrEnDash | Unit | U+2014 and U+2013 give `Malformed(EmDashSeparator)`, never `MissingReason` |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_should_TellUseAsciiDoubleHyphen_When_EmDashSeparator | Unit | Message is `use ASCII '--' ... Write: kibitzer:ignore <rule> -- <why>`, ASCII only |
-| IS-3 | src/inline_ignores.rs | parse_comment_line_should_HandleRuleListEdges_When_CommaVariants | Unit | `a,b` valid; `a,a` dedups; `a, b`, `a,,b`, `a,`, `,a` give `BadRuleList`; `a,<rule>` is `NotADirective` |
+| IS-3 | src/inline_ignores/tests.rs | parse_comment_line_should_HandleRuleListEdges_When_CommaVariants | Unit | `a,b` valid; `a,a` dedups; `a, b`, `a,,b`, `a,`, `,a` give `BadRuleList`; `a,<rule>` is `NotADirective` |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_should_ReportEachUnknownElementAndStillSuppress_When_CommaListMixesKnownAndUnknown | Unit | `flag-argument,flag-arg`: finding dropped, one did-you-mean for `flag-arg` |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_should_EmitNothingForUnknownRule_When_NoNearMatch | Unit | `made-up-rule` yields no `[ignore-syntax]` (surfaced by `[unused-ignore]` with the not-a-known-rule wording instead, rows below) |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_findings_should_BeAdvisory_When_FileHasBlockingChecks | Unit | `[ignore-syntax]` never sets exit code 2 |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_should_Report_When_NearMissMarker | Unit | `'kibitzer: ignore' not recognized; use 'kibitzer:ignore'` |
 | IS-3 | src/checkers/inline_ignore.rs | inline_ignore_messages_should_ContainNoEmDash_When_AllReasonsRendered | Unit | `em-dash-overuse` is a default check |
-| IS-3 | src/inline_ignores.rs | parse_comment_line_should_ReturnNotADirective_When_ProseMentionsKibitzer | Unit | `// see kibitzer: allow list in docs`, `// the kibitzer:ignore syntax is documented` produce no finding |
-| IS-3 (UX r2 gap 1) | src/inline_ignores.rs | parse_comment_line_should_ReturnNotAtCommentStart_When_DirectiveFollowsOtherText | Unit | `// TODO kibitzer:ignore flag-argument -- legacy API, callers pinned` and `// legacy: kibitzer:ignore flag-argument -- legacy API, callers pinned` give `Malformed(NotAtCommentStart)`, never `NotADirective`, and do not suppress |
-| IS-3 (UX r2 gap 1) | src/inline_ignores.rs | parse_comment_line_should_StayNotADirective_When_LaterMentionLacksFullGrammar | Unit | Error path (prose stays quiet): `// the kibitzer:ignore syntax is documented` (no rule list/`--`) and `// see kibitzer:ignore <rule> -- <why>` (placeholder) remain `NotADirective` |
+| IS-3 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnNotADirective_When_ProseMentionsKibitzer | Unit | `// see kibitzer: allow list in docs`, `// the kibitzer:ignore syntax is documented` produce no finding |
+| IS-3 (UX r2 gap 1) | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnNotAtCommentStart_When_DirectiveFollowsOtherText | Unit | `// TODO kibitzer:ignore flag-argument -- legacy API, callers pinned` and `// legacy: kibitzer:ignore flag-argument -- legacy API, callers pinned` give `Malformed(NotAtCommentStart)`, never `NotADirective`, and do not suppress |
+| IS-3 (UX r2 gap 1) | src/inline_ignores/tests.rs | parse_comment_line_should_StayNotADirective_When_LaterMentionLacksFullGrammar | Unit | Error path (prose stays quiet): `// the kibitzer:ignore syntax is documented` (no rule list/`--`) and `// see kibitzer:ignore <rule> -- <why>` (placeholder) remain `NotADirective` |
 | IS-3 (UX r2 gap 1) | src/checkers/inline_ignore.rs | inline_ignore_should_Report_When_DirectiveNotAtCommentStart | Unit | `8: [ignore-syntax] kibitzer:ignore must start the comment; it was found after other text and suppresses nothing. Write it as its own comment: kibitzer:ignore flag-argument -- <why>`; ASCII only; the original `[flag-argument]` finding still prints (integration: `kibitzer run` shows both lines) |
 | IS-3 | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintBothLines_When_MalformedIgnoreAboveRealFinding | Integration | `[ignore-syntax]` and original `[flag-argument]` both print |
-| IS-3 | src/inline_ignores.rs | known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources | Unit | Each `"[<id>]` literal in `src/checkers/*.rs` and `src/single_call_site_delegation.rs` (outside `#[cfg(test)]`) is in `KNOWN_RULES` or a registered checker name |
+| IS-3 | src/inline_ignores/tests.rs | known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources | Unit | Each `"[<id>]` literal in `src/checkers/*.rs` and `src/single_call_site_delegation.rs` (outside `#[cfg(test)]`) is in `KNOWN_RULES` or a registered checker name |
 | IS-3 | src/check.rs | apply_inline_ignores_should_Suppress_When_RuleAbsentFromKnownRules | Unit | `[some-new-rule]` finding with a directive naming it still drops (table is advisory) |
 | IS-3 | src/check.rs | inline_ignore_should_YieldPassingEmptyResult_When_BinaryFile | Integration | PNG-like bytes `\x89PNG\r\n\x1a\n\xff\xfe`: passing, empty result |
 | IS-3 | src/check.rs | inline_ignore_should_YieldPassingEmptyResult_When_InvalidUtf8GoFile | Integration | Invalid UTF-8 `.go` file |
@@ -132,43 +132,43 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | IS-5 | src/mcp.rs | get_info_instructions_should_MentionKibitzerIgnore_When_Read | Unit | Updated `get_info_instructions_*` test |
 | IS-5 | src/mcp.rs | run_checks_should_EndWithSyntaxHint_When_FindingsPresent | Unit | Last line is the one-line syntax with the file's leader |
 | IS-5 | src/mcp.rs | run_checks_should_OmitSyntaxHint_When_ZeroFindings | Unit | Error path |
-| IS-5 | src/inline_ignores.rs | comment_leader_should_MatchLanguage_When_GoPyMdAndFallback | Unit | Leader by `Language::for_path`, `.md`, fallback `#` |
-| RH-1 (P1-1) | src/inline_ignores.rs | anchor_conformance_should_DropFinding_When_DirectiveOnReportedLineOrRowAbove (table over every checker in `default_checks()`) | Integration | Per checker: real checker fires on its `ANCHOR_FIXTURES` source; whole-line directive on row N-1 and same-row directive on row N each drop the finding |
-| RH-1 (P1-1) | src/inline_ignores.rs | anchor_conformance_should_HaveFixtureOrExemption_When_DefaultCheckerAdded | Unit | Every `default_checks()` name has a fixture or an `ANCHOR_EXEMPT` entry with a reason; new checker without one fails the build |
+| IS-5 | src/inline_ignores/tests.rs | comment_leader_should_MatchLanguage_When_GoPyMdAndFallback | Unit | Leader by `Language::for_path`, `.md`, fallback `#` |
+| RH-1 (P1-1) | src/inline_ignores/anchor_tests.rs | anchor_conformance_should_DropFinding_When_DirectiveOnReportedLineOrRowAbove (table over every checker in `default_checks()`) | Integration | Per checker: real checker fires on its `ANCHOR_FIXTURES` source; whole-line directive on row N-1 and same-row directive on row N each drop the finding |
+| RH-1 (P1-1) | src/inline_ignores/anchor_tests.rs | anchor_conformance_should_HaveFixtureOrExemption_When_DefaultCheckerAdded | Unit | Every `default_checks()` name has a fixture or an `ANCHOR_EXEMPT` entry with a reason; new checker without one fails the build |
 | RH-1 (P1-1) | src/hook.rs | hook_hint_should_NameExactAnchorRow_When_FindingAtLine20 | Unit | `put this on its own line directly above line 20 (or at the end of line 20): // kibitzer:ignore flag-argument -- <why>` (no bare "line 19"); head-of-file wording for `file-size`/`file-complexity` |
 | RH-1 (P1-1) | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitUnusedIgnoreAdvisory_When_AddedDirectiveMatchesNothingInChangedLines | Integration | Directive at row 12 in `changed_lines`, finding at 20: advisory says `Move the comment to the line directly above line 20 (or the end of line 20)`, contains "Move" and not "place"/"line 19"; comment at 19: silent |
 | RH-1 (P1-1) | src/inline_post_pass.rs | run_checks_for_trigger_should_SkipRawRerun_When_NoDirectiveRowInChangedLines | Unit | Rerun counter stays 0 |
-| RH-1: finding line vs comment placement (multi-line constructs) | src/inline_ignores.rs | file_size_ignore_should_Suppress_When_DirectiveInFirstTenLines | Integration | Real `file-size` on a 900-line Go file, ignore on row 1, finding at 900 dropped |
-| RH-1 | src/inline_ignores.rs | file_size_ignore_should_NotSuppress_When_DirectiveBelowRowTen | Integration | Error path |
-| RH-1 | src/inline_ignores.rs | file_complexity_ignore_should_DropOnlyOneFinding_When_DirectiveAboveFirstFunction | Integration | 3 complex functions, ignore above the first: 2 remain; ignore on line 1: 0 remain |
-| RH-1 | src/inline_ignores.rs | covers_should_BeTrue_When_FindingLineZeroNormalizedToOne | Unit | `Finding.line == 0` becomes `Line(1)`, directive on line 1 covers |
-| RH-1 | src/inline_ignores.rs | duplicate_code_ignore_should_Suppress_When_AboveLastOccurrence | Integration | Duplicates at 5 and 40; ignore above 40 drops, above 5 keeps |
-| RH-1 | src/inline_ignores.rs | over_commented_ignore_should_Suppress_When_AboveFirstLeadingCommentRow | Integration | Real `comment-quality-go`, finding at row 20 |
-| RH-1 | src/inline_ignores.rs | commented_out_code_ignore_should_Suppress_When_AboveThatRow | Integration | Per-row anchor |
-| RH-2: cross-file checks report two locations | src/inline_ignores.rs | duplicate_cross_file_ignore_should_CoverOnlyOwnFile_When_IgnoreInAGoOnly | Integration | `a.go` clean, `b.go` still reports |
-| RH-3: comment-in-string false matches | src/inline_ignores.rs | scan_directives_should_NotListMarker_When_InRustStringAndMarkdownFence | Unit | String literal and fenced block both ignored (also indented code block) |
+| RH-1: finding line vs comment placement (multi-line constructs) | src/inline_ignores/tests.rs | file_size_ignore_should_Suppress_When_DirectiveInFirstTenLines | Integration | Real `file-size` on a 900-line Go file, ignore on row 1, finding at 900 dropped |
+| RH-1 | src/inline_ignores/tests.rs | file_size_ignore_should_NotSuppress_When_DirectiveBelowRowTen | Integration | Error path |
+| RH-1 | src/inline_ignores/tests.rs | file_complexity_ignore_should_DropOnlyOneFinding_When_DirectiveAboveFirstFunction | Integration | 3 complex functions, ignore above the first: 2 remain; ignore on line 1: 0 remain |
+| RH-1 | src/inline_ignores/tests.rs | covers_should_BeTrue_When_FindingLineZeroNormalizedToOne | Unit | `Finding.line == 0` becomes `Line(1)`, directive on line 1 covers |
+| RH-1 | src/inline_ignores/tests.rs | duplicate_code_ignore_should_Suppress_When_AboveLastOccurrence | Integration | Duplicates at 5 and 40; ignore above 40 drops, above 5 keeps |
+| RH-1 | src/inline_ignores/tests.rs | over_commented_ignore_should_Suppress_When_AboveFirstLeadingCommentRow | Integration | Real `comment-quality-go`, finding at row 20 |
+| RH-1 | src/inline_ignores/tests.rs | commented_out_code_ignore_should_Suppress_When_AboveThatRow | Integration | Per-row anchor |
+| RH-2: cross-file checks report two locations | src/inline_ignores/tests.rs | duplicate_cross_file_ignore_should_CoverOnlyOwnFile_When_IgnoreInAGoOnly | Integration | `a.go` clean, `b.go` still reports |
+| RH-3: comment-in-string false matches | src/inline_ignores/tests.rs | scan_directives_should_NotListMarker_When_InRustStringAndMarkdownFence | Unit | String literal and fenced block both ignored (also indented code block) |
 | RH-3 | tests/inline_ignore_cli.rs | kibitzer_run_should_NotSuppressOrReport_When_MarkerOnlyInStringLiteralsOfOwnRepo | Integration | Self-run on this repo: nothing suppressed or reported by string-literal markers |
-| RH-4: Markdown comments and prose checks | src/inline_ignores.rs | markdown_link_integrity_ignore_should_Suppress_When_NamedByCheckerName | Integration | Real checker, `[foo] used but never defined`, `<!-- kibitzer:ignore markdown-link-integrity -- placeholder -->` above; also "defined but never used" and "file does not exist" variants |
-| RH-4 | src/inline_ignores.rs | markdown_link_integrity_ignore_should_NotMatch_When_DirectiveNamesRefId | Unit | Error path: directive naming `foo` does not match |
+| RH-4: Markdown comments and prose checks | src/inline_ignores/tests.rs | markdown_link_integrity_ignore_should_Suppress_When_NamedByCheckerName | Integration | Real checker, `[foo] used but never defined`, `<!-- kibitzer:ignore markdown-link-integrity -- placeholder -->` above; also "defined but never used" and "file does not exist" variants |
+| RH-4 | src/inline_ignores/tests.rs | markdown_link_integrity_ignore_should_NotMatch_When_DirectiveNamesRefId | Unit | Error path: directive naming `foo` does not match |
 | RH-4 | src/markdown_text.rs | prose_checks_should_BeIdentical_When_DirectiveHtmlCommentAdded | Unit | `repetitive-sentence-structure` and `missing-paragraph-break` findings equal with and without the comment |
 | RH-5: checkers without a `[rule-id]` prefix | src/check.rs | apply_inline_ignores_should_MatchCheckerName_When_NoBracketPrefix | Unit | `primitive-obsession` finding dropped by directive naming `primitive-obsession` |
-| RH-5 | src/inline_ignores.rs | rule_matches_should_BeFalse_When_DynamicPrefixCheckerAndBracketMatch | Unit | `DYNAMIC_PREFIX_CHECKERS` never match by `[x]` prefix |
+| RH-5 | src/inline_ignores/tests.rs | rule_matches_should_BeFalse_When_DynamicPrefixCheckerAndBracketMatch | Unit | `DYNAMIC_PREFIX_CHECKERS` never match by `[x]` prefix |
 | RH-6: precedence with `accepted/` and comment-quality interplay | src/check.rs | inline_should_RunBeforeAccepted_When_BothMatch | Unit | Order: inline then `drop_accepted_findings` |
 | RH-6 | src/checkers/comment_quality.rs | comment_quality_should_EmitNothing_When_DirectiveCommentContainsCodeLikeText | Unit | `// kibitzer:ignore flag-argument -- see foo(bar) and x = y`: no `commented-out-code` / `verbose-comment` |
 | RH-6 | src/checkers/comment_quality.rs | over_commented_should_NotCount_When_KibitzerCommentAddedAtThresholdMinusOne | Unit | No `[over-commented]` |
 | RH-6 | src/checkers/comment_quality.rs | other_checkers_should_BeUnperturbed_When_ValidIgnoreAdded | Integration | `duplicate-code`, `syntax-rules-go`, `em-dash-overuse` findings identical modulo line shift |
-| OQ-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnNearMiss_When_SpaceAfterColonOrSynonym | Unit | `kibitzer: ignore`, `disable`, `allow`, `suppress`, `false_positive`, and `kibitzer:false-positive` (Amendment 1: not a directive, never suppresses) |
-| OQ-2: same line, next line, or both | src/inline_ignores.rs | covers_should_AcceptSameRowAndRowBelow_When_WholeLineDirective | Unit | Both |
-| OQ-2 | src/inline_ignores.rs | covers_should_RejectRowBelow_When_TrailingDirective | Unit | Trailing covers own row only |
-| OQ-3: unused/stale ignores reported | src/inline_ignores.rs | unused_ignores_should_Report_When_NoMatchingFinding | Unit | `<file>:<row>: [unused-ignore] kibitzer:ignore flag-argument suppresses nothing - remove it` |
-| OQ-3 | src/inline_ignores.rs | unused_ignores_should_BeEmpty_When_DirectiveCoversRawFinding | Unit | Used ignore not reported |
-| OQ-3 | src/inline_ignores.rs | unused_ignores_should_BeEmpty_When_AlsoShadowedByAccepted | Unit | Judged against raw findings |
+| OQ-1 | src/inline_ignores/tests.rs | parse_comment_line_should_ReturnNearMiss_When_SpaceAfterColonOrSynonym | Unit | `kibitzer: ignore`, `disable`, `allow`, `suppress`, `false_positive`, and `kibitzer:false-positive` (Amendment 1: not a directive, never suppresses) |
+| OQ-2: same line, next line, or both | src/inline_ignores/tests.rs | covers_should_AcceptSameRowAndRowBelow_When_WholeLineDirective | Unit | Both |
+| OQ-2 | src/inline_ignores/tests.rs | covers_should_RejectRowBelow_When_TrailingDirective | Unit | Trailing covers own row only |
+| OQ-3: unused/stale ignores reported | src/inline_ignores/tests.rs | unused_ignores_should_Report_When_NoMatchingFinding | Unit | `<file>:<row>: [unused-ignore] kibitzer:ignore flag-argument suppresses nothing - remove it` |
+| OQ-3 | src/inline_ignores/tests.rs | unused_ignores_should_BeEmpty_When_DirectiveCoversRawFinding | Unit | Used ignore not reported |
+| OQ-3 | src/inline_ignores/tests.rs | unused_ignores_should_BeEmpty_When_AlsoShadowedByAccepted | Unit | Judged against raw findings |
 | OQ-3 (DEFERRED, Task 2.2.2b) | src/run.rs | unused_rerun_should_FindShadowedFinding_When_AcceptedEntryShadowsIt | Integration | Covering ignore plus matching `accepted/` entry: no `[unused-ignore]`; the rerun uses `raw_findings_for_check`, which never applies `accepted/` |
 | OQ-3 (DEFERRED, Task 2.2.2b) | src/run.rs | unused_ran_checkers_should_DeriveFromFirstPassCheckNames_When_CheckSkipped | Unit | Check skipped by size/trigger/config is absent from `CheckResult.check_name` set, so its rules are not judged |
-| OQ-3 | src/inline_ignores.rs | unused_ignores_should_SkipRule_When_OwningCheckerDisabledOrDidNotRun | Unit | Disabled in `inspect.json`, over `MAX_NATIVE_CHECK_BYTES`, or excluded by trigger |
-| OQ-3 | src/inline_ignores.rs | unused_ignores_should_FailOpen_When_RuleOwnershipUnknown | Unit | Unknown ownership not judged |
-| OQ-3 | src/inline_ignores.rs | unused_ignores_should_JudgeByCheckerName_When_MarkdownLinkIntegrity | Unit | Used `markdown-link-integrity` ignore not reported |
-| OQ-3 (UX r2 gap 4) | src/inline_ignores.rs | unused_ignores_should_PointToCheckList_When_RuleIsNeitherKnownNorCheckerName | Unit | `made-up-rule` (no near match) yields `[unused-ignore] 'made-up-rule' is not a known rule or checker; run 'kibitzer check list' to see valid names`; text contains `kibitzer check list` and not `remove it`; a known rule with no finding still yields `suppresses nothing - remove it` |
+| OQ-3 | src/inline_ignores/tests.rs | unused_ignores_should_SkipRule_When_OwningCheckerDisabledOrDidNotRun | Unit | Disabled in `inspect.json`, over `MAX_NATIVE_CHECK_BYTES`, or excluded by trigger |
+| OQ-3 | src/inline_ignores/tests.rs | unused_ignores_should_FailOpen_When_RuleOwnershipUnknown | Unit | Unknown ownership not judged |
+| OQ-3 | src/inline_ignores/tests.rs | unused_ignores_should_JudgeByCheckerName_When_MarkdownLinkIntegrity | Unit | Used `markdown-link-integrity` ignore not reported |
+| OQ-3 (UX r2 gap 4) | src/inline_ignores/tests.rs | unused_ignores_should_PointToCheckList_When_RuleIsNeitherKnownNorCheckerName | Unit | `made-up-rule` (no near match) yields `[unused-ignore] 'made-up-rule' is not a known rule or checker; run 'kibitzer check list' to see valid names`; text contains `kibitzer check list` and not `remove it`; a known rule with no finding still yields `suppresses nothing - remove it` |
 | OQ-3 (UX r3 gap 5, Task 2.2.2e) | tests/inline_ignore_cli.rs | kibitzer_run_should_PointToCheckList_When_IgnoreNamesUnknownRule | Integration | End to end in `kibitzer run` with Task 2.2.2b NOT shipped: typo rule with no near match prints the not-a-known-rule line from first-pass data; a rule outside `KNOWN_RULES` that really suppressed a finding prints nothing |
 | Cache hit keeps inline outcome (plan Task 1.2.2b1c) | src/cache.rs | cache_roundtrip_should_PreserveInlineOutcome_When_ResultHasFirstAnchorAndDropped | Unit | `put`/`save`/`load`/`get` returns the same `first_anchor` and `dropped` |
 | Cache compat (Task 1.2.2b1c) | src/check.rs | check_result_should_DeserializeWithEmptyInline_When_CacheJsonLacksInlineKey | Unit | Old `cache.json` entry loads; `inline` is the empty outcome (same style as the `findings` back-compat test at `src/check.rs:3029`) |
@@ -209,7 +209,7 @@ N/A (plan: no schema or data changes; `.kibitzer/accepted/` format untouched). N
 
 | Stack | Coverage command | Target |
 |---|---|---|
-| Rust | `cargo tarpaulin --out Stdout` (scope with `--packages kibitzer`; also `cargo test` and `cargo clippy` as the ship gate) | ≥80% line on `src/inline_ignores.rs` and `src/checkers/inline_ignore.rs` |
+| Rust | `cargo tarpaulin --out Stdout` (scope with `--packages kibitzer`; also `cargo test` and `cargo clippy` as the ship gate) | ≥80% line on `src/inline_ignores/tests.rs` and `src/checkers/inline_ignore.rs` |
 
 - All public (`pub(crate)`) functions in `inline_ignores`: happy path + error path covered.
 - All external integrations (hook, MCP, CLI, git HEAD baseline): unit-tested and at least one binary-level integration test.

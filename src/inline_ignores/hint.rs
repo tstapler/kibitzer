@@ -1,0 +1,77 @@
+//! The one-line syntax teaching shown in footers and hook context.
+
+use std::path::Path;
+
+use super::types::*;
+use crate::checker::Language;
+
+/// How a comment is written in a file type: text before and after the directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommentLeader {
+    pub open: &'static str,
+    pub close: &'static str,
+}
+
+/// Leader by grammar language, `.md`, else `#` (the fallback scanner accepts it).
+pub(crate) fn comment_leader(path: &Path) -> CommentLeader {
+    let (open, close) = match Language::for_path(path) {
+        Some(Language::Python) => ("#", ""),
+        Some(_) => ("//", ""),
+        None if path.extension().is_some_and(|e| e == "md") => ("<!--", " -->"),
+        None => ("#", ""),
+    };
+    CommentLeader { open, close }
+}
+
+pub(crate) const HINT_RULE_LIMIT: usize = 6;
+
+/// The footer's one-line syntax teaching. `anchor` is the first shown finding; without it the
+/// generic `<rule>` form is rendered and `rule_ids` is ignored.
+pub(crate) fn syntax_hint(
+    path: &Path,
+    anchor: Option<(&RuleId, Line)>,
+    rule_ids: &[&RuleId],
+) -> String {
+    syntax_hint_limited(path, anchor, rule_ids, HINT_RULE_LIMIT)
+}
+
+/// As `syntax_hint`, listing at most `max_rules` ids (then `...`); the footer budget shrinks it.
+pub(crate) fn syntax_hint_limited(
+    path: &Path,
+    anchor: Option<(&RuleId, Line)>,
+    rule_ids: &[&RuleId],
+    max_rules: usize,
+) -> String {
+    let leader = comment_leader(path);
+    let rule_text = anchor.map_or("<rule>", |(rule, _)| rule.as_str());
+    let mut hint = format!(
+        "Dismiss a judged finding: {} kibitzer:ignore {rule_text} -- <why>{}, ",
+        leader.open, leader.close
+    );
+    match anchor {
+        Some((rule, line)) if FILE_SCOPE_RULES.contains(&rule.as_str()) => hint.push_str(&format!(
+            "in the first {FILE_HEAD_LINES} lines or on the anchor line (line {})",
+            line.get()
+        )),
+        Some((_, line)) => hint.push_str(&format!(
+            "on its own line directly above line {} (or at its end)",
+            line.get()
+        )),
+        None => hint.push_str("on its own line directly above the flagged line (or at its end)"),
+    }
+    hint.push('.');
+    if anchor.is_some() && !rule_ids.is_empty() {
+        let shown: Vec<&str> = rule_ids
+            .iter()
+            .take(max_rules.max(1))
+            .map(|r| r.as_str())
+            .collect();
+        let more = if rule_ids.len() > shown.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        hint.push_str(&format!(" Rules: {}{more}.", shown.join(", ")));
+    }
+    hint
+}
