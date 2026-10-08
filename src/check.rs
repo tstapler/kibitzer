@@ -3639,4 +3639,34 @@ mod inline_seam_tests {
         assert!(!result.passed);
         assert!(result.output.contains("reading"), "{}", result.output);
     }
+
+    #[test]
+    fn inline_ignore_volume_should_SurviveDiffScoping_When_ChangedLinesIsFifthDirectiveRow() {
+        let dir = tmp_dir("volume");
+        let mut source = String::from("package main\n");
+        for row in [10, 20, 30, 35, 40] {
+            while source.lines().count() + 1 < row {
+                source.push('\n');
+            }
+            source.push_str("// kibitzer:ignore flag-argument -- pinned by caller\n");
+        }
+        let file = dir.join("main.go");
+        std::fs::write(&file, &source).unwrap();
+        let result = run_native_check(
+            &inline_ignore_check(),
+            crate::checkers::inline_ignore::NAME,
+            &dir,
+            &file,
+            Some(&[(40, 40)]),
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
+        assert!(!result.passed);
+        assert!(
+            result.output.contains("main.go:40: [ignore-volume]"),
+            "{}",
+            result.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

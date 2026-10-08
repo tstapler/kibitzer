@@ -52,6 +52,7 @@ impl Checker for InlineIgnoreChecker {
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
         let lines: Vec<&str> = ctx.source.lines().collect();
         let mut findings = Vec::new();
+        let mut valid_rows = Vec::new();
         for (row, parse) in scan_directives(file, ctx.source) {
             let line = lines.get(row.get() - 1).copied().unwrap_or_default();
             match parse {
@@ -59,6 +60,7 @@ impl Checker for InlineIgnoreChecker {
                     findings.push(syntax_finding(row.get(), malformed_message(reason, line)));
                 }
                 DirectiveParse::Valid(d) => {
+                    valid_rows.push(row.get());
                     for rule in d.rules().iter().filter(|r| !known_rule(r.as_str())) {
                         if let Some(near) = did_you_mean(rule.as_str()) {
                             findings.push(syntax_finding(
@@ -74,9 +76,23 @@ impl Checker for InlineIgnoreChecker {
                 DirectiveParse::NotADirective => {}
             }
         }
+        // At the threshold row only, so the finding is inside the changed lines of the edit
+        // that adds the 5th directive and later directives add no repeat noise.
+        if let Some(&row) = valid_rows.get(IGNORE_VOLUME_THRESHOLD - 1) {
+            findings.push(Finding {
+                line: row,
+                message: format!(
+                    "[ignore-volume] {} inline ignores in this file; tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong",
+                    valid_rows.len()
+                ),
+            });
+        }
+        findings.sort_by_key(|f| f.line);
         Ok(findings)
     }
 }
+
+const IGNORE_VOLUME_THRESHOLD: usize = 5;
 
 fn syntax_finding(line: usize, message: String) -> Finding {
     Finding {
@@ -340,5 +356,62 @@ mod tests {
     fn inline_ignore_should_EmitNothing_When_DirectiveValid() {
         assert!(go("// kibitzer:ignore flag-argument -- legacy api pinned").is_empty());
         assert!(run("x.go", "package main\n").is_empty());
+    }
+
+    fn go_with_directives(count: usize, fifth_at: usize) -> String {
+        let mut source = String::from("package main\n");
+        let mut row = 1;
+        for n in 0..count {
+            let target = if n == 4 { fifth_at } else { row + 2 };
+            while row + 1 < target {
+                source.push('\n');
+                row += 1;
+            }
+            source.push_str(&format!(
+                "// kibitzer:ignore flag-argument -- pinned by caller {n}\n"
+            ));
+            row += 1;
+        }
+        source
+    }
+
+    fn volume_findings(source: &str) -> Vec<String> {
+        run("x.go", source)
+            .into_iter()
+            .filter(|f| f.contains("[ignore-volume]"))
+            .collect()
+    }
+
+    #[test]
+    fn inline_ignore_should_EmitVolumeFinding_When_FiveValidDirectives() {
+        let source = go_with_directives(5, 40);
+        assert_eq!(
+            volume_findings(&source),
+            vec![
+                "40: [ignore-volume] 5 inline ignores in this file; tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_EmitVolumeOncePerFile_When_SevenValidDirectives() {
+        let source = go_with_directives(7, 40);
+        let found = volume_findings(&source);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("40: "), "{found:?}");
+    }
+
+    #[test]
+    fn inline_ignore_should_EmitNothing_When_FourValidDirectives() {
+        assert!(volume_findings(&go_with_directives(4, 40)).is_empty());
+    }
+
+    #[test]
+    fn inline_ignore_should_NotCountMalformedDirectives_When_CountingVolume() {
+        let source = format!(
+            "{}// kibitzer:ignore flag-argument\n",
+            go_with_directives(4, 40)
+        );
+        assert!(volume_findings(&source).is_empty());
     }
 }
