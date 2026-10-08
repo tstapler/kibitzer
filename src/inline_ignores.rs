@@ -381,6 +381,44 @@ pub fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
     scan_directives_with_cache(&GrammarCache::new(), path, source)
 }
 
+/// Rules whose anchor is not a statement: a directive in the file head also covers them.
+const FILE_SCOPE_RULES: &[&str] = &["file-size", "file-complexity"];
+const FILE_HEAD_LINES: usize = 10;
+/// Diagnostics about directives themselves; suppressing them would hide the repair prompt.
+const META_RULES: &[&str] = &[
+    "ignore-syntax",
+    "unused-ignore",
+    "ignore-volume",
+    "blocking-suppressed",
+];
+/// Checkers whose leading `[x]` prefix is data (a link ref id), not a rule id.
+const DYNAMIC_PREFIX_CHECKERS: &[&str] = &["markdown-link-integrity"];
+
+/// The leading `[x]` of a finding message, if any.
+fn bracket_prefix(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix('[')?;
+    rest.split_once(']').map(|(rule, _)| rule)
+}
+
+/// Matching never consults a rule table, so a stale table cannot make an ignore fail closed.
+pub(crate) fn rule_matches(directive_rule: &RuleId, checker_name: &str, message: &str) -> bool {
+    if META_RULES.contains(&directive_rule.as_str()) {
+        return false;
+    }
+    if directive_rule.as_str() == checker_name {
+        return true;
+    }
+    !DYNAMIC_PREFIX_CHECKERS.contains(&checker_name)
+        && bracket_prefix(message) == Some(directive_rule.as_str())
+}
+
+/// A whole-line directive also covers the row below its last row; a trailing one only its own rows.
+pub(crate) fn covers(d: &Directive, finding_line: Line, rule_match: bool) -> bool {
+    rule_match
+        && ((d.start_line <= finding_line && finding_line <= d.end_line)
+            || (d.whole_line && finding_line.get() == d.end_line.get() + 1))
+}
+
 // Test names follow the validation plan's should_X_When_Y convention.
 #[cfg(test)]
 #[allow(non_snake_case)]
@@ -798,5 +836,70 @@ mod tests {
         let scanned = scan_directives_with_cache(&cache, Path::new("x.go"), &source);
         assert!(scanned.is_empty());
         assert!(format!("{cache:?}").contains("languages_cached: 0"));
+    }
+
+    fn dir(rule_names: &[&str], start: usize, end: usize, whole_line: bool) -> Directive {
+        Directive::new(
+            rules(rule_names),
+            Reason::new("legacy api pinned", &[]).unwrap(),
+            Line::new(start),
+            Line::new(end),
+            whole_line,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn covers_should_BeTrueOnlyAtNextRow_When_WholeLineDirective() {
+        let d = dir(&["flag-argument"], 9, 9, true);
+        assert!(covers(&d, Line::new(10), true));
+        assert!(covers(&d, Line::new(9), true));
+        assert!(!covers(&d, Line::new(11), true));
+        assert!(!covers(&d, Line::new(10), false));
+    }
+
+    #[test]
+    fn covers_should_StayOnOwnRow_When_TrailingComment() {
+        let d = dir(&["flag-argument"], 9, 9, false);
+        assert!(covers(&d, Line::new(9), true));
+        assert!(!covers(&d, Line::new(10), true));
+    }
+
+    #[test]
+    fn covers_should_SpanAllRows_When_BlockComment() {
+        let d = dir(&["flag-argument"], 4, 6, true);
+        assert!(covers(&d, Line::new(5), true));
+        assert!(covers(&d, Line::new(7), true));
+        assert!(!covers(&d, Line::new(8), true));
+    }
+
+    #[test]
+    fn covers_should_TreatLineZeroAsLineOne() {
+        let d = dir(&["file-size"], 1, 1, true);
+        assert!(covers(&d, Line::new(0), true));
+    }
+
+    #[test]
+    fn rule_matches_should_MatchCheckerNameOrBracketPrefix() {
+        let r = |s: &str| RuleId::new(s).unwrap();
+        assert!(rule_matches(&r("flag-argument"), "syntax-rules-go", "[flag-argument] x"));
+        assert!(rule_matches(&r("primitive-obsession"), "primitive-obsession", "plain text"));
+        assert!(!rule_matches(&r("other"), "syntax-rules-go", "[flag-argument] x"));
+        assert!(rule_matches(&r("some-new-rule"), "unknown-checker", "[some-new-rule] m"));
+    }
+
+    #[test]
+    fn rule_matches_should_BeFalse_When_DynamicPrefixCheckerAndBracketMatch() {
+        let r = |s: &str| RuleId::new(s).unwrap();
+        let msg = "[foo] used but never defined";
+        assert!(!rule_matches(&r("foo"), "markdown-link-integrity", msg));
+        assert!(rule_matches(&r("markdown-link-integrity"), "markdown-link-integrity", msg));
+    }
+
+    #[test]
+    fn rule_matches_should_BeFalse_When_MetaRule() {
+        let r = |s: &str| RuleId::new(s).unwrap();
+        assert!(!rule_matches(&r("ignore-syntax"), "inline-ignore", "[ignore-syntax] bad"));
+        assert!(!rule_matches(&r("unused-ignore"), "unused-ignore", "x"));
     }
 }
