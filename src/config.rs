@@ -1809,6 +1809,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn default_checks_should_ScopeInlineIgnoreToGrammarExtensionsAndMd_When_Read() {
         let defaults = default_checks();
         let check = defaults
@@ -1827,6 +1828,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn inline_ignore_findings_should_BeAdvisory_When_FileHasBlockingChecks() {
         let severity_of = |name: &str| {
             default_checks()

@@ -25,6 +25,8 @@ mod hook_log;
 mod hotspots;
 mod import_graph;
 mod inline_ignores;
+#[cfg(test)]
+mod inline_ignores_anchor_tests;
 mod install;
 mod isp_fat_interface;
 mod jaccard;

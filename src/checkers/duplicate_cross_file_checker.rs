@@ -270,6 +270,21 @@ impl DuplicateIndex {
     }
 }
 
+/// Test hook for the anchor-conformance table: the real index logic against an in-memory
+/// index (the checker's own `check` persists to disk), indexing `others` then `(target, source)`.
+#[cfg(test)]
+pub(crate) fn findings_with_siblings(
+    others: &[(&str, &str)],
+    target: &str,
+    source: &str,
+) -> Vec<Finding> {
+    let mut index = DuplicateIndex::default();
+    for (path, text) in others {
+        index.reindex_file_and_find_duplicates(Path::new(path), text);
+    }
+    index.reindex_file_and_find_duplicates(Path::new(target), source)
+}
+
 /// Every `MIN_BLOCK_LINES`-line qualifying window in `source`, as `(0-indexed start
 /// line, joined normalized text)` — the exact text (not a hash) is used as the index
 /// key so two different blocks can never collide onto the same entry.

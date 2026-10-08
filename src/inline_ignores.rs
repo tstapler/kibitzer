@@ -428,7 +428,7 @@ pub fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
 }
 
 /// Rules whose anchor is not a statement: a directive in the file head also covers them.
-const FILE_SCOPE_RULES: &[&str] = &["file-size", "file-complexity"];
+pub(crate) const FILE_SCOPE_RULES: &[&str] = &["file-size", "file-complexity"];
 const FILE_HEAD_LINES: usize = 10;
 /// Diagnostics about directives themselves; suppressing them would hide the repair prompt.
 const META_RULES: &[&str] = &[

@@ -1,5 +1,6 @@
 //! Exercises the real `kibitzer run` binary against temp directories, covering the
 //! `inline-ignore` checker's end-to-end contract (output lines, exit status).
+#![allow(non_snake_case)]
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
