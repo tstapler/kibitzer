@@ -424,8 +424,13 @@ fn run_checker_against_source(
         severity,
         inline_ctx,
     } = run;
-    let findings =
-        crate::checker::run_checker_configured(checker_name, file_path, source, options)?;
+    let findings = crate::checker::run_checker_configured_with_scans(
+        checker_name,
+        file_path,
+        source,
+        options,
+        &inline_ctx.scan_memo,
+    )?;
     let applied = apply_inline_ignores(
         findings,
         file_path,

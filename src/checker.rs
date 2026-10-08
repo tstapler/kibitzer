@@ -151,6 +151,17 @@ pub trait Checker {
     /// Run the check against `file`'s already-loaded `ctx`.
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>>;
 
+    /// [`check`](Checker::check) given the run's directive-scan memo, so a checker that reads
+    /// inline directives shares the scan the ignore pass does. Defaults to `check`.
+    fn check_with_scans(
+        &self,
+        file: &Path,
+        ctx: &CheckContext,
+        _scans: &crate::inline_ignores::ScanMemo,
+    ) -> Result<Vec<Finding>> {
+        self.check(file, ctx)
+    }
+
     /// Reconfigures this checker using a project's per-check `options` object
     /// (`config::Check::options`, from `.kibitzer/inspect.json`). The default,
     /// inherited by every checker that doesn't override it, ignores `options` and
@@ -220,11 +231,29 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
 /// per-project `Check` in scope (`backtest.rs`'s reconstructed-history runs, most tests)
 /// use [`run_checker_with_cache`] directly instead, passing `None`-equivalent behavior by
 /// simply not calling `configure` at all.
+#[cfg(test)]
 pub fn run_checker_configured(
     checker_name: &str,
     file: &Path,
     source: &str,
     options: Option<&serde_json::Value>,
+) -> Result<Vec<Finding>> {
+    run_checker_configured_with_scans(
+        checker_name,
+        file,
+        source,
+        options,
+        &crate::inline_ignores::ScanMemo::default(),
+    )
+}
+
+/// [`run_checker_configured`] sharing `scans` with the caller's inline-ignore pass.
+pub fn run_checker_configured_with_scans(
+    checker_name: &str,
+    file: &Path,
+    source: &str,
+    options: Option<&serde_json::Value>,
+    scans: &crate::inline_ignores::ScanMemo,
 ) -> Result<Vec<Finding>> {
     let checker = lookup(checker_name)
         .ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
@@ -233,7 +262,7 @@ pub fn run_checker_configured(
         None => checker,
     };
     let cache = GrammarCache::new();
-    run_checker_with_cache(checker.as_ref(), file, source, &cache)
+    run_checker_on_tree(checker.as_ref(), file, source, &cache, scans)
 }
 
 /// The parse-then-check step [`run_checker_configured`] delegates to once it has a
@@ -249,6 +278,22 @@ pub fn run_checker_with_cache(
     source: &str,
     cache: &GrammarCache,
 ) -> Result<Vec<Finding>> {
+    run_checker_on_tree(
+        checker,
+        file,
+        source,
+        cache,
+        &crate::inline_ignores::ScanMemo::default(),
+    )
+}
+
+fn run_checker_on_tree(
+    checker: &dyn Checker,
+    file: &Path,
+    source: &str,
+    cache: &GrammarCache,
+    scans: &crate::inline_ignores::ScanMemo,
+) -> Result<Vec<Finding>> {
     let tree = match checker.language() {
         Some(language) => Some(cache.parse(language, source)?),
         None => None,
@@ -257,7 +302,7 @@ pub fn run_checker_with_cache(
         source,
         tree: tree.as_ref(),
     };
-    checker.check(file, &ctx)
+    checker.check_with_scans(file, &ctx, scans)
 }
 
 /// Parses at most once per [`Language`] over this cache instance's lifetime, regardless

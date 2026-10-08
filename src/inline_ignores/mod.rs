@@ -20,10 +20,9 @@ pub(crate) use hint::{HINT_RULE_LIMIT, batch_syntax_hint, syntax_hint, syntax_hi
 pub use parse::is_directive_comment;
 pub(crate) use parse::{echo_parts, near_miss_text};
 pub(crate) use rules::{anchor_rule, did_you_mean, known_rule, owned_by};
-pub use scan::scan_directives;
+pub use scan::ScanMemo;
 pub use types::{
-    Directive, DirectiveParse, InlineOutcome, Line, MalformedReason, Reason, RuleId, Scanned,
-    WeakReason,
+    Directive, DirectiveParse, InlineOutcome, Line, MalformedReason, Reason, RuleId, WeakReason,
 };
 pub(crate) use types::{LineSpan, RawFinding, rows_intersect, valid_directives};
 pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores};
@@ -31,6 +30,10 @@ pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores}
 // Reached through this module only by tests; production code names the submodule item itself.
 #[cfg(test)]
 pub(crate) use parse::parse_comment_line;
+#[cfg(test)]
+pub use scan::scan_directives;
+#[cfg(test)]
+pub use types::Scanned;
 #[cfg(test)]
 pub(crate) use types::{Anchor, DroppedFinding, FILE_SCOPE_RULES, ReasonError};
 #[cfg(test)]

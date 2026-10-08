@@ -8,8 +8,8 @@ use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::inline_ignores::{
-    DirectiveParse, MalformedReason, Scanned, WeakReason, did_you_mean, echo_parts, known_rule,
-    near_miss_text, scan_directives,
+    DirectiveParse, MalformedReason, RuleId, ScanMemo, WeakReason, did_you_mean, echo_parts,
+    known_rule, near_miss_text,
 };
 
 /// Every grammar-backed extension plus markdown: the files whose comments the scanners read.
@@ -54,46 +54,66 @@ impl Checker for InlineIgnoreChecker {
     }
 
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        self.check_with_scans(file, ctx, &ScanMemo::default())
+    }
+
+    fn check_with_scans(
+        &self,
+        file: &Path,
+        ctx: &CheckContext,
+        scans: &ScanMemo,
+    ) -> Result<Vec<Finding>> {
         let lines: Vec<&str> = ctx.source.lines().collect();
         let mut findings = Vec::new();
         let mut valid_rows = Vec::new();
-        for Scanned { row, parse } in scan_directives(file, ctx.source) {
-            let line = lines.get(row.get() - 1).copied().unwrap_or_default();
-            match parse {
+        for scanned in scans.scan(file, ctx.source).iter() {
+            let row = scanned.row.get();
+            let line = lines.get(row - 1).copied().unwrap_or_default();
+            match &scanned.parse {
+                DirectiveParse::NotADirective => {}
                 DirectiveParse::Malformed(reason) => {
-                    findings.push(syntax_finding(row.get(), malformed_message(reason, line)));
+                    findings.push(syntax_finding(row, malformed_message(*reason, line)));
                 }
                 DirectiveParse::Valid(d) => {
-                    valid_rows.push(row.get());
-                    for rule in d.rules().iter().filter(|r| !known_rule(r.as_str())) {
-                        if let Some(near) = did_you_mean(rule.as_str()) {
-                            findings.push(syntax_finding(
-                                row.get(),
-                                format!(
-                                    "unknown rule '{rule}' - did you mean '{near}'?",
-                                    rule = rule.as_str()
-                                ),
-                            ));
-                        }
-                    }
+                    valid_rows.push(row);
+                    findings.extend(unknown_rule_findings(row, d.rules()));
                 }
-                DirectiveParse::NotADirective => {}
             }
         }
-        // At the threshold row only, so the finding is inside the changed lines of the edit
-        // that adds the 5th directive and later directives add no repeat noise.
-        if let Some(&row) = valid_rows.get(IGNORE_VOLUME_THRESHOLD - 1) {
-            findings.push(Finding {
-                line: row,
-                message: format!(
-                    "[ignore-volume] {} inline ignores in this file; tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong",
-                    valid_rows.len()
-                ),
-            });
-        }
+        findings.extend(volume_finding(&valid_rows));
         findings.sort_by_key(|f| f.line);
         Ok(findings)
     }
+}
+
+/// One `did you mean` finding per unrecognised rule that has a near match.
+fn unknown_rule_findings(row: usize, rules: &[RuleId]) -> impl Iterator<Item = Finding> + '_ {
+    rules
+        .iter()
+        .filter(|rule| !known_rule(rule.as_str()))
+        .filter_map(move |rule| {
+            let near = did_you_mean(rule.as_str())?;
+            Some(syntax_finding(
+                row,
+                format!(
+                    "unknown rule '{rule}' - did you mean '{near}'?",
+                    rule = rule.as_str()
+                ),
+            ))
+        })
+}
+
+/// Reported at the threshold row only, so the finding is inside the changed lines of the
+/// edit that adds the 5th directive and later directives add no repeat noise.
+fn volume_finding(valid_rows: &[usize]) -> Option<Finding> {
+    let &row = valid_rows.get(IGNORE_VOLUME_THRESHOLD - 1)?;
+    Some(Finding {
+        line: row,
+        message: format!(
+            "[ignore-volume] {} inline ignores in this file; tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong",
+            valid_rows.len()
+        ),
+    })
 }
 
 const IGNORE_VOLUME_THRESHOLD: usize = 5;
@@ -171,6 +191,36 @@ mod tests {
             "x.go",
             &format!("package main\n\n{comment}\nfunc f(b bool) {{}}\n"),
         )
+    }
+
+    #[test]
+    fn inline_ignore_should_ScanOnce_When_CheckerAndIgnorePassShareTheMemo() {
+        use crate::inline_ignores::{InlineIgnoreContext, apply_inline_ignores};
+        use std::sync::atomic::Ordering;
+        let src =
+            "package main\n\n// kibitzer:ignore flag-arg -- legacy api pinned\nfunc f(b bool) {}\n";
+        let path = Path::new("x.go");
+        let ctx = InlineIgnoreContext::default();
+        let findings = crate::checker::run_checker_configured_with_scans(
+            NAME,
+            path,
+            src,
+            None,
+            &ctx.scan_memo,
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        apply_inline_ignores(
+            findings,
+            path,
+            src,
+            NAME,
+            crate::config::Severity::Advisory,
+            &ctx,
+        );
+        // Both the checker and the ignore pass asked the memo; only one parsed.
+        assert_eq!(ctx.scan_memo.hash_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 1);
     }
 
     #[test]
