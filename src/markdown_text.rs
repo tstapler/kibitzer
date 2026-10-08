@@ -140,7 +140,9 @@ pub fn check_paragraphs(
     findings
 }
 
+// Test names follow the validation plan's should_X_When_Y convention.
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 
@@ -171,5 +173,53 @@ mod tests {
             paragraphs.is_empty(),
             "table cells should never surface as paragraphs, got: {paragraphs:?}"
         );
+    }
+
+    fn prose_findings(source: &str) -> Vec<(String, usize, String)> {
+        ["repetitive-sentence-structure", "missing-paragraph-break"]
+            .iter()
+            .flat_map(|name| {
+                crate::checker::run_checker_configured(
+                    name,
+                    std::path::Path::new("a.md"),
+                    source,
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .map(move |f| (name.to_string(), f.line, f.message))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prose_checks_should_BeIdentical_When_DirectiveHtmlCommentAdded() {
+        let paragraph = "This is bad. This is worse. This is worst. It ends. It goes on. The rest follows. Another one here. And a last one.";
+        let plain = format!("# Title\n\n{paragraph}\n");
+        let baseline = prose_findings(&plain);
+        assert!(
+            baseline
+                .iter()
+                .any(|f| f.0 == "repetitive-sentence-structure"),
+            "fixture must trigger the check: {baseline:?}"
+        );
+        let directive = "<!-- kibitzer:ignore missing-paragraph-break -- long on purpose -->";
+        for variant in [
+            format!("# Title\n\n{paragraph}\n{directive}\n"),
+            format!("# Title\n\n{paragraph}\n\n{directive}\n"),
+            format!("# Title\n\n{directive}\n{paragraph}\n"),
+        ] {
+            let with_comment = prose_findings(&variant);
+            let strip_line = |v: &[(String, usize, String)]| {
+                v.iter()
+                    .map(|f| (f.0.clone(), f.2.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                strip_line(&with_comment),
+                strip_line(&baseline),
+                "{variant:?}"
+            );
+        }
     }
 }

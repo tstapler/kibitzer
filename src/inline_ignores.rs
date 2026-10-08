@@ -381,7 +381,9 @@ pub fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
     scan_directives_with_cache(&GrammarCache::new(), path, source)
 }
 
+// Test names follow the validation plan's should_X_When_Y convention.
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 

@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::rules;
+use crate::inline_ignores::is_directive_comment;
 use crate::tree_walk::comment_kinds;
 
 /// `over-commented` fires when a declaration's attached comment lines are at least this
@@ -228,6 +229,10 @@ impl Checker for CommentQualityChecker {
         let mut in_fence = false;
         for comment in &comments {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
+            // The fix an agent adds for a finding must not itself produce one.
+            if is_directive_comment(text) {
+                continue;
+            }
             check_verbose_phrases(*comment, text, &mut findings);
             in_fence =
                 check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
@@ -643,7 +648,7 @@ fn check_proportionality(
     let body_total_lines = body.end_position().row - body.start_position().row + 1;
 
     let mut comment_rows = BTreeSet::new();
-    collect_comment_rows(body, comment_kinds, &mut comment_rows);
+    collect_comment_rows(body, comment_kinds, src, &mut comment_rows);
     let body_comment_lines = comment_rows.len();
 
     let leading_nodes = leading_comment_nodes(decl, comment_kinds, src);
@@ -778,8 +783,13 @@ fn comment_end_row(node: Node) -> usize {
     }
 }
 
-fn collect_comment_rows(node: Node, comment_kinds: &[&str], rows: &mut BTreeSet<usize>) {
-    if comment_kinds.contains(&node.kind()) {
+fn collect_comment_rows(
+    node: Node,
+    comment_kinds: &[&str],
+    src: &[u8],
+    rows: &mut BTreeSet<usize>,
+) {
+    if comment_kinds.contains(&node.kind()) && !is_directive_node(node, src) {
         for row in node.start_position().row..=comment_end_row(node) {
             rows.insert(row);
         }
@@ -787,7 +797,7 @@ fn collect_comment_rows(node: Node, comment_kinds: &[&str], rows: &mut BTreeSet<
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_comment_rows(child, comment_kinds, rows);
+        collect_comment_rows(child, comment_kinds, src, rows);
     }
 }
 
@@ -797,6 +807,10 @@ fn collect_comment_rows(node: Node, comment_kinds: &[&str], rows: &mut BTreeSet<
 /// than documentation. A real backtest finding: a run of leftover commented-out
 /// function stubs immediately before a real, unrelated function was getting folded
 /// into that function's "leading doc comment," inflating its comment-to-code ratio.
+fn is_directive_node(node: Node, src: &[u8]) -> bool {
+    node.utf8_text(src).is_ok_and(is_directive_comment)
+}
+
 fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8]) -> Vec<Node<'a>> {
     let mut nodes = Vec::new();
     let mut next_start_row = decl.start_position().row;
@@ -811,6 +825,13 @@ fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8])
         let Ok(text) = sibling.utf8_text(src) else {
             break;
         };
+        // Not counted, but a directive between a doc comment and its function must not
+        // split the doc block.
+        if is_directive_comment(text) {
+            next_start_row = sibling.start_position().row;
+            cursor = sibling;
+            continue;
+        }
         if text
             .lines()
             .any(|line| looks_like_code(strip_comment_markers(line)))
@@ -843,7 +864,9 @@ inventory::submit! {
     })
 }
 
+// Test names follow the validation plan's should_X_When_Y convention.
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
     use crate::checker::{GrammarCache, run_checker_with_cache};
@@ -1441,6 +1464,74 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn comment_quality_should_EmitNothing_When_DirectiveCommentContainsCodeLikeText() {
+        let src = "package main\n\n// kibitzer:ignore flag-argument -- see foo(bar) and x = y\nfunc F() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+
+    #[test]
+    fn over_commented_should_NotCount_When_KibitzerCommentAddedAtThresholdMinusOne() {
+        let doc = "// This function adds two numbers together.\n// It takes a and b as parameters.\n// It returns the sum of a and b.\n// It never returns anything else.\n// It has no side effects.\n";
+        let body = "func Add(a, b int) int {\n\treturn a + b\n}\n";
+        let at_minus_one = format!("package main\n\n{doc}{body}");
+        assert!(
+            run(Language::Go, &at_minus_one)
+                .iter()
+                .all(|f| !f.message.contains("[over-commented]"))
+        );
+        let with_directive = format!(
+            "package main\n\n{doc}// kibitzer:ignore flag-argument -- pinned by public API\n{body}"
+        );
+        let findings = run(Language::Go, &with_directive);
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn over_commented_should_NotCount_When_KibitzerCommentInsideBody() {
+        let src = "package main\n\n// Adds.\n// It takes a and b.\n// It returns the sum.\n// Nothing else.\n// Really nothing.\nfunc Add(a, b int) int {\n\t// kibitzer:ignore flag-argument -- pinned by public API\n\treturn a + b\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn other_checkers_should_BeUnperturbed_When_ValidIgnoreAdded() {
+        let body = "func F() int {\n\treturn 4242 + 4242 + 4242 + 4242\n}\n\nfunc G() int {\n\treturn 4242 + 4242 + 4242 + 4242\n}\n";
+        let directive = "// kibitzer:ignore replace-magic-literal -- pinned by wire format\n";
+        let plain = format!("package main\n\n{body}");
+        let with_directive = format!("package main\n\n{directive}{body}");
+        // Digits are stripped so findings that cite line numbers compare modulo the shift.
+        let normalized = |source: &str, checker: &str| -> Vec<String> {
+            crate::checker::run_checker_configured(checker, &PathBuf::from("a.go"), source, None)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.message.chars().filter(|c| !c.is_ascii_digit()).collect())
+                .collect()
+        };
+        for checker in ["duplicate-code", "syntax-rules", "em-dash-overuse"] {
+            assert_eq!(
+                normalized(&with_directive, checker),
+                normalized(&plain, checker),
+                "{checker}"
+            );
+        }
+        assert!(
+            !normalized(&plain, "syntax-rules").is_empty(),
+            "fixture must trigger syntax-rules"
         );
     }
 }
