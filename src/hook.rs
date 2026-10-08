@@ -322,7 +322,7 @@ fn advisory_footer(
 }
 
 /// Distinct rule ids across every failing result, in order.
-fn union_rule_ids<'a>(failures: &[&'a CheckResult]) -> Vec<&'a RuleId> {
+pub(crate) fn union_rule_ids<'a>(failures: &[&'a CheckResult]) -> Vec<&'a RuleId> {
     let mut ids: Vec<&RuleId> = Vec::new();
     for result in failures {
         for id in result.inline.rule_ids() {

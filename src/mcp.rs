@@ -287,6 +287,35 @@ struct TypeHierarchyResponse {
     edges: Vec<TypeRelationEdge>,
 }
 
+/// `run_checks` prose: one line per failure, then (only when something failed) the one-line
+/// `kibitzer:ignore` syntax for `path`'s comment leader, so an agent needs no doc fetch.
+fn render_run_checks_report(results: &[CheckResult], path: &Path) -> String {
+    let failed: Vec<&CheckResult> = results.iter().filter(|r| !r.passed).collect();
+    if failed.is_empty() {
+        return "all checks passed".to_string();
+    }
+    let mut lines: Vec<String> = failed
+        .iter()
+        .map(|r| {
+            // Task 4.3.1c: a plugin-backed check whose binary is missing
+            // renders `[skipped]`, not `[Advisory]`/`[Blocking]` — an agent
+            // shouldn't read "not installed" as "ran and found a defect."
+            if r.plugin_missing {
+                format!("[skipped] {}: {}", r.check_name, r.describe())
+            } else {
+                format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe())
+            }
+        })
+        .collect();
+    let anchor = failed.iter().find_map(|r| r.inline.first_anchor());
+    lines.push(crate::inline_ignores::syntax_hint(
+        path,
+        anchor,
+        &crate::hook::union_rule_ids(&failed),
+    ));
+    lines.join("\n")
+}
+
 /// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain
 /// string) so a caller of these two JSON-returning tools never has to branch on response
 /// shape between the success and failure path, per ADR-001.
@@ -958,6 +987,7 @@ impl KibitzerServer {
     )]
     async fn run_checks(&self, req: Parameters<RunChecksRequest>) -> String {
         let file_path = PathBuf::from(&req.0.file_path);
+        let req_path = file_path.clone();
         let trigger = req.0.trigger;
         // Command-based checks can each block for up to `COMMAND_TIMEOUT` — run the
         // whole synchronous dispatch on a blocking-pool thread (the same pattern
@@ -981,27 +1011,7 @@ impl KibitzerServer {
         .await;
 
         match outcome {
-            Ok(Ok(results)) => {
-                let failures: Vec<String> = results
-                    .iter()
-                    .filter(|r| !r.passed)
-                    .map(|r| {
-                        // Task 4.3.1c: a plugin-backed check whose binary is missing
-                        // renders `[skipped]`, not `[Advisory]`/`[Blocking]` — an agent
-                        // shouldn't read "not installed" as "ran and found a defect."
-                        if r.plugin_missing {
-                            format!("[skipped] {}: {}", r.check_name, r.describe())
-                        } else {
-                            format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe())
-                        }
-                    })
-                    .collect();
-                if failures.is_empty() {
-                    "all checks passed".to_string()
-                } else {
-                    failures.join("\n")
-                }
-            }
+            Ok(Ok(results)) => render_run_checks_report(&results, &req_path),
             Ok(Err(e)) => format!("error running checks: {e}"),
             Err(e) => format!("run_checks task failed: {e}"),
         }
@@ -1436,7 +1446,9 @@ impl ServerHandler for KibitzerServer {
                  symbol by exact reference), or list_callers/list_callees (function-level \
                  call-graph traversal, Go/TS/JS only) — all four return JSON, not prose. If a \
                  check fires on an edit that didn't actually introduce the problem it claims, \
-                 call report_false_positive instead of just noting it in the transcript."
+                 call report_false_positive instead of just noting it in the transcript. To \
+                 dismiss a finding you judged acceptable, add a `kibitzer:ignore <rule> -- \
+                 <why>` comment above the flagged line."
                     .to_string(),
             ),
             ..Default::default()
@@ -3067,6 +3079,80 @@ mod tests {
         assert!(instructions.contains("list_callers"), "got: {instructions}");
         assert!(instructions.contains("list_callees"), "got: {instructions}");
         assert!(instructions.contains("JSON"), "got: {instructions}");
+    }
+
+    #[test]
+    fn get_info_instructions_should_MentionInlineIgnore_When_Read() {
+        let instructions = KibitzerServer::new()
+            .get_info()
+            .instructions
+            .expect("has instructions");
+        assert!(
+            instructions.contains("kibitzer:ignore"),
+            "got: {instructions}"
+        );
+        assert!(
+            !instructions.contains("kibitzer:false-positive"),
+            "got: {instructions}"
+        );
+    }
+
+    fn failing(name: &str, rule: Option<(&str, usize)>) -> CheckResult {
+        let mut inline = crate::inline_ignores::InlineOutcome::default();
+        if let Some((rule, line)) = rule {
+            inline.shown.push((
+                crate::inline_ignores::RuleId::new(rule).unwrap(),
+                crate::inline_ignores::Line::new(line),
+            ));
+        }
+        CheckResult {
+            check_name: name.to_string(),
+            severity: Severity::Advisory,
+            passed: false,
+            output: "x.go:4: [flag-argument] boolean parameter".to_string(),
+            message: None,
+            command: String::new(),
+            findings: Vec::new(),
+            plugin_missing: false,
+            inline,
+        }
+    }
+
+    #[test]
+    fn run_checks_report_should_EndWithSyntaxHint_When_FindingsPresent() {
+        let report = render_run_checks_report(
+            &[failing("go-flag-argument", Some(("flag-argument", 4)))],
+            Path::new("x.go"),
+        );
+        let last = report.lines().last().unwrap();
+        assert!(
+            last.contains("// kibitzer:ignore flag-argument -- <why>")
+                && last.contains("above line 4"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
+    fn run_checks_report_should_UseGenericHint_When_NoStructuredAnchor() {
+        let report = render_run_checks_report(&[failing("shell", None)], Path::new("notes.md"));
+        assert!(
+            report
+                .lines()
+                .last()
+                .unwrap()
+                .contains("<!-- kibitzer:ignore <rule> -- <why> -->"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
+    fn run_checks_report_should_OmitHint_When_AllPass() {
+        let mut ok = failing("go-flag-argument", None);
+        ok.passed = true;
+        assert_eq!(
+            render_run_checks_report(&[ok], Path::new("x.go")),
+            "all checks passed"
+        );
     }
 
     #[test]
