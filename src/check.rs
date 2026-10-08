@@ -3422,6 +3422,20 @@ mod inline_seam_tests {
     }
 
     #[test]
+    fn check_result_should_DeserializeWithEmptyInline_When_CacheJsonLacksInlineKey() {
+        let old_shape_json = r#"{
+            "check_name": "syntax-rules-go",
+            "severity": "advisory",
+            "passed": false,
+            "output": "x.go:3: [flag-argument] b",
+            "message": null,
+            "command": "kibitzer check native syntax-rules x.go"
+        }"#;
+        let result: CheckResult = serde_json::from_str(old_shape_json).unwrap();
+        assert_eq!(result.inline, InlineOutcome::default());
+    }
+
+    #[test]
     fn run_checks_for_trigger_should_DropFinding_When_IgnoreCoversChangedLine() {
         let dir = tmp_dir("trigger");
         let file = dir.join("main.go");

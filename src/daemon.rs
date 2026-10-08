@@ -406,3 +406,59 @@ mod spawn_debounce_tests {
         assert!(!spawn_is_debounced(None, SystemTime::now()));
     }
 }
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod inline_cache_tests {
+    use super::*;
+
+    #[test]
+    fn handle_run_checks_should_ReturnFirstAnchor_When_ResultServedFromCache() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), r#"{"checks": []}"#).unwrap();
+        let file = dir.join("main.go");
+        std::fs::write(
+            &file,
+            "package main\n\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n",
+        )
+        .unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache_path = dir.join("cache.json");
+
+        let anchor = |results: &[CheckResult]| {
+            results
+                .iter()
+                .find(|r| r.check_name == "syntax-rules-go")
+                .and_then(|r| {
+                    r.inline
+                        .first_anchor()
+                        .map(|(rule, line)| (rule.as_str().to_string(), line.get()))
+                })
+        };
+        let first = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        assert_eq!(anchor(&first), Some(("flag-argument".to_string(), 3)));
+        // Unchanged file and config: the second call must be a cache hit that still carries the anchor.
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .get(
+                    &file,
+                    &crate::config::resolve_config_path(&dir),
+                    &crate::plugin::default_registry_path(),
+                    "batch"
+                )
+                .is_some(),
+            "second request would not be a cache hit"
+        );
+        let second = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        assert_eq!(anchor(&second), anchor(&first));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

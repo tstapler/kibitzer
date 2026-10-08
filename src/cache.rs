@@ -56,20 +56,38 @@ struct CacheEntry {
 /// Persistent, file-fingerprint-keyed cache of check results, shared across daemon
 /// connections (and, via load/save, across daemon restarts) so unchanged files under
 /// repeated `run`/`hook` invocations skip re-executing check commands entirely.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Cache {
     entries: HashMap<String, CacheEntry>,
     /// (file_path, check_name) pairs that have failed a blocking check at least once
     /// under a live per-edit trigger without yet passing again — see `apply_grace`.
     #[serde(default)]
     grace_pending: HashMap<String, bool>,
+    /// Binary version that wrote this cache. Entries are keyed on file/config/registry
+    /// stamps only, so a pre-upgrade result would otherwise keep serving findings that
+    /// ignore handling should now hide. Same-version dev builds still share a cache.
+    #[serde(default)]
+    kibitzer_version: String,
+}
+
+/// Hand-written so a fresh cache is stamped with the running version, while a deserialized
+/// one without the key (an older binary's file) reads as stamped with nothing.
+impl Default for Cache {
+    fn default() -> Self {
+        Cache {
+            entries: HashMap::new(),
+            grace_pending: HashMap::new(),
+            kibitzer_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
 }
 
 impl Cache {
     pub fn load(path: &Path) -> Self {
         fs::read_to_string(path)
             .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .and_then(|raw| serde_json::from_str::<Cache>(&raw).ok())
+            .filter(|cache| cache.kibitzer_version == env!("CARGO_PKG_VERSION"))
             .unwrap_or_default()
     }
 
@@ -268,6 +286,106 @@ mod registry_invalidation_tests {
             result.is_some(),
             "registry_stamp being None on both sides must never itself cause a miss"
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn cache_roundtrip_should_PreserveInlineOutcome_When_ResultHasFirstAnchorAndDropped() {
+        use crate::inline_ignores::{DroppedFinding, InlineOutcome, Line, Reason, RuleId};
+        let file_path = tmp_path("rt-file.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let config_path = tmp_path("rt-inspect.json");
+        fs::write(&config_path, "{}").unwrap();
+        let registry_path = tmp_path("rt-registry.json");
+        let cache_path = tmp_path("rt-cache.json");
+
+        let rule = RuleId::new("flag-argument").unwrap();
+        let mut result = sample_result();
+        result.inline = InlineOutcome {
+            shown: vec![(rule.clone(), Line::new(7))],
+            kept: vec![(rule.clone(), Line::new(7))],
+            dropped: vec![DroppedFinding {
+                directive_start: Line::new(3),
+                directive_end: Line::new(3),
+                rule,
+                reason: Reason::new("legacy api pinned", &[]).unwrap(),
+                finding_line: Line::new(4),
+                severity: Severity::Blocking,
+            }],
+        };
+        let mut cache = Cache::default();
+        cache.put(
+            &file_path,
+            &config_path,
+            &registry_path,
+            "batch",
+            vec![result.clone()],
+        );
+        cache.save(&cache_path).unwrap();
+        let loaded = Cache::load(&cache_path);
+        let hit = loaded
+            .get(&file_path, &config_path, &registry_path, "batch")
+            .expect("round trip must keep the entry");
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_file(&cache_path);
+        assert_eq!(hit[0].inline, result.inline);
+        assert_eq!(hit[0].inline.first_anchor().map(|(_, l)| l.get()), Some(7));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn cache_load_should_DiscardEntries_When_StoredKibitzerVersionDiffers() {
+        let file_path = tmp_path("ver-file.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let config_path = tmp_path("ver-inspect.json");
+        fs::write(&config_path, "{}").unwrap();
+        let registry_path = tmp_path("ver-registry.json");
+        let cache_path = tmp_path("ver-cache.json");
+
+        let mut cache = Cache::default();
+        cache.put(
+            &file_path,
+            &config_path,
+            &registry_path,
+            "batch",
+            vec![sample_result()],
+        );
+        cache.save(&cache_path).unwrap();
+        let current = fs::read_to_string(&cache_path).unwrap();
+        let stamp = format!(r#""kibitzer_version":"{}""#, env!("CARGO_PKG_VERSION"));
+        assert!(
+            current.contains(&stamp),
+            "save must stamp the running version"
+        );
+        assert_eq!(
+            Cache::load(&cache_path).entries.len(),
+            1,
+            "current version loads intact"
+        );
+
+        fs::write(
+            &cache_path,
+            current.replace(&stamp, r#""kibitzer_version":"0.0.0""#),
+        )
+        .unwrap();
+        assert!(Cache::load(&cache_path).entries.is_empty(), "stale version");
+
+        fs::write(&cache_path, current.replace(&format!(",{stamp}"), "")).unwrap();
+        assert!(
+            !fs::read_to_string(&cache_path)
+                .unwrap()
+                .contains("kibitzer_version")
+        );
+        assert!(
+            Cache::load(&cache_path).entries.is_empty(),
+            "no version key"
+        );
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_file(&cache_path);
     }
 }
 
