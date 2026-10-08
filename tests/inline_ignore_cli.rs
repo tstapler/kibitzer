@@ -265,3 +265,128 @@ fn kibitzer_run_should_ApplyBothSuppressors_When_InlineAndAcceptedMatchSameFindi
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn repo_file(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+/// Lines whose own rule tag (the first `: [tag]`) is a directive diagnostic; a line that merely
+/// quotes the tag inside a string literal does not count.
+fn directive_diagnostics(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|l| {
+            l.split_once(": [").is_some_and(|(_, rest)| {
+                rest.starts_with("ignore-syntax]") || rest.starts_with("unused-ignore]")
+            })
+        })
+        .collect()
+}
+
+/// Copies of this repo's own files that mention the marker only in string literals and
+/// prose, run through the real `kibitzer run`.
+#[test]
+fn kibitzer_run_should_NotSuppressOrReport_When_MarkerOnlyInStringLiteralsOfOwnRepo() {
+    let dir = temp_dir("self-run");
+    for rel in [
+        "src/inline_ignores.rs",
+        "src/checkers/inline_ignore.rs",
+        "src/hook.rs",
+        "src/inline_post_pass.rs",
+        "tests/inline_ignore_cli.rs",
+        "tests/hook_contract.rs",
+    ] {
+        let name = rel.rsplit('/').next().unwrap();
+        std::fs::copy(repo_file(rel), dir.join(name)).unwrap();
+    }
+    let stdout = run_with_args(&dir, &[]);
+    assert!(
+        directive_diagnostics(&stdout).is_empty(),
+        "{:#?}",
+        directive_diagnostics(&stdout)
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|l| l.starts_with("[kibitzer]") && l.contains("suppressed inline")),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn docs_examples_should_NotSelfSuppress_When_KibitzerRunOnDocs() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
+        .arg("run")
+        .arg(repo_file("docs"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        directive_diagnostics(&stdout).is_empty(),
+        "{:#?}",
+        directive_diagnostics(&stdout)
+    );
+}
+
+#[test]
+fn docs_should_ContainNoNoInlineStance_When_GrepRun() {
+    let stances = ["no inline", "no inline/per-line", "still no inline"];
+    let mut files = vec![repo_file("CLAUDE.md"), repo_file("README.md")];
+    for entry in std::fs::read_dir(repo_file("docs")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "md") {
+            files.push(path);
+        }
+    }
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap().to_lowercase();
+        for stance in stances {
+            assert!(!text.contains(stance), "{} says {stance:?}", path.display());
+        }
+    }
+}
+
+fn suppressing_checks_doc() -> String {
+    std::fs::read_to_string(repo_file("docs/suppressing-checks.md")).unwrap()
+}
+
+#[test]
+fn docs_suppressing_checks_should_ContainGrammarAndAnchorTable_When_Read() {
+    let doc = suppressing_checks_doc();
+    for needle in [
+        "## Dismiss one finding inline",
+        "### Grammar",
+        "kibitzer:ignore <rule>[,<rule>...] -- <reason>",
+        "One marker.",
+        "### Where the comment goes",
+        "| Checker | Where the ignore goes |",
+        "`file-size`",
+        "`duplicate-code`",
+        "`markdown-link-integrity`",
+        "Never suppressible:",
+        "`blocking-suppressed`",
+    ] {
+        assert!(
+            doc.contains(needle),
+            "suppressing-checks.md lacks {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn docs_should_StateHookStaleIgnoreGapAndCheckNativeBypass_When_Read() {
+    let doc = suppressing_checks_doc().replace("\n  ", " ");
+    assert!(
+        doc.contains("only when the directive sits inside the lines just edited"),
+        "stale-ignore hook gap missing"
+    );
+    assert!(
+        doc.contains("A stale ignore elsewhere in a file is not reported by the hook"),
+        "stale-ignore-elsewhere gap missing"
+    );
+    assert!(
+        doc.contains("`kibitzer check native <name> <file>`** runs the raw checker and bypasses inline ignores"),
+        "check native bypass missing"
+    );
+}
