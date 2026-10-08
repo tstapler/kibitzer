@@ -3313,6 +3313,33 @@ mod tests {
     /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
     /// plugin-backed check whose binary is missing, instead of raw shell noise a real
     /// command failure would look like.
+    #[tokio::test]
+    async fn run_checks_should_OmitCoveredFinding_When_InlineIgnoreAboveIt() {
+        const FUNC: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+        let dir = tmp_dir("run-checks-inline");
+        let report = |file: &str, source: String| {
+            let path = dir.join(file);
+            std::fs::write(&path, source).unwrap();
+            let server = KibitzerServer::new();
+            let req = RunChecksRequest {
+                file_path: path.display().to_string(),
+                trigger: "batch".to_string(),
+            };
+            async move { server.run_checks(Parameters(req)).await }
+        };
+        let control = report("control.go", format!("package main\n\n{FUNC}")).await;
+        let covered = report(
+            "covered.go",
+            format!(
+                "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\n{FUNC}"
+            ),
+        )
+        .await;
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(control.contains("[flag-argument]"), "got: {control}");
+        assert!(!covered.contains("[flag-argument]"), "got: {covered}");
+    }
+
     mod plugin_missing_rendering_tests {
         use super::*;
         use crate::config::OutputFormat;
