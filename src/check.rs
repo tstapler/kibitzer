@@ -2666,6 +2666,7 @@ mod git_head_integration_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn architecture_check_should_NotApplyInlineIgnores_When_WholeRepoCheck() {
         let repo = TempRepo::new("arch-no-inline");
         repo.write_and_commit("go.mod", "module fixture\ngo 1.21\n", "init");

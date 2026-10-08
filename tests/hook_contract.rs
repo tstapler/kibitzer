@@ -393,6 +393,7 @@ fn blocking_exit_also_prints_ignore_syntax_repair_from_inline_ignore_result() {
 const FLAG_FUNC: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
 
 #[test]
+#[allow(non_snake_case)]
 fn hook_should_OmitCoveredFinding_When_InlineIgnoreAboveIt() {
     let repo = TempRepo::new(
         "inline-covered",
