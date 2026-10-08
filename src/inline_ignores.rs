@@ -197,6 +197,47 @@ static LATER_DIRECTIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bkibitzer:ignore\s+[a-z0-9-]+(?:,[a-z0-9-]+)*\s+--\s+\S").unwrap()
 });
 
+static NEAR_MISS_ANYWHERE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"kibitzer\s*:\s*(?:ignore|disable|allow|suppress|false[-_ ]positive)\b").unwrap()
+});
+
+/// The near-miss marker as written on a source line, for echoing back in the repair message.
+pub(crate) fn near_miss_text(line: &str) -> Option<&str> {
+    NEAR_MISS_ANYWHERE_RE.find(line).map(|m| m.as_str())
+}
+
+/// A directive line as written, normalised for repair messages: the rule list (split on commas
+/// and whitespace, rejoined with commas) and the reason text after the separator, if any.
+/// Reads the raw source line because the parse result does not carry the text.
+pub(crate) fn echo_parts(line: &str) -> (String, String) {
+    let rest = line
+        .find(MARKER)
+        .map_or("", |i| line[i + MARKER.len()..].trim());
+    let rest = rest
+        .strip_suffix("*/")
+        .or_else(|| rest.strip_suffix("-->"))
+        .unwrap_or(rest)
+        .trim();
+    let (rules, reason) = match find_separator(rest) {
+        Some(i) => (&rest[..i], rest[i + 2..].trim()),
+        None => match rest.find(['\u{2014}', '\u{2013}']) {
+            Some(i) => (
+                &rest[..i],
+                rest[i..]
+                    .trim_start_matches(['\u{2014}', '\u{2013}'])
+                    .trim(),
+            ),
+            None => (rest, ""),
+        },
+    };
+    let rules = rules
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|r| !r.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    (rules, reason.to_string())
+}
+
 /// Finds a standalone `--` token (whitespace or text edge on both sides).
 fn find_separator(rest: &str) -> Option<usize> {
     rest.match_indices("--").map(|(i, _)| i).find(|&i| {
@@ -463,7 +504,11 @@ pub(crate) const KNOWN_RULES: &[&str] = &[
 /// `KNOWN_RULES` plus every registered checker name, built once (the registry is fixed per process).
 static SUGGESTION_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
     let mut names: Vec<String> = KNOWN_RULES.iter().map(|r| r.to_string()).collect();
-    names.extend(crate::checker::registry().iter().map(|c| c.name().to_string()));
+    names.extend(
+        crate::checker::registry()
+            .iter()
+            .map(|c| c.name().to_string()),
+    );
     names.sort();
     names.dedup();
     names
@@ -500,7 +545,11 @@ pub(crate) fn did_you_mean(unknown: &str) -> Option<&'static str> {
         .iter()
         .filter_map(|name| {
             let prefix = unknown.len() >= MIN_PREFIX_SUGGESTION_LEN && name.starts_with(unknown);
-            let score = if prefix { 1 } else { levenshtein(unknown, name) };
+            let score = if prefix {
+                1
+            } else {
+                levenshtein(unknown, name)
+            };
             (score <= MAX_SUGGESTION_DISTANCE && name != unknown).then_some((score, name))
         })
         .min_by_key(|(score, name)| (*score, name.len()))
@@ -1531,7 +1580,10 @@ mod tests {
         assert_eq!(did_you_mean("flag-arg"), Some("flag-argument"));
         assert_eq!(did_you_mean("flag-arguments"), Some("flag-argument"));
         assert_eq!(did_you_mean("deep-nestng"), Some("deep-nesting"));
-        assert_eq!(did_you_mean("primitive-obsesion"), Some("primitive-obsession"));
+        assert_eq!(
+            did_you_mean("primitive-obsesion"),
+            Some("primitive-obsession")
+        );
     }
 
     #[test]

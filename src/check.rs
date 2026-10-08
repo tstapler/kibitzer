@@ -685,7 +685,9 @@ fn run_checker_against_file(
     let source = match std::fs::read_to_string(file_path) {
         Ok(source) => source,
         // This checker runs on every walked file, so binary or unreadable ones are not failures.
-        Err(_) if checker_name == crate::checkers::inline_ignore::NAME => return Ok(SourceCheck::passing()),
+        Err(_) if checker_name == crate::checkers::inline_ignore::NAME => {
+            return Ok(SourceCheck::passing());
+        }
         Err(err) => {
             return Err(err).with_context(|| format!("reading {}", file_path.display()));
         }

@@ -7,6 +7,10 @@ use std::sync::LazyLock;
 use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::inline_ignores::{
+    DirectiveParse, MalformedReason, WeakReason, did_you_mean, echo_parts, known_rule,
+    near_miss_text, scan_directives,
+};
 
 /// Every grammar-backed extension plus markdown: the files whose comments the scanners read.
 static GLOBS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -39,10 +43,80 @@ impl Checker for InlineIgnoreChecker {
         &GLOBS
     }
 
-    fn check(&self, _file: &Path, _ctx: &CheckContext) -> Result<Vec<Finding>> {
-        Ok(Vec::new())
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        let lines: Vec<&str> = ctx.source.lines().collect();
+        let mut findings = Vec::new();
+        for (row, parse) in scan_directives(file, ctx.source) {
+            let line = lines.get(row.get() - 1).copied().unwrap_or_default();
+            match parse {
+                DirectiveParse::Malformed(reason) => {
+                    findings.push(syntax_finding(row.get(), malformed_message(reason, line)));
+                }
+                DirectiveParse::Valid(d) => {
+                    for rule in d.rules().iter().filter(|r| !known_rule(r.as_str())) {
+                        if let Some(near) = did_you_mean(rule.as_str()) {
+                            findings.push(syntax_finding(
+                                row.get(),
+                                format!(
+                                    "unknown rule '{rule}' - did you mean '{near}'?",
+                                    rule = rule.as_str()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                DirectiveParse::NotADirective => {}
+            }
+        }
+        Ok(findings)
     }
 }
+
+fn syntax_finding(line: usize, message: String) -> Finding {
+    Finding {
+        line,
+        message: format!("[ignore-syntax] {message}"),
+    }
+}
+
+/// ASCII-only repair text for one malformed directive; the offending line supplies the echo.
+fn malformed_message(reason: MalformedReason, line: &str) -> String {
+    let (rules, written_reason) = echo_parts(line);
+    let rules = if rules.is_empty() {
+        "<rule>".to_string()
+    } else {
+        rules
+    };
+    match reason {
+        MalformedReason::MissingRule => {
+            "kibitzer:ignore needs a rule id. Write: kibitzer:ignore <rule> -- <why>".to_string()
+        }
+        MalformedReason::MissingReason => format!(
+            "kibitzer:ignore {rules} has no reason. Write: kibitzer:ignore {rules} -- <why this is acceptable>"
+        ),
+        MalformedReason::WeakReason(WeakReason::TooShort) => format!(
+            "reason '{written_reason}' is too short to explain the code. Write: kibitzer:ignore {rules} -- {CONCRETE_REASON}"
+        ),
+        MalformedReason::WeakReason(WeakReason::RuleEcho) => format!(
+            "reason repeats the rule id instead of saying why the code is acceptable. Write: kibitzer:ignore {rules} -- {CONCRETE_REASON}"
+        ),
+        MalformedReason::NearMissMarker => format!(
+            "'{}' not recognized; use 'kibitzer:ignore'",
+            near_miss_text(line).unwrap_or("kibitzer:")
+        ),
+        MalformedReason::NotAtCommentStart => format!(
+            "kibitzer:ignore must start the comment; it was found after other text and suppresses nothing. Write it as its own comment: kibitzer:ignore {rules} -- <why>"
+        ),
+        MalformedReason::EmDashSeparator => format!(
+            "use ASCII '--' (two hyphens) between the rule and the reason, not an em dash. Write: kibitzer:ignore {rules} -- <why>"
+        ),
+        MalformedReason::BadRuleList => format!(
+            "rule list must be comma-separated with no spaces. Write: kibitzer:ignore {rules} -- <why>"
+        ),
+    }
+}
+
+const CONCRETE_REASON: &str = "<the concrete constraint that makes this code acceptable>";
 
 inventory::submit! {
     crate::checker::CheckerFactory(|| vec![Box::new(InlineIgnoreChecker)])
@@ -53,9 +127,26 @@ inventory::submit! {
 mod tests {
     use super::*;
 
+    fn run(path: &str, source: &str) -> Vec<String> {
+        let ctx = CheckContext { source, tree: None };
+        InlineIgnoreChecker
+            .check(Path::new(path), &ctx)
+            .unwrap()
+            .into_iter()
+            .map(|f| format!("{}: {}", f.line, f.message))
+            .collect()
+    }
+
+    fn go(comment: &str) -> Vec<String> {
+        run(
+            "x.go",
+            &format!("package main\n\n{comment}\nfunc f(b bool) {{}}\n"),
+        )
+    }
+
     #[test]
     fn inline_ignore_checker_should_BeRegisteredRawTextAdvisoryScope() {
-        let checker = crate::checker::lookup("inline-ignore").expect("registered");
+        let checker = crate::checker::lookup(NAME).expect("registered");
         assert_eq!(checker.language(), None);
         let globs = checker.file_globs();
         assert!(globs.contains(&"**/*.md"));
@@ -65,5 +156,183 @@ mod tests {
             }
         }
         assert_eq!(globs.len(), 13);
+    }
+
+    #[test]
+    fn inline_ignore_should_Report_When_MissingReason() {
+        let src = "package main\n\n\n\n\n\n\n// kibitzer:ignore flag-argument\nfunc f(b bool) {}\n";
+        assert_eq!(
+            run("x.go", src),
+            vec![
+                "8: [ignore-syntax] kibitzer:ignore flag-argument has no reason. Write: kibitzer:ignore flag-argument -- <why this is acceptable>"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_Report_When_MissingRule() {
+        assert_eq!(
+            go("// kibitzer:ignore -- why not"),
+            vec![
+                "3: [ignore-syntax] kibitzer:ignore needs a rule id. Write: kibitzer:ignore <rule> -- <why>"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_SuggestRule_When_UnknownRuleNearKnown() {
+        assert_eq!(
+            go("// kibitzer:ignore flag-arg -- legacy api pinned"),
+            vec!["3: [ignore-syntax] unknown rule 'flag-arg' - did you mean 'flag-argument'?"]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_EmitNothingForUnknownRule_When_NoNearMatch() {
+        assert!(go("// kibitzer:ignore made-up-rule -- legacy api pinned").is_empty());
+    }
+
+    #[test]
+    fn inline_ignore_should_ReportEachUnknownElementAndStillSuppress_When_CommaListMixesKnownAndUnknown()
+     {
+        let out = go("// kibitzer:ignore flag-argument,flag-arg -- legacy api pinned");
+        assert_eq!(
+            out,
+            vec!["3: [ignore-syntax] unknown rule 'flag-arg' - did you mean 'flag-argument'?"]
+        );
+        let src = "package main\n\n// kibitzer:ignore flag-argument,flag-arg -- legacy api pinned\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+        let findings =
+            crate::checker::run_checker_configured("syntax-rules", Path::new("x.go"), src, None)
+                .unwrap();
+        let applied = crate::inline_ignores::apply_inline_ignores(
+            findings,
+            Path::new("x.go"),
+            src,
+            "syntax-rules",
+            crate::config::Severity::Advisory,
+            &crate::inline_ignores::InlineIgnoreContext::default(),
+        );
+        assert!(applied.kept.is_empty(), "{:?}", applied.kept);
+        assert_eq!(applied.dropped.len(), 1);
+    }
+
+    #[test]
+    fn inline_ignore_should_Report_When_NearMissMarker() {
+        assert_eq!(
+            go("// kibitzer: ignore foo -- bar baz"),
+            vec!["3: [ignore-syntax] 'kibitzer: ignore' not recognized; use 'kibitzer:ignore'"]
+        );
+        assert_eq!(
+            go("// kibitzer:false-positive primitive-obsession -- id is opaque"),
+            vec![
+                "3: [ignore-syntax] 'kibitzer:false-positive' not recognized; use 'kibitzer:ignore'"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_TellUseAsciiDoubleHyphen_When_EmDashSeparator() {
+        for dash in ['\u{2014}', '\u{2013}'] {
+            let out = go(&format!(
+                "// kibitzer:ignore flag-argument {dash} legacy API"
+            ));
+            assert_eq!(
+                out,
+                vec![
+                    "3: [ignore-syntax] use ASCII '--' (two hyphens) between the rule and the reason, not an em dash. Write: kibitzer:ignore flag-argument -- <why>"
+                ]
+            );
+            assert!(!out[0].contains("no reason"));
+        }
+    }
+
+    #[test]
+    fn inline_ignore_should_Report_When_BadRuleList() {
+        for text in ["a, b", "a,,b", "a,"] {
+            let out = go(&format!("// kibitzer:ignore {text} -- legacy api pinned"));
+            assert_eq!(out.len(), 1, "{text}");
+            assert!(
+                out[0].contains(
+                    "rule list must be comma-separated with no spaces. Write: kibitzer:ignore "
+                ),
+                "{out:?}"
+            );
+        }
+        assert!(
+            go("// kibitzer:ignore a, b -- legacy api pinned")[0].contains("ignore a,b -- <why>")
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_Report_When_DirectiveNotAtCommentStart() {
+        assert_eq!(
+            go("// TODO kibitzer:ignore flag-argument -- legacy API, callers pinned"),
+            vec![
+                "3: [ignore-syntax] kibitzer:ignore must start the comment; it was found after other text and suppresses nothing. Write it as its own comment: kibitzer:ignore flag-argument -- <why>"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_RenderSeparateMessages_When_ReasonTooShortVersusRuleEcho() {
+        let short = &go("// kibitzer:ignore flag-argument -- needed")[0];
+        let echo = &go("// kibitzer:ignore flag-argument -- flag-argument")[0];
+        assert!(short.contains("reason 'needed' is too short to explain the code. Write: kibitzer:ignore flag-argument -- <the concrete constraint that makes this code acceptable>"), "{short}");
+        assert!(echo.contains("reason repeats the rule id instead of saying why the code is acceptable. Write: kibitzer:ignore flag-argument -- <the concrete constraint"), "{echo}");
+        assert_ne!(short, echo);
+        for m in [short, echo] {
+            assert!(!m.contains("at least two words"));
+            assert!(m.contains("concrete constraint"));
+        }
+    }
+
+    #[test]
+    fn inline_ignore_should_Report_When_TrailingCommentIsMalformed() {
+        let out = run(
+            "x.go",
+            "package main\n\nvar x = 1 // kibitzer:ignore flag-argument\n",
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].starts_with("3: [ignore-syntax] kibitzer:ignore flag-argument has no reason."),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_ReadMarkdownComments_When_MdFile() {
+        let out = run(
+            "n.md",
+            "# T\n\n<!-- kibitzer:ignore markdown-link-integrity -->\n",
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("has no reason"), "{out:?}");
+    }
+
+    #[test]
+    fn inline_ignore_messages_should_ContainNoEmDash_When_AllReasonsRendered() {
+        let cases = [
+            "// kibitzer:ignore -- why not",
+            "// kibitzer:ignore flag-argument",
+            "// kibitzer:ignore flag-argument -- needed",
+            "// kibitzer:ignore flag-argument -- flag-argument",
+            "// kibitzer: ignore flag-argument -- legacy api",
+            "// TODO kibitzer:ignore flag-argument -- legacy api pinned",
+            "// kibitzer:ignore flag-argument \u{2014} legacy api",
+            "// kibitzer:ignore a, b -- legacy api pinned",
+            "// kibitzer:ignore flag-arg -- legacy api pinned",
+        ];
+        for case in cases {
+            let out = go(case);
+            assert_eq!(out.len(), 1, "{case}");
+            assert!(!out[0].contains(['\u{2014}', '\u{2013}']), "{}", out[0]);
+            assert!(out[0].is_ascii(), "{}", out[0]);
+        }
+    }
+
+    #[test]
+    fn inline_ignore_should_EmitNothing_When_DirectiveValid() {
+        assert!(go("// kibitzer:ignore flag-argument -- legacy api pinned").is_empty());
+        assert!(run("x.go", "package main\n").is_empty());
     }
 }
