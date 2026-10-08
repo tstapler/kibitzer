@@ -85,3 +85,17 @@ were never shown to the agent, so the true agent-visible `R` is far below the re
 
 Limits: replay uses today's checkers; transcripts cannot show a dismissal; token costs are INFERRED; single-user sample;
 n = 20 hand-classified.
+
+## Human decision (Task 0.1.3), 2026-10-07
+
+Decided by the requester (tstapler): **PROCEED with the FULL plan** (about 62h committed as planned; 59.5h after the
+single-marker collapse below). Deferred items stay deferred: Task 2.2.2b, the `run` footer `false-positive` split,
+and the success ack.
+
+- Unit of `S`: **re-report events x A** (8085 x 0.20 = 1617), so `p* = 0.31`, under the 0.5 line. The other two readings
+  of `S` (distinct findings, tuples) would have given SHRINK; they are not used.
+- Caveats seen and accepted: (1) 13 of 20 sampled re-surfacings never appeared in any hook feedback, so the replay
+  overstates `R`; `A = 20%` is the only visibility correction; (2) the marker split collapses to the single
+  `kibitzer:ignore` marker (Task 0.1.2 result above), which drops Story 3.2.1 and the marker clause from the footer.
+- Revised post-ship target (from the plan): re-surfacing rate of dismissed findings at most `R - 0.5 x G`, with
+  `G = 11.9%` (literal `R`) so the replay-basis target is about `59.33% - 5.95% = 53.4%`; revised at the 30-day review.

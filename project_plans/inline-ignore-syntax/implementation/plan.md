@@ -1,8 +1,17 @@
 # Implementation Plan: inline-ignore-syntax
 
-**Feature**: Inline `kibitzer:ignore` / `kibitzer:false-positive` comments that suppress a native per-file finding on the same line or the line below, with mandatory rule and reason.
+**Feature**: Inline `kibitzer:ignore` comments that suppress a native per-file finding on the same line or the line below, with mandatory rule and reason.
 **Date**: 2026-10-07
-**Status**: Gated. Phase 0 (baseline replay go/no-go) must record PROCEED or SHRINK before any Phase 1 task starts
+**Status**: Phase 0 gate decided 2026-10-07: PROCEED with the full plan (59.5h committed after the single-marker collapse; `docs/backtest-triage/inline-ignore-gate.md`). Phases 1-4 in implementation.
+
+## Amendment 1 (2026-10-07): single marker, supersedes any text below that says otherwise
+
+The Task 0.1.2 marker test failed (class (c) 0 of 4) and the requester accepted the collapse. Wherever this plan or `validation.md` mentions a second marker, read it as follows:
+- Only `kibitzer:ignore` exists. `kibitzer:false-positive` is not a directive; it parses as `Malformed(NearMissMarker)` (add `false-positive`/`false_positive` to the near-miss set; the message echoes the text found: `'kibitzer:false-positive' not recognized; use 'kibitzer:ignore'`). `DirectiveKind` and `Directive.kind`/`DroppedFinding.kind` do not exist.
+- Story 3.2.1, Epic 3.2 and Tasks 3.2.1a/b are dropped (there is no `list --inline`; `kibitzer check false-positives list` is unchanged). Remove `list --inline` wording from docs, `CLAUDE.md` and Task 4.1.1f's checklist; `[ignore-volume]` message drops the `(N false-positive)` part.
+- The hook footer carries no marker clause; the syntax line is `Dismiss a judged finding: // kibitzer:ignore <rule> -- <why>, on its own line directly above the flagged line (above line 20 for the first). Rules: ...`. The 640/215 character caps stay as ceilings.
+- Hours (recounted with the command in "Effort and appetite": 61.5 sum of per-task figures): Story 3.2.1 (2.5h) leaves the committed slice, so Phases 1-4 are 55.5h and the committed total is 59.5h (the table below shows the pre-collapse 58.0/62.0/64.0/49.0 figures; subtract 2.5 from the first three, and the SHRINK slice no longer applies).
+- Validation rows for `list_false_positive_markers_*`, `false_positives_list_*inline*`, `*FalsePositiveKind*`, `*AcceptBothMarkers*`, `*SuppressIdentically*` are dropped; the near-miss row also covers `kibitzer:false-positive`.
 **ADRs**: [ADR-001](../decisions/ADR-001-adopt-inline-ignore-comments.md), [ADR-002](../decisions/ADR-002-blocking-checks-suppressible-with-guardrails.md)
 
 Line refs are against master @ 3660e64 and were re-checked in this phase.
@@ -43,7 +52,7 @@ The requirements ask for: syntax, shared-path filtering, malformed error, false-
 | `[unused-ignore]` hook advisory (Story 2.2.3 family) | KEEP (dropped only in the SHRINK slice) | P1-1 wrong-row loop; the correction fires where the mistake happens | 10.5 (2.2.0a 1, 2.2.2a 1.5, 2.2.3a 5, 2.2.3d 1, 2.2.3c 1, 2.2.3b 1) |
 | `[unused-ignore]` in `kibitzer run` (Task 2.2.2b) | DEFER to follow-up PR | nothing depends on it; the unknown-rule typo case is covered without it by Task 2.2.2e | 2.0 (not in committed total) |
 | Unknown-rule audit in `kibitzer run` (Task 2.2.2e) | KEEP | UX: a typo'd rule must not be silent in the CLI even with 2.2.2b deferred; reuses the Task 2.2.3c first-pass logic, no rerun | 1.0 |
-| Marker split (`false-positive` vs `ignore`, Story 3.2.1) | KEEP, conditional | the requirements name it (In Scope); Phase 0 Task 0.1.2 tests it before build and collapses to one marker if agreement is under 70% | 2.5 |
+| Marker split (`false-positive` vs `ignore`, Story 3.2.1) | DROPPED 2026-10-07 (Amendment 1) | Task 0.1.2 collapsed to one marker (class (c) 0 of 4) | 0 (was 2.5) |
 | Success ack line (old Task 3.1.2 ack) | DEFER (cut) | a working ignore makes the finding vanish; `kibitzer run` confirms; ~40 tokens per edit for an ambiguity that costs one command; revisit if the 30-day sample shows agents re-adding directives that already work | 0 (was folded in, unbudgeted) |
 | `run` one-line syntax hint (Task 2.2.1c) | KEEP | UX gap: developers otherwise find the syntax only in docs; 0.5h | 0.5 |
 
@@ -58,7 +67,7 @@ The requirements ask for: syntax, shared-path filtering, malformed error, false-
 | `Line` | 1-based line number newtype (`NonZeroUsize`); the only row type `Directive` and `covers` accept | Converted from tree-sitter's 0-based `start_position().row` at the single scan boundary; `Finding.line == 0` is normalized to `Line(1)` in its one constructor |
 | `Directive` | One parsed ignore comment: kind, non-empty rules, reason, `start_line`/`end_line` (`Line`), `whole_line: bool` (no code precedes the comment on its start row) | Struct in `src/inline_ignores.rs` |
 | `Scanned` | `(Line, DirectiveParse)` pair returned by `scan_directives` | Defined next to `Directive` |
-| `DirectiveKind` | `Ignore` (accepted tradeoff) / `FalsePositive` (checker misfire) | Enum; both suppress identically |
+| `DirectiveKind` | REMOVED by Amendment 1 (single marker) | Do not create the type; drop `kind` from `Directive` and `DroppedFinding` |
 | `RuleId` | Rule a directive names; must match `[a-z0-9-]+` (so a doc-comment placeholder like `<rule>` is not a directive). Matches a finding when it equals the finding's checker name, or equals the leading `[x]` prefix and the checker is not in `DYNAMIC_PREFIX_CHECKERS` (see Story 1.2.2) | Newtype over `String`; matching lives in `inline_ignores`, `accepted_findings::extract_rule` (`src/accepted_findings.rs:105`) is not changed |
 | `DYNAMIC_PREFIX_CHECKERS` | Checkers whose `[...]` prefix is data, not a rule id: `markdown-link-integrity` (ref id, `src/checkers/markdown_link_integrity.rs:264,295,379,397,400`) | Their findings only match a directive naming the checker |
 | `Reason` | Trimmed text after ` -- ` meeting a minimum-quality rule: at least 2 whitespace-separated words (a mechanical floor, not the target the messages state), and not equal (case-insensitive, hyphens/spaces folded) to any rule id in the directive | Newtype; constructor rejects empty, one-word, and rule-id-echo reasons (parse, don't validate). A rejected reason yields `Malformed(WeakReason(kind))` with `kind` = `TooShort` or `RuleEcho` (separate repair messages, Task 1.1.1d) and the directive does not suppress. Limit: this stops lazy boilerplate like `-- needed` or `-- flag-argument`, not a determined two-word lie (`-- legacy code`); review and the footer counts cover that |
@@ -151,7 +160,7 @@ Research correction: `research/features.md` §2 says `god_class.rs:520` emits `l
 
 ## Accepted risks
 
-- **Marker adoption (pre-mortem #5)**: agents may default to `ignore` and leave the false-positive worklist thin, or use `false-positive` for tradeoffs. Accepted: both markers suppress identically, so a wrong choice never blocks work. Mitigation is steering, not enforcement: the hook hint carries the one-clause rule (`false-positive` = the checker is wrong; `ignore` = the code is right for a stated reason) and the `run` footer reports the `false-positive` share. If a month of use shows a near-zero share, revisit the marker design (kill criterion 4 in `requirements.md` Roadmap Fit; measured at the 30-day review, Task 4.1.1f).
+- **Marker adoption (pre-mortem #5)**: resolved by Amendment 1 (single marker); no steering clause, no worklist.
 - **`KNOWN_RULES` staleness**: advisory only, never gates suppression; see Task 2.1.1c.
 - **Two-word lie in `Reason`**: the quality rule rejects boilerplate, not intent; the repo-level blocking count and the hook advisory (Story 3.1.2) are the remaining checks. The two-word floor is kept, not raised (round-3 UX gap 8): a mechanical floor cannot tell `-- legacy code` from a real constraint, and a boilerplate denylist is whack-a-mole that grows the message surface. The control is data: Phase 0 Task 0.1.1 reads the reasons agents gave in prose for the 20 classified cases, and the 30-day review reads a 20-directive sample; if more than 10% of sampled reasons are boilerplate that passes the floor, apply the ADR-002 lever (stricter reason check) before anything else.
 - **`[ignore-volume]` fires once per file** (round-3 UX gap 6): anchored at the 5th directive's row only. A 6th directive added in a later edit is not re-flagged in the hook, because its row is the only changed row and no finding sits there. ACCEPTED, not fixed: firing at every directive from the 5th on would make `kibitzer run` print N-4 lines for a file the maintainer already knows is heavy, and the visibility that matters for later additions is the repo-level `run` footer count and the diff itself, which the maintainer reviews. If the 30-day sample shows files growing past 5 without review, lower the threshold or re-fire at every 5th (ADR-002 lever).
@@ -161,7 +170,7 @@ Research correction: `research/features.md` §2 says `god_class.rs:520` emits `l
 1. **Syntax**: `<leader> kibitzer:ignore <rule>[,<rule>...] -- <reason>` and `kibitzer:false-positive ...`. ASCII `--` (`em-dash-overuse` is a default check). One reason is shared across a comma list.
 2. **Scope**: comment on the finding's line (any row the comment spans) or on the row directly above the finding (physical, no skipping decorators or attributes). Rationale: `Finding` carries one line only (`src/checker.rs:12-15`), so the mechanical rule is "match the reported line"; the `file:line:` prefix in every finding tells the author which line.
 3. **Multi-line findings**: anchor is the checker's reported line; the ignore goes there or one above. Per-checker convention table in Story 1.2.1. A trailing comment on a code line covers only its own row; the "one above" rule applies only to whole-line comments.
-4. **Markers**: two (`ignore`, `false-positive`); both suppress.
+4. **Markers**: one (`ignore`) after Amendment 1; `false-positive` is a near-miss, not a directive.
 5. **Blocking checks**: suppressible (ADR-002).
 6. **Malformed**: reported by checker `inline-ignore` as `[ignore-syntax]` at the comment's row, with the exact fix; does not suppress; the original finding stays visible.
 7. **Unused**: `[unused-ignore]` in two places with different status. (a) Hook path, Story 2.2.3 (**core**, in the committed slice): for a directive whose own rows fall inside `changed_lines` (the agent just added or edited it) that covers no raw finding, emit `[unused-ignore]` with the nearest raw finding row. This is the P1 wrong-row mitigation (pre-mortem #1) and the key correction loop, because the hook is where a misplaced directive happens; the footer hint alone teaches only the first finding's row. Never emitted for untouched directives. (b) `kibitzer run`, Story 2.2.2 (**pre-declared first cut**, may ship as a follow-up PR): unscoped (`changed_lines == None`), every directive. Judged against raw (ignores-disabled, `accepted/`-free) findings so an ignore shadowed by `accepted/` is still "used". The plan stays correct if 2.2.2 ships later: 2.2.3 reuses `unused_ignores` (Task 2.2.2a, the pure `unused_ignores` function, is shared and belongs to the committed slice, so 2.2.3 does not depend on any `run.rs` work). The hook variant is bounded: it reruns the owning checkers raw only for files whose changed lines contain a directive, which is rare (latency budget in Non-functional budgets).
@@ -218,9 +227,9 @@ Footer/run:      1.2.2b2 -> 2.2.1a -> 2.2.1b -> 2.2.1c
 Teaching:        1.2.2a -> 3.1.1a -> 3.1.1b -> 3.1.1c -> 3.1.1d
                  1.2.2b1b, 1.2.2b1c, 2.2.0a -> 3.1.1b            (shown-findings anchor and rule ids on CheckResult, cache-surviving)
 
-Listing:         1.1.2b -> 3.2.1a -> 3.2.1b                      (skipped if Task 0.1.2 collapses to one marker)
+Listing:         (dropped, Amendment 1)
 
-Docs:            {2.1.2a, 2.2.1b, 2.2.1c, 2.2.2e, 2.2.3b, 3.1.1d, 3.1.2a, 3.2.1b} -> 3.3.1a -> 3.3.1b
+Docs:            {2.1.2a, 2.2.1b, 2.2.1c, 2.2.2e, 2.2.3b, 3.1.1d, 3.1.2a} -> 3.3.1a -> 3.3.1b
 
 Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
                  {1.2.2b1b, 2.2.3d, 3.1.1b} -> 4.1.1c            (scan counters, rerun re-measure, footer length)
@@ -271,8 +280,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 **Acceptance Criteria**:
 - A valid directive in a comment of each of the 7 grammars (Go, TS/TSX, JS, Python, Java, Kotlin, Rust) parses to a `Directive`.
   - *Given* Go source `// kibitzer:ignore flag-argument -- legacy API, callers pinned` at 1-based line 7, *When* `scan_directives` runs, *Then* one `Directive{kind: Ignore, rules: [RuleId("flag-argument")], reason: Reason("legacy API, callers pinned"), start_line: Line(7), end_line: Line(7), whole_line: true}`.
-- Python `# kibitzer:false-positive primitive-obsession -- id is opaque` parses with `kind: FalsePositive`.
-  - *Given* that Python line at row 3, *When* scanned, *Then* kind `FalsePositive`, rule `primitive-obsession`.
+- (Amendment 1) Python `# kibitzer:false-positive primitive-obsession -- id is opaque` is `Malformed(NearMissMarker)` and does not suppress; `# kibitzer:ignore primitive-obsession -- id is opaque` parses as `Valid`.
 - A directive inside a string literal is ignored.
   - *Given* Rust `let s = "// kibitzer:ignore x -- y";`, *When* scanned, *Then* zero directives.
 - Missing rule or reason is `Malformed`, never `Valid`.
@@ -286,7 +294,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - Near miss spellings are `Malformed(NearMissMarker)`, but only when the stripped comment text starts with the marker (same position as the exact form).
   - *Given* `// kibitzer: ignore foo -- bar`, *When* parsed, *Then* `Malformed(NearMissMarker)`.
   - *Given* prose `// see kibitzer: allow list in docs` or `// the kibitzer:ignore syntax is documented`, *When* parsed, *Then* `NotADirective`.
-- A complete, well-formed directive that appears after other comment text is `Malformed(NotAtCommentStart)`, never a silent no-op ("malformed is not silent"). Detection requires the whole exact grammar later in the stripped text (`kibitzer:(ignore|false-positive)` + a valid `[a-z0-9-]+` rule list + ` -- ` + a non-empty reason), so prose and placeholders stay `NotADirective`.
+- A complete, well-formed directive that appears after other comment text is `Malformed(NotAtCommentStart)`, never a silent no-op ("malformed is not silent"). Detection requires the whole exact grammar later in the stripped text (`kibitzer:ignore` + a valid `[a-z0-9-]+` rule list + ` -- ` + a non-empty reason), so prose and placeholders stay `NotADirective`.
   - *Given* `// TODO kibitzer:ignore flag-argument -- legacy API, callers pinned` or `// legacy: kibitzer:ignore flag-argument -- legacy API, callers pinned`, *When* parsed, *Then* `Malformed(NotAtCommentStart)` and it does not suppress (the repair text is in Story 2.1.1).
   - *Given* `// the kibitzer:ignore syntax is documented` (no rule list or ` -- `) or `// see kibitzer:ignore <rule> -- <why>` (placeholder), *Then* `NotADirective`.
 - A rustdoc-style placeholder is not a directive.
@@ -306,7 +314,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - Files: `src/inline_ignores.rs`, `src/main.rs`, `src/tree_walk.rs`, `src/checkers/comment_quality.rs`
 
 ##### Task 1.1.1b: Directive line grammar (~1.5h)
-- `parse_comment_line(text: &str) -> DirectiveParse`: strip leading `//`, `///`, `//!`, `#`, `/*`, `/**`, `*`, `<!--` and trailing `*/`, `-->`; match `^kibitzer:(ignore|false-positive)\s+RULES\s+--\s+REASON$` with `regex` (already a dep); detect near-miss `^kibitzer\s*:\s*(ignore|disable|allow|suppress|false[-_ ]positive)` (anchored to the start of the stripped text, same position as the exact form) that is not exact. Detect `NotAtCommentStart` with the same exact-grammar regex unanchored (`\bkibitzer:(ignore|false-positive)\s+RULES\s+--\s+\S`) run only when the anchored forms did not match, so a prose mention without a rule list and ` -- ` stays `NotADirective`. Trim CR and tabs.
+- `parse_comment_line(text: &str) -> DirectiveParse`: strip leading `//`, `///`, `//!`, `#`, `/*`, `/**`, `*`, `<!--` and trailing `*/`, `-->`; match `^kibitzer:ignore\s+RULES\s+--\s+REASON$` with `regex` (already a dep); detect near-miss `^kibitzer\s*:\s*(ignore|disable|allow|suppress|false[-_ ]positive)` (anchored to the start of the stripped text, same position as the exact form) that is not exact. Detect `NotAtCommentStart` with the same exact-grammar regex unanchored (`\bkibitzer:(ignore|false-positive)\s+RULES\s+--\s+\S`) run only when the anchored forms did not match, so a prose mention without a rule list and ` -- ` stays `NotADirective`. Trim CR and tabs.
 - Unit tests: valid, comma list, missing rule, missing reason, empty reason after `--`, near-miss, CRLF, tabs, em dash and en dash separators are `Malformed(EmDashSeparator)` (never `MissingReason`), rule-list edge cases (`a,b`, `a,a`, `a, b`, `a,,b`, `a,`), negative prose mentions (`// see kibitzer: allow list`, `// the kibitzer:ignore syntax ...`), rustdoc placeholder `/// kibitzer:ignore <rule> -- <why>`, and the not-at-start positives (`// TODO kibitzer:ignore x -- why here`, `// legacy: kibitzer:ignore x -- why here`) which return `Malformed(NotAtCommentStart)`.
 - Files: `src/inline_ignores.rs`
 
@@ -522,7 +530,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 **As a** maintainer, **I want** heavy ignore use in one file to be visible, **so that** blanket silencing shows up.
 **Acceptance Criteria**:
 - `[ignore-volume]` fires at 5 or more valid directives in a file, anchored at the row of the 5th directive so it is inside the changed lines when the agent adds that directive (a line-1 anchor would be dropped by diff-scoping, `src/check.rs:473`).
-  - *Given* a Go file with 5 valid directives (2 `false-positive`), the 5th at line 40, *When* `inline-ignore` runs, *Then* one finding at line 40: `[ignore-volume] 5 inline ignores in this file (2 false-positive); tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong`.
+  - *Given* a Go file with 5 valid directives, the 5th at line 40, *When* `inline-ignore` runs, *Then* one finding at line 40: `[ignore-volume] 5 inline ignores in this file; tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong`.
   - Emitted **once per file**, at the 5th directive's row only; a 6th, 7th, ... directive adds no further finding (no repeat noise on every added directive). Known limit: a 6th directive added in a later edit is not re-flagged in the hook (the 5th's row is outside `changed_lines`); the `kibitzer run` footer's repo-level counts and the `[blocking-suppressed]` advisory remain the visibility for that case.
   - *Given* the same file run with `changed_lines = Some(&[(40,40)])`, *Then* the finding survives scoping.
 - 4 directives produce no volume finding.
@@ -656,7 +664,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 **As an** agent, **I want** a copy-pasteable example in the hook footer, **so that** I need no doc fetch.
 **Acceptance Criteria**:
 - Hook advisory footer carries the syntax with the edited file's comment leader.
-  - *Given* a failed check on `src/foo.go`, *When* the PostToolUse hook renders (`src/hook.rs:207-219`), *Then* the context ends with text containing `// kibitzer:ignore <rule> -- <why>` and `// kibitzer:false-positive <rule> -- <why>`; for `notes.md` the leader is `<!-- ... -->`; for `x.py` it is `#`.
+  - *Given* a failed check on `src/foo.go`, *When* the PostToolUse hook renders (`src/hook.rs:207-219`), *Then* the context ends with text containing `// kibitzer:ignore <rule> -- <why>` (and no `false-positive` marker, Amendment 1); for `notes.md` the leader is `<!-- ... -->`; for `x.py` it is `#`.
 - The hint names the exact anchor row for the first **shown** finding, from structured data.
   - *Given* a failed `[flag-argument]` finding at `src/foo.go:20` (a `CheckResult` whose `inline.first_anchor() == Some((RuleId("flag-argument"), Line(20)))`), *When* the hook renders, *Then* the hint contains `above line 20` and the example `// kibitzer:ignore flag-argument -- <why>`, worded as "on its own line directly above the flagged line (or at its end)" ("directly above line 20", not "line 19": unambiguous when an agent has already inserted lines). The rule and line come from `InlineOutcome.shown`, never from parsing the rendered `file:line: [rule]` text. For a `FILE_SCOPE_RULES` finding the clause says `in the first 10 lines or on the anchor line`.
   - *Given* a finding at line 20 that is outside `changed_lines` (scoped out) or removed by an `accepted/` entry, plus a shown finding at line 5, *When* the hook renders, *Then* the anchor row is 5, never 20 (round-3 engineering gap 3: the anchor is computed after diff-scoping and `accepted/`, Task 1.2.2b1b).
@@ -664,7 +672,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
   - *Given* several failing results, *Then* the anchor comes from the first shown finding of the first failing result, and the hint is rendered once.
 - Rule ids are listed, not inferred (round-3 UX gap 2). A finding with no `[rule]` prefix shows no id in its own line, and the finding line itself is **not** changed: its rendered form is the input to `accepted_findings::extract_rule` (`src/accepted_findings.rs:105`), to `scripts/backtest-triage.py`, and to the text-membership step of Task 1.2.2b1b, so prepending an id would change `accepted/` matching and every consumer. Instead the footer ends with `Rules: <id>, <id>` built from `InlineOutcome::rule_ids()` of every failing result (distinct, in order, at most 6 then `...`), where an unprefixed checker contributes its checker name via `anchor_rule`. This replaces the earlier fixed clause "the rule id is the [x] in the finding, or the checker name": the agent copies a listed id and needs no rule to recall.
   - *Given* two failing results, `flag-argument` (prefixed) then `primitive-obsession` (no prefix), *When* the hook renders, *Then* the footer contains `Rules: flag-argument, primitive-obsession`; *Given* a cached result from an older binary with an empty `inline`, *Then* the `Rules:` line is omitted and the generic form `<rule>` is used (no crash, no stale ids).
-- Marker steering is one clause: `false-positive: the checker is wrong here; ignore: the code is right for a stated reason` (compressed in the footer to `or kibitzer:false-positive if the checker is wrong`; if Task 0.1.2 collapses to one marker, the clause is dropped).
+- Marker steering: none. Task 0.1.2 collapsed to one marker, so the clause is dropped (Amendment 1).
 - Footer growth is bounded with a fixed drop order, and measured (round-3 UX gap 1). The footer is paid on every failing hook call and the feature exists to save tokens, so the budget is small: whole footer at most 640 characters (about 160 tokens), **net added over today's footer text at most 215 characters (about 54 tokens)**. Today's footer text is 423 characters (counted: `len()` of the string in `src/hook.rs:207-219` including both URLs; the earlier "about 480" was wrong). The compact syntax block measured 235 characters in the research draft: `Dismiss a judged finding: // kibitzer:ignore <rule> -- <why>, on its own line directly above the flagged line (above line 20 for the first), or kibitzer:false-positive if the checker is wrong. Rules: flag-argument, primitive-obsession.` Fitting it inside the 215-character net means trimming about 20 characters of the existing prose. The research target was about 45 tokens (180 characters); the extra 9 tokens carry the three clauses that close P1/P2 failures (anchor row, marker choice, rule ids), so the cap is not lowered further. No once-per-session decay: the hook is a one-shot process and decay needs a per-session state file; deferred, and revisited only if the Task 0.1.1 / 4.1.1c net-token check fails.
   - *Given* the pre-change footer length recorded in Task 3.1.1b, *When* the hook renders for the longest case (long path, long rule id, `.md` leader, 6 listed rules), *Then* the whole footer is at most 640 characters and the net added text at most 215. Drop order when over budget (first dropped first): (1) the `reporting-false-positives.md` link and its sentence; (2) trim the existing turn-off prose; (3) the `suppressing-checks.md` link; (4) the `Rules:` list is truncated, not dropped. The syntax line and the first-finding anchor are never dropped. The longest-case test asserts the anchor is present at the limit, and a second test with the budget artificially exceeded asserts the drop order.
   - Net-token check: Task 0.1.1 computes the break-even (`p*`) from replay data before build; Task 4.1.1c re-checks it with the final measured footer length.
@@ -711,29 +719,8 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - Reads `CheckResult.inline.dropped` (the `DroppedFinding` list returned by `apply_inline_ignores` since Task 1.2.2a, filtered to `severity == Blocking`; no signature change). In `src/inline_post_pass.rs` (Task 2.2.0a; **not** `check.rs`), when `changed_lines` is `Some`, emit one `[blocking-suppressed]` advisory result (check name `inline-ignore`, severity Advisory) per such directive whose rows intersect `changed_lines`. `kibitzer run` already carries the repo-level count in its footer (Story 2.2.1). `META_RULES` gains `blocking-suppressed`. Depends on Tasks 1.2.2b2 and 2.2.0a only; it does not need Task 2.2.3a (the changed-lines plumbing lives in the post-pass module from 2.2.0a).
 - Files: `src/inline_post_pass.rs`, `src/inline_ignores.rs`
 
-### Epic 3.2: False-positive worklist
-**Goal**: Maintainers list `kibitzer:false-positive` markers by rule.
-
-#### Story 3.2.1: `kibitzer check false-positives list --inline` (conditional: skipped if Task 0.1.2 collapses to one marker)
-**As a** maintainer, **I want** inline false-positive markers listed paste-ready, **so that** each becomes a regression test.
-**Acceptance Criteria**:
-- Lists only `false-positive` markers, grouped by rule.
-  - *Given* a repo with `kibitzer:false-positive primitive-obsession -- id is opaque` in `a.go:12` and `kibitzer:ignore flag-argument -- legacy` in `b.go:3`, *When* `kibitzer check false-positives list --inline`, *Then* output has `## primitive-obsession` with `a.go:12 -- id is opaque` plus the flagged source line, and nothing for `flag-argument`.
-- Empty result message.
-  - *Given* no markers, *When* run, *Then* `[kibitzer] no inline false-positive markers found`.
-- A marker in a string literal or fence is not listed.
-  - *Given* `.md` fence containing the marker, *When* run, *Then* not listed.
-- Existing queue behavior unchanged.
-  - *Given* no `--inline`, *When* `list`, *Then* output identical to today (`src/main.rs:459-483`).
-**Files**: `src/main.rs`, `src/inline_ignores.rs`
-
-##### Task 3.2.1a: Collector (~1.5h)
-- `list_false_positive_markers(root) -> Vec<Marker{file,row,rules,reason,flagged_line}>` reusing `scan_directives` over the file set `run.rs` already enumerates (reuse its walker, honoring ignores). Flagged line = same row if code precedes the comment, else row below.
-- Files: `src/inline_ignores.rs`, `src/run.rs` (read)
-
-##### Task 3.2.1b: CLI (~1h)
-- Add `#[arg(long)] inline: bool` to `FalsePositivesAction::List` (`src/main.rs:~308`); format grouped by rule in the same paste-ready markdown style as `false_positive::format_markdown_entry`. Print a one-line nudge to also file `report_false_positive` for general misfires.
-- Files: `src/main.rs`, `src/false_positive.rs` (read)
+### Epic 3.2: False-positive worklist (DROPPED 2026-10-07)
+Dropped with the single-marker collapse (gate note `docs/backtest-triage/inline-ignore-gate.md`, Task 0.1.2: class (c) 0 of 4). Story 3.2.1 and Tasks 3.2.1a/3.2.1b (2.5h) are removed; there is no `kibitzer check false-positives list --inline`, and `list` is unchanged. Misfires keep flowing through `report_false_positive`.
 
 ### Epic 3.3: Docs and catalog
 **Goal**: The reversed stance is documented consistently in one change.
@@ -758,7 +745,7 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 - Files: `docs/suppressing-checks.md`, `docs/accepting-findings.md`
 
 ##### Task 3.3.1b: Cross-references and catalog (~0.5h)
-- `docs/reporting-false-positives.md`: mention the inline marker and `list --inline`. Repo `CLAUDE.md` "Default check catalog": add `inline-ignore`; in "Cutting a release" add one line to run `kibitzer check false-positives list --inline` at each release cut (the owner and cadence for the marker worklist, requirements metric 3; no separate cadence is invented for a one-maintainer repo). Docs must not promise `[unused-ignore]` in `kibitzer run` unless Story 2.2.2 shipped in the same PR; if it is deferred, document only the hook advisory. In `docs/suppressing-checks.md` also document: stale ignores outside the edited lines are unreported in the hook until Story 2.2.2 ships (see the AC); `kibitzer check native` bypasses inline ignores; `markdown-link-integrity` ignores name the checker, not the link label; trailing comments cover only their own line; fallback-only (non-grammar) files honor ignores but do not report malformed ones.
+- `docs/reporting-false-positives.md`: mention that a judged finding can be dismissed inline with `kibitzer:ignore` and that a checker misfire should still be reported through `report_false_positive` (no `list --inline`, Amendment 1). Repo `CLAUDE.md` "Default check catalog": add `inline-ignore`. Docs must not promise `[unused-ignore]` in `kibitzer run` unless Story 2.2.2 shipped in the same PR; if it is deferred, document only the hook advisory. In `docs/suppressing-checks.md` also document: stale ignores outside the edited lines are unreported in the hook until Story 2.2.2 ships (see the AC); `kibitzer check native` bypasses inline ignores; `markdown-link-integrity` ignores name the checker, not the link label; trailing comments cover only their own line; fallback-only (non-grammar) files honor ignores but do not report malformed ones.
 - Files: `docs/reporting-false-positives.md`, `CLAUDE.md`
 
 ---
@@ -808,5 +795,5 @@ Validation:      3.3.1b -> 4.1.1a -> 4.1.1b
 ##### Task 4.1.1f: Post-ship review checklist (30 days after release) (~1h)
 - Not code; a dated checklist recorded in the PR body so the learning loop is not forgotten. Owner: the maintainer (tstapler); due date = release tag date + 30 calendar days, written into the release PR when the tag is cut (hard stop day 44, see `requirements.md` Roadmap Fit).
 - **Sample-size rule** (round-3 product gap 6: one maintainer plus kibitzer's own repo is a small sample). Pool every repo and session whose transcripts live under `~/.claude/projects` and where the hook was active, not only this repo; count directives added in the window. If fewer than 20 directives or fewer than 30 dismissed findings exist at day 30, the kill criteria are **INCONCLUSIVE, not triggered**: extend once to day 60 and re-run on pooled data; if still short at day 60, record "insufficient use" and treat that as evidence for kill criterion 2 (agents are not using it), not as a pass.
-- Compute metric 1 on dismissed findings only (fixed ones excluded) against the revised target recorded in the Phase 0 gate note (`R - 0.5 x G`), using Task 0.1.1's script on pooled post-ship transcripts; compute the standalone guardrail metric (`[blocking-suppressed]` advisories per 100 directives reviewed); the channel mix from the `kibitzer run` footer counts and `git log -S 'kibitzer:'` vs. new `accepted/` entries; and metric 3's outcome (marker backlog age and checker changes) from `kibitzer check false-positives list --inline`. Test the three risky assumptions: read every `[blocking-suppressed]` advisory and a 20-directive sample of reasons, counting boilerplate that passes the two-word floor (assumption A; more than 10% boilerplate triggers the ADR-002 stricter-reason lever); confirm the `list --inline` backlog is being triaged (B); sample 20 `false-positive` markers and judge marker choice against the Phase 0 agreement figure (C). Apply the kill criteria in `requirements.md` Roadmap Fit and record the outcome.
+- Compute metric 1 on dismissed findings only (fixed ones excluded) against the revised target recorded in the Phase 0 gate note (`R - 0.5 x G`), using Task 0.1.1's script on pooled post-ship transcripts; compute the standalone guardrail metric (`[blocking-suppressed]` advisories per 100 directives reviewed); the channel mix from the `kibitzer run` footer counts and `git log -S 'kibitzer:'` vs. new `accepted/` entries. Test the risky assumption that remains: read every `[blocking-suppressed]` advisory and a 20-directive sample of reasons, counting boilerplate that passes the two-word floor (assumption A; more than 10% boilerplate triggers the ADR-002 stricter-reason lever). Assumptions B and C and metric 3 were dropped with the single-marker collapse (Amendment 1). Apply the kill criteria in `requirements.md` Roadmap Fit and record the outcome.
 - Files: none

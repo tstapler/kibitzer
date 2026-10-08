@@ -2,6 +2,8 @@
 
 **Date**: 2026-10-07
 
+**Amendment 1 (2026-10-07)**: single marker (`kibitzer:ignore` only; `kibitzer:false-positive` is a near-miss). The SM-3 and IS-4 listing rows and the two-marker rows were removed; any remaining "both markers" wording reads as "the marker". See plan.md Amendment 1.
+
 ## Happy Path Scenario
 Given a Go file where `kibitzer run` and the PostToolUse hook report a `[flag-argument]` finding that the author has judged acceptable (today only dismissible through a hand-written `.kibitzer/accepted/*.json` entry that goes stale on line drift), when the author adds one line `// kibitzer:ignore flag-argument -- legacy API, callers pinned` directly above the flagged line, then the finding no longer appears in hook, MCP `run_checks` or `kibitzer run` output, stays suppressed after 5 lines are inserted above it, and the `kibitzer run` footer reports `1 findings suppressed inline`.
 
@@ -9,7 +11,7 @@ Given a Go file where `kibitzer run` and the PostToolUse hook report a `[flag-ar
 
 ## Test Stack
 - **Unit**: Rust built-in `#[test]` in `#[cfg(test)] mod tests` (`src/inline_ignores.rs`, `src/checkers/inline_ignore.rs`, `src/check.rs`, `src/hook.rs`, `src/mcp.rs`, `src/config.rs`, `src/accepted_findings.rs`, `src/checkers/comment_quality.rs`), `assert_eq!`, `tempfile` dirs, `GrammarCache::new().parse` for tree-sitter fixtures. Type names follow the plan glossary (`Line`, `Directive`, `DirectiveParse`, `MalformedReason`, `RuleId`, `Reason`, `InlineIgnoreContext`).
-- **Integration**: real checkers via `crate::checker::run_checker_configured` (in-crate), plus binary-level CLI tests in `tests/inline_ignore_cli.rs` (new, same style as `tests/false_positives_cli.rs` and `tests/hook_contract.rs`) spawning `kibitzer run`, `kibitzer hook`, `kibitzer check false-positives list --inline` against temp repos.
+- **Integration**: real checkers via `crate::checker::run_checker_configured` (in-crate), plus binary-level CLI tests in `tests/inline_ignore_cli.rs` (new, same style as `tests/false_positives_cli.rs` and `tests/hook_contract.rs`) spawning `kibitzer run`, `kibitzer hook` against temp repos.
 - **E2E / UX**: manual checklist (Task 4.1.1d). `design/ux.md` is absent (research has `research/ux.md` only), so there is no UX Acceptance table; the user-facing surfaces (hook footer, MCP hint, CLI footer) are covered by the integration rows below.
 
 Naming: `subject_should_Expected_When_Condition`.
@@ -34,10 +36,6 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | SM-2: suppression survives edits elsewhere | src/check.rs | ignore_should_SurviveEdits_When_LinesInsertedAbove | Unit | Happy path: 5 lines inserted at line 1, ignore now row 15, finding line 16, still suppressed |
 | SM-2 | src/check.rs | ignore_should_StopSuppressing_When_FindingMovesAwayFromComment | Unit | Error path: a blank line inserted between ignore and statement re-surfaces the finding |
 | SM-2 | tests/inline_ignore_cli.rs | kibitzer_run_should_StaySuppressed_When_FileEditedElsewhere | Integration | Run before and after prepending a license header; both runs silent |
-| SM-3: false-positive markers listable with one command | src/inline_ignores.rs | list_false_positive_markers_should_ReturnOnlyFalsePositiveKind_When_MixedMarkers | Unit | Happy path: `a.go:12` fp marker returned; `b.go:3` `ignore` marker excluded |
-| SM-3 | src/inline_ignores.rs | list_false_positive_markers_should_SkipMarker_When_InStringOrFence | Unit | Error path: marker in `.md` fence and Rust string literal not listed |
-| SM-3 | tests/inline_ignore_cli.rs | false_positives_list_inline_should_GroupByRule_When_MarkersExist | Integration | Output has `## primitive-obsession`, `a.go:12 -- id is opaque`, flagged source line, nothing for `flag-argument` |
-| SM-3 | tests/inline_ignore_cli.rs | false_positives_list_inline_should_PrintEmptyMessage_When_NoMarkers | Integration | `[kibitzer] no inline false-positive markers found` |
 | SM-4: zero regressions in `.kibitzer/accepted/` | src/accepted_findings.rs | existing `accepted_findings` test module (all tests) | Unit | `cargo test accepted` passes unchanged; `extract_rule` (:105) not modified |
 | SM-4 | src/check.rs | accepted_entry_should_StillSuppress_When_NoInlineDirective | Unit | Happy path: `accepted/` entry alone drops the finding, as before |
 | SM-4 | src/check.rs | accepted_entry_should_NotBeAffected_When_InlineDisabled | Unit | Error path: `mode: Disabled` leaves accepted filtering identical |
@@ -61,14 +59,14 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | CON-3 | src/check.rs | architecture_check_should_NotApplyInlineIgnores_When_WholeRepoCheck | Unit | Error path: architecture findings unaffected by an ignore comment |
 | CON-3 | src/check.rs | kibitzer_check_native_should_BypassInlineIgnores_When_RunDirectly | Integration | `kibitzer check native <name> <file>` prints raw finding (corpus workflow), documented |
 | CON-4: suppressions stay reviewable | src/inline_ignores.rs | apply_inline_ignores_should_KeepFinding_When_RuleIsMetRule | Unit | Error path: `kibitzer:ignore ignore-syntax -- x` cannot suppress `[ignore-syntax]` (also `unused-ignore`, `ignore-volume`) |
-| CON-4 | src/checkers/inline_ignore.rs | inline_ignore_should_EmitVolumeFinding_When_FiveValidDirectives | Unit | Happy path: finding at 5th directive row (line 40), message `5 inline ignores in this file (2 false-positive); tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong` |
+| CON-4 | src/checkers/inline_ignore.rs | inline_ignore_should_EmitVolumeFinding_When_FiveValidDirectives | Unit | Happy path: finding at 5th directive row (line 40), message `5 inline ignores in this file tell the user you are silencing this many checks here, and either fix the code or ask the user whether a check is wrong` |
 | CON-4 (UX r2 gap 6) | src/checkers/inline_ignore.rs | inline_ignore_should_EmitVolumeOncePerFile_When_SevenValidDirectives | Unit | Exactly one `[ignore-volume]`, at the 5th directive's row; none at the 6th or 7th |
 | CON-4 | src/checkers/inline_ignore.rs | inline_ignore_should_EmitNothing_When_FourValidDirectives | Unit | Error path: below threshold, zero `[ignore-volume]` |
 | CON-4 | src/checkers/inline_ignore.rs | inline_ignore_volume_should_SurviveDiffScoping_When_ChangedLinesIsFifthDirectiveRow | Integration | `changed_lines = Some(&[(40,40)])` keeps the volume finding |
 | CON-4 (P1-2) | src/inline_ignores.rs | reason_new_should_Reject_When_OneWordOrEqualsRuleId | Unit | `-- needed` gives `WeakReason(TooShort)`; `-- flag-argument`, `-- Flag Argument`, and a two-word echo give `WeakReason(RuleEcho)`; none suppress; `-- legacy API, callers pinned` accepted |
 | CON-4 (P1-2) | src/checkers/inline_ignore.rs | inline_ignore_should_RenderSeparateMessages_When_ReasonTooShortVersusRuleEcho | Unit | `-- needed` renders `reason 'needed' is too short to explain the code. Write: ... <the concrete constraint that makes this code acceptable>`; `-- flag-argument` renders `reason repeats the rule id instead of saying why ...`; the two strings differ, neither contains `at least two words`, both contain `concrete constraint`, no em dash |
-| CON-4 (P1-2) | src/inline_ignores.rs | apply_inline_ignores_should_CountBlocking_When_BlockingCheckSuppressed | Unit | `SuppressionCounts` total/blocking split (the `false_positive` counter was cut) |
-| CON-4 (P1-2) | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintBlockingShareInFooter_When_BlockingFindingSuppressed | Integration | Footer `3 findings suppressed inline (1 from blocking checks) ...`; zero parts omitted; no `false-positive` split |
+| CON-4 (P1-2) | src/inline_ignores.rs | apply_inline_ignores_should_CountBlocking_When_BlockingCheckSuppressed | Unit | `SuppressionCounts` total/blocking split |
+| CON-4 (P1-2) | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintBlockingShareInFooter_When_BlockingFindingSuppressed | Integration | Footer `3 findings suppressed inline (1 from blocking checks) ...`; zero parts omitted; no split |
 | CON-4 (P1-2) | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitBlockingSuppressedAdvisory_When_AddedDirectiveSilencesBlocking | Integration | `.md` directive in `changed_lines` over a `markdown-link-integrity` finding yields `[blocking-suppressed] ...; tell the user you silenced a blocking check and why, so they can confirm it` advisory (text names the user, does not contain `confirm this is intended`), exit code unaffected |
 | CON-4 (P1-2) | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitNoBlockingAdvisory_When_DirectiveOutsideChangedLinesOrAdvisoryCheck | Unit | Error path |
 | CON-4 (P1-2) | src/inline_ignores.rs | apply_inline_ignores_should_KeepFinding_When_RuleIsBlockingSuppressed | Unit | `blocking-suppressed` in `META_RULES` |
@@ -82,8 +80,6 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | NFR-1 | src/inline_ignores.rs | scan_memo_should_Rescan_When_ContentHashChangesOrPathDiffers | Unit | Edited source rescans and no longer suppresses; single entry replaced, never grows |
 | NFR-1 | src/inline_ignores.rs | scan_directives_should_ConstructNoParser_When_SourceLacksKibitzer | Unit | 10,000-line input, unused `GrammarCache` stays unused |
 | IS-1: syntax (rule id, required reason, same/next line, optional marker) | src/inline_ignores.rs | parse_comment_line_should_ReturnIgnoreKind_When_KibitzerIgnore | Unit | Happy path: Go `// kibitzer:ignore flag-argument -- legacy API, callers pinned` at line 7 gives full `Directive` |
-| IS-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnFalsePositiveKind_When_KibitzerFalsePositive | Unit | Python `# kibitzer:false-positive primitive-obsession -- id is opaque` |
-| IS-1 | src/inline_ignores.rs | directive_should_SuppressIdentically_When_IgnoreOrFalsePositiveKind | Unit | Both kinds drop the same finding |
 | IS-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnAllRules_When_CommaList | Unit | `a,b -- why` yields two `RuleId`s, one shared reason |
 | IS-1 | src/inline_ignores.rs | rule_id_new_should_Reject_When_PlaceholderOrUppercase | Unit | Error path: `<rule>` and `Foo_Bar` not valid `[a-z0-9-]+` |
 | IS-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnNotADirective_When_RustdocPlaceholder | Unit | `/// kibitzer:ignore <rule> -- <why>` is prose |
@@ -120,9 +116,6 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | IS-3 | src/check.rs | inline_ignore_should_YieldPassingEmptyResult_When_InvalidUtf8GoFile | Integration | Invalid UTF-8 `.go` file |
 | IS-3 | src/check.rs | other_checker_should_KeepFailedResult_When_ReadError | Unit | Error path: existing read-error semantics unchanged for non-`inline-ignore` checkers |
 | IS-3 | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintNoInlineIgnoreOutput_When_DirHasBinaryFiles | Integration | `kibitzer run <dir>` with a PNG and bad-UTF-8 file: no `inline-ignore` line, exit status unaffected |
-| IS-4: false-positive listing command | tests/false_positives_cli.rs | false_positives_list_should_BeUnchanged_When_NoInlineFlag | Integration | Without `--inline`, output identical to today (`src/main.rs:459-483`) |
-| IS-4 | src/main.rs | false_positives_list_args_should_Parse_When_InlineFlagGiven | Unit | `--inline` parses on `FalsePositivesAction::List` |
-| IS-4 | src/inline_ignores.rs | list_false_positive_markers_should_ReturnFlaggedLine_When_TrailingVsWholeLine | Unit | Flagged line is same row for trailing comment, row below for whole-line |
 | IS-5: docs updated | tests/inline_ignore_cli.rs | docs_should_ContainNoNoInlineStance_When_GrepRun | Integration | `rg "no inline\|no inline/per-line\|still no inline" docs/ CLAUDE.md` returns zero matches |
 | IS-5 | tests/inline_ignore_cli.rs | docs_suppressing_checks_should_ContainGrammarAndAnchorTable_When_Read | Integration | Section lists grammar, both markers, same-or-above scope, per-checker anchor table, meta-rule exclusion |
 | IS-5 (UX r2 gap 9) | tests/inline_ignore_cli.rs | docs_should_StateHookStaleIgnoreGap_When_Story222NotShipped | Integration | `docs/suppressing-checks.md` says the hook reports an unused ignore only inside the edited lines and that stale ignores elsewhere are not reported in the hook until Story 2.2.2 ships (or names `kibitzer run` as the audit if 2.2.2 shipped in the same PR) |
@@ -165,8 +158,7 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | RH-6 | src/checkers/comment_quality.rs | comment_quality_should_EmitNothing_When_DirectiveCommentContainsCodeLikeText | Unit | `// kibitzer:ignore flag-argument -- see foo(bar) and x = y`: no `commented-out-code` / `verbose-comment` |
 | RH-6 | src/checkers/comment_quality.rs | over_commented_should_NotCount_When_KibitzerCommentAddedAtThresholdMinusOne | Unit | No `[over-commented]` |
 | RH-6 | src/checkers/comment_quality.rs | other_checkers_should_BeUnperturbed_When_ValidIgnoreAdded | Integration | `duplicate-code`, `syntax-rules-go`, `em-dash-overuse` findings identical modulo line shift |
-| OQ-1: exact syntax and separate marker | src/inline_ignores.rs | parse_comment_line_should_AcceptBothMarkers_When_IgnoreAndFalsePositive | Unit | Decision 4 (two markers) |
-| OQ-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnNearMiss_When_SpaceAfterColonOrSynonym | Unit | `kibitzer: ignore`, `disable`, `allow`, `suppress`, `false_positive` |
+| OQ-1 | src/inline_ignores.rs | parse_comment_line_should_ReturnNearMiss_When_SpaceAfterColonOrSynonym | Unit | `kibitzer: ignore`, `disable`, `allow`, `suppress`, `false_positive`, and `kibitzer:false-positive` (Amendment 1: not a directive, never suppresses) |
 | OQ-2: same line, next line, or both | src/inline_ignores.rs | covers_should_AcceptSameRowAndRowBelow_When_WholeLineDirective | Unit | Both |
 | OQ-2 | src/inline_ignores.rs | covers_should_RejectRowBelow_When_TrailingDirective | Unit | Trailing covers own row only |
 | OQ-3: unused/stale ignores reported | src/inline_ignores.rs | unused_ignores_should_Report_When_NoMatchingFinding | Unit | `<file>:<row>: [unused-ignore] kibitzer:ignore flag-argument suppresses nothing - remove it` |
@@ -195,7 +187,6 @@ Note: requirements.md Success Metrics were rewritten as outcomes (re-surfacing r
 | OQ-3 (Story 2.2.3, core) | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitUnusedIgnoreWithNearestRow_When_AddedDirectiveOnWrongRow | Integration | Directive at row 12, finding at row 20, `changed_lines=[(12,12)]`: `12: [unused-ignore] ... the finding is at line 20. Move the comment to the line directly above line 20 (or the end of line 20)`; at row 19: silent |
 | OQ-3 | src/inline_post_pass.rs | run_checks_for_trigger_should_EmitNoUnusedIgnore_When_ChangedLinesScoped | Integration | `changed_lines = Some(&[(1,3)])`, unused ignore at row 50, nothing in any result |
 | OQ-3 (DEFERRED, Task 2.2.2b) | tests/inline_ignore_cli.rs | kibitzer_run_should_ReportUnusedIgnore_When_UnscopedRunAndNoFinding | Integration | End to end |
-| OQ-4: listing lives under `kibitzer check false-positives` | tests/inline_ignore_cli.rs | false_positives_list_inline_should_NotifyReportFalsePositive_When_Listed | Integration | Output ends with the nudge to also use `report_false_positive` |
 | Raw mode / backtest hygiene (SM-1, plan Story 2.2.1) | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintCoveredFinding_When_NoInlineIgnoresFlag | Integration | Flag shows raw; default hides |
 | Raw mode | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintFooterWithCount_When_ThreeSuppressed | Integration | Last line `[kibitzer] 3 findings suppressed inline (...) (rerun with --no-inline-ignores to see them)`; absent at 0 (blocking and false-positive split asserted in the CON-4 P1-2 rows) |
 | Raw mode (UX r3 gap 4) | tests/inline_ignore_cli.rs | kibitzer_run_should_PrintSyntaxHintOnce_When_AtLeastOneFindingReported | Integration | One `[kibitzer] to dismiss a finding you judged acceptable: <comment> kibitzer:ignore <rule> -- <why> ...` line when a finding is reported; absent on a clean run |
