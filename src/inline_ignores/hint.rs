@@ -25,6 +25,14 @@ pub(crate) fn comment_leader(path: &Path) -> CommentLeader {
 
 pub(crate) const HINT_RULE_LIMIT: usize = 6;
 
+/// Longer ids (a finding's `[prefix]` is free text) would blow the footer budget, so the hint
+/// falls back to the generic `<rule>` form and omits them from the `Rules:` list.
+const MAX_HINT_RULE_CHARS: usize = 64;
+
+fn fits_hint(rule: &RuleId) -> bool {
+    rule.as_str().len() <= MAX_HINT_RULE_CHARS
+}
+
 /// A directive as written in a comment, with `<why>` standing for the reason.
 fn directive_example(open: &str, rule_text: &str, close: &str) -> String {
     format!("{open} {MARKER} {rule_text} -- <why>{close}")
@@ -56,7 +64,10 @@ pub(crate) fn syntax_hint_limited(
     max_rules: usize,
 ) -> String {
     let leader = comment_leader(path);
-    let rule_text = anchor.map_or("<rule>", |(rule, _)| rule.as_str());
+    let rule_text = anchor
+        .map(|(rule, _)| rule)
+        .filter(|rule| fits_hint(rule))
+        .map_or("<rule>", RuleId::as_str);
     let mut hint = format!(
         "Dismiss a judged finding: {}, ",
         directive_example(leader.open, rule_text, leader.close)
@@ -73,13 +84,14 @@ pub(crate) fn syntax_hint_limited(
         None => hint.push_str("on its own line directly above the flagged line (or at its end)"),
     }
     hint.push('.');
-    if anchor.is_some() && !rule_ids.is_empty() {
-        let shown: Vec<&str> = rule_ids
+    if anchor.is_some() && rule_ids.iter().any(|r| fits_hint(r)) {
+        let listable: Vec<&RuleId> = rule_ids.iter().copied().filter(|r| fits_hint(r)).collect();
+        let shown: Vec<&str> = listable
             .iter()
             .take(max_rules.max(1))
             .map(|r| r.as_str())
             .collect();
-        let more = if rule_ids.len() > shown.len() {
+        let more = if listable.len() > shown.len() {
             ", ..."
         } else {
             ""

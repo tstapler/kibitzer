@@ -22,6 +22,7 @@ mod glob;
 mod go_call_resolution;
 mod god_class;
 mod hook;
+mod hook_footer;
 mod hook_log;
 mod hotspots;
 mod import_graph;
