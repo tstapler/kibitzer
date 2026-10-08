@@ -210,17 +210,13 @@ mod registry_invalidation_tests {
     }
 
     fn sample_result() -> CheckResult {
-        CheckResult {
-            check_name: "sample-check".to_string(),
-            severity: Severity::Advisory,
-            passed: true,
-            output: String::new(),
-            message: None,
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline: crate::inline_ignores::InlineOutcome::default(),
-        }
+        CheckResult::new(
+            "sample-check".to_string(),
+            Severity::Advisory,
+            true,
+            String::new(),
+        )
+        .with_inline(crate::inline_ignores::InlineOutcome::default())
     }
 
     #[test]
@@ -449,17 +445,8 @@ mod grace_tests {
     }
 
     fn result(severity: Severity, passed: bool) -> CheckResult {
-        CheckResult {
-            check_name: "no-bad-marker".to_string(),
-            severity,
-            passed,
-            output: String::new(),
-            message: None,
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline: crate::inline_ignores::InlineOutcome::default(),
-        }
+        CheckResult::new("no-bad-marker".to_string(), severity, passed, String::new())
+            .with_inline(crate::inline_ignores::InlineOutcome::default())
     }
 
     #[test]

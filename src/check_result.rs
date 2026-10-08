@@ -55,6 +55,57 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
+    /// A result with no message, command, structured findings or inline outcome; chain the
+    /// `with_*` builders to set those.
+    pub fn new(
+        check_name: impl Into<String>,
+        severity: Severity,
+        passed: bool,
+        output: impl Into<String>,
+    ) -> Self {
+        CheckResult {
+            check_name: check_name.into(),
+            severity,
+            passed,
+            output: output.into(),
+            message: None,
+            command: String::new(),
+            findings: Vec::new(),
+            plugin_missing: false,
+            inline: InlineOutcome::default(),
+        }
+    }
+
+    /// A passed result with no output.
+    pub fn passing(check_name: impl Into<String>, severity: Severity) -> Self {
+        CheckResult::new(check_name, severity, true, String::new())
+    }
+
+    pub fn with_message(mut self, message: Option<String>) -> Self {
+        self.message = message;
+        self
+    }
+
+    pub fn with_command(mut self, command: impl Into<String>) -> Self {
+        self.command = command.into();
+        self
+    }
+
+    pub fn with_findings(mut self, findings: Vec<crate::architecture_checks::ArchFinding>) -> Self {
+        self.findings = findings;
+        self
+    }
+
+    pub fn with_plugin_missing(mut self) -> Self {
+        self.plugin_missing = true;
+        self
+    }
+
+    pub fn with_inline(mut self, inline: InlineOutcome) -> Self {
+        self.inline = inline;
+        self
+    }
+
     /// Text to show the agent for a failed check: a top-level summary by default, with
     /// an explicit path to the full detail on demand. The config `message` explains
     /// *why* the rule exists / is blocking; the command's own `output` says *where* the
@@ -89,17 +140,14 @@ mod describe_tests {
     use super::*;
 
     fn result(message: Option<&str>, output: &str) -> CheckResult {
-        CheckResult {
-            check_name: "test-check".to_string(),
-            severity: Severity::Blocking,
-            passed: false,
-            output: output.to_string(),
-            message: message.map(String::from),
-            command: "some-check-command".to_string(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline: InlineOutcome::default(),
-        }
+        CheckResult::new(
+            "test-check".to_string(),
+            Severity::Blocking,
+            false,
+            output.to_string(),
+        )
+        .with_message(message.map(String::from))
+        .with_command("some-check-command".to_string())
     }
 
     #[test]

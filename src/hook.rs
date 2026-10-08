@@ -352,16 +352,14 @@ mod advisory_context_rendering_tests {
     use crate::config::Severity;
 
     fn result(plugin_missing: bool) -> CheckResult {
-        CheckResult {
-            check_name: "kibitzer-stub-plugin".to_string(),
-            severity: Severity::Advisory,
-            passed: false,
-            output: String::new(),
-            message: Some("plugin 'kibitzer-stub-plugin' is not installed".to_string()),
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing,
-            inline: crate::inline_ignores::InlineOutcome::default(),
+        let result = CheckResult::new("kibitzer-stub-plugin", Severity::Advisory, false, "")
+            .with_message(Some(
+                "plugin 'kibitzer-stub-plugin' is not installed".to_string(),
+            ));
+        if plugin_missing {
+            result.with_plugin_missing()
+        } else {
+            result
         }
     }
 

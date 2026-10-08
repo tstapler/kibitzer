@@ -9,8 +9,8 @@ use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, Severity};
 use crate::inline_ignores::{
-    Directive, FirstPass, InlineOutcome, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind,
-    owned_by, rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
+    Directive, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind, owned_by,
+    rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
 };
 
 /// Reruns one native check against `source` with inline ignores disabled; injected so this
@@ -206,17 +206,12 @@ fn blocking_suppressions(
 }
 
 fn advisory_result(output: &str) -> CheckResult {
-    CheckResult {
-        check_name: crate::checkers::inline_ignore::NAME.to_string(),
-        severity: Severity::Advisory,
-        passed: false,
-        output: output.to_string(),
-        message: None,
-        command: String::new(),
-        findings: Vec::new(),
-        plugin_missing: false,
-        inline: InlineOutcome::default(),
-    }
+    CheckResult::new(
+        crate::checkers::inline_ignore::NAME.to_string(),
+        Severity::Advisory,
+        false,
+        output.to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -230,20 +225,16 @@ mod tests {
         check_name: &str,
         dropped: Vec<DroppedFinding>,
     ) -> CheckResult {
-        CheckResult {
-            check_name: check_name.to_string(),
-            severity: Severity::Blocking,
-            passed: true,
-            output: String::new(),
-            message: None,
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline: InlineOutcome {
-                dropped,
-                ..Default::default()
-            },
-        }
+        CheckResult::new(
+            check_name.to_string(),
+            Severity::Blocking,
+            true,
+            String::new(),
+        )
+        .with_inline(InlineOutcome {
+            dropped,
+            ..Default::default()
+        })
     }
 
     pub(super) fn dropped(

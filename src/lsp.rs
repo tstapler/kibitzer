@@ -577,17 +577,14 @@ mod tests {
     use std::sync::atomic::AtomicU64 as TestAtomicU64;
 
     fn result(severity: Severity, passed: bool, output: &str) -> CheckResult {
-        CheckResult {
-            check_name: "test-check".to_string(),
+        CheckResult::new(
+            "test-check".to_string(),
             severity,
             passed,
-            output: output.to_string(),
-            message: None,
-            command: "true".to_string(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline: crate::inline_ignores::InlineOutcome::default(),
-        }
+            output.to_string(),
+        )
+        .with_command("true".to_string())
+        .with_inline(crate::inline_ignores::InlineOutcome::default())
     }
 
     #[test]

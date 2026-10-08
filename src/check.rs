@@ -88,17 +88,7 @@ fn run_check_with_timeout(
         // than falling through to the `command`-only branch below, which would panic on
         // `check.command` being unset (an architecture check has neither `command` nor
         // `checker`).
-        return Ok(CheckResult {
-            check_name: check.name.clone(),
-            severity: check.severity,
-            passed: true,
-            output: String::new(),
-            message: None,
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline: InlineOutcome::default(),
-        });
+        return Ok(CheckResult::passing(check.name.clone(), check.severity));
     }
 
     // Task 4.3.1b: a plugin-backed check (always `command`-based, never `checker`) whose
@@ -108,22 +98,14 @@ fn run_check_with_timeout(
     // indistinguishable from a real check failure. Severity is forced to `Advisory`
     // regardless of `check.severity` so a missing install never blocks an edit.
     if let Some(binary_path) = registry.missing_binary_for(&check.name) {
-        return Ok(CheckResult {
-            check_name: check.name.clone(),
-            severity: Severity::Advisory,
-            passed: false,
-            output: String::new(),
-            message: Some(format!(
+        return Ok(CheckResult::new(check.name.clone(), Severity::Advisory, false, String::new())
+.with_message(Some(format!(
                 "plugin '{}' is not installed (expected binary at {}) — run `kibitzer plugin install {}`",
                 check.name,
                 binary_path.display(),
                 check.name
-            )),
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: true,
-            inline: InlineOutcome::default(),
-        });
+            )))
+.with_plugin_missing());
     }
 
     let command = check
@@ -135,24 +117,21 @@ fn run_check_with_timeout(
     let output = match run_command_with_timeout(&cmd_str, repo_root, timeout)? {
         CommandOutcome::Completed(output) => output,
         CommandOutcome::TimedOut => {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!("command timed out after {timeout:?} and was killed: {cmd_str}"),
-                message: Some(format!(
-                    "{}check timed out after {timeout:?} and was killed",
-                    check
-                        .message
-                        .as_ref()
-                        .map(|m| format!("{m} — "))
-                        .unwrap_or_default()
-                )),
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-                inline: InlineOutcome::default(),
-            });
+            return Ok(CheckResult::new(
+                check.name.clone(),
+                check.severity,
+                false,
+                format!("command timed out after {timeout:?} and was killed: {cmd_str}"),
+            )
+            .with_message(Some(format!(
+                "{}check timed out after {timeout:?} and was killed",
+                check
+                    .message
+                    .as_ref()
+                    .map(|m| format!("{m} — "))
+                    .unwrap_or_default()
+            )))
+            .with_command(cmd_str));
         }
     };
 
@@ -204,17 +183,11 @@ fn run_check_with_timeout(
         }
     }
 
-    Ok(CheckResult {
-        check_name: check.name.clone(),
-        severity,
-        passed,
-        output: combined,
-        message,
-        command: cmd_str,
-        findings: Vec::new(),
-        plugin_missing: false,
-        inline: InlineOutcome::default(),
-    })
+    Ok(
+        CheckResult::new(check.name.clone(), severity, passed, combined)
+            .with_message(message)
+            .with_command(cmd_str),
+    )
 }
 
 /// Outcome of [`run_command_with_timeout`]: either the child exited (successfully or not —
@@ -315,17 +288,9 @@ fn run_native_check(
         let globs: Vec<String> = checker.file_globs().iter().map(|g| g.to_string()).collect();
         let rel_path = relativize(repo_root, file_path);
         if !matches_scope(&rel_path, &globs) {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: true,
-                output: String::new(),
-                message: None,
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-                inline: InlineOutcome::default(),
-            });
+            return Ok(
+                CheckResult::passing(check.name.clone(), check.severity).with_command(cmd_str)
+            );
         }
     }
 
@@ -347,17 +312,14 @@ fn run_native_check(
     ) {
         Ok(result) => result,
         Err(err) => {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!("{err:#}"),
-                message: check.message.clone(),
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-                inline: InlineOutcome::default(),
-            });
+            return Ok(CheckResult::new(
+                check.name.clone(),
+                check.severity,
+                false,
+                format!("{err:#}"),
+            )
+            .with_message(check.message.clone())
+            .with_command(cmd_str));
         }
     };
 
@@ -424,17 +386,12 @@ fn run_native_check(
     );
     inline_outcome.kept = capped_anchors(checker_name, kept_findings.iter());
 
-    Ok(CheckResult {
-        check_name: check.name.clone(),
-        severity,
-        passed,
-        output: combined,
-        message,
-        command: cmd_str,
-        findings: Vec::new(),
-        plugin_missing: false,
-        inline: inline_outcome,
-    })
+    Ok(
+        CheckResult::new(check.name.clone(), severity, passed, combined)
+            .with_message(message)
+            .with_command(cmd_str)
+            .with_inline(inline_outcome),
+    )
 }
 
 /// Runs `checker_name` against `source` (as if it were the content of `file_path`),
@@ -1175,16 +1132,10 @@ pub fn run_architecture_check(
         .expect("config-load validation guarantees architecture_checker is set");
 
     let cmd_str = format!("kibitzer check architecture {arch_name}");
-    let error_result = |output: String| CheckResult {
-        check_name: check.name.clone(),
-        severity: check.severity,
-        passed: false,
-        output,
-        message: check.message.clone(),
-        command: cmd_str.clone(),
-        findings: Vec::new(),
-        plugin_missing: false,
-        inline: InlineOutcome::default(),
+    let error_result = |output: String| {
+        CheckResult::new(check.name.clone(), check.severity, false, output)
+            .with_message(check.message.clone())
+            .with_command(cmd_str.clone())
     };
 
     let Some(any_checker) = lookup_any_architecture_checker(arch_name) else {
@@ -1246,17 +1197,12 @@ pub fn run_architecture_check(
         }
     }
 
-    Ok(CheckResult {
-        check_name: check.name.clone(),
-        severity,
-        passed,
-        output: combined,
-        message,
-        command: cmd_str,
-        findings,
-        plugin_missing: false,
-        inline: InlineOutcome::default(),
-    })
+    Ok(
+        CheckResult::new(check.name.clone(), severity, passed, combined)
+            .with_message(message)
+            .with_command(cmd_str)
+            .with_findings(findings),
+    )
 }
 
 /// Native-checker counterpart to [`check_against_git_head_repo`]: snapshots HEAD the same

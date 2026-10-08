@@ -3106,17 +3106,13 @@ mod tests {
                 line: crate::inline_ignores::Line::new(line),
             });
         }
-        CheckResult {
-            check_name: name.to_string(),
-            severity: Severity::Advisory,
-            passed: false,
-            output: "x.go:4: [flag-argument] boolean parameter".to_string(),
-            message: None,
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: false,
-            inline,
-        }
+        CheckResult::new(
+            name.to_string(),
+            Severity::Advisory,
+            false,
+            "x.go:4: [flag-argument] boolean parameter".to_string(),
+        )
+        .with_inline(inline)
     }
 
     #[test]
