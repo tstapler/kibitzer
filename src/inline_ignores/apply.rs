@@ -25,6 +25,27 @@ pub struct SuppressionCounts {
     pub blocking: AtomicUsize,
 }
 
+impl SuppressionCounts {
+    /// Repo-wide summary line, so 1-4 ignores per file across many files still add up to a
+    /// visible total; `None` when nothing was suppressed.
+    pub fn footer(&self) -> Option<String> {
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        let blocking = self.blocking.load(Ordering::Relaxed);
+        let noun = if total == 1 { "finding" } else { "findings" };
+        let blocking_part = if blocking > 0 {
+            format!(" ({blocking} from blocking checks)")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "[kibitzer] {total} {noun} suppressed inline{blocking_part} (rerun with --no-inline-ignores to see them)"
+        ))
+    }
+}
+
 /// How one run applies inline ignores. Cloning shares the counter and memo.
 #[derive(Debug, Clone, Default)]
 pub struct InlineIgnoreContext {

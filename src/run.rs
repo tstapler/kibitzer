@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 
@@ -9,9 +7,7 @@ use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_effective_config};
-use crate::inline_ignores::{
-    InlineIgnoreContext, InlineIgnoreMode, SuppressionCounts, batch_syntax_hint,
-};
+use crate::inline_ignores::{InlineIgnoreMode, batch_syntax_hint};
 
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
@@ -95,8 +91,8 @@ fn report_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
 /// and must run exactly once per batch invocation, not once per matched file — otherwise an
 /// N-file repo re-runs an already-whole-repo command N times (confirmed: ~22x, >90s, against
 /// design-docs' ~22 markdown files).
-pub fn run_batch(dir: PathBuf, trigger: &str, no_inline_ignores: bool) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) = run_batch_collect(&dir, trigger, no_inline_ignores)?;
+pub fn run_batch(dir: PathBuf, trigger: &str, mode: InlineIgnoreMode) -> Result<ExitCode> {
+    let (any_blocking_failure, lines) = run_batch_collect(&dir, trigger, mode)?;
     for line in &lines {
         println!("{line}");
     }
@@ -114,7 +110,7 @@ pub fn run_batch(dir: PathBuf, trigger: &str, no_inline_ignores: bool) -> Result
 fn run_batch_collect(
     dir: &Path,
     trigger: &str,
-    no_inline_ignores: bool,
+    mode: InlineIgnoreMode,
 ) -> Result<(bool, Vec<String>)> {
     let (config, repo_root) = find_effective_config(dir)?;
 
@@ -135,12 +131,7 @@ fn run_batch_collect(
     // `accepted_findings::ACCEPTED_FINDINGS_DIR` must surface as one clean error here,
     // before any file's checks run, rather than failing nondeterministically mid-batch
     // depending on file-walk order.
-    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
-    // One counter per run (never a global) so parallel runs and tests cannot share a count.
-    run_ctx.inline.counter = Some(Arc::new(SuppressionCounts::default()));
-    if no_inline_ignores {
-        run_ctx.inline.mode = InlineIgnoreMode::Disabled;
-    }
+    let run_ctx = crate::run_context::RunContext::for_batch(&repo_root, mode)?;
 
     for check in &repo_checks {
         if !check.triggers.is_empty() && !check.triggers.iter().any(|t| t == trigger) {
@@ -168,7 +159,7 @@ fn run_batch_collect(
             &run_ctx,
         )?;
         // With ignores disabled nothing is ever dropped, so every rule would look unknown.
-        let audit = if no_inline_ignores {
+        let audit = if mode == InlineIgnoreMode::Disabled {
             Vec::new()
         } else {
             crate::inline_post_pass::unknown_rule_advisories(file, &results, &run_ctx)
@@ -185,27 +176,14 @@ fn run_batch_collect(
         // Teaches the syntax where developers see findings; otherwise it is only in the docs.
         lines.push(batch_syntax_hint());
     }
-    lines.extend(suppression_footer(&run_ctx.inline));
+    lines.extend(
+        run_ctx
+            .inline
+            .counter
+            .as_ref()
+            .and_then(|counts| counts.footer()),
+    );
     Ok((any_blocking_failure, lines))
-}
-
-/// Repo-wide count, so 1-4 ignores per file across many files still add up to a visible total.
-fn suppression_footer(ctx: &InlineIgnoreContext) -> Option<String> {
-    let counts = ctx.counter.as_ref()?;
-    let total = counts.total.load(Ordering::Relaxed);
-    if total == 0 {
-        return None;
-    }
-    let blocking = counts.blocking.load(Ordering::Relaxed);
-    let noun = if total == 1 { "finding" } else { "findings" };
-    let blocking_part = if blocking > 0 {
-        format!(" ({blocking} from blocking checks)")
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "[kibitzer] {total} {noun} suppressed inline{blocking_part} (rerun with --no-inline-ignores to see them)"
-    ))
 }
 
 #[cfg(test)]
@@ -216,6 +194,7 @@ mod tests {
     use crate::config::{Check, Severity};
 
     use super::run_batch_collect;
+    use crate::inline_ignores::InlineIgnoreMode;
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -302,7 +281,8 @@ mod tests {
         let dir = tmp_dir("zero-match-under-blocking");
         write_zero_match_only_component_deps_fixture(&dir);
 
-        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual", false).unwrap();
+        let (any_blocking_failure, lines) =
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -336,7 +316,8 @@ mod tests {
         let dir = tmp_dir("real-violation-stays-blocking");
         write_real_component_deps_violation_fixture(&dir);
 
-        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual", false).unwrap();
+        let (any_blocking_failure, lines) =
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 

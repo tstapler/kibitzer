@@ -2,11 +2,12 @@
 //! `run_checks_for_trigger`: the `accepted/` entries and how inline ignores apply.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::accepted_findings::{AcceptedFindings, find_accepted_findings};
-use crate::inline_ignores::InlineIgnoreContext;
+use crate::inline_ignores::{InlineIgnoreContext, InlineIgnoreMode, SuppressionCounts};
 
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
@@ -25,5 +26,17 @@ impl RunContext {
     /// Loads the `accepted/` entries above `start`; inline ignores start in their default mode.
     pub fn load(start: &Path) -> Result<Self> {
         find_accepted_findings(start).map(Self::new)
+    }
+
+    /// For one `kibitzer run` batch: a fresh suppression counter (never global, so parallel
+    /// runs and tests cannot share a count) and the requested inline-ignore `mode`.
+    pub fn for_batch(repo_root: &Path, mode: InlineIgnoreMode) -> Result<Self> {
+        let mut ctx = Self::load(repo_root)?;
+        ctx.inline = InlineIgnoreContext {
+            mode,
+            counter: Some(Arc::new(SuppressionCounts::default())),
+            ..InlineIgnoreContext::default()
+        };
+        Ok(ctx)
     }
 }

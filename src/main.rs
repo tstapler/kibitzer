@@ -343,7 +343,15 @@ fn main() -> Result<ExitCode> {
             dir,
             trigger,
             no_inline_ignores,
-        } => run::run_batch(dir, &trigger, no_inline_ignores),
+        } => run::run_batch(
+            dir,
+            &trigger,
+            if no_inline_ignores {
+                inline_ignores::InlineIgnoreMode::Disabled
+            } else {
+                inline_ignores::InlineIgnoreMode::Apply
+            },
+        ),
         Command::Hook => hook::run_hook(),
         Command::Mcp => {
             let rt = tokio::runtime::Runtime::new()?;
