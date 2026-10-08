@@ -153,6 +153,10 @@ fn advisory_check_exits_zero_and_reports_via_stdout_context() {
     assert!(stdout.contains("no-bad-marker"));
     assert!(stdout.contains("found a BAD marker"));
     assert!(stdout.contains("hookSpecificOutput"));
+    assert!(
+        stdout.contains("# kibitzer:ignore <rule> -- <why>"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -356,4 +360,28 @@ fn blocking_check_grace_persists_across_diff_scoped_edits_without_a_daemon() {
     );
     assert!(stdout.is_empty());
     assert!(stderr.contains("no-bad-marker"));
+}
+
+/// A malformed `kibitzer:ignore` is an advisory `inline-ignore` result; on the exit-2 path it
+/// must still reach stderr or the agent never sees the repair while stuck on a blocking check.
+#[test]
+fn blocking_exit_also_prints_ignore_syntax_repair_from_inline_ignore_result() {
+    let repo = TempRepo::new(
+        "blocking-with-ignore-syntax",
+        json!({
+            "name": "no-bad-marker",
+            "command": "! grep -q BAD {file}",
+            "severity": "blocking",
+            "message": "found a BAD marker",
+        }),
+    );
+    let content = "# Doc\n\nBAD\n\n<!-- kibitzer:ignore -->\n";
+    let (code, _, stderr) = repo.run_hook("doc.md", content);
+    assert_eq!(code, 0, "first failure gets grace: {stderr}");
+
+    let (code, stdout, stderr) = repo.run_hook("doc.md", content);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("no-bad-marker"), "stderr: {stderr}");
+    assert!(stderr.contains("[ignore-syntax]"), "stderr: {stderr}");
+    assert!(stderr.contains("kibitzer:ignore"), "stderr: {stderr}");
 }

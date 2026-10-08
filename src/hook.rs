@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::check::CheckResult;
 use crate::config::Severity;
 use crate::daemon::run_checks_smart;
+use crate::inline_ignores::{Line, RuleId, syntax_hint, syntax_hint_limited};
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -197,8 +198,17 @@ pub fn run_hook() -> Result<ExitCode> {
                 result.describe()
             );
         }
+        // A malformed or misplaced ignore on the blocked file would otherwise stay invisible
+        // exactly when the agent is stuck, so repair text goes out with the blocking lines.
+        for result in failures
+            .iter()
+            .filter(|r| r.check_name == "inline-ignore" && r.severity != Severity::Blocking)
+        {
+            eprintln!("[kibitzer] inline-ignore: {}", result.describe());
+        }
         eprintln!(
-            "[kibitzer] to disable a check or exclude a file, see \
+            "[kibitzer] to dismiss a judged finding, add `kibitzer:ignore <rule> -- <why>`; to \
+             disable a check or exclude a file, see \
              https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md"
         );
         return Ok(ExitCode::from(2));
@@ -209,14 +219,13 @@ pub fn run_hook() -> Result<ExitCode> {
         .map(|r| render_advisory_context_line(r))
         .collect::<Vec<_>>()
         .join("\n");
-    context.push_str(
-        "\n\nIf any of the above looks like a false positive (fired on content the edit \
-         didn't actually introduce, or on a pattern the check misidentifies), see \
-         https://github.com/tstapler/kibitzer/blob/master/docs/reporting-false-positives.md \
-         for how to file it — don't just note it in passing. To turn a check off (repo-wide) \
-         or exclude a specific file, see \
-         https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md.",
-    );
+    context.push_str("\n\n");
+    let anchor = failures.iter().find_map(|r| r.inline.first_anchor());
+    context.push_str(&advisory_footer(
+        std::path::Path::new(&file_path),
+        anchor,
+        &union_rule_ids(&failures),
+    ));
 
     let payload = json!({
         "hookSpecificOutput": {
@@ -226,6 +235,103 @@ pub fn run_hook() -> Result<ExitCode> {
     });
     println!("{payload}");
     Ok(ExitCode::SUCCESS)
+}
+
+const FALSE_POSITIVE_SENTENCE: &str = "If any of the above looks like a false positive (fired on content the edit \
+     didn't actually introduce, or on a pattern the check misidentifies), see \
+     https://github.com/tstapler/kibitzer/blob/master/docs/reporting-false-positives.md \
+     for how to file it, don't just note it in passing.";
+const TURN_OFF_SENTENCE: &str = "To turn a check off (repo-wide) or exclude a specific file, see \
+     https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md.";
+const TURN_OFF_SHORT_SENTENCE: &str = "To turn a check off or exclude a file, see \
+     https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md.";
+
+/// The footer is paid on every failing hook call, so it has a hard ceiling; it is the
+/// pre-hint footer (423 characters) plus at most `MAX_NET_ADDED_CHARS`.
+const MAX_FOOTER_CHARS: usize = 640;
+const MAX_NET_ADDED_CHARS: usize = 215;
+const BASELINE_FOOTER_CHARS: usize = 423;
+
+/// What the footer has shed, in drop order. The syntax line and the anchor are never shed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trim {
+    Nothing,
+    FalsePositiveLink,
+    TurnOffProse,
+    SuppressingChecksLink,
+}
+
+const TRIM_ORDER: [Trim; 4] = [
+    Trim::Nothing,
+    Trim::FalsePositiveLink,
+    Trim::TurnOffProse,
+    Trim::SuppressingChecksLink,
+];
+
+fn render_footer(trim: Trim, hint: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if trim == Trim::Nothing {
+        parts.push(FALSE_POSITIVE_SENTENCE);
+    }
+    match trim {
+        Trim::Nothing | Trim::FalsePositiveLink => parts.push(TURN_OFF_SENTENCE),
+        Trim::TurnOffProse => parts.push(TURN_OFF_SHORT_SENTENCE),
+        Trim::SuppressingChecksLink => {}
+    }
+    parts.push(hint);
+    parts.join(" ")
+}
+
+/// Advisory footer: links plus the syntax hint for `path`, within `max_chars`. Sheds prose in
+/// `TRIM_ORDER`, then truncates the `Rules:` list down to one id (never to zero).
+fn advisory_footer_within(
+    path: &std::path::Path,
+    anchor: Option<(&RuleId, Line)>,
+    rule_ids: &[&RuleId],
+    max_chars: usize,
+) -> String {
+    let full_hint = syntax_hint(path, anchor, rule_ids);
+    for trim in TRIM_ORDER {
+        let footer = render_footer(trim, &full_hint);
+        if footer.chars().count() <= max_chars {
+            return footer;
+        }
+    }
+    let last = TRIM_ORDER[TRIM_ORDER.len() - 1];
+    let mut footer = render_footer(last, &full_hint);
+    for limit in (1..rule_ids.len().min(6)).rev() {
+        footer = render_footer(last, &syntax_hint_limited(path, anchor, rule_ids, limit));
+        if footer.chars().count() <= max_chars {
+            break;
+        }
+    }
+    footer
+}
+
+fn advisory_footer(
+    path: &std::path::Path,
+    anchor: Option<(&RuleId, Line)>,
+    rule_ids: &[&RuleId],
+) -> String {
+    advisory_footer_within(
+        path,
+        anchor,
+        rule_ids,
+        MAX_FOOTER_CHARS.min(BASELINE_FOOTER_CHARS + MAX_NET_ADDED_CHARS),
+    )
+}
+
+/// Distinct rule ids across every failing result, in order.
+fn union_rule_ids<'a>(failures: &[&'a CheckResult]) -> Vec<&'a RuleId> {
+    let mut ids: Vec<&RuleId> = Vec::new();
+    for result in failures {
+        for id in result.inline.rule_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 /// One line of the PostToolUse advisory `additionalContext` for a failed, non-blocking
@@ -414,5 +520,201 @@ func TestX(t *testing.T) {\n\
         let ranges = compute_changed_lines(&tool_input, &path);
         std::fs::remove_file(&path).ok();
         assert_eq!(ranges, None);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod footer_tests {
+    use super::*;
+    use crate::inline_ignores::{DirectiveParse, parse_comment_line};
+    use std::path::Path;
+
+    const FP_LINK: &str = "reporting-false-positives.md";
+    const SUPPRESS_LINK: &str = "suppressing-checks.md";
+
+    fn rid(name: &str) -> RuleId {
+        RuleId::new(name).unwrap()
+    }
+
+    fn chars(text: &str) -> usize {
+        text.chars().count()
+    }
+
+    /// The pre-hint footer, byte for byte as shipped (em dash included), pins the baseline.
+    #[test]
+    fn hook_footer_should_Measure423Characters_When_BeforeSyntaxHint() {
+        let legacy = format!(
+            "{} {TURN_OFF_SENTENCE}",
+            FALSE_POSITIVE_SENTENCE.replace("it, don't", "it \u{2014} don't")
+        );
+        assert_eq!(chars(&legacy), BASELINE_FOOTER_CHARS);
+        assert_eq!(BASELINE_FOOTER_CHARS, 423);
+    }
+
+    #[test]
+    fn hook_footer_should_EndWithSyntaxAndAnchor_When_AnchorKnown() {
+        let rule = rid("flag-argument");
+        let footer = advisory_footer(
+            Path::new("src/foo.go"),
+            Some((&rule, Line::new(20))),
+            &[&rule],
+        );
+        assert!(footer.ends_with("Rules: flag-argument."), "{footer}");
+        assert!(
+            footer.contains("// kibitzer:ignore flag-argument -- <why>"),
+            "{footer}"
+        );
+        assert!(footer.contains("above line 20"), "{footer}");
+        assert!(
+            footer.contains(FP_LINK) && footer.contains(SUPPRESS_LINK),
+            "{footer}"
+        );
+        assert!(!footer.contains("false-positive "), "{footer}");
+    }
+
+    #[test]
+    fn hook_footer_should_UseGenericForm_When_NoStructuredData() {
+        let footer = advisory_footer(Path::new("x.py"), None, &[]);
+        assert!(
+            footer.contains("# kibitzer:ignore <rule> -- <why>"),
+            "{footer}"
+        );
+        assert!(!footer.contains("Rules:"), "{footer}");
+    }
+
+    fn longest_case() -> (Vec<RuleId>, String) {
+        let ids: Vec<RuleId> = [
+            "markdown-link-integrity",
+            "duplicate-code-cross-file",
+            "primitive-obsession",
+            "repetitive-sentence-structure",
+            "missing-paragraph-break",
+            "comment-quality-markdown",
+            "extra-rule",
+        ]
+        .iter()
+        .map(|n| rid(n))
+        .collect();
+        let refs: Vec<&RuleId> = ids.iter().collect();
+        let footer = advisory_footer(
+            Path::new("docs/a/very/long/path/to/some-notes-file.md"),
+            Some((&ids[0], Line::new(1234))),
+            &refs,
+        );
+        (ids, footer)
+    }
+
+    #[test]
+    fn hook_footer_should_StayWithinBudgetAndKeepAnchor_When_LongestCase() {
+        let (_ids, footer) = longest_case();
+        assert!(
+            chars(&footer) <= MAX_FOOTER_CHARS,
+            "{} chars: {footer}",
+            chars(&footer)
+        );
+        assert!(
+            chars(&footer) <= BASELINE_FOOTER_CHARS + MAX_NET_ADDED_CHARS,
+            "{} chars: {footer}",
+            chars(&footer)
+        );
+        assert!(footer.contains("above line 1234"), "{footer}");
+        assert!(
+            footer.contains("<!-- kibitzer:ignore markdown-link-integrity -- <why> -->"),
+            "{footer}"
+        );
+        assert!(
+            footer.contains("Rules: markdown-link-integrity"),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn hook_footer_should_StayWithinBudget_When_TypicalGoCase() {
+        let a = rid("flag-argument");
+        let b = rid("primitive-obsession");
+        let footer = advisory_footer(
+            Path::new("src/foo.go"),
+            Some((&a, Line::new(20))),
+            &[&a, &b],
+        );
+        assert!(
+            chars(&footer) <= BASELINE_FOOTER_CHARS + MAX_NET_ADDED_CHARS,
+            "{} chars",
+            chars(&footer)
+        );
+    }
+
+    #[test]
+    fn hook_footer_should_DropInOrder_When_BudgetExceeded() {
+        let ids: Vec<RuleId> = (0..4).map(|i| rid(&format!("some-rule-{i}"))).collect();
+        let refs: Vec<&RuleId> = ids.iter().collect();
+        let anchor = Some((&ids[0], Line::new(7)));
+        let path = Path::new("a.go");
+        let hint = syntax_hint(path, anchor, &refs);
+        let len_at = |trim| chars(&render_footer(trim, &hint));
+
+        let at = |cap| advisory_footer_within(path, anchor, &refs, cap);
+        let f = at(len_at(Trim::Nothing) - 1);
+        assert!(
+            !f.contains(FP_LINK) && f.contains("(repo-wide)") && f.contains(SUPPRESS_LINK),
+            "{f}"
+        );
+        let f = at(len_at(Trim::FalsePositiveLink) - 1);
+        assert!(
+            !f.contains("(repo-wide)") && f.contains(SUPPRESS_LINK),
+            "{f}"
+        );
+        let f = at(len_at(Trim::TurnOffProse) - 1);
+        assert!(
+            !f.contains(SUPPRESS_LINK)
+                && f.contains("Rules: some-rule-0, some-rule-1, some-rule-2, some-rule-3."),
+            "{f}"
+        );
+        let f = at(len_at(Trim::SuppressingChecksLink) - 1);
+        assert!(
+            f.contains("Rules: some-rule-0, some-rule-1, some-rule-2, ..."),
+            "{f}"
+        );
+        let f = at(1);
+        assert!(f.contains("Rules: some-rule-0, ..."), "{f}");
+        assert!(
+            f.contains("kibitzer:ignore some-rule-0 -- <why>") && f.contains("above line 7"),
+            "{f}"
+        );
+    }
+
+    /// Fills `<rule>`/`<why>` in the footer's example and strips nothing else: the parser
+    /// drops the leader and trailer itself.
+    fn example_line(footer: &str, open: &str) -> String {
+        let start = footer.find(open).expect("example leader in footer");
+        let rest = &footer[start..];
+        let end = rest.find(", ").unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn hook_footer_example_should_ParseAsValidDirective_When_PlaceholdersFilled() {
+        for (path, open) in [
+            ("a.go", "//"),
+            ("a.py", "#"),
+            ("a.md", "<!--"),
+            ("a.rs", "//"),
+        ] {
+            let rule = rid("flag-argument");
+            let anchored = advisory_footer(Path::new(path), Some((&rule, Line::new(9))), &[&rule]);
+            let generic = advisory_footer(Path::new(path), None, &[]);
+            for footer in [anchored, generic] {
+                let example = example_line(&footer, &format!("{open} kibitzer:ignore"))
+                    .replace("<rule>", "flag-argument")
+                    .replace("<why>", "legacy callers");
+                match parse_comment_line(&example) {
+                    DirectiveParse::Valid(d) => {
+                        assert_eq!(d.rules(), &[rid("flag-argument")], "{example}");
+                    }
+                    other => panic!("example {example:?} parsed as {other:?}"),
+                }
+            }
+        }
     }
 }
