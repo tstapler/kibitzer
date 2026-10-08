@@ -1346,6 +1346,11 @@ mod tests {
             "[ignore-syntax] bad"
         ));
         assert!(!rule_matches(&r("unused-ignore"), "unused-ignore", "x"));
+        assert!(!rule_matches(
+            &r("blocking-suppressed"),
+            "inline-ignore",
+            "[blocking-suppressed] x"
+        ));
     }
 
     fn finding(line: usize, message: &str) -> Finding {
