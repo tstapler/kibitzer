@@ -58,10 +58,11 @@ reported against the string-literal markers in sources and tests. Four output li
 
 ## 4.1.1c Fast path, latency, footer
 
-Tests added in `src/inline_ignores.rs` (commit d6f08cd, formatted in 251d427), both passing:
+Test added in `src/inline_ignores.rs` (commit d6f08cd, formatted in 251d427):
 `apply_inline_ignores_should_UseNoScanOrHash_When_NoKibitzerSubstring` (5,000-line Go source, 1,000 calls, `scans == 0`,
-`hash_calls == 0`) and `apply_inline_ignores_should_StayWithinRatioOfSubstringSearch_When_NoKibitzerSubstring` (median of 5 of
-1,000 calls at most 20x a `contains("kibitzer")` baseline plus 5 ms).
+`hash_calls == 0`). That commit also added a wall-clock ratio test (at most 20x a `contains("kibitzer")` baseline) and a
+rerun-latency ratio test; both were removed in the post-verify cleanup as flaky on loaded machines, and the `ScanMemo`
+counters they sat beside are now `#[cfg(test)]`. The manual timings below remain the latency evidence.
 
 Hook-path raw rerun on the final code. Method: `kibitzer hook` subprocess, fresh cache per call, no daemon, Edit payload
 inserting `// kibitzer:ignore long-function -- ...` (marker) or `// plain comment` (no marker) above a unique line near the top;
@@ -74,8 +75,7 @@ in-process timing). Two batches per file.
 | `src/check.rs` (largest by lines) | 194 / 178 ms | 217 / 199 ms | **23 / 21 ms** |
 | Task 2.2.3d spike (plan.md), rules.rs / check.rs | n/a | n/a | 26.9 / 25.9 ms (rerun alone 26.8 / 29.5 ms) |
 
-Result: at most 34 ms added, well under the 150 ms target; consistent with the spike. The 2x ratio guard is the Task 2.2.3b
-test; this run did not re-measure the rerun-to-first-pass ratio separately.
+Result: at most 34 ms added, well under the 150 ms target; consistent with the spike. The rerun-to-first-pass ratio was not re-measured by this run.
 
 `ScanMemo` thrash: daemon started with an isolated socket, hook calls (Edit payload, marker) against two copies of the
 largest files, median per call, n=10 each. Run 2 of 2 shown; in run 1 the alternating medians were about 20 ms slower than repeated (206 and 212 vs 184 ms), so the sign flips between runs and the difference is noise.
@@ -137,6 +137,61 @@ Final gates: `cargo build` ok; `cargo test` 1426 passed, 0 failed (1381 unit, 9 
 
 - The public corpus has no `kibitzer` strings, so it proves quiet-at-scale and binary safety, not precision on prose mentions;
   the precision evidence is the 147 mention files in the tstapler repos, this repo's self-run, and the unit tests.
-- Eight repos (deno, k8s, cassandra, vscode, servo, mdn, gitlab, stapler-squad) did not finish a full `kibitzer run` inside the time box.
+- A full-tree `kibitzer run` still did not finish for eight repos (deno, k8s, cassandra, vscode, servo, mdn, gitlab, stapler-squad); see "Follow-up" for what the per-file and per-directory reruns did cover and the 24 directories that still timed out.
 - Hook and daemon timings are single-machine, whole-process wall time with 20 to 40 ms of run-to-run noise.
 - The counterfactual coverage check is a rule-level proxy.
+
+## Follow-up: the eight timed-out repos
+
+Measured 2026-10-08, release build of this branch (`target/release/kibitzer`), scripts kept outside the repo. Whole-tree
+`kibitzer run` is infeasible for these repos, so two narrower runs replaced it.
+
+**Per-file sweep of the inline-ignore checker.** `rg --files` (gitignore respected) over the in-scope extensions
+(`go ts tsx js jsx mjs cjs py java kt kts rs md`), then `xargs -n1 -P8 kibitzer check native inline-ignore <file>`. This
+exercises exactly the new checker on every in-scope file, with no time cap hit.
+
+| Repo | In-scope files | Output lines | Error lines | Wall time |
+|---|---|---|---|---|
+| denoland/deno | 6,227 | **0** | 24 (4 non-UTF-8 files, 6 lines each) | 14 s |
+| kubernetes/website | 8,316 | **0** | 0 | 60 s |
+| apache/cassandra | 6,480 | **0** | 0 | 33 s |
+| microsoft/vscode | 14,968 | **0** | 0 | 52 s |
+| servo/servo | 68,719 | **0** | 36 (6 non-UTF-8 files, 6 lines each) | 245 s |
+| mdn/content | 14,651 | **0** | 0 | 28 s |
+| gitlabhq/gitlabhq | 15,366 | **0** | 0 | 44 s |
+| tstapler/stapler-squad (`~/code` checkout) | 7,475 | **0** | 0 | 17 s |
+| kubernetes/kubernetes (not asked for, run for completeness) | 18,003 | **0** | 0 | 46 s |
+
+The error lines are the known single-file-CLI UTF-8 read failure described above, not inline-ignore output.
+
+**Per-directory `kibitzer run`.** Every top-level directory of the same repos (`.git`, `node_modules`, `vendor`, `target`
+skipped; files directly in a repo root were not run), `kibitzer run <dir>` with a 180 s cap, 6 at a time: 135 directories.
+**111 finished, 24 still timed out.** Across the 111 finished runs: **0** `: [ignore-syntax]` lines, **0** `: [unused-ignore]`
+lines, **0** `suppressed inline` footers.
+
+| Repo | Directories finished | Directories timed out at 180 s |
+|---|---|---|
+| deno | 3 | `cli`, `libs`, `ext`, `tests` |
+| kubernetes/website | 10 | `content` |
+| cassandra | 13 | `src`, `test` |
+| vscode | 6 | `extensions`, `src` |
+| servo | 8 | `components`, `tests` |
+| mdn | 2 | `files` |
+| gitlabhq | 29 | `app`, `doc`, `doc-locale`, `spec` |
+| stapler-squad | 30 | `server`, `session`, `tests`, `web-app` |
+| kubernetes/kubernetes | 10 | `cmd`, `pkg`, `staging`, `test` |
+
+What is still not shown: a complete `kibitzer run` (all default checkers) over those 24 directories. For them the only
+evidence is the per-file sweep above, which covers the `inline-ignore` checker but not the suppression path inside `run`
+(inline filtering of other checkers' findings). The public corpus has no `kibitzer` strings (see Limits), so a suppression
+there could only come from a false directive match, and none of the 111 finished directories showed one.
+
+## Deferred after the verify review (not done in this pass)
+
+- Module cycle between `check` and `inline_post_pass` (review item C1).
+- Splitting `src/inline_ignores.rs` (C2).
+- Options struct for the `check.rs` signatures (C7).
+- A single `RuleInfo` table in place of `KNOWN_RULES` plus the ownership table.
+- Index-based `shown` tracking in `InlineOutcome`.
+- From the plan's Amendment 1: Task 2.2.2b (full `kibitzer run` unused-ignore audit), the run-footer false-positive split,
+  the success acknowledgement, and Story 3.2.1.
