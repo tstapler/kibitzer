@@ -686,12 +686,108 @@ fn covering<'a>(
 ) -> Option<(&'a Directive, &'a RuleId)> {
     let line = Line::new(finding.line);
     directives.iter().find_map(|d| {
-        d.rules().iter().find_map(|r| {
-            let matched = rule_matches(r, checker_name, &finding.message);
-            let in_head =
-                d.start_line.get() <= FILE_HEAD_LINES && FILE_SCOPE_RULES.contains(&r.as_str());
-            (covers(d, line, matched) || (matched && in_head)).then_some((*d, r))
-        })
+        d.rules()
+            .iter()
+            .find_map(|r| rule_covers(d, r, checker_name, &finding.message, line).then_some((*d, r)))
+    })
+}
+
+/// The one definition of "this directive rule silences this finding", shared by the apply
+/// path and the unused-ignore judgement so the two cannot disagree.
+fn rule_covers(
+    d: &Directive,
+    rule: &RuleId,
+    checker_name: &str,
+    message: &str,
+    line: Line,
+) -> bool {
+    let matched = rule_matches(rule, checker_name, message);
+    let in_head =
+        d.start_line.get() <= FILE_HEAD_LINES && FILE_SCOPE_RULES.contains(&rule.as_str());
+    covers(d, line, matched) || (matched && in_head)
+}
+
+/// A finding as the checker reported it, before any directive was applied. Built from
+/// structured findings, never parsed from rendered text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawFinding {
+    pub line: Line,
+    pub checker: String,
+    pub rule: RuleId,
+    pub message: String,
+}
+
+/// Checker-name prefixes or suffixes whose findings carry `rule`, for the rules whose checker
+/// name differs from the rule id. `None` means ownership is unknown, so the rule is not judged.
+fn owner_matches(rule: &str, checker: &str) -> Option<bool> {
+    match rule {
+        "commented-out-code" | "over-commented" | "verbose-comment" => {
+            Some(checker.starts_with("comment-quality"))
+        }
+        "long-function" | "deep-nesting" | "long-parameter-list" | "flag-argument"
+        | "unreachable-code" | "replace-magic-literal" | "extract-variable" => {
+            Some(checker.starts_with("syntax-rules"))
+        }
+        "file-size" => Some(checker.ends_with("file-size")),
+        _ if crate::checker::lookup(rule).is_some() => Some(checker == rule),
+        _ => None,
+    }
+}
+
+fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(s, e)| s <= d.end_line.get() && d.start_line.get() <= e)
+}
+
+/// Directives that suppress nothing, judged against `raw` (findings before any directive or
+/// `accepted/` entry, so a shadowed ignore still counts as used). A rule is judged only when
+/// its owning checker is in `ran_checkers`; unowned rules fail open, except a name that is not
+/// a known rule or checker at all, which is reported as a probable typo. `only_rows` limits
+/// judgement to directives touching those ranges (the hook's changed lines).
+pub(crate) fn unused_ignores(
+    directives: &[Directive],
+    raw: &[RawFinding],
+    ran_checkers: &[&str],
+    only_rows: Option<&[(usize, usize)]>,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for d in directives {
+        if only_rows.is_some_and(|ranges| !rows_intersect(d, ranges)) {
+            continue;
+        }
+        for rule in d.rules() {
+            let used = raw
+                .iter()
+                .any(|f| rule_covers(d, rule, &f.checker, &f.message, f.line));
+            if used {
+                continue;
+            }
+            if let Some(message) = unused_message(rule.as_str(), ran_checkers) {
+                out.push(Finding {
+                    line: d.start_line.get(),
+                    message,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The advisory for a rule that matched no raw finding, or `None` when it cannot be judged.
+fn unused_message(rule: &str, ran_checkers: &[&str]) -> Option<String> {
+    if known_rule(rule) {
+        let judged = ran_checkers
+            .iter()
+            .any(|c| owner_matches(rule, c) == Some(true));
+        return judged
+            .then(|| format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it"));
+    }
+    // `[ignore-syntax]` already carries the suggestion for a near miss.
+    did_you_mean(rule).is_none().then(|| {
+        format!(
+            "[unused-ignore] '{rule}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+        )
     })
 }
 
@@ -1649,5 +1745,137 @@ mod tests {
             missing.is_empty(),
             "add these ids to KNOWN_RULES: {missing:?}"
         );
+    }
+
+    fn directive_at(rule_list: &[&str], start: usize, end: usize, whole_line: bool) -> Directive {
+        Directive::new(
+            rules(rule_list),
+            Reason::new("legacy api pinned", &[]).unwrap(),
+            Line::new(start),
+            Line::new(end),
+            whole_line,
+        )
+        .unwrap()
+    }
+
+    fn raw(checker: &str, rule: &str, line: usize, message: &str) -> RawFinding {
+        RawFinding {
+            line: Line::new(line),
+            checker: checker.to_string(),
+            rule: RuleId::new(rule).unwrap(),
+            message: message.to_string(),
+        }
+    }
+
+    const SYNTAX: &[&str] = &["syntax-rules-go"];
+
+    #[test]
+    fn unused_ignores_should_Report_When_NoMatchingFinding() {
+        let d = directive_at(&["flag-argument"], 9, 9, true);
+        let out = unused_ignores(&[d], &[], SYNTAX, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 9);
+        assert_eq!(
+            out[0].message,
+            "[unused-ignore] kibitzer:ignore flag-argument suppresses nothing - remove it"
+        );
+    }
+
+    #[test]
+    fn unused_ignores_should_BeEmpty_When_DirectiveCoversRawFinding() {
+        let d = directive_at(&["flag-argument"], 9, 9, true);
+        let f = raw("syntax-rules-go", "flag-argument", 10, "[flag-argument] x");
+        assert!(unused_ignores(&[d], &[f], SYNTAX, None).is_empty());
+    }
+
+    #[test]
+    fn unused_ignores_should_Report_When_FindingTwoRowsBelowWholeLineDirective() {
+        let d = directive_at(&["flag-argument"], 9, 9, true);
+        let f = raw("syntax-rules-go", "flag-argument", 11, "[flag-argument] x");
+        assert_eq!(unused_ignores(&[d], &[f], SYNTAX, None).len(), 1);
+    }
+
+    #[test]
+    fn unused_ignores_should_BeEmpty_When_AlsoShadowedByAccepted() {
+        // Raw findings are taken before `accepted/` is applied, so a shadowed finding is still raw.
+        let d = directive_at(&["flag-argument"], 4, 4, true);
+        let shadowed = raw("syntax-rules-go", "flag-argument", 5, "[flag-argument] x");
+        assert!(unused_ignores(&[d], &[shadowed], SYNTAX, None).is_empty());
+    }
+
+    #[test]
+    fn unused_ignores_should_SkipRule_When_OwningCheckerDisabledOrDidNotRun() {
+        let d = directive_at(&["flag-argument"], 9, 9, true);
+        assert!(unused_ignores(&[d.clone()], &[], &["em-dash-overuse"], None).is_empty());
+        assert!(unused_ignores(&[d], &[], &[], None).is_empty());
+    }
+
+    #[test]
+    fn unused_ignores_should_FailOpen_When_RuleOwnershipUnknown() {
+        // `god-class` is a known rule whose emitting checker is outside the registry.
+        let d = directive_at(&["god-class"], 9, 9, true);
+        assert!(unused_ignores(&[d], &[], SYNTAX, None).is_empty());
+    }
+
+    #[test]
+    fn unused_ignores_should_JudgeByCheckerName_When_MarkdownLinkIntegrity() {
+        let d = directive_at(&["markdown-link-integrity"], 3, 3, true);
+        let f = raw(
+            "markdown-link-integrity",
+            "markdown-link-integrity",
+            4,
+            "[foo] used but never defined",
+        );
+        let ran = ["markdown-link-integrity"];
+        assert!(unused_ignores(&[d.clone()], &[f], &ran, None).is_empty());
+        assert_eq!(unused_ignores(&[d], &[], &ran, None).len(), 1);
+    }
+
+    #[test]
+    fn unused_ignores_should_PointToCheckList_When_RuleIsNeitherKnownNorCheckerName() {
+        let d = directive_at(&["made-up-rule"], 9, 9, true);
+        let out = unused_ignores(&[d], &[], SYNTAX, None);
+        assert_eq!(
+            out[0].message,
+            "[unused-ignore] 'made-up-rule' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+        );
+        assert!(!out[0].message.contains("remove it"));
+    }
+
+    #[test]
+    fn unused_ignores_should_StaySilent_When_UnknownRuleHasNearMatchOrWasUsed() {
+        // A near miss is already reported by `[ignore-syntax]`; a built id that matched is used.
+        let near = directive_at(&["flag-argumnt"], 9, 9, true);
+        assert!(unused_ignores(&[near], &[], SYNTAX, None).is_empty());
+        let plugin = directive_at(&["plugin-only-rule"], 9, 9, true);
+        let f = raw("plugin-check", "plugin-only-rule", 10, "[plugin-only-rule] x");
+        assert!(unused_ignores(&[plugin], &[f], SYNTAX, None).is_empty());
+    }
+
+    #[test]
+    fn unused_ignores_should_ReportEachUnusedRule_When_CommaList() {
+        let d = directive_at(&["flag-argument", "long-function"], 9, 9, true);
+        let f = raw("syntax-rules-go", "long-function", 10, "[long-function] x");
+        let out = unused_ignores(&[d], &[f], SYNTAX, None);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].message.contains("flag-argument"), "{}", out[0].message);
+    }
+
+    #[test]
+    fn unused_ignores_should_OnlyJudgeTouchedDirectives_When_OnlyRowsGiven() {
+        let near = directive_at(&["flag-argument"], 12, 12, true);
+        let far = directive_at(&["flag-argument"], 50, 50, true);
+        let out = unused_ignores(&[near, far], &[], SYNTAX, Some(&[(12, 12)]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 12);
+        let none = directive_at(&["flag-argument"], 50, 50, true);
+        assert!(unused_ignores(&[none], &[], SYNTAX, Some(&[(1, 3)])).is_empty());
+    }
+
+    #[test]
+    fn unused_ignores_should_HonorFileHead_When_FileSizeRule() {
+        let d = directive_at(&["file-size"], 1, 1, true);
+        let f = raw("go-file-size", "file-size", 900, "[file-size] big");
+        assert!(unused_ignores(&[d], &[f], &["go-file-size"], None).is_empty());
     }
 }
