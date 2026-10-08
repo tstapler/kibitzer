@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::rules;
+use crate::tree_walk::comment_kinds;
 
 /// `over-commented` fires when a declaration's attached comment lines are at least this
 /// multiple of its body's code-line count. A well-justified "why" comment can easily run
@@ -168,17 +169,6 @@ const USED_BY_REASON: &str =
 fn contains_issue_number_token(text: &str) -> bool {
     let bytes = text.as_bytes();
     (0..bytes.len()).any(|i| bytes[i] == b'#' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
-}
-
-fn comment_kinds(lang: Language) -> &'static [&'static str] {
-    match lang {
-        Language::Go
-        | Language::Python
-        | Language::TypeScript
-        | Language::Tsx
-        | Language::JavaScript => &["comment"],
-        Language::Java | Language::Kotlin | Language::Rust => &["line_comment", "block_comment"],
-    }
 }
 
 pub struct CommentQualityChecker {

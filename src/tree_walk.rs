@@ -1,5 +1,19 @@
 use tree_sitter::Node;
 
+use crate::checker::Language;
+
+/// Tree-sitter node kinds that are comments in `lang`'s grammar.
+pub(crate) fn comment_kinds(lang: Language) -> &'static [&'static str] {
+    match lang {
+        Language::Go
+        | Language::Python
+        | Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript => &["comment"],
+        Language::Java | Language::Kotlin | Language::Rust => &["line_comment", "block_comment"],
+    }
+}
+
 /// Iterative preorder tree-sitter descent: visits `node`, then every descendant, in the
 /// same order a naive `fn walk(node) { visit(node); for child in node.children() {
 /// walk(child) } }` would — but using `TreeCursor`'s own `goto_first_child`/
