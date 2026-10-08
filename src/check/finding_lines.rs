@@ -136,7 +136,7 @@ mod tests {
     fn run_native_check_should_MatchTextScoping_When_MessageSpansLines() {
         use crate::accepted_findings::AcceptedFindings;
         use crate::check::{
-            run_checker_against_file, run_native_check, scope_output_to_changed_lines,
+            NativeRun, run_checker_against_file, run_native_check, scope_output_to_changed_lines,
         };
         use crate::config::{Check, Severity};
         let dir = std::env::temp_dir().join(format!("kibitzer-multiline-{}", std::process::id()));
@@ -155,9 +155,13 @@ mod tests {
         );
         std::fs::write(&file, &source).unwrap();
         let ctx = crate::inline_ignores::InlineIgnoreContext::default();
-        let raw =
-            run_checker_against_file("syntax-rules-rust", &file, None, Severity::Advisory, &ctx)
-                .unwrap();
+        let run = NativeRun {
+            checker_name: "syntax-rules-rust",
+            options: None,
+            severity: Severity::Advisory,
+            inline_ctx: &ctx,
+        };
+        let raw = run_checker_against_file(run, &file).unwrap();
         assert!(raw.combined.contains('\n'), "{:?}", raw.combined);
         let check = Check {
             name: "syntax-rules-rust".to_string(),

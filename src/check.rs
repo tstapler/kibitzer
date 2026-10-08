@@ -294,6 +294,8 @@ fn run_native_check(
         }
     }
 
+    let run = NativeRun::for_check(check, checker_name, &accepted.inline);
+
     // Degrade to a failed CheckResult on error (e.g. an unreadable file) instead of
     // propagating, matching the shell-out path above where a command's own failure is
     // captured as `passed_raw = false` rather than aborting the whole batch — a single
@@ -303,13 +305,7 @@ fn run_native_check(
         passed: passed_raw,
         findings: kept_findings,
         inline: mut inline_outcome,
-    } = match run_checker_against_file(
-        checker_name,
-        file_path,
-        check.options.as_ref(),
-        check.severity,
-        &accepted.inline,
-    ) {
+    } = match run_checker_against_file(run, file_path) {
         Ok(result) => result,
         Err(err) => {
             return Ok(CheckResult::new(
@@ -357,15 +353,7 @@ fn run_native_check(
     let mut message = check.message.clone();
 
     if !passed && severity == Severity::Blocking {
-        let baseline = check_native_against_git_head(
-            checker_name,
-            repo_root,
-            file_path,
-            changed_lines,
-            check.options.as_ref(),
-            check.severity,
-            &accepted.inline,
-        );
+        let baseline = check_native_against_git_head(run, repo_root, file_path, changed_lines);
         if let Some(false) = baseline {
             severity = Severity::Advisory;
             message = Some(format!(
@@ -394,18 +382,46 @@ fn run_native_check(
     )
 }
 
+/// What one in-process checker run needs besides the file: which checker, its options, the
+/// check's severity (recorded on dropped findings) and the inline-ignore context.
+#[derive(Clone, Copy)]
+struct NativeRun<'a> {
+    checker_name: &'a str,
+    options: Option<&'a serde_json::Value>,
+    severity: Severity,
+    inline_ctx: &'a InlineIgnoreContext,
+}
+
+impl<'a> NativeRun<'a> {
+    fn for_check(
+        check: &'a Check,
+        checker_name: &'a str,
+        inline_ctx: &'a InlineIgnoreContext,
+    ) -> Self {
+        NativeRun {
+            checker_name,
+            options: check.options.as_ref(),
+            severity: check.severity,
+            inline_ctx,
+        }
+    }
+}
+
 /// Runs `checker_name` against `source` (as if it were the content of `file_path`),
 /// producing output in the same `{file}:{line}: {message}` convention a shell-out check's
 /// command output would follow, so downstream diff-scoping and baseline logic can treat
 /// native and shell-out checks identically.
 fn run_checker_against_source(
-    checker_name: &str,
+    run: NativeRun,
     file_path: &Path,
     source: &str,
-    options: Option<&serde_json::Value>,
-    severity: Severity,
-    inline_ctx: &InlineIgnoreContext,
 ) -> anyhow::Result<SourceCheck> {
+    let NativeRun {
+        checker_name,
+        options,
+        severity,
+        inline_ctx,
+    } = run;
     let findings =
         crate::checker::run_checker_configured(checker_name, file_path, source, options)?;
     let applied = apply_inline_ignores(
@@ -475,12 +491,9 @@ fn raw_findings_for_check(
         return Ok(Vec::new());
     };
     let raw = run_checker_against_source(
-        checker_name,
+        NativeRun::for_check(check, checker_name, &InlineIgnoreContext::disabled()),
         file_path,
         source,
-        check.options.as_ref(),
-        check.severity,
-        &InlineIgnoreContext::disabled(),
     )?;
     Ok(raw
         .findings
@@ -494,13 +507,8 @@ fn raw_findings_for_check(
         .collect())
 }
 
-fn run_checker_against_file(
-    checker_name: &str,
-    file_path: &Path,
-    options: Option<&serde_json::Value>,
-    severity: Severity,
-    inline_ctx: &InlineIgnoreContext,
-) -> anyhow::Result<SourceCheck> {
+fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<SourceCheck> {
+    let checker_name = run.checker_name;
     if let Ok(metadata) = std::fs::metadata(file_path)
         && metadata.len() > MAX_NATIVE_CHECK_BYTES
     {
@@ -516,27 +524,17 @@ fn run_checker_against_file(
             return Err(err).with_context(|| format!("reading {}", file_path.display()));
         }
     };
-    run_checker_against_source(
-        checker_name,
-        file_path,
-        &source,
-        options,
-        severity,
-        inline_ctx,
-    )
+    run_checker_against_source(run, file_path, &source)
 }
 
 /// Native-checker counterpart to [`check_against_git_head`]: same git-HEAD comparison, but
 /// runs the checker in-process against the HEAD content instead of shelling out to a
 /// substituted command.
 fn check_native_against_git_head(
-    checker_name: &str,
+    run: NativeRun,
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
-    options: Option<&serde_json::Value>,
-    severity: Severity,
-    inline_ctx: &InlineIgnoreContext,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
     let show = Command::new("git")
@@ -560,18 +558,18 @@ fn check_native_against_git_head(
 
     let source = String::from_utf8(show.stdout).ok()?;
     // Replays honor the run's mode but never feed its counter.
-    let replay_ctx = inline_ctx.without_counter();
+    let replay_ctx = run.inline_ctx.without_counter();
     let SourceCheck {
         combined,
         passed: passed_raw,
         ..
     } = run_checker_against_source(
-        checker_name,
+        NativeRun {
+            inline_ctx: &replay_ctx,
+            ..run
+        },
         file_path,
         &source,
-        options,
-        severity,
-        &replay_ctx,
     )
     .ok()?;
 
@@ -898,15 +896,9 @@ pub(crate) fn check_predates_git_head(
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
     if let Some(checker_name) = &check.checker {
-        return check_native_against_git_head(
-            checker_name,
-            repo_root,
-            file_path,
-            changed_lines,
-            check.options.as_ref(),
-            check.severity,
-            &InlineIgnoreContext::default(),
-        );
+        let ctx = InlineIgnoreContext::default();
+        let run = NativeRun::for_check(check, checker_name, &ctx);
+        return check_native_against_git_head(run, repo_root, file_path, changed_lines);
     }
     let command = check.command.as_deref()?;
     command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
@@ -3058,12 +3050,14 @@ mod inline_seam_tests {
 
     fn run_src(source: &str, ctx: &InlineIgnoreContext) -> SourceCheck {
         run_checker_against_source(
-            "syntax-rules",
+            NativeRun {
+                checker_name: "syntax-rules",
+                options: None,
+                severity: Severity::Advisory,
+                inline_ctx: ctx,
+            },
             Path::new("x.go"),
             source,
-            None,
-            Severity::Advisory,
-            ctx,
         )
         .unwrap()
     }
@@ -3152,22 +3146,26 @@ mod inline_seam_tests {
         let source = "package main\n\n// kibitzer:ignore primitive-obsession -- ids are plain strings\nfunc f(a, b string) {}\n";
         let ctx = InlineIgnoreContext::default();
         let out = run_checker_against_source(
-            "primitive-obsession",
+            NativeRun {
+                checker_name: "primitive-obsession",
+                options: None,
+                severity: Severity::Advisory,
+                inline_ctx: &ctx,
+            },
             Path::new("x.go"),
             source,
-            None,
-            Severity::Advisory,
-            &ctx,
         )
         .unwrap();
         assert!(out.passed, "{}", out.combined);
         let raw = run_checker_against_source(
-            "primitive-obsession",
+            NativeRun {
+                checker_name: "primitive-obsession",
+                options: None,
+                severity: Severity::Advisory,
+                inline_ctx: &InlineIgnoreContext::disabled(),
+            },
             Path::new("x.go"),
             source,
-            None,
-            Severity::Advisory,
-            &InlineIgnoreContext::disabled(),
         )
         .unwrap();
         assert!(!raw.passed);
@@ -3482,13 +3480,15 @@ mod inline_seam_tests {
         git(&["commit", "-q", "-m", "init"]);
         let at_head = |ctx: &InlineIgnoreContext| {
             check_native_against_git_head(
-                "syntax-rules",
+                NativeRun {
+                    checker_name: "syntax-rules",
+                    options: None,
+                    severity: Severity::Blocking,
+                    inline_ctx: ctx,
+                },
                 &dir,
                 &file,
                 None,
-                None,
-                Severity::Blocking,
-                ctx,
             )
         };
         assert_eq!(at_head(&InlineIgnoreContext::default()), Some(true));
