@@ -9,10 +9,8 @@ use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, Severity};
 use crate::inline_ignores::{
-    Directive, DirectiveParse, DroppedFinding, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome,
-    Line, RawFinding, Reason, RuleId, did_you_mean, has_owner, known_rule, nearest_finding_line,
-    owned_by, remove_it_message, rows_intersect, span_intersects, unknown_rule_message,
-    unused_ignores,
+    Directive, FirstPass, InlineOutcome, Line, RawFinding, Reason, RuleId, UnusedKind, owned_by,
+    rows_intersect, span_intersects, unowned_verdicts, unused_ignores, valid_directives,
 };
 
 /// Reruns one native check against `source` with inline ignores disabled; injected so this
@@ -56,124 +54,37 @@ fn unused_advisories(input: &PostPassInput, changed_lines: &[(usize, usize)]) ->
         .inline
         .scan_memo
         .scan(input.file_path, &source);
-    let touched: Vec<&Directive> = scanned
-        .iter()
-        .filter_map(|(_, p)| match p {
-            DirectiveParse::Valid(d) if rows_intersect(d, changed_lines) => Some(d),
-            _ => None,
-        })
+    let touched: Vec<&Directive> = valid_directives(&scanned)
+        .into_iter()
+        .filter(|d| rows_intersect(d, changed_lines))
         .collect();
     if touched.is_empty() {
         return Vec::new();
     }
-    let ran: Vec<&str> = input
-        .results
-        .iter()
-        .map(|r| r.check_name.as_str())
-        .collect();
-    let raw = rerun_owning_checks(input, &ran, &touched, &source);
-    let mut out = Vec::new();
-    for d in &touched {
-        for rule in d.rules().iter().filter(|r| has_owner(r.as_str())) {
-            if let Some(msg) = judge_owned(d, rule, &raw, &ran) {
-                out.push(format!(
-                    "{}:{}: {msg}",
-                    input.file_path.display(),
-                    d.start_line.get()
-                ));
-            }
-        }
-    }
-    let dropped: Vec<&DroppedFinding> = input
-        .results
-        .iter()
-        .flat_map(|r| &r.inline.dropped)
-        .collect();
-    let kept: Vec<&(RuleId, Line)> = input.results.iter().flat_map(|r| &r.inline.kept).collect();
-    for (row, msg) in judge_unowned(&touched, &dropped, &ran, &kept, Some(changed_lines)) {
-        out.push(format!(
-            "{}:{}: {msg}",
-            input.file_path.display(),
-            row.get()
-        ));
-    }
-    out
-}
-
-/// Judges rules the ownership table does not cover from first-pass data only (no rerun):
-/// a rule that dropped a finding is used; otherwise the nearest surviving finding of that
-/// rule names the right row, a ran check's own name means "remove it", and a name nothing
-/// recognizes is reported as a probable typo. `rows` limits judgement to touched directives
-/// (`None` judges every directive, for `kibitzer run`). Returns `(directive row, message)`.
-pub(crate) fn judge_unowned(
-    directives: &[&Directive],
-    dropped: &[&DroppedFinding],
-    ran_checkers: &[&str],
-    kept: &[&(RuleId, Line)],
-    rows: Option<&[(usize, usize)]>,
-) -> Vec<(Line, String)> {
-    unowned_verdicts(directives, dropped, ran_checkers, kept, rows)
+    let first = first_pass(input.results);
+    let raw = rerun_owning_checks(input, &first.ran, &touched, &source);
+    unused_ignores(touched.iter().copied(), &raw, &first.ran, None)
         .into_iter()
-        .map(|v| (v.row, v.message))
+        .chain(unowned_verdicts(
+            touched.iter().copied(),
+            &first,
+            Some(changed_lines),
+        ))
+        .map(|v| located(input.file_path, v.row, &v.message))
         .collect()
 }
 
-/// Why an unowned rule was reported; `kibitzer run` keeps only the typo kind.
-#[derive(PartialEq, Eq)]
-enum UnownedKind {
-    WrongRow,
-    RemoveIt,
-    UnknownRule,
-}
-
-struct UnownedVerdict {
-    row: Line,
-    kind: UnownedKind,
-    message: String,
-}
-
-fn unowned_verdicts(
-    directives: &[&Directive],
-    dropped: &[&DroppedFinding],
-    ran_checkers: &[&str],
-    kept: &[&(RuleId, Line)],
-    rows: Option<&[(usize, usize)]>,
-) -> Vec<UnownedVerdict> {
-    let mut out = Vec::new();
-    for d in directives {
-        if rows.is_some_and(|r| !rows_intersect(d, r)) {
-            continue;
-        }
-        for rule in d.rules().iter().filter(|r| !has_owner(r.as_str())) {
-            let used = dropped
-                .iter()
-                .any(|f| f.directive_start == d.start_line && f.rule == *rule);
-            if used {
-                continue;
-            }
-            let nearest = kept
-                .iter()
-                .filter(|(r, _)| r == rule)
-                .map(|(_, l)| *l)
-                .min_by_key(|l| (l.get().abs_diff(d.start_line.get()), l.get()));
-            let name = rule.as_str();
-            let verdict = if let Some(n) = nearest {
-                Some((UnownedKind::WrongRow, wrong_row_message(d, rule, n)))
-            } else if ran_checkers.contains(&name) {
-                Some((UnownedKind::RemoveIt, remove_it_message(name)))
-            } else if !known_rule(name) && did_you_mean(name).is_none() {
-                Some((UnownedKind::UnknownRule, unknown_rule_message(name)))
-            } else {
-                None
-            };
-            out.extend(verdict.map(|(kind, message)| UnownedVerdict {
-                row: d.start_line,
-                kind,
-                message,
-            }));
-        }
+fn first_pass(results: &[CheckResult]) -> FirstPass<'_> {
+    FirstPass {
+        ran: results.iter().map(|r| r.check_name.as_str()).collect(),
+        dropped: results.iter().flat_map(|r| &r.inline.dropped).collect(),
+        kept: results.iter().flat_map(|r| &r.inline.kept).collect(),
     }
-    out
+}
+
+/// `{file}:{row}: {message}`, the line shape every advisory shares.
+fn located(file_path: &Path, row: Line, message: &str) -> String {
+    format!("{}:{}: {message}", file_path.display(), row.get())
 }
 
 /// `kibitzer run` audit: a typo'd rule must not be silent in the CLI even
@@ -187,27 +98,11 @@ pub(crate) fn unknown_rule_advisories(
         return Vec::new();
     };
     let scanned = accepted.inline.scan_memo.scan(file_path, &source);
-    let directives: Vec<&Directive> = scanned
+    let verdicts = unowned_verdicts(valid_directives(&scanned), &first_pass(results), None);
+    verdicts
         .iter()
-        .filter_map(|(_, p)| match p {
-            DirectiveParse::Valid(d) => Some(d),
-            _ => None,
-        })
-        .collect();
-    let ran: Vec<&str> = results.iter().map(|r| r.check_name.as_str()).collect();
-    let dropped: Vec<&DroppedFinding> = results.iter().flat_map(|r| &r.inline.dropped).collect();
-    let kept: Vec<&(RuleId, Line)> = results.iter().flat_map(|r| &r.inline.kept).collect();
-    unowned_verdicts(&directives, &dropped, &ran, &kept, None)
-        .into_iter()
-        .filter(|v| v.kind == UnownedKind::UnknownRule)
-        .map(|v| {
-            advisory_result(&format!(
-                "{}:{}: {}",
-                file_path.display(),
-                v.row.get(),
-                v.message
-            ))
-        })
+        .filter(|v| v.kind == UnusedKind::UnknownRule)
+        .map(|v| advisory_result(&located(file_path, v.row, &v.message)))
         .collect()
 }
 
@@ -257,44 +152,6 @@ fn rerun_owning_checks(
     raw
 }
 
-/// Advisory text for one owned rule of `d` that covers no raw finding, with the nearest
-/// finding's row when there is one.
-fn judge_owned(d: &Directive, rule: &RuleId, raw: &[RawFinding], ran: &[&str]) -> Option<String> {
-    let single = Directive::new(
-        vec![rule.clone()],
-        d.reason.clone(),
-        d.start_line,
-        d.end_line,
-        d.whole_line,
-    )?;
-    let judged = unused_ignores(&[single], raw, ran, None).pop()?;
-    if FILE_SCOPE_RULES.contains(&rule.as_str()) {
-        return Some(format!(
-            "[unused-ignore] kibitzer:ignore {rule} must sit in the first {FILE_HEAD_LINES} lines of the file to apply; move the comment there",
-            rule = rule.as_str()
-        ));
-    }
-    match nearest_finding_line(rule, raw, d.start_line) {
-        Some(n) => Some(wrong_row_message(d, rule, n)),
-        None => Some(judged.message),
-    }
-}
-
-fn wrong_row_message(d: &Directive, rule: &RuleId, finding: Line) -> String {
-    let (start, end) = (d.start_line.get(), d.end_line.get());
-    let covered = match (start == end, d.whole_line) {
-        (true, true) => format!("line {start} or {}", end + 1),
-        (true, false) => format!("line {start}"),
-        (false, true) => format!("lines {start}-{end} or {}", end + 1),
-        (false, false) => format!("lines {start}-{end}"),
-    };
-    let n = finding.get();
-    format!(
-        "[unused-ignore] kibitzer:ignore {} matches no finding at {covered}; the finding is at line {n}. Move the comment to the line directly above line {n} (or the end of line {n})",
-        rule.as_str()
-    )
-}
-
 /// One directive that silenced at least one blocking finding, with every rule it silenced.
 struct BlockingSuppression {
     row: Line,
@@ -305,13 +162,12 @@ struct BlockingSuppression {
 impl BlockingSuppression {
     fn render(&self, file_path: &Path) -> String {
         let rules: Vec<&str> = self.rules.iter().map(RuleId::as_str).collect();
-        format!(
-            "{}:{}: [blocking-suppressed] {} finding silenced inline (reason: {}); tell the user you silenced a blocking check and why, so they can confirm it",
-            file_path.display(),
-            self.row.get(),
+        let message = format!(
+            "[blocking-suppressed] {} finding silenced inline (reason: {}); tell the user you silenced a blocking check and why, so they can confirm it",
             rules.join(", "),
             self.reason.as_str()
-        )
+        );
+        located(file_path, self.row, &message)
     }
 }
 
@@ -540,9 +396,25 @@ mod tests {
         kept: &[(RuleId, Line)],
     ) -> Vec<(Line, String)> {
         let d = directive_for(rule, 12);
-        let dropped: Vec<&DroppedFinding> = dropped.iter().collect();
-        let kept: Vec<&(RuleId, Line)> = kept.iter().collect();
-        judge_unowned(&[&d], &dropped, ran, &kept, Some(&[(12, 12)]))
+        judge_directives(&[&d], dropped, ran, kept, Some(&[(12, 12)]))
+    }
+
+    fn judge_directives(
+        directives: &[&Directive],
+        dropped: &[DroppedFinding],
+        ran: &[&str],
+        kept: &[(RuleId, Line)],
+        rows: Option<&[(usize, usize)]>,
+    ) -> Vec<(Line, String)> {
+        let first = FirstPass {
+            ran: ran.to_vec(),
+            dropped: dropped.iter().collect(),
+            kept: kept.iter().collect(),
+        };
+        unowned_verdicts(directives.iter().copied(), &first, rows)
+            .into_iter()
+            .map(|v| (v.row, v.message))
+            .collect()
     }
 
     fn kept_at(rule: &str, row: usize) -> (RuleId, Line) {
@@ -606,8 +478,8 @@ mod tests {
     fn judge_unowned_should_SkipOwnedRulesAndDirectivesOutsideRows() {
         assert!(judge("flag-argument", &[], &[], &[]).is_empty());
         let d = directive_for("acme-rule", 50);
-        assert!(judge_unowned(&[&d], &[], &[], &[], Some(&[(1, 3)])).is_empty());
-        assert_eq!(judge_unowned(&[&d], &[], &[], &[], None).len(), 1);
+        assert!(judge_directives(&[&d], &[], &[], &[], Some(&[(1, 3)])).is_empty());
+        assert_eq!(judge_directives(&[&d], &[], &[], &[], None).len(), 1);
     }
 
     #[test]

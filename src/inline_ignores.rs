@@ -135,6 +135,27 @@ impl Directive {
         &self.rules
     }
 
+    /// Whether this directive's `rule` silences a finding of `checker_name`/`message` on `line`.
+    /// The one definition shared by the apply path and the unused-ignore judgement, so the
+    /// two cannot disagree. A whole-line directive also covers the row below its last row; a
+    /// trailing one only its own rows; a file-scope rule is also covered from the file head.
+    pub(crate) fn covers(
+        &self,
+        rule: &RuleId,
+        checker_name: &str,
+        message: &str,
+        line: Line,
+    ) -> bool {
+        if !rule_matches(rule, checker_name, message) {
+            return false;
+        }
+        let on_row = (self.start_line <= line && line <= self.end_line)
+            || (self.whole_line && line.get() == self.end_line.get() + 1);
+        let in_head =
+            self.start_line.get() <= FILE_HEAD_LINES && FILE_SCOPE_RULES.contains(&rule.as_str());
+        on_row || in_head
+    }
+
     fn placed(mut self, start: Line, end: Line, whole_line: bool) -> Self {
         self.start_line = start;
         self.end_line = end;
@@ -167,6 +188,17 @@ pub enum DirectiveParse {
 
 /// A parse result and the 1-based row of the comment line it came from.
 pub type Scanned = (Line, DirectiveParse);
+
+/// The well-formed directives among `scanned`, in source order.
+pub(crate) fn valid_directives(scanned: &[Scanned]) -> Vec<&Directive> {
+    scanned
+        .iter()
+        .filter_map(|(_, parse)| match parse {
+            DirectiveParse::Valid(d) => Some(d),
+            _ => None,
+        })
+        .collect()
+}
 
 const LEADERS: &[&str] = &["<!--", "///", "//!", "//", "/**", "/*", "#", "*"];
 
@@ -456,13 +488,6 @@ pub(crate) fn rule_matches(directive_rule: &RuleId, checker_name: &str, message:
     }
     !DYNAMIC_PREFIX_CHECKERS.contains(&checker_name)
         && bracket_prefix(message) == Some(directive_rule.as_str())
-}
-
-/// A whole-line directive also covers the row below its last row; a trailing one only its own rows.
-pub(crate) fn covers(d: &Directive, finding_line: Line, rule_match: bool) -> bool {
-    rule_match
-        && ((d.start_line <= finding_line && finding_line <= d.end_line)
-            || (d.whole_line && finding_line.get() == d.end_line.get() + 1))
 }
 
 /// The rule a finding answers to: its leading `[x]` prefix, or the checker name when it has
@@ -817,24 +842,10 @@ fn covering<'a>(
     let line = Line::new(finding.line);
     directives.iter().find_map(|d| {
         d.rules().iter().find_map(|r| {
-            rule_covers(d, r, checker_name, &finding.message, line).then_some((*d, r))
+            d.covers(r, checker_name, &finding.message, line)
+                .then_some((*d, r))
         })
     })
-}
-
-/// The one definition of "this directive rule silences this finding", shared by the apply
-/// path and the unused-ignore judgement so the two cannot disagree.
-fn rule_covers(
-    d: &Directive,
-    rule: &RuleId,
-    checker_name: &str,
-    message: &str,
-    line: Line,
-) -> bool {
-    let matched = rule_matches(rule, checker_name, message);
-    let in_head =
-        d.start_line.get() <= FILE_HEAD_LINES && FILE_SCOPE_RULES.contains(&rule.as_str());
-    covers(d, line, matched) || (matched && in_head)
 }
 
 /// A finding as the checker reported it, before any directive was applied. Built from
@@ -887,62 +898,172 @@ pub(crate) fn span_intersects((start, end): (Line, Line), ranges: &[(usize, usiz
         .any(|&(s, e)| s <= end.get() && start.get() <= e)
 }
 
-/// Directives that suppress nothing, judged against `raw` (findings before any directive or
-/// `accepted/` entry, so a shadowed ignore still counts as used). A rule is judged only when
-/// its owning checker is in `ran_checkers`; unowned rules fail open, except a name that is not
-/// a known rule or checker at all, which is reported as a probable typo. `only_rows` limits
-/// judgement to directives touching those ranges (the hook's changed lines).
-pub(crate) fn unused_ignores(
-    directives: &[Directive],
-    raw: &[RawFinding],
-    ran_checkers: &[&str],
-    only_rows: Option<&[(usize, usize)]>,
-) -> Vec<Finding> {
-    let mut out = Vec::new();
-    for d in directives {
-        if only_rows.is_some_and(|ranges| !rows_intersect(d, ranges)) {
-            continue;
-        }
-        for rule in d.rules() {
-            let used = raw
-                .iter()
-                .any(|f| rule_covers(d, rule, &f.checker, &f.message, f.line));
-            if used {
-                continue;
-            }
-            if let Some(message) = unused_message(rule.as_str(), ran_checkers) {
-                out.push(Finding {
-                    line: d.start_line.get(),
-                    message,
-                });
-            }
-        }
-    }
-    out
+/// Why a directive rule was reported as unused; `kibitzer run` keeps only `UnknownRule`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnusedKind {
+    WrongRow,
+    FileHead,
+    RemoveIt,
+    UnknownRule,
 }
 
-pub(crate) fn remove_it_message(rule: &str) -> String {
+/// One `[unused-ignore]` finding for a directive rule, from either judgement path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnusedVerdict {
+    pub row: Line,
+    pub kind: UnusedKind,
+    pub message: String,
+}
+
+impl UnusedVerdict {
+    fn at(d: &Directive, kind: UnusedKind, message: String) -> Self {
+        UnusedVerdict {
+            row: d.start_line,
+            kind,
+            message,
+        }
+    }
+}
+
+/// What the first pass already saw, for judging rules no checker-ownership entry covers.
+pub(crate) struct FirstPass<'a> {
+    pub ran: Vec<&'a str>,
+    pub dropped: Vec<&'a DroppedFinding>,
+    pub kept: Vec<&'a (RuleId, Line)>,
+}
+
+/// Verdicts for the rules of `directives` (limited to those touching `rows`, when given) whose
+/// ownership is `owned`, each rule judged by `judge`.
+fn judge_rules<'a>(
+    directives: impl IntoIterator<Item = &'a Directive>,
+    rows: Option<&[(usize, usize)]>,
+    owned: bool,
+    judge: impl Fn(&Directive, &RuleId) -> Option<UnusedVerdict>,
+) -> Vec<UnusedVerdict> {
+    directives
+        .into_iter()
+        .filter(|d| !rows.is_some_and(|r| !rows_intersect(d, r)))
+        .flat_map(|d| {
+            let judge = &judge;
+            d.rules()
+                .iter()
+                .filter(move |r| has_owner(r.as_str()) == owned)
+                .filter_map(move |r| judge(d, r))
+        })
+        .collect()
+}
+
+/// Owned rules that suppress nothing, judged against `raw` (findings before any directive or
+/// `accepted/` entry, so a shadowed ignore still counts as used). A rule is judged only when
+/// its owning checker is in `ran_checkers`. `rows` limits judgement to directives touching
+/// those ranges (the hook's changed lines).
+pub(crate) fn unused_ignores<'a>(
+    directives: impl IntoIterator<Item = &'a Directive>,
+    raw: &[RawFinding],
+    ran_checkers: &[&str],
+    rows: Option<&[(usize, usize)]>,
+) -> Vec<UnusedVerdict> {
+    judge_rules(directives, rows, true, |d, rule| {
+        owned_verdict(d, rule, raw, ran_checkers)
+    })
+}
+
+fn owned_verdict(
+    d: &Directive,
+    rule: &RuleId,
+    raw: &[RawFinding],
+    ran_checkers: &[&str],
+) -> Option<UnusedVerdict> {
+    let used = raw
+        .iter()
+        .any(|f| d.covers(rule, &f.checker, &f.message, f.line));
+    let judged = ran_checkers
+        .iter()
+        .any(|c| owner_matches(rule.as_str(), c) == Some(true));
+    if used || !judged {
+        return None;
+    }
+    let (kind, message) = if FILE_SCOPE_RULES.contains(&rule.as_str()) {
+        (UnusedKind::FileHead, file_head_message(rule))
+    } else if let Some(n) = nearest_finding_line(rule, raw, d.start_line) {
+        (UnusedKind::WrongRow, wrong_row_message(d, rule, n))
+    } else {
+        (UnusedKind::RemoveIt, remove_it_message(rule.as_str()))
+    };
+    Some(UnusedVerdict::at(d, kind, message))
+}
+
+/// Judges rules the ownership table does not cover from first-pass data only (no rerun): a
+/// rule that dropped a finding is used; otherwise the nearest surviving finding of that rule
+/// names the right row, a ran check's own name means "remove it", and a name nothing
+/// recognizes is reported as a probable typo.
+pub(crate) fn unowned_verdicts<'a>(
+    directives: impl IntoIterator<Item = &'a Directive>,
+    first: &FirstPass,
+    rows: Option<&[(usize, usize)]>,
+) -> Vec<UnusedVerdict> {
+    judge_rules(directives, rows, false, |d, rule| {
+        unowned_verdict(d, rule, first)
+    })
+}
+
+fn unowned_verdict(d: &Directive, rule: &RuleId, first: &FirstPass) -> Option<UnusedVerdict> {
+    let used = first
+        .dropped
+        .iter()
+        .any(|f| f.directive_start == d.start_line && f.rule == *rule);
+    if used {
+        return None;
+    }
+    let name = rule.as_str();
+    let nearest = first
+        .kept
+        .iter()
+        .filter(|(r, _)| r == rule)
+        .map(|(_, l)| *l)
+        .min_by_key(|l| (l.get().abs_diff(d.start_line.get()), l.get()));
+    let (kind, message) = if let Some(n) = nearest {
+        (UnusedKind::WrongRow, wrong_row_message(d, rule, n))
+    } else if first.ran.contains(&name) {
+        (UnusedKind::RemoveIt, remove_it_message(name))
+    } else if !known_rule(name) && did_you_mean(name).is_none() {
+        (UnusedKind::UnknownRule, unknown_rule_message(name))
+    } else {
+        return None;
+    };
+    Some(UnusedVerdict::at(d, kind, message))
+}
+
+fn remove_it_message(rule: &str) -> String {
     format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it")
 }
 
-pub(crate) fn unknown_rule_message(rule: &str) -> String {
+fn unknown_rule_message(rule: &str) -> String {
     format!(
         "[unused-ignore] '{rule}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
     )
 }
 
-/// The advisory for a rule that matched no raw finding, or `None` when it cannot be judged.
-fn unused_message(rule: &str, ran_checkers: &[&str]) -> Option<String> {
-    if known_rule(rule) {
-        let judged = ran_checkers
-            .iter()
-            .any(|c| owner_matches(rule, c) == Some(true));
-        return judged.then(|| remove_it_message(rule));
-    }
-    // `[ignore-syntax]` already carries the suggestion for a near miss.
-    did_you_mean(rule)
-        .is_none()
-        .then(|| unknown_rule_message(rule))
+fn file_head_message(rule: &RuleId) -> String {
+    format!(
+        "[unused-ignore] kibitzer:ignore {} must sit in the first {FILE_HEAD_LINES} lines of the file to apply; move the comment there",
+        rule.as_str()
+    )
+}
+
+fn wrong_row_message(d: &Directive, rule: &RuleId, finding: Line) -> String {
+    let (start, end) = (d.start_line.get(), d.end_line.get());
+    let covered = match (start == end, d.whole_line) {
+        (true, true) => format!("line {start} or {}", end + 1),
+        (true, false) => format!("line {start}"),
+        (false, true) => format!("lines {start}-{end} or {}", end + 1),
+        (false, false) => format!("lines {start}-{end}"),
+    };
+    let n = finding.get();
+    format!(
+        "[unused-ignore] kibitzer:ignore {} matches no finding at {covered}; the finding is at line {n}. Move the comment to the line directly above line {n} (or the end of line {n})",
+        rule.as_str()
+    )
 }
 
 /// Drops findings covered by a valid directive. The early returns run before any hashing,
@@ -963,13 +1084,7 @@ pub(crate) fn apply_inline_ignores(
         };
     }
     let scanned = ctx.scan_memo.scan(file, source);
-    let directives: Vec<&Directive> = scanned
-        .iter()
-        .filter_map(|(_, p)| match p {
-            DirectiveParse::Valid(d) => Some(d),
-            _ => None,
-        })
-        .collect();
+    let directives = valid_directives(&scanned);
     let mut applied = AppliedIgnores::default();
     for finding in findings {
         match covering(&directives, checker_name, &finding) {
@@ -1424,6 +1539,16 @@ mod tests {
         assert!(format!("{cache:?}").contains("languages_cached: 0"));
     }
 
+    fn covers_row(d: &Directive, row: usize, rule_match: bool) -> bool {
+        let rule = &d.rules()[0];
+        let checker = if rule_match {
+            rule.as_str()
+        } else {
+            "other-checker"
+        };
+        d.covers(rule, checker, "", Line::new(row))
+    }
+
     fn dir(rule_names: &[&str], start: usize, end: usize, whole_line: bool) -> Directive {
         Directive::new(
             rules(rule_names),
@@ -1438,31 +1563,31 @@ mod tests {
     #[test]
     fn covers_should_BeTrueOnlyAtNextRow_When_WholeLineDirective() {
         let d = dir(&["flag-argument"], 9, 9, true);
-        assert!(covers(&d, Line::new(10), true));
-        assert!(covers(&d, Line::new(9), true));
-        assert!(!covers(&d, Line::new(11), true));
-        assert!(!covers(&d, Line::new(10), false));
+        assert!(covers_row(&d, 10, true));
+        assert!(covers_row(&d, 9, true));
+        assert!(!covers_row(&d, 11, true));
+        assert!(!covers_row(&d, 10, false));
     }
 
     #[test]
     fn covers_should_StayOnOwnRow_When_TrailingComment() {
         let d = dir(&["flag-argument"], 9, 9, false);
-        assert!(covers(&d, Line::new(9), true));
-        assert!(!covers(&d, Line::new(10), true));
+        assert!(covers_row(&d, 9, true));
+        assert!(!covers_row(&d, 10, true));
     }
 
     #[test]
     fn covers_should_SpanAllRows_When_BlockComment() {
         let d = dir(&["flag-argument"], 4, 6, true);
-        assert!(covers(&d, Line::new(5), true));
-        assert!(covers(&d, Line::new(7), true));
-        assert!(!covers(&d, Line::new(8), true));
+        assert!(covers_row(&d, 5, true));
+        assert!(covers_row(&d, 7, true));
+        assert!(!covers_row(&d, 8, true));
     }
 
     #[test]
     fn covers_should_TreatLineZeroAsLineOne() {
         let d = dir(&["file-size"], 1, 1, true);
-        assert!(covers(&d, Line::new(0), true));
+        assert!(covers_row(&d, 0, true));
     }
 
     #[test]
@@ -1999,7 +2124,7 @@ mod tests {
         let d = directive_at(&["flag-argument"], 9, 9, true);
         let out = unused_ignores(&[d], &[], SYNTAX, None);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].line, 9);
+        assert_eq!(out[0].row, Line::new(9));
         assert_eq!(
             out[0].message,
             "[unused-ignore] kibitzer:ignore flag-argument suppresses nothing - remove it"
@@ -2041,7 +2166,8 @@ mod tests {
     fn unused_ignores_should_FailOpen_When_RuleOwnershipUnknown() {
         // `god-class` is a known rule whose emitting checker is outside the registry.
         let d = directive_at(&["god-class"], 9, 9, true);
-        assert!(unused_ignores(&[d], &[], SYNTAX, None).is_empty());
+        assert!(unused_ignores(std::slice::from_ref(&d), &[], SYNTAX, None).is_empty());
+        assert!(unowned(&d, &[]).is_empty());
     }
 
     #[test]
@@ -2061,7 +2187,8 @@ mod tests {
     #[test]
     fn unused_ignores_should_PointToCheckList_When_RuleIsNeitherKnownNorCheckerName() {
         let d = directive_at(&["made-up-rule"], 9, 9, true);
-        let out = unused_ignores(&[d], &[], SYNTAX, None);
+        let out = unowned(&d, &[]);
+        assert_eq!(out[0].kind, UnusedKind::UnknownRule);
         assert_eq!(
             out[0].message,
             "[unused-ignore] 'made-up-rule' is not a known rule or checker; run 'kibitzer check list' to see valid names"
@@ -2073,15 +2200,26 @@ mod tests {
     fn unused_ignores_should_StaySilent_When_UnknownRuleHasNearMatchOrWasUsed() {
         // A near miss is already reported by `[ignore-syntax]`; a built id that matched is used.
         let near = directive_at(&["flag-argumnt"], 9, 9, true);
-        assert!(unused_ignores(&[near], &[], SYNTAX, None).is_empty());
+        assert!(unowned(&near, &[]).is_empty());
         let plugin = directive_at(&["plugin-only-rule"], 9, 9, true);
-        let f = raw(
-            "plugin-check",
-            "plugin-only-rule",
-            10,
-            "[plugin-only-rule] x",
-        );
-        assert!(unused_ignores(&[plugin], &[f], SYNTAX, None).is_empty());
+        let used = DroppedFinding {
+            directive_start: Line::new(9),
+            directive_end: Line::new(9),
+            rule: rid("plugin-only-rule"),
+            reason: Reason::new("legacy api pinned", &[]).unwrap(),
+            finding_line: Line::new(10),
+            severity: Severity::Advisory,
+        };
+        assert!(unowned(&plugin, &[used]).is_empty());
+    }
+
+    fn unowned(d: &Directive, dropped: &[DroppedFinding]) -> Vec<UnusedVerdict> {
+        let first = FirstPass {
+            ran: SYNTAX.to_vec(),
+            dropped: dropped.iter().collect(),
+            kept: Vec::new(),
+        };
+        unowned_verdicts([d], &first, None)
     }
 
     #[test]
@@ -2103,7 +2241,7 @@ mod tests {
         let far = directive_at(&["flag-argument"], 50, 50, true);
         let out = unused_ignores(&[near, far], &[], SYNTAX, Some(&[(12, 12)]));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].line, 12);
+        assert_eq!(out[0].row, Line::new(12));
         let none = directive_at(&["flag-argument"], 50, 50, true);
         assert!(unused_ignores(&[none], &[], SYNTAX, Some(&[(1, 3)])).is_empty());
     }
