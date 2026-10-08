@@ -532,8 +532,8 @@ fn covering<'a>(
     directives.iter().find_map(|d| {
         d.rules().iter().find_map(|r| {
             let matched = rule_matches(r, checker_name, &finding.message);
-            let in_head = d.start_line.get() <= FILE_HEAD_LINES
-                && FILE_SCOPE_RULES.contains(&r.as_str());
+            let in_head =
+                d.start_line.get() <= FILE_HEAD_LINES && FILE_SCOPE_RULES.contains(&r.as_str());
             (covers(d, line, matched) || (matched && in_head)).then_some((*d, r))
         })
     })
@@ -549,9 +549,7 @@ pub(crate) fn apply_inline_ignores(
     severity: Severity,
     ctx: &InlineIgnoreContext,
 ) -> AppliedIgnores {
-    if findings.is_empty()
-        || ctx.mode == InlineIgnoreMode::Disabled
-        || !source.contains("kibitzer")
+    if findings.is_empty() || ctx.mode == InlineIgnoreMode::Disabled || !source.contains("kibitzer")
     {
         return AppliedIgnores {
             kept: findings,
@@ -1053,10 +1051,26 @@ mod tests {
     #[test]
     fn rule_matches_should_MatchCheckerNameOrBracketPrefix() {
         let r = |s: &str| RuleId::new(s).unwrap();
-        assert!(rule_matches(&r("flag-argument"), "syntax-rules-go", "[flag-argument] x"));
-        assert!(rule_matches(&r("primitive-obsession"), "primitive-obsession", "plain text"));
-        assert!(!rule_matches(&r("other"), "syntax-rules-go", "[flag-argument] x"));
-        assert!(rule_matches(&r("some-new-rule"), "unknown-checker", "[some-new-rule] m"));
+        assert!(rule_matches(
+            &r("flag-argument"),
+            "syntax-rules-go",
+            "[flag-argument] x"
+        ));
+        assert!(rule_matches(
+            &r("primitive-obsession"),
+            "primitive-obsession",
+            "plain text"
+        ));
+        assert!(!rule_matches(
+            &r("other"),
+            "syntax-rules-go",
+            "[flag-argument] x"
+        ));
+        assert!(rule_matches(
+            &r("some-new-rule"),
+            "unknown-checker",
+            "[some-new-rule] m"
+        ));
     }
 
     #[test]
@@ -1064,13 +1078,21 @@ mod tests {
         let r = |s: &str| RuleId::new(s).unwrap();
         let msg = "[foo] used but never defined";
         assert!(!rule_matches(&r("foo"), "markdown-link-integrity", msg));
-        assert!(rule_matches(&r("markdown-link-integrity"), "markdown-link-integrity", msg));
+        assert!(rule_matches(
+            &r("markdown-link-integrity"),
+            "markdown-link-integrity",
+            msg
+        ));
     }
 
     #[test]
     fn rule_matches_should_BeFalse_When_MetaRule() {
         let r = |s: &str| RuleId::new(s).unwrap();
-        assert!(!rule_matches(&r("ignore-syntax"), "inline-ignore", "[ignore-syntax] bad"));
+        assert!(!rule_matches(
+            &r("ignore-syntax"),
+            "inline-ignore",
+            "[ignore-syntax] bad"
+        ));
         assert!(!rule_matches(&r("unused-ignore"), "unused-ignore", "x"));
     }
 
@@ -1128,7 +1150,10 @@ mod tests {
     fn apply_inline_ignores_should_DropAndReport_When_DirectiveCovers() {
         let ctx = InlineIgnoreContext::default();
         let out = apply(
-            vec![finding(10, "[flag-argument] x"), finding(30, "[flag-argument] y")],
+            vec![
+                finding(10, "[flag-argument] x"),
+                finding(30, "[flag-argument] y"),
+            ],
             GO_IGNORE_ABOVE_10,
             "syntax-rules-go",
             Severity::Blocking,
@@ -1137,7 +1162,10 @@ mod tests {
         assert_eq!(out.kept, vec![finding(30, "[flag-argument] y")]);
         assert_eq!(out.dropped.len(), 1);
         let d = &out.dropped[0];
-        assert_eq!((d.directive_start, d.directive_end), (Line::new(9), Line::new(9)));
+        assert_eq!(
+            (d.directive_start, d.directive_end),
+            (Line::new(9), Line::new(9))
+        );
         assert_eq!(d.rule.as_str(), "flag-argument");
         assert_eq!(d.reason.as_str(), "legacy api pinned");
         assert_eq!(d.finding_line, Line::new(10));
@@ -1146,7 +1174,8 @@ mod tests {
 
     #[test]
     fn apply_inline_ignores_should_MatchCheckerName_When_NoBracketPrefix() {
-        let source = "// kibitzer:ignore primitive-obsession -- ids are plain strings\nfn f(a: String) {}\n";
+        let source =
+            "// kibitzer:ignore primitive-obsession -- ids are plain strings\nfn f(a: String) {}\n";
         let out = apply(
             vec![finding(2, "param a is a primitive")],
             source,
@@ -1173,9 +1202,13 @@ mod tests {
 
     #[test]
     fn apply_inline_ignores_should_DropOnlyOwnRow_When_TrailingComment() {
-        let source = "package main\nx := f() // kibitzer:ignore flag-argument -- legacy api\ny := g()\n";
+        let source =
+            "package main\nx := f() // kibitzer:ignore flag-argument -- legacy api\ny := g()\n";
         let out = apply(
-            vec![finding(2, "[flag-argument] a"), finding(3, "[flag-argument] b")],
+            vec![
+                finding(2, "[flag-argument] a"),
+                finding(3, "[flag-argument] b"),
+            ],
             source,
             "c",
             Severity::Advisory,
@@ -1202,7 +1235,10 @@ mod tests {
         let mut source = String::from("// kibitzer:ignore file-complexity -- generated tables\n");
         source.push_str(&"x\n".repeat(50));
         let out = apply(
-            vec![finding(20, "[file-complexity] a"), finding(40, "[file-complexity] a")],
+            vec![
+                finding(20, "[file-complexity] a"),
+                finding(40, "[file-complexity] a"),
+            ],
             &source,
             "file-complexity",
             Severity::Advisory,
@@ -1239,7 +1275,10 @@ mod tests {
             ..Default::default()
         };
         apply(
-            vec![finding(10, "[flag-argument] x"), finding(30, "[flag-argument] y")],
+            vec![
+                finding(10, "[flag-argument] x"),
+                finding(30, "[flag-argument] y"),
+            ],
             GO_IGNORE_ABOVE_10,
             "c",
             Severity::Blocking,
@@ -1272,7 +1311,9 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
-                let findings = (0..n).map(|i| finding(2 + i * 2, "[flag-argument] a")).collect();
+                let findings = (0..n)
+                    .map(|i| finding(2 + i * 2, "[flag-argument] a"))
+                    .collect();
                 apply(findings, &source, "c", Severity::Advisory, &ctx);
                 counter.total.load(Ordering::Relaxed)
             })
@@ -1327,9 +1368,16 @@ mod tests {
     #[test]
     fn anchor_rule_should_UseChecker_When_NoPrefixOrDynamic() {
         assert_eq!(anchor_rule("c", &finding(1, "[a-b] m")).as_str(), "a-b");
-        assert_eq!(anchor_rule("primitive-obsession", &finding(1, "plain")).as_str(), "primitive-obsession");
         assert_eq!(
-            anchor_rule("markdown-link-integrity", &finding(1, "[foo] used but never defined")).as_str(),
+            anchor_rule("primitive-obsession", &finding(1, "plain")).as_str(),
+            "primitive-obsession"
+        );
+        assert_eq!(
+            anchor_rule(
+                "markdown-link-integrity",
+                &finding(1, "[foo] used but never defined")
+            )
+            .as_str(),
             "markdown-link-integrity"
         );
     }
