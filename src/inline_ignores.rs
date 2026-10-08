@@ -825,9 +825,13 @@ pub(crate) fn nearest_finding_line(rule: &RuleId, raw: &[RawFinding], from: Line
 }
 
 pub(crate) fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
+    span_intersects((d.start_line, d.end_line), ranges)
+}
+
+pub(crate) fn span_intersects((start, end): (Line, Line), ranges: &[(usize, usize)]) -> bool {
     ranges
         .iter()
-        .any(|&(s, e)| s <= d.end_line.get() && d.start_line.get() <= e)
+        .any(|&(s, e)| s <= end.get() && start.get() <= e)
 }
 
 /// Directives that suppress nothing, judged against `raw` (findings before any directive or

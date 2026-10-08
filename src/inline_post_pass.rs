@@ -12,7 +12,7 @@ use crate::config::{Check, Severity};
 use crate::inline_ignores::{
     Directive, DirectiveParse, DroppedFinding, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome,
     Line, RawFinding, Reason, RuleId, did_you_mean, has_owner, known_rule, nearest_finding_line,
-    owned_by, rows_intersect, unused_ignores,
+    owned_by, rows_intersect, span_intersects, unused_ignores,
 };
 
 /// Everything the post-pass may read; `checks` and `accepted` feed the unused-ignore rerun.
@@ -332,7 +332,7 @@ fn blocking_suppressions(
         .filter(|d| d.severity == Severity::Blocking);
     for drop in blocking_drops {
         let rows = (drop.directive_start, drop.directive_end);
-        if !touches(rows, changed_lines) {
+        if !span_intersects(rows, changed_lines) {
             continue;
         }
         match found.iter_mut().find(|(key, _)| *key == rows) {
@@ -351,12 +351,6 @@ fn blocking_suppressions(
         }
     }
     found.into_iter().map(|(_, s)| s).collect()
-}
-
-fn touches((start, end): (Line, Line), ranges: &[(usize, usize)]) -> bool {
-    ranges
-        .iter()
-        .any(|&(s, e)| s <= end.get() && start.get() <= e)
 }
 
 fn advisory_result(output: &str) -> CheckResult {

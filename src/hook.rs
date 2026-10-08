@@ -202,7 +202,7 @@ pub fn run_hook() -> Result<ExitCode> {
         // exactly when the agent is stuck, so repair text goes out with the blocking lines.
         for result in failures
             .iter()
-            .filter(|r| r.check_name == "inline-ignore" && r.severity != Severity::Blocking)
+            .filter(|r| r.check_name == crate::checkers::inline_ignore::NAME && r.severity != Severity::Blocking)
         {
             eprintln!("[kibitzer] inline-ignore: {}", result.describe());
         }
@@ -247,10 +247,8 @@ const TURN_OFF_SHORT_SENTENCE: &str = "To turn a check off or exclude a file, se
      https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md.";
 
 /// The footer is paid on every failing hook call, so it has a hard ceiling; it is the
-/// pre-hint footer (423 characters) plus at most `MAX_NET_ADDED_CHARS`.
-const MAX_FOOTER_CHARS: usize = 640;
-const MAX_NET_ADDED_CHARS: usize = 215;
-const BASELINE_FOOTER_CHARS: usize = 423;
+/// pre-hint footer (423 characters) plus at most 215 characters of syntax hint.
+const MAX_FOOTER_CHARS: usize = 638;
 
 /// What the footer has shed, in drop order. The syntax line and the anchor are never shed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,7 +281,9 @@ fn render_footer(trim: Trim, hint: &str) -> String {
 }
 
 /// Advisory footer: links plus the syntax hint for `path`, within `max_chars`. Sheds prose in
-/// `TRIM_ORDER`, then truncates the `Rules:` list down to one id (never to zero).
+/// `TRIM_ORDER`, then truncates the `Rules:` list down to one id (never to zero). Only if
+/// `max_chars` is below that irreducible floor does it return over budget; `advisory_footer`
+/// asserts the production budget is above it.
 fn advisory_footer_within(
     path: &std::path::Path,
     anchor: Option<(&RuleId, Line)>,
@@ -313,12 +313,12 @@ fn advisory_footer(
     anchor: Option<(&RuleId, Line)>,
     rule_ids: &[&RuleId],
 ) -> String {
-    advisory_footer_within(
-        path,
-        anchor,
-        rule_ids,
-        MAX_FOOTER_CHARS.min(BASELINE_FOOTER_CHARS + MAX_NET_ADDED_CHARS),
-    )
+    let footer = advisory_footer_within(path, anchor, rule_ids, MAX_FOOTER_CHARS);
+    debug_assert!(
+        footer.chars().count() <= MAX_FOOTER_CHARS,
+        "footer over budget: {footer}"
+    );
+    footer
 }
 
 /// Distinct rule ids across every failing result, in order.
@@ -530,6 +530,7 @@ mod footer_tests {
     use crate::inline_ignores::{DirectiveParse, parse_comment_line};
     use std::path::Path;
 
+    const BASELINE_FOOTER_CHARS: usize = 423;
     const FP_LINK: &str = "reporting-false-positives.md";
     const SUPPRESS_LINK: &str = "suppressing-checks.md";
 
@@ -606,15 +607,15 @@ mod footer_tests {
     }
 
     #[test]
+    fn hook_footer_budget_should_BeBaselinePlus215_When_Pinned() {
+        assert_eq!(MAX_FOOTER_CHARS, BASELINE_FOOTER_CHARS + 215);
+    }
+
+    #[test]
     fn hook_footer_should_StayWithinBudgetAndKeepAnchor_When_LongestCase() {
         let (_ids, footer) = longest_case();
         assert!(
             chars(&footer) <= MAX_FOOTER_CHARS,
-            "{} chars: {footer}",
-            chars(&footer)
-        );
-        assert!(
-            chars(&footer) <= BASELINE_FOOTER_CHARS + MAX_NET_ADDED_CHARS,
             "{} chars: {footer}",
             chars(&footer)
         );
@@ -639,7 +640,7 @@ mod footer_tests {
             &[&a, &b],
         );
         assert!(
-            chars(&footer) <= BASELINE_FOOTER_CHARS + MAX_NET_ADDED_CHARS,
+            chars(&footer) <= MAX_FOOTER_CHARS,
             "{} chars",
             chars(&footer)
         );
