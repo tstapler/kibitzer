@@ -13,6 +13,9 @@ use crate::inline_ignores::{InlineIgnoreContext, InlineIgnoreMode, SuppressionCo
 pub struct RunContext {
     pub accepted: AcceptedFindings,
     pub inline: InlineIgnoreContext,
+    /// Skip the post-pass advisories for an unscoped (whole-file) run: `kibitzer run` and the
+    /// LSP report suppressions through their own footer or not at all, and have no agent to tell.
+    pub skip_whole_file_advisories: bool,
 }
 
 impl RunContext {
@@ -20,6 +23,7 @@ impl RunContext {
         RunContext {
             accepted,
             inline: InlineIgnoreContext::default(),
+            skip_whole_file_advisories: false,
         }
     }
 
@@ -37,6 +41,7 @@ impl RunContext {
             counter: Some(Arc::new(SuppressionCounts::default())),
             ..InlineIgnoreContext::default()
         };
+        ctx.skip_whole_file_advisories = true;
         Ok(ctx)
     }
 }

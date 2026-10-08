@@ -75,6 +75,9 @@ enum Command {
         /// Report findings that `kibitzer:ignore` comments would otherwise hide.
         #[arg(long)]
         no_inline_ignores: bool,
+        /// Exit nonzero when any finding of a blocking check was suppressed inline.
+        #[arg(long)]
+        deny_blocking_suppression: bool,
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
@@ -343,6 +346,7 @@ fn main() -> Result<ExitCode> {
             dir,
             trigger,
             no_inline_ignores,
+            deny_blocking_suppression,
         } => run::run_batch(
             dir,
             &trigger,
@@ -351,6 +355,7 @@ fn main() -> Result<ExitCode> {
             } else {
                 inline_ignores::InlineIgnoreMode::Apply
             },
+            deny_blocking_suppression,
         ),
         Command::Hook => hook::run_hook(),
         Command::Mcp => {

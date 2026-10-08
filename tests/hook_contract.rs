@@ -458,3 +458,23 @@ fn hook_strips_terminal_escapes_and_carriage_returns_when_check_output_is_hostil
         "{context:?}"
     );
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_EmitBlockingSuppressedAdvisory_When_WriteSilencesBlockingFinding() {
+    let repo = TempRepo::new(
+        "inline-blocking-write",
+        json!({
+            "name": "syntax-rules-go",
+            "checker": "syntax-rules",
+            "severity": "blocking",
+        }),
+    );
+    let covered = format!(
+        "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\n{FLAG_FUNC}"
+    );
+    let (code, stdout, stderr) = repo.run_hook("covered.go", &covered);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("[blocking-suppressed]"), "stdout: {stdout}");
+    assert!(stdout.contains("legacy api pinned"), "stdout: {stdout}");
+}

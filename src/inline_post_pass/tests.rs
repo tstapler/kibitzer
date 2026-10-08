@@ -52,7 +52,7 @@ pub(super) fn run_with(
 }
 
 #[test]
-fn run_should_ReturnNothing_When_ChangedLinesIsNone() {
+fn run_should_EmitBlockingAdvisory_When_WholeFileWriteDropsBlockingFinding() {
     let results = [result_with_dropped(
         "markdown-link-integrity",
         vec![dropped(
@@ -62,7 +62,69 @@ fn run_should_ReturnNothing_When_ChangedLinesIsNone() {
             Severity::Blocking,
         )],
     )];
-    assert!(run_with(None, &results).is_empty());
+    let out = run_with(None, &results);
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].output.contains("[blocking-suppressed]"),
+        "{}",
+        out[0].output
+    );
+}
+
+#[test]
+fn run_should_ReturnNothing_When_UnscopedRunAndWholeFileAdvisoriesSkipped() {
+    let results = [result_with_dropped(
+        "markdown-link-integrity",
+        vec![dropped(
+            "markdown-link-integrity",
+            "placeholder for later",
+            (4, 4),
+            Severity::Blocking,
+        )],
+    )];
+    let ctx = RunContext {
+        skip_whole_file_advisories: true,
+        ..RunContext::default()
+    };
+    let out = run(PostPassInput {
+        checks: &[],
+        file_path: Path::new("/repo/doc.md"),
+        changed_lines: None,
+        results: &results,
+        run_ctx: &ctx,
+        raw_rerun: &no_rerun,
+    });
+    assert!(out.is_empty());
+}
+
+#[test]
+fn run_should_FoldOverflow_When_MoreThanTenBlockingDirectives() {
+    let drops: Vec<_> = (0..25)
+        .map(|i| {
+            dropped(
+                "markdown-link-integrity",
+                "placeholder for later",
+                (2 * i + 1, 2 * i + 1),
+                Severity::Blocking,
+            )
+        })
+        .collect();
+    let out = run_with(
+        None,
+        &[result_with_dropped("markdown-link-integrity", drops)],
+    );
+    assert_eq!(out.len(), 11);
+    assert!(
+        out[10].output.contains("15 more directives"),
+        "{}",
+        out[10].output
+    );
+}
+
+#[test]
+fn run_should_NotEmitUnusedIgnore_When_WholeFileWrite() {
+    let out = run_with(None, &[result_with_dropped("file-size", Vec::new())]);
+    assert!(out.is_empty());
 }
 
 #[test]

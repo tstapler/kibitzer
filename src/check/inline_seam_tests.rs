@@ -266,6 +266,7 @@ fn accepted_entry_should_NotBeAffected_When_InlineDisabled() {
             accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
         },
         inline: InlineIgnoreContext::disabled(),
+        ..RunContext::default()
     };
     let result = native(&dir, &go_source(IGNORE, IGNORE), None, &run_ctx);
     assert!(!result.passed);

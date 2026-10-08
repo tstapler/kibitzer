@@ -393,3 +393,34 @@ fn docs_should_StateHookStaleIgnoreGapAndCheckNativeBypass_When_Read() {
         "check native bypass missing"
     );
 }
+
+fn exit_code_with_args(dir: &PathBuf, extra: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
+        .arg("run")
+        .arg(dir)
+        .args(extra)
+        .output()
+        .unwrap();
+    (out.status.code(), String::from_utf8(out.stdout).unwrap())
+}
+
+#[test]
+fn kibitzer_run_should_ExitNonzero_When_DenyBlockingSuppressionAndBlockingFindingSuppressed() {
+    let dir = temp_dir("deny-blocking");
+    std::fs::write(dir.join("notes.md"), COVERED_MD).unwrap();
+    let (default_code, _) = exit_code_with_args(&dir, &[]);
+    assert_eq!(default_code, Some(0), "default behaviour is unchanged");
+    let (code, stdout) = exit_code_with_args(&dir, &["--deny-blocking-suppression"]);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.contains("--deny-blocking-suppression"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_ExitZero_When_DenyBlockingSuppressionAndOnlyAdvisorySuppressed() {
+    let dir = temp_dir("deny-advisory-only");
+    std::fs::write(dir.join("main.go"), TWO_COVERED_GO).unwrap();
+    let (code, stdout) = exit_code_with_args(&dir, &["--deny-blocking-suppression"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

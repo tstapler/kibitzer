@@ -28,20 +28,58 @@ pub(crate) struct PostPassInput<'a> {
     pub raw_rerun: RawRerun<'a>,
 }
 
-/// Synthesized `inline-ignore` results to append after the first pass. Empty unless the run
-/// is diff-scoped: an unscoped run reports through `kibitzer run`'s footer instead.
+/// Most `[blocking-suppressed]` lines one run emits; the rest fold into a count line.
+const MAX_BLOCKING_ADVISORIES: usize = 10;
+
+const WHOLE_FILE: &[(usize, usize)] = &[(1, usize::MAX)];
+
+/// Synthesized `inline-ignore` results to append after the first pass. A diff-scoped run
+/// reports blocking suppressions and unused ignores inside the changed lines. A whole-file
+/// write (`changed_lines` is `None`, e.g. the `Write` tool) treats every directive as just
+/// added, but reports only blocking suppressions. `kibitzer run` and the LSP skip both.
 pub(crate) fn run(input: PostPassInput) -> Vec<CheckResult> {
-    let Some(changed_lines) = input.changed_lines else {
-        return Vec::new();
+    let (changed_lines, scoped) = match input.changed_lines {
+        Some(lines) => (lines, true),
+        None if input.run_ctx.skip_whole_file_advisories => return Vec::new(),
+        None => (WHOLE_FILE, false),
     };
-    let blocking = blocking_suppressions(input.results, changed_lines)
-        .into_iter()
-        .map(|s| s.render(input.file_path));
-    let unused = unused_advisories(&input, changed_lines);
+    let blocking = blocking_advisories(input.results, changed_lines, input.file_path);
+    let unused = if scoped {
+        unused_advisories(&input, changed_lines)
+    } else {
+        Vec::new()
+    };
     blocking
+        .into_iter()
         .chain(unused)
         .map(|line| advisory_result(&line))
         .collect()
+}
+
+/// One advisory line per blocking suppression, the overflow past `MAX_BLOCKING_ADVISORIES`
+/// folded into a single count line so a rewrite with many ignores stays bounded.
+fn blocking_advisories(
+    results: &[CheckResult],
+    changed_lines: &[(usize, usize)],
+    file_path: &Path,
+) -> Vec<String> {
+    let all = blocking_suppressions(results, changed_lines);
+    let overflow = all.len().saturating_sub(MAX_BLOCKING_ADVISORIES);
+    let mut lines: Vec<String> = all
+        .iter()
+        .take(MAX_BLOCKING_ADVISORIES)
+        .map(|s| s.render(file_path))
+        .collect();
+    if overflow > 0 {
+        lines.push(located(
+            file_path,
+            all[MAX_BLOCKING_ADVISORIES].row,
+            &format!(
+                "[blocking-suppressed] {overflow} more directives silenced blocking findings in this file; run kibitzer run --no-inline-ignores to list them"
+            ),
+        ));
+    }
+    lines
 }
 
 /// `[unused-ignore]` lines for directives the edit just touched that silence nothing. Reruns

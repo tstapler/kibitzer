@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 
@@ -91,8 +92,17 @@ fn report_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
 /// and must run exactly once per batch invocation, not once per matched file — otherwise an
 /// N-file repo re-runs an already-whole-repo command N times (confirmed: ~22x, >90s, against
 /// design-docs' ~22 markdown files).
-pub fn run_batch(dir: PathBuf, trigger: &str, mode: InlineIgnoreMode) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) = run_batch_collect(&dir, trigger, mode)?;
+///
+/// `deny_blocking_suppression` also fails the run (exit 1) when any finding of a blocking
+/// check was suppressed inline, so CI can refuse a `kibitzer:ignore` on a blocking check.
+pub fn run_batch(
+    dir: PathBuf,
+    trigger: &str,
+    mode: InlineIgnoreMode,
+    deny_blocking_suppression: bool,
+) -> Result<ExitCode> {
+    let (any_blocking_failure, lines) =
+        run_batch_collect(&dir, trigger, mode, deny_blocking_suppression)?;
     for line in &lines {
         println!("{line}");
     }
@@ -111,6 +121,7 @@ fn run_batch_collect(
     dir: &Path,
     trigger: &str,
     mode: InlineIgnoreMode,
+    deny_blocking_suppression: bool,
 ) -> Result<(bool, Vec<String>)> {
     let (config, repo_root) = find_effective_config(dir)?;
 
@@ -176,13 +187,15 @@ fn run_batch_collect(
         // Teaches the syntax where developers see findings; otherwise it is only in the docs.
         lines.push(batch_syntax_hint());
     }
-    lines.extend(
-        run_ctx
-            .inline
-            .counter
-            .as_ref()
-            .and_then(|counts| counts.footer()),
-    );
+    let counts = run_ctx.inline.counter.as_ref();
+    lines.extend(counts.and_then(|counts| counts.footer()));
+    let blocking_suppressed = counts.map_or(0, |c| c.blocking.load(Ordering::Relaxed));
+    if deny_blocking_suppression && blocking_suppressed > 0 {
+        any_blocking_failure = true;
+        lines.push(format!(
+            "[kibitzer] failing: {blocking_suppressed} blocking finding(s) suppressed inline and --deny-blocking-suppression is set"
+        ));
+    }
     Ok((any_blocking_failure, lines))
 }
 
@@ -282,7 +295,7 @@ mod tests {
         write_zero_match_only_component_deps_fixture(&dir);
 
         let (any_blocking_failure, lines) =
-            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply).unwrap();
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -317,7 +330,7 @@ mod tests {
         write_real_component_deps_violation_fixture(&dir);
 
         let (any_blocking_failure, lines) =
-            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply).unwrap();
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
