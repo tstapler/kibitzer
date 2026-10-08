@@ -1465,6 +1465,7 @@ pub async fn run_mcp_server() -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
