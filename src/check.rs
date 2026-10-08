@@ -12,7 +12,7 @@ use crate::accepted_findings::{AcceptedFindings, FilterOutcome};
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 use crate::inline_ignores::{
-    InlineIgnoreContext, InlineOutcome, Line, anchor_rule, apply_inline_ignores,
+    InlineIgnoreContext, InlineOutcome, Line, RawFinding, anchor_rule, apply_inline_ignores,
 };
 use crate::plugin::Registry;
 
@@ -668,7 +668,38 @@ const MAX_INLINE_ANCHORS: usize = 20;
 /// tree-sitter parse. `PostToolUse` runs this path on every single edit, so a file this
 /// large — which a "long file"/"long function" checker has nothing useful to say about
 /// anyway — is worth skipping outright rather than paying that cost every time.
-const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Findings of `check`'s native checker as it reported them: inline ignores disabled, and
+/// none of diff-scoping, `accepted/` or the HEAD baseline applied (those live in
+/// `run_native_check`, which this deliberately bypasses). Empty for a non-native check.
+pub(crate) fn raw_findings_for_check(
+    check: &Check,
+    file_path: &Path,
+    source: &str,
+) -> anyhow::Result<Vec<RawFinding>> {
+    let Some(checker_name) = &check.checker else {
+        return Ok(Vec::new());
+    };
+    let raw = run_checker_against_source(
+        checker_name,
+        file_path,
+        source,
+        check.options.as_ref(),
+        check.severity,
+        &InlineIgnoreContext::disabled(),
+    )?;
+    Ok(raw
+        .findings
+        .into_iter()
+        .map(|f| RawFinding {
+            line: Line::new(f.line),
+            checker: checker_name.clone(),
+            rule: anchor_rule(checker_name, &f),
+            message: f.message,
+        })
+        .collect())
+}
 
 fn run_checker_against_file(
     checker_name: &str,
@@ -3264,6 +3295,34 @@ mod inline_seam_tests {
         let out = run_src(&go_source(IGNORE, IGNORE), &InlineIgnoreContext::disabled());
         assert_eq!(out.findings.len(), 2);
         assert!(!out.passed);
+    }
+
+    #[test]
+    fn raw_findings_for_check_should_ReturnStructuredFindings_When_DirectiveWouldSuppress() {
+        let check = crate::config::default_checks()
+            .into_iter()
+            .find(|c| c.name == "syntax-rules-go")
+            .unwrap();
+        let source = go_source(IGNORE, "");
+        let raw = raw_findings_for_check(&check, Path::new("x.go"), &source).unwrap();
+        let flag: Vec<_> = raw
+            .iter()
+            .filter(|f| f.rule.as_str() == "flag-argument")
+            .collect();
+        assert_eq!(flag.len(), 2, "{raw:?}");
+        assert_eq!(flag[0].line.get(), 4);
+        assert_eq!(flag[0].checker, "syntax-rules");
+    }
+
+    #[test]
+    fn raw_findings_for_check_should_BeEmpty_When_CheckIsNotNative() {
+        let mut check = crate::config::default_checks().remove(0);
+        check.checker = None;
+        assert!(
+            raw_findings_for_check(&check, Path::new("x.go"), "package main\n")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

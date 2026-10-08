@@ -429,7 +429,7 @@ pub fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
 
 /// Rules whose anchor is not a statement: a directive in the file head also covers them.
 pub(crate) const FILE_SCOPE_RULES: &[&str] = &["file-size", "file-complexity"];
-const FILE_HEAD_LINES: usize = 10;
+pub(crate) const FILE_HEAD_LINES: usize = 10;
 /// Diagnostics about directives themselves; suppressing them would hide the repair prompt.
 const META_RULES: &[&str] = &[
     "inline-ignore",
@@ -582,10 +582,12 @@ pub struct ScanMemo {
     entry: Mutex<Option<MemoEntry>>,
     pub scans: AtomicUsize,
     pub hash_calls: AtomicUsize,
+    /// Hook-path raw reruns performed (Story 2.2.3); the test seam for "no rerun without a directive row".
+    pub raw_reruns: AtomicUsize,
 }
 
 impl ScanMemo {
-    fn scan(&self, path: &Path, source: &str) -> Arc<Vec<Scanned>> {
+    pub(crate) fn scan(&self, path: &Path, source: &str) -> Arc<Vec<Scanned>> {
         self.hash_calls.fetch_add(1, Ordering::Relaxed);
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -737,7 +739,25 @@ fn owner_matches(rule: &str, checker: &str) -> Option<bool> {
     }
 }
 
-fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
+/// Whether any checker could own `rule` by the table; `false` means "judge from first-pass data".
+pub(crate) fn has_owner(rule: &str) -> bool {
+    owner_matches(rule, "").is_some()
+}
+
+/// Owner check against a check name, for choosing which checks to rerun.
+pub(crate) fn owned_by(rule: &str, check_name: &str) -> bool {
+    owner_matches(rule, check_name) == Some(true)
+}
+
+/// Row of the raw finding `rule` answers to that lies nearest `from` (earlier row on a tie).
+pub(crate) fn nearest_finding_line(rule: &RuleId, raw: &[RawFinding], from: Line) -> Option<Line> {
+    raw.iter()
+        .filter(|f| rule_matches(rule, &f.checker, &f.message))
+        .map(|f| f.line)
+        .min_by_key(|l| (l.get().abs_diff(from.get()), l.get()))
+}
+
+pub(crate) fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
     ranges
         .iter()
         .any(|&(s, e)| s <= d.end_line.get() && d.start_line.get() <= e)

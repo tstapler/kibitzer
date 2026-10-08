@@ -4,22 +4,28 @@
 
 use std::path::Path;
 
+use std::sync::atomic::Ordering;
+
 use crate::accepted_findings::AcceptedFindings;
-use crate::check::CheckResult;
+use crate::check::{CheckResult, MAX_NATIVE_CHECK_BYTES, raw_findings_for_check};
 use crate::config::{Check, Severity};
-use crate::inline_ignores::{InlineOutcome, Line, Reason, RuleId};
+use crate::inline_ignores::{
+    Directive, DirectiveParse, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome, Line, RawFinding,
+    Reason, RuleId, has_owner, nearest_finding_line, owned_by, rows_intersect, unused_ignores,
+};
 use crate::plugin::Registry;
 
 /// Everything the post-pass may read. `checks`, `repo_root`, `accepted` and `registry` are
 /// carried for the unused-ignore rerun (Story 2.2.3), which needs the same context as the loop.
-#[allow(dead_code)]
 pub(crate) struct PostPassInput<'a> {
     pub checks: &'a [Check],
+    #[allow(dead_code)]
     pub repo_root: &'a Path,
     pub file_path: &'a Path,
     pub changed_lines: Option<&'a [(usize, usize)]>,
     pub results: &'a [CheckResult],
     pub accepted: &'a AcceptedFindings,
+    #[allow(dead_code)]
     pub registry: &'a Registry,
 }
 
@@ -29,10 +35,142 @@ pub(crate) fn run(input: PostPassInput) -> Vec<CheckResult> {
     let Some(changed_lines) = input.changed_lines else {
         return Vec::new();
     };
-    blocking_suppressions(input.results, changed_lines)
+    let blocking = blocking_suppressions(input.results, changed_lines)
         .into_iter()
-        .map(|s| advisory_result(&s.render(input.file_path)))
+        .map(|s| s.render(input.file_path));
+    let unused = unused_advisories(&input, changed_lines);
+    blocking
+        .chain(unused)
+        .map(|line| advisory_result(&line))
         .collect()
+}
+
+/// `[unused-ignore]` lines for directives the edit just touched that silence nothing. Reruns
+/// only the owning checks, and only when a touched directive names a rule they own.
+fn unused_advisories(input: &PostPassInput, changed_lines: &[(usize, usize)]) -> Vec<String> {
+    let Ok(source) = read_markered_source(input.file_path) else {
+        return Vec::new();
+    };
+    let scanned = input
+        .accepted
+        .inline
+        .scan_memo
+        .scan(input.file_path, &source);
+    let touched: Vec<&Directive> = scanned
+        .iter()
+        .filter_map(|(_, p)| match p {
+            DirectiveParse::Valid(d) if rows_intersect(d, changed_lines) => Some(d),
+            _ => None,
+        })
+        .collect();
+    if touched.is_empty() {
+        return Vec::new();
+    }
+    let ran: Vec<&str> = input
+        .results
+        .iter()
+        .map(|r| r.check_name.as_str())
+        .collect();
+    let raw = rerun_owning_checks(input, &ran, &touched, &source);
+    let mut out = Vec::new();
+    for d in &touched {
+        for rule in d.rules().iter().filter(|r| has_owner(r.as_str())) {
+            if let Some(msg) = judge_owned(d, rule, &raw, &ran) {
+                out.push(format!(
+                    "{}:{}: {msg}",
+                    input.file_path.display(),
+                    d.start_line.get()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The file text, only when it is small enough for the first pass to have judged it and
+/// carries the marker; one extra page-cache-hot read per hook call.
+fn read_markered_source(file_path: &Path) -> std::io::Result<String> {
+    let too_big = std::fs::metadata(file_path)
+        .map(|m| m.len() > MAX_NATIVE_CHECK_BYTES)
+        .unwrap_or(false);
+    if too_big {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let source = std::fs::read_to_string(file_path)?;
+    if source.contains("kibitzer") {
+        Ok(source)
+    } else {
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+}
+
+/// Raw findings from the checks that ran and own a rule some touched directive names.
+/// Never diff-scoped, so a finding outside `changed_lines` still counts.
+fn rerun_owning_checks(
+    input: &PostPassInput,
+    ran: &[&str],
+    touched: &[&Directive],
+    source: &str,
+) -> Vec<RawFinding> {
+    let owners = input.checks.iter().filter(|c| {
+        ran.contains(&c.name.as_str())
+            && touched
+                .iter()
+                .flat_map(|d| d.rules())
+                .any(|r| owned_by(r.as_str(), &c.name))
+    });
+    let mut raw = Vec::new();
+    for check in owners {
+        input
+            .accepted
+            .inline
+            .scan_memo
+            .raw_reruns
+            .fetch_add(1, Ordering::Relaxed);
+        // A failing checker was already reported by the first pass.
+        if let Ok(found) = raw_findings_for_check(check, input.file_path, source) {
+            raw.extend(found);
+        }
+    }
+    raw
+}
+
+/// Advisory text for one owned rule of `d` that covers no raw finding, with the nearest
+/// finding's row when there is one.
+fn judge_owned(d: &Directive, rule: &RuleId, raw: &[RawFinding], ran: &[&str]) -> Option<String> {
+    let single = Directive::new(
+        vec![rule.clone()],
+        d.reason.clone(),
+        d.start_line,
+        d.end_line,
+        d.whole_line,
+    )?;
+    let judged = unused_ignores(&[single], raw, ran, None).pop()?;
+    if FILE_SCOPE_RULES.contains(&rule.as_str()) {
+        return Some(format!(
+            "[unused-ignore] kibitzer:ignore {rule} must sit in the first {FILE_HEAD_LINES} lines of the file to apply; move the comment there",
+            rule = rule.as_str()
+        ));
+    }
+    match nearest_finding_line(rule, raw, d.start_line) {
+        Some(n) => Some(wrong_row_message(d, rule, n)),
+        None => Some(judged.message),
+    }
+}
+
+fn wrong_row_message(d: &Directive, rule: &RuleId, finding: Line) -> String {
+    let (start, end) = (d.start_line.get(), d.end_line.get());
+    let covered = match (start == end, d.whole_line) {
+        (true, true) => format!("line {start} or {}", end + 1),
+        (true, false) => format!("line {start}"),
+        (false, true) => format!("lines {start}-{end} or {}", end + 1),
+        (false, false) => format!("lines {start}-{end}"),
+    };
+    let n = finding.get();
+    format!(
+        "[unused-ignore] kibitzer:ignore {} matches no finding at {covered}; the finding is at line {n}. Move the comment to the line directly above line {n} (or the end of line {n})",
+        rule.as_str()
+    )
 }
 
 /// One directive that silenced at least one blocking finding, with every rule it silenced.
@@ -306,5 +444,135 @@ mod tests {
                 .filter(|r| r.severity == Severity::Blocking)
                 .all(|r| r.passed)
         );
+    }
+
+    const GO_IGNORE: &str = "// kibitzer:ignore flag-argument -- legacy API, callers pinned\n";
+    const GO_FUNC: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+
+    /// `package main`, then `directive` on `directive_row` and `func f(b bool)` (a
+    /// `[flag-argument]` finding) on row 20; every other row is blank.
+    fn go_with_directive_at(directive_row: usize, directive: &str) -> String {
+        let mut rows = vec![String::new(); 19];
+        rows[0] = "package main".to_string();
+        rows[directive_row - 1] = directive.trim_end().to_string();
+        format!("{}\n{GO_FUNC}", rows.join("\n"))
+    }
+
+    struct Hook {
+        results: Vec<CheckResult>,
+        accepted: AcceptedFindings,
+    }
+
+    fn run_hook(name: &str, source: &str, changed: Option<&[(usize, usize)]>) -> Hook {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-post-pass-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.go");
+        std::fs::write(&file, source).unwrap();
+        let accepted = AcceptedFindings::default();
+        let results = crate::check::run_checks_for_trigger(
+            &crate::config::default_checks(),
+            "PostToolUse",
+            &dir,
+            &file,
+            changed,
+            &Registry::default(),
+            &accepted,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        Hook { results, accepted }
+    }
+
+    fn unused_lines(h: &Hook) -> Vec<&str> {
+        h.results
+            .iter()
+            .filter(|r| r.output.contains("[unused-ignore]"))
+            .map(|r| r.output.as_str())
+            .collect()
+    }
+
+    fn reruns(h: &Hook) -> usize {
+        h.accepted
+            .inline
+            .scan_memo
+            .raw_reruns
+            .load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_EmitUnusedIgnoreWithNearestRow_When_AddedDirectiveOnWrongRow()
+    {
+        let h = run_hook(
+            "wrong",
+            &go_with_directive_at(12, GO_IGNORE),
+            Some(&[(12, 12)]),
+        );
+        let lines = unused_lines(&h);
+        assert_eq!(lines.len(), 1, "{:#?}", h.results);
+        assert!(lines[0].ends_with(
+            "x.go:12: [unused-ignore] kibitzer:ignore flag-argument matches no finding at line 12 or 13; the finding is at line 20. Move the comment to the line directly above line 20 (or the end of line 20)"
+        ), "{}", lines[0]);
+        assert!(!lines[0].contains("line 19"));
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_EmitNoUnusedIgnore_When_DirectiveCoversFinding() {
+        let h = run_hook(
+            "right",
+            &go_with_directive_at(19, GO_IGNORE),
+            Some(&[(19, 19)]),
+        );
+        assert!(unused_lines(&h).is_empty(), "{:#?}", h.results);
+        assert_eq!(reruns(&h), 1);
+    }
+
+    #[test]
+    fn post_pass_should_NameRowTwenty_When_ChangedLinesIsRowTwelveOnly() {
+        let h = run_hook(
+            "scoped",
+            &go_with_directive_at(12, GO_IGNORE),
+            Some(&[(12, 12)]),
+        );
+        // Diff-scoping hid row 20 from the first pass, yet the advisory still names it.
+        assert!(
+            h.results
+                .iter()
+                .filter(|r| r.check_name == "syntax-rules-go")
+                .all(|r| !r.output.contains("x.go:20:")),
+            "{:#?}",
+            h.results
+        );
+        assert!(unused_lines(&h)[0].contains("the finding is at line 20"));
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_SkipRawRerun_When_NoDirectiveRowInChangedLines() {
+        let h = run_hook(
+            "norow",
+            &go_with_directive_at(12, GO_IGNORE),
+            Some(&[(1, 3)]),
+        );
+        assert_eq!(reruns(&h), 0);
+        assert!(unused_lines(&h).is_empty());
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_SkipRawRerun_When_FileLacksMarker() {
+        let h = run_hook("nomarker", &go_with_directive_at(12, ""), Some(&[(12, 12)]));
+        assert_eq!(reruns(&h), 0);
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_PointToHead_When_FileScopeDirectiveBelowRowTen() {
+        let ignore = "// kibitzer:ignore file-size -- generated tables, splitting is churn\n";
+        let h = run_hook(
+            "filescope",
+            &go_with_directive_at(12, ignore),
+            Some(&[(12, 12)]),
+        );
+        let lines = unused_lines(&h);
+        assert_eq!(lines.len(), 1, "{:#?}", h.results);
+        assert!(lines[0].contains("first 10 lines"), "{}", lines[0]);
     }
 }
