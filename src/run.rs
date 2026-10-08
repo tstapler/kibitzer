@@ -172,9 +172,15 @@ fn run_batch_collect(
         }
     }
 
+    if !lines.is_empty() {
+        lines.push(SYNTAX_HINT.to_string());
+    }
     lines.extend(suppression_footer(&accepted.inline));
     Ok((any_blocking_failure, lines))
 }
+
+/// Teaches the syntax where developers see findings; otherwise it is only in the docs.
+const SYNTAX_HINT: &str = "[kibitzer] to dismiss a finding you judged acceptable: <comment> kibitzer:ignore <rule> -- <why> (docs/suppressing-checks.md)";
 
 /// Repo-wide count, so 1-4 ignores per file across many files still add up to a visible total.
 fn suppression_footer(ctx: &InlineIgnoreContext) -> Option<String> {

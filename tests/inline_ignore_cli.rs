@@ -125,3 +125,32 @@ fn kibitzer_run_should_PrintNoFooter_When_NothingSuppressed() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&clean);
 }
+
+const HINT: &str = "[kibitzer] to dismiss a finding you judged acceptable: <comment> kibitzer:ignore <rule> -- <why> (docs/suppressing-checks.md)";
+
+#[test]
+fn kibitzer_run_should_PrintSyntaxHintOnce_When_AtLeastOneFindingReported() {
+    let dir = temp_dir("hint");
+    let uncovered = "package main\n\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n\nfunc g(c bool) {\n\tif c {\n\t\tprintln(\"y\")\n\t}\n}\n";
+    std::fs::write(dir.join("main.go"), uncovered).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert_eq!(stdout.lines().filter(|l| *l == HINT).count(), 1, "{stdout}");
+    let clean = temp_dir("hint-clean");
+    std::fs::write(clean.join("main.go"), "package main\n").unwrap();
+    assert!(!run_with_args(&clean, &[]).contains("kibitzer:ignore <rule>"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&clean);
+}
+
+#[test]
+fn kibitzer_run_should_PrintHintBeforeFooter_When_FindingAndSuppressionBothPresent() {
+    let dir = temp_dir("hint-order");
+    let source = format!("{TWO_COVERED_GO}\nfunc h(d bool) {{\n\tif d {{\n\t\tprintln(\"z\")\n\t}}\n}}\n");
+    std::fs::write(dir.join("main.go"), source).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let hint = lines.iter().position(|l| *l == HINT).expect(&stdout);
+    assert_eq!(hint + 2, lines.len(), "hint then footer last: {stdout}");
+    assert!(lines[hint + 1].contains("suppressed inline"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
