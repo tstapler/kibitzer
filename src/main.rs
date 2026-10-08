@@ -24,6 +24,7 @@ mod hook;
 mod hook_log;
 mod hotspots;
 mod import_graph;
+mod inline_ignores;
 mod install;
 mod isp_fat_interface;
 mod jaccard;
