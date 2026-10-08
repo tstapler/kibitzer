@@ -646,6 +646,17 @@ struct SourceCheck {
     inline: InlineOutcome,
 }
 
+impl SourceCheck {
+    fn passing() -> Self {
+        SourceCheck {
+            combined: String::new(),
+            passed: true,
+            findings: Vec::new(),
+            inline: InlineOutcome::default(),
+        }
+    }
+}
+
 /// Most anchors a `CheckResult` keeps; the footer only names the first and the hook is capped.
 const MAX_INLINE_ANCHORS: usize = 20;
 
@@ -669,15 +680,16 @@ fn run_checker_against_file(
     if let Ok(metadata) = std::fs::metadata(file_path)
         && metadata.len() > MAX_NATIVE_CHECK_BYTES
     {
-        return Ok(SourceCheck {
-            combined: String::new(),
-            passed: true,
-            findings: Vec::new(),
-            inline: InlineOutcome::default(),
-        });
+        return Ok(SourceCheck::passing());
     }
-    let source = std::fs::read_to_string(file_path)
-        .with_context(|| format!("reading {}", file_path.display()))?;
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(source) => source,
+        // This checker runs on every walked file, so binary or unreadable ones are not failures.
+        Err(_) if checker_name == crate::checkers::inline_ignore::NAME => return Ok(SourceCheck::passing()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", file_path.display()));
+        }
+    };
     run_checker_against_source(
         checker_name,
         file_path,
@@ -3563,5 +3575,66 @@ mod inline_seam_tests {
         assert_eq!(at_head(&InlineIgnoreContext::default()), Some(true));
         assert_eq!(at_head(&InlineIgnoreContext::disabled()), Some(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn inline_ignore_check() -> Check {
+        Check {
+            name: crate::checkers::inline_ignore::NAME.to_string(),
+            checker: Some(crate::checkers::inline_ignore::NAME.to_string()),
+            ..flag_check(Severity::Advisory)
+        }
+    }
+
+    fn run_on_bytes(file: &str, bytes: &[u8], check: &Check, checker: &str) -> CheckResult {
+        let dir = tmp_dir("bytes");
+        let path = dir.join(file);
+        std::fs::write(&path, bytes).unwrap();
+        let result = run_native_check(
+            check,
+            checker,
+            &dir,
+            &path,
+            None,
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn inline_ignore_should_YieldPassingEmptyResult_When_BinaryFile() {
+        let result = run_on_bytes(
+            "blob.md",
+            b"\x89PNG\r\n\x1a\n\xff\xfe",
+            &inline_ignore_check(),
+            crate::checkers::inline_ignore::NAME,
+        );
+        assert!(result.passed);
+        assert!(result.output.is_empty(), "{}", result.output);
+    }
+
+    #[test]
+    fn inline_ignore_should_YieldPassingEmptyResult_When_InvalidUtf8GoFile() {
+        let result = run_on_bytes(
+            "bad.go",
+            b"package main\n// \xff\xfe\n",
+            &inline_ignore_check(),
+            crate::checkers::inline_ignore::NAME,
+        );
+        assert!(result.passed);
+        assert!(result.output.is_empty(), "{}", result.output);
+    }
+
+    #[test]
+    fn other_checker_should_KeepFailedResult_When_ReadError() {
+        let result = run_on_bytes(
+            "bad.go",
+            b"package main\n// \xff\xfe\n",
+            &flag_check(Severity::Advisory),
+            "syntax-rules",
+        );
+        assert!(!result.passed);
+        assert!(result.output.contains("reading"), "{}", result.output);
     }
 }

@@ -17,11 +17,13 @@ static GLOBS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
+pub const NAME: &str = "inline-ignore";
+
 pub struct InlineIgnoreChecker;
 
 impl Checker for InlineIgnoreChecker {
     fn name(&self) -> &str {
-        "inline-ignore"
+        NAME
     }
 
     fn description(&self) -> &str {
