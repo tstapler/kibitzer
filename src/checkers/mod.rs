@@ -15,6 +15,7 @@ pub mod go_error_context;
 pub mod go_ignored_error;
 pub mod go_table_driven_test;
 pub mod go_type_switch_density;
+pub mod inline_ignore;
 pub mod java_error_context;
 pub mod java_ignored_error;
 pub mod java_lost_exception_cause;

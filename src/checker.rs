@@ -79,7 +79,7 @@ impl Language {
     /// added, so every `.rs` file was skipped for architecture-export/LSP-symbol
     /// purposes with no error, only an easy-to-miss stat. `arch_export.rs`'s copy had
     /// the identical gap, independently. Nothing forced any of them to stay in sync.
-    fn extensions(self) -> &'static [&'static str] {
+    pub(crate) fn extensions(self) -> &'static [&'static str] {
         match self {
             Language::Go => &["go"],
             Language::TypeScript => &["ts"],
@@ -90,6 +90,16 @@ impl Language {
             Language::Kotlin => &["kt", "kts"],
             Language::Rust => &["rs"],
         }
+    }
+
+    /// A `**/*.<ext>` glob for every extension of every language, for checks that apply to
+    /// all grammar-backed files.
+    pub(crate) fn all_globs() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .flat_map(|lang| lang.extensions())
+            .map(|ext| format!("**/*.{ext}"))
+            .collect()
     }
 
     /// Maps a file extension (no leading `.`) to the `Language` that parses it.

@@ -391,6 +391,7 @@ const FILE_SCOPE_RULES: &[&str] = &["file-size", "file-complexity"];
 const FILE_HEAD_LINES: usize = 10;
 /// Diagnostics about directives themselves; suppressing them would hide the repair prompt.
 const META_RULES: &[&str] = &[
+    "inline-ignore",
     "ignore-syntax",
     "unused-ignore",
     "ignore-volume",
@@ -434,6 +435,76 @@ pub(crate) fn anchor_rule(checker_name: &str, finding: &Finding) -> RuleId {
     bracket_prefix(&finding.message)
         .and_then(RuleId::new)
         .unwrap_or_else(by_name)
+}
+
+/// Rule ids that appear as `[id]` message prefixes. Advisory only: it feeds the unknown-rule
+/// suggestion and never decides suppression, so a stale entry costs a hint, not an ignore.
+/// `known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources` guards drift.
+pub(crate) const KNOWN_RULES: &[&str] = &[
+    "commented-out-code",
+    "over-commented",
+    "verbose-comment",
+    "long-function",
+    "deep-nesting",
+    "long-parameter-list",
+    "flag-argument",
+    "unreachable-code",
+    "replace-magic-literal",
+    "extract-variable",
+    "file-size",
+    "single-call-site-delegation",
+    "god-class",
+    "isp-fat-interface",
+    "unreferenced-private-symbol",
+    "go-type-switch-density",
+    "go-encapsulate-collection",
+];
+
+/// `KNOWN_RULES` plus every registered checker name, built once (the registry is fixed per process).
+static SUGGESTION_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut names: Vec<String> = KNOWN_RULES.iter().map(|r| r.to_string()).collect();
+    names.extend(crate::checker::registry().iter().map(|c| c.name().to_string()));
+    names.sort();
+    names.dedup();
+    names
+});
+
+/// Whether `rule` names something kibitzer knows. Meta rules count as known so they are not
+/// reported as typos, though they never suppress.
+pub(crate) fn known_rule(rule: &str) -> bool {
+    META_RULES.contains(&rule) || SUGGESTION_NAMES.iter().any(|n| n == rule)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let up = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != *cb)).min(up + 1).min(row[j] + 1);
+            diag = up;
+        }
+    }
+    row[b.len()]
+}
+
+const MAX_SUGGESTION_DISTANCE: usize = 2;
+const MIN_PREFIX_SUGGESTION_LEN: usize = 4;
+
+/// The closest known name within edit distance 2, or one the unknown text is a prefix of
+/// (`flag-arg` for `flag-argument`; truncation is too far away for edit distance alone).
+pub(crate) fn did_you_mean(unknown: &str) -> Option<&'static str> {
+    SUGGESTION_NAMES
+        .iter()
+        .filter_map(|name| {
+            let prefix = unknown.len() >= MIN_PREFIX_SUGGESTION_LEN && name.starts_with(unknown);
+            let score = if prefix { 1 } else { levenshtein(unknown, name) };
+            (score <= MAX_SUGGESTION_DISTANCE && name != unknown).then_some((score, name))
+        })
+        .min_by_key(|(score, name)| (*score, name.len()))
+        .map(|(_, name)| name.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1453,5 +1524,36 @@ mod tests {
             .as_str(),
             "markdown-link-integrity"
         );
+    }
+
+    #[test]
+    fn did_you_mean_should_SuggestNearestKnown_When_TypoOrTruncation() {
+        assert_eq!(did_you_mean("flag-arg"), Some("flag-argument"));
+        assert_eq!(did_you_mean("flag-arguments"), Some("flag-argument"));
+        assert_eq!(did_you_mean("deep-nestng"), Some("deep-nesting"));
+        assert_eq!(did_you_mean("primitive-obsesion"), Some("primitive-obsession"));
+    }
+
+    #[test]
+    fn did_you_mean_should_ReturnNone_When_NothingNear() {
+        assert_eq!(did_you_mean("made-up-rule"), None);
+        assert_eq!(did_you_mean("zzz"), None);
+        assert_eq!(did_you_mean("flag-argument"), None);
+    }
+
+    #[test]
+    fn known_rule_should_AcceptRulesCheckersAndMeta_When_Queried() {
+        assert!(known_rule("flag-argument"));
+        assert!(known_rule("primitive-obsession"));
+        assert!(known_rule("syntax-rules-rust"));
+        assert!(known_rule("ignore-syntax"));
+        assert!(!known_rule("made-up-rule"));
+    }
+
+    #[test]
+    fn levenshtein_should_CountEdits() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("same", "same"), 0);
     }
 }
