@@ -1725,7 +1725,9 @@ mod tests {
 
     fn apply_once_kept(source: &str, ctx: &InlineIgnoreContext) -> usize {
         let findings = vec![finding(10, "[flag-argument] x")];
-        apply(findings, source, "c", Severity::Advisory, ctx).kept.len()
+        apply(findings, source, "c", Severity::Advisory, ctx)
+            .kept
+            .len()
     }
 
     fn median_of_5(mut run: impl FnMut() -> usize) -> std::time::Duration {
