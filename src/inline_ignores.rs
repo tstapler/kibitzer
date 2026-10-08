@@ -1608,4 +1608,46 @@ mod tests {
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(levenshtein("same", "same"), 0);
     }
+
+    /// Message-prefix ids (`"[id]`) in checker sources outside `#[cfg(test)]`.
+    fn static_rule_prefixes() -> Vec<(String, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("checkers"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        for top_level in [
+            "single_call_site_delegation.rs",
+            "god_class.rs",
+            "isp_fat_interface.rs",
+            "unreferenced_symbols.rs",
+        ] {
+            files.push(root.join(top_level));
+        }
+        let prefix = Regex::new(r#""\[([a-z][a-z0-9-]*)\]"#).unwrap();
+        let mut found = Vec::new();
+        for file in files {
+            let name = file.file_name().unwrap().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let production = text.split("#[cfg(test)]").next().unwrap();
+            for cap in prefix.captures_iter(production) {
+                found.push((name.clone(), cap[1].to_string()));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources() {
+        let found = static_rule_prefixes();
+        assert!(found.len() >= 15, "scan found too little: {}", found.len());
+        let missing: Vec<_> = found.iter().filter(|(_, id)| !known_rule(id)).collect();
+        assert!(
+            missing.is_empty(),
+            "add these ids to KNOWN_RULES: {missing:?}"
+        );
+    }
 }

@@ -13,10 +13,16 @@ use crate::inline_ignores::{
 };
 
 /// Every grammar-backed extension plus markdown: the files whose comments the scanners read.
-static GLOBS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+pub(crate) fn scope_globs() -> Vec<String> {
     Language::all_globs()
         .into_iter()
         .chain(std::iter::once("**/*.md".to_string()))
+        .collect()
+}
+
+static GLOBS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    scope_globs()
+        .into_iter()
         .map(|glob| &*Box::leak(glob.into_boxed_str()))
         .collect()
 });
