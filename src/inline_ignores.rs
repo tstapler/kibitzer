@@ -1717,6 +1717,61 @@ mod tests {
         assert_eq!(held.as_ref().unwrap().0, PathBuf::from("other.go"));
     }
 
+    const FAST_PATH_CALLS: usize = 1_000;
+
+    fn big_go_source_without_marker() -> String {
+        "func f(b bool) { _ = b }\n".repeat(5_000)
+    }
+
+    fn apply_once_kept(source: &str, ctx: &InlineIgnoreContext) -> usize {
+        let findings = vec![finding(10, "[flag-argument] x")];
+        apply(findings, source, "c", Severity::Advisory, ctx).kept.len()
+    }
+
+    fn median_of_5(mut run: impl FnMut() -> usize) -> std::time::Duration {
+        let mut times: Vec<_> = (0..5)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                std::hint::black_box(run());
+                start.elapsed()
+            })
+            .collect();
+        times.sort();
+        times[2]
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_UseNoScanOrHash_When_NoKibitzerSubstring() {
+        let ctx = InlineIgnoreContext::default();
+        let source = big_go_source_without_marker();
+        for _ in 0..FAST_PATH_CALLS {
+            assert_eq!(apply_once_kept(&source, &ctx), 1);
+        }
+        assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 0);
+        assert_eq!(ctx.scan_memo.hash_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_StayWithinRatioOfSubstringSearch_When_NoKibitzerSubstring() {
+        let ctx = InlineIgnoreContext::default();
+        let source = big_go_source_without_marker();
+        let baseline = median_of_5(|| {
+            (0..FAST_PATH_CALLS)
+                .filter(|_| std::hint::black_box(&source).contains("kibitzer"))
+                .count()
+        });
+        let filtered = median_of_5(|| {
+            (0..FAST_PATH_CALLS)
+                .map(|_| apply_once_kept(&source, &ctx))
+                .sum()
+        });
+        // Coarse relative bound only: no absolute time, so a slow CI machine cannot flake it.
+        assert!(
+            filtered <= baseline * 20 + std::time::Duration::from_millis(5),
+            "apply took {filtered:?} vs substring baseline {baseline:?}"
+        );
+    }
+
     #[test]
     fn inline_outcome_should_ExposeFirstAnchorAndDistinctRules() {
         let r = |s: &str| RuleId::new(s).unwrap();
