@@ -437,14 +437,6 @@ pub fn scan_directives(path: &Path, source: &str) -> Vec<Scanned> {
 /// Rules whose anchor is not a statement: a directive in the file head also covers them.
 pub(crate) const FILE_SCOPE_RULES: &[&str] = &["file-size", "file-complexity"];
 pub(crate) const FILE_HEAD_LINES: usize = 10;
-/// Diagnostics about directives themselves; suppressing them would hide the repair prompt.
-const META_RULES: &[&str] = &[
-    "inline-ignore",
-    "ignore-syntax",
-    "unused-ignore",
-    "ignore-volume",
-    "blocking-suppressed",
-];
 /// Checkers whose leading `[x]` prefix is data (a link ref id), not a rule id.
 const DYNAMIC_PREFIX_CHECKERS: &[&str] = &["markdown-link-integrity"];
 
@@ -456,7 +448,7 @@ fn bracket_prefix(message: &str) -> Option<&str> {
 
 /// Matching never consults a rule table, so a stale table cannot make an ignore fail closed.
 pub(crate) fn rule_matches(directive_rule: &RuleId, checker_name: &str, message: &str) -> bool {
-    if META_RULES.contains(&directive_rule.as_str()) {
+    if is_meta_rule(directive_rule.as_str()) {
         return false;
     }
     if directive_rule.as_str() == checker_name {
@@ -556,32 +548,85 @@ pub(crate) fn syntax_hint_limited(
     hint
 }
 
-/// Rule ids that appear as `[id]` message prefixes. Advisory only: it feeds the unknown-rule
-/// suggestion and never decides suppression, so a stale entry costs a hint, not an ignore.
-/// `known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources` guards drift.
-pub(crate) const KNOWN_RULES: &[&str] = &[
-    "commented-out-code",
-    "over-commented",
-    "verbose-comment",
-    "long-function",
-    "deep-nesting",
-    "long-parameter-list",
-    "flag-argument",
-    "unreachable-code",
-    "replace-magic-literal",
-    "extract-variable",
-    "file-size",
-    "single-call-site-delegation",
-    "god-class",
-    "isp-fat-interface",
-    "unreferenced-private-symbol",
-    "go-type-switch-density",
-    "go-encapsulate-collection",
+/// How a checker name is recognised as the producer of a rule's findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerMatch {
+    Prefix(&'static str),
+    Suffix(&'static str),
+    /// A checker named exactly like the rule, resolved through the checker registry.
+    SameName,
+    /// No per-file checker owns it, so it is judged from first-pass data only.
+    Unowned,
+}
+
+pub(crate) struct RuleInfo {
+    pub id: &'static str,
+    pub owner: OwnerMatch,
+    /// Diagnostics about directives themselves; suppressing them would hide the repair prompt.
+    pub meta: bool,
+}
+
+const fn rule(id: &'static str, owner: OwnerMatch) -> RuleInfo {
+    RuleInfo {
+        id,
+        owner,
+        meta: false,
+    }
+}
+
+const fn meta_rule(id: &'static str, owner: OwnerMatch) -> RuleInfo {
+    RuleInfo {
+        id,
+        owner,
+        meta: true,
+    }
+}
+
+/// The one rule table: ids that appear as `[id]` message prefixes, who owns them, and which
+/// are meta. Advisory only: it feeds the unknown-rule suggestion and the unused-ignore rerun
+/// and never decides suppression, so a stale entry costs a hint, not an ignore. A registered
+/// checker absent from the table is still owned by name (see `owner_matches`).
+/// `rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources` guards drift.
+pub(crate) const RULES: &[RuleInfo] = &[
+    rule("commented-out-code", OwnerMatch::Prefix("comment-quality")),
+    rule("over-commented", OwnerMatch::Prefix("comment-quality")),
+    rule("verbose-comment", OwnerMatch::Prefix("comment-quality")),
+    rule("long-function", OwnerMatch::Prefix("syntax-rules")),
+    rule("deep-nesting", OwnerMatch::Prefix("syntax-rules")),
+    rule("long-parameter-list", OwnerMatch::Prefix("syntax-rules")),
+    rule("flag-argument", OwnerMatch::Prefix("syntax-rules")),
+    rule("unreachable-code", OwnerMatch::Prefix("syntax-rules")),
+    rule("replace-magic-literal", OwnerMatch::Prefix("syntax-rules")),
+    rule("extract-variable", OwnerMatch::Prefix("syntax-rules")),
+    rule("file-size", OwnerMatch::Suffix("file-size")),
+    rule("single-call-site-delegation", OwnerMatch::Unowned),
+    rule("god-class", OwnerMatch::Unowned),
+    rule("isp-fat-interface", OwnerMatch::Unowned),
+    rule("unreferenced-private-symbol", OwnerMatch::Unowned),
+    rule("go-type-switch-density", OwnerMatch::SameName),
+    rule("go-encapsulate-collection", OwnerMatch::SameName),
+    meta_rule("inline-ignore", OwnerMatch::SameName),
+    meta_rule("ignore-syntax", OwnerMatch::Unowned),
+    meta_rule("unused-ignore", OwnerMatch::Unowned),
+    meta_rule("ignore-volume", OwnerMatch::Unowned),
+    meta_rule("blocking-suppressed", OwnerMatch::Unowned),
 ];
 
-/// `KNOWN_RULES` plus every registered checker name, built once (the registry is fixed per process).
+fn rule_info(rule: &str) -> Option<&'static RuleInfo> {
+    RULES.iter().find(|r| r.id == rule)
+}
+
+fn is_meta_rule(rule: &str) -> bool {
+    rule_info(rule).is_some_and(|r| r.meta)
+}
+
+/// The non-meta `RULES` ids plus every registered checker name, built once (the registry is fixed per process).
 static SUGGESTION_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let mut names: Vec<String> = KNOWN_RULES.iter().map(|r| r.to_string()).collect();
+    let mut names: Vec<String> = RULES
+        .iter()
+        .filter(|r| !r.meta)
+        .map(|r| r.id.to_string())
+        .collect();
     names.extend(
         crate::checker::registry()
             .iter()
@@ -595,7 +640,7 @@ static SUGGESTION_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
 /// Whether `rule` names something kibitzer knows. Meta rules count as known so they are not
 /// reported as typos, though they never suppress.
 pub(crate) fn known_rule(rule: &str) -> bool {
-    META_RULES.contains(&rule) || SUGGESTION_NAMES.iter().any(|n| n == rule)
+    is_meta_rule(rule) || SUGGESTION_NAMES.iter().any(|n| n == rule)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -802,23 +847,15 @@ pub(crate) struct RawFinding {
     pub message: String,
 }
 
-/// Checker-name prefixes or suffixes whose findings carry `rule`, for the rules whose checker
-/// name differs from the rule id. `None` means ownership is unknown, so the rule is not judged.
+/// Whether `checker` produces `rule`'s findings. `None` means ownership is unknown, so the
+/// rule is not judged by rerun.
 fn owner_matches(rule: &str, checker: &str) -> Option<bool> {
-    match rule {
-        "commented-out-code" | "over-commented" | "verbose-comment" => {
-            Some(checker.starts_with("comment-quality"))
-        }
-        "long-function"
-        | "deep-nesting"
-        | "long-parameter-list"
-        | "flag-argument"
-        | "unreachable-code"
-        | "replace-magic-literal"
-        | "extract-variable" => Some(checker.starts_with("syntax-rules")),
-        "file-size" => Some(checker.ends_with("file-size")),
-        _ if crate::checker::lookup(rule).is_some() => Some(checker == rule),
-        _ => None,
+    let same_name = || crate::checker::lookup(rule).map(|_| checker == rule);
+    match rule_info(rule).map(|r| r.owner) {
+        Some(OwnerMatch::Prefix(p)) => Some(checker.starts_with(p)),
+        Some(OwnerMatch::Suffix(p)) => Some(checker.ends_with(p)),
+        Some(OwnerMatch::Unowned) => None,
+        Some(OwnerMatch::SameName) | None => same_name(),
     }
 }
 
@@ -1894,14 +1931,45 @@ mod tests {
     }
 
     #[test]
-    fn known_rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources() {
+    fn rules_should_CoverEveryStaticRulePrefix_When_DriftGuardScansCheckerSources() {
         let found = static_rule_prefixes();
         assert!(found.len() >= 15, "scan found too little: {}", found.len());
         let missing: Vec<_> = found.iter().filter(|(_, id)| !known_rule(id)).collect();
+        assert!(missing.is_empty(), "add these ids to RULES: {missing:?}");
+    }
+
+    #[test]
+    fn rules_should_GiveAnOwner_When_RuleComesFromSyntaxRulesOrCommentQuality() {
+        let found = static_rule_prefixes();
+        let owned_files = ["rules.rs", "comment_quality.rs", "file_size.rs"];
+        let scanned = found
+            .iter()
+            .filter(|(file, _)| owned_files.contains(&file.as_str()))
+            .count();
         assert!(
-            missing.is_empty(),
-            "add these ids to KNOWN_RULES: {missing:?}"
+            scanned >= 11,
+            "scan reached too few owned-file ids: {scanned}"
         );
+        let ownerless: Vec<_> = found
+            .iter()
+            .filter(|(file, _)| {
+                ["rules.rs", "comment_quality.rs", "file_size.rs"].contains(&file.as_str())
+            })
+            .filter(|(_, id)| !has_owner(id))
+            .collect();
+        assert!(
+            ownerless.is_empty(),
+            "add an owner entry to RULES for: {ownerless:?}"
+        );
+    }
+
+    #[test]
+    fn rules_should_HaveUniqueIds() {
+        let mut ids: Vec<&str> = RULES.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before);
     }
 
     fn directive_at(rule_list: &[&str], start: usize, end: usize, whole_line: bool) -> Directive {
