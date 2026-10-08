@@ -1643,12 +1643,10 @@ pub fn run_checks_for_trigger(
     }
     let extra = crate::inline_post_pass::run(crate::inline_post_pass::PostPassInput {
         checks,
-        repo_root,
         file_path,
         changed_lines,
         results: &results,
         accepted,
-        registry,
     });
     results.extend(extra);
     Ok(results)

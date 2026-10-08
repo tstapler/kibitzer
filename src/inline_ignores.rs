@@ -1,9 +1,5 @@
-//! Inline `kibitzer:ignore <rule>[,<rule>...] -- <reason>` directives: parsing only.
-//! Matching and application at the check seam live in later tasks of the
-//! inline-ignore-syntax plan.
-//!
-//! Items here are not yet called from non-test code; later tasks wire them in.
-#![allow(dead_code)]
+//! Inline `kibitzer:ignore <rule>[,<rule>...] -- <reason>` directives: parsing, scanning,
+//! matching, and application to findings.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

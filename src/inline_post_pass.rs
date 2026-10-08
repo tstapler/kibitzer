@@ -14,20 +14,14 @@ use crate::inline_ignores::{
     Line, RawFinding, Reason, RuleId, did_you_mean, has_owner, known_rule, nearest_finding_line,
     owned_by, rows_intersect, unused_ignores,
 };
-use crate::plugin::Registry;
 
-/// Everything the post-pass may read. `checks`, `repo_root`, `accepted` and `registry` are
-/// carried for the unused-ignore rerun (Story 2.2.3), which needs the same context as the loop.
+/// Everything the post-pass may read; `checks` and `accepted` feed the unused-ignore rerun.
 pub(crate) struct PostPassInput<'a> {
     pub checks: &'a [Check],
-    #[allow(dead_code)]
-    pub repo_root: &'a Path,
     pub file_path: &'a Path,
     pub changed_lines: Option<&'a [(usize, usize)]>,
     pub results: &'a [CheckResult],
     pub accepted: &'a AcceptedFindings,
-    #[allow(dead_code)]
-    pub registry: &'a Registry,
 }
 
 /// Synthesized `inline-ignore` results to append after the first pass. Empty unless the run
@@ -49,7 +43,7 @@ pub(crate) fn run(input: PostPassInput) -> Vec<CheckResult> {
 /// `[unused-ignore]` lines for directives the edit just touched that silence nothing. Reruns
 /// only the owning checks, and only when a touched directive names a rule they own.
 fn unused_advisories(input: &PostPassInput, changed_lines: &[(usize, usize)]) -> Vec<String> {
-    let Ok(source) = read_markered_source(input.file_path) else {
+    let Some(source) = read_markered_source(input.file_path) else {
         return Vec::new();
     };
     let scanned = input
@@ -194,7 +188,7 @@ pub(crate) fn unknown_rule_advisories(
     results: &[CheckResult],
     accepted: &AcceptedFindings,
 ) -> Vec<CheckResult> {
-    let Ok(source) = read_markered_source(file_path) else {
+    let Some(source) = read_markered_source(file_path) else {
         return Vec::new();
     };
     let scanned = accepted.inline.scan_memo.scan(file_path, &source);
@@ -224,19 +218,16 @@ pub(crate) fn unknown_rule_advisories(
 
 /// The file text, only when it is small enough for the first pass to have judged it and
 /// carries the marker; one extra page-cache-hot read per hook call.
-fn read_markered_source(file_path: &Path) -> std::io::Result<String> {
+fn read_markered_source(file_path: &Path) -> Option<String> {
     let too_big = std::fs::metadata(file_path)
         .map(|m| m.len() > MAX_NATIVE_CHECK_BYTES)
         .unwrap_or(false);
     if too_big {
-        return Err(std::io::ErrorKind::InvalidInput.into());
+        return None;
     }
-    let source = std::fs::read_to_string(file_path)?;
-    if source.contains("kibitzer") {
-        Ok(source)
-    } else {
-        Err(std::io::ErrorKind::NotFound.into())
-    }
+    std::fs::read_to_string(file_path)
+        .ok()
+        .filter(|source| source.contains("kibitzer"))
 }
 
 /// Raw findings from the checks that ran and own a rule some touched directive names.
@@ -386,6 +377,7 @@ fn advisory_result(output: &str) -> CheckResult {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::plugin::Registry;
     use crate::config::Severity;
     use crate::inline_ignores::{DroppedFinding, InlineOutcome, Line, Reason, RuleId};
 
@@ -431,12 +423,10 @@ mod tests {
     ) -> Vec<CheckResult> {
         run(PostPassInput {
             checks: &[],
-            repo_root: Path::new("/repo"),
             file_path: Path::new("/repo/doc.md"),
             changed_lines,
             results,
             accepted: &AcceptedFindings::default(),
-            registry: &Registry::default(),
         })
     }
 
@@ -829,12 +819,10 @@ mod tests {
         first.inline.kept = vec![kept_at("acme-rule", 20)];
         let out = run(PostPassInput {
             checks: &[],
-            repo_root: &dir,
             file_path: &file,
             changed_lines: Some(&[(12, 12)]),
             results: &[first],
             accepted: &AcceptedFindings::default(),
-            registry: &Registry::default(),
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(out.len(), 1, "{out:#?}");
