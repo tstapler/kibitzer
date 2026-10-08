@@ -184,3 +184,84 @@ fn kibitzer_run_should_PrintNoUnusedIgnore_When_IgnoreSuppressesFinding() {
     assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn kibitzer_check_native_should_BypassInlineIgnores_When_RunDirectly() {
+    let dir = temp_dir("check-native");
+    let file = dir.join("main.go");
+    std::fs::write(&file, COVERED_GO).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
+        .args(["check", "native", "syntax-rules"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[flag-argument]"), "{stdout}");
+    assert!(!out.status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const INLINE_AND_ACCEPTED_GO: &str = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n\nfunc g(c bool) {\n\tif c {\n\t\tprintln(\"y\")\n\t}\n}\n";
+
+#[test]
+fn kibitzer_run_should_ApplyBothSuppressors_When_InlineAndAcceptedMatchDifferentFindings() {
+    let dir = temp_dir("both-suppressors");
+    std::fs::write(dir.join("main.go"), INLINE_AND_ACCEPTED_GO).unwrap();
+    let before = run_with_args(&dir, &[]);
+    assert!(before.contains("main.go:10: [flag-argument]"), "{before}");
+    assert!(!before.contains("main.go:4:"), "{before}");
+
+    std::fs::create_dir_all(dir.join(".kibitzer/accepted")).unwrap();
+    std::fs::write(
+        dir.join(".kibitzer/accepted/g.json"),
+        r#"{"rule": "flag-argument", "file": "main.go", "line": 10, "content": "func g(c bool) {", "reason": "kept on purpose"}"#,
+    )
+    .unwrap();
+    let both = run_with_args(&dir, &[]);
+    assert!(!both.contains("[flag-argument]"), "{both}");
+
+    let raw = run_with_args(&dir, &["--no-inline-ignores"]);
+    assert!(raw.contains("main.go:4: [flag-argument]"), "{raw}");
+    assert!(
+        !raw.contains("main.go:10:"),
+        "accepted still applies: {raw}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_KeepIgnoreSuppressing_When_FileEditedElsewhere() {
+    let dir = temp_dir("edited-elsewhere");
+    let file = dir.join("main.go");
+    std::fs::write(&file, COVERED_GO).unwrap();
+    assert!(!run_with_args(&dir, &[]).contains("[flag-argument]"));
+
+    let edited = format!(
+        "// header added above\n\n{COVERED_GO}\nfunc unrelated() {{\n\tprintln(\"z\")\n}}\n"
+    );
+    std::fs::write(&file, edited).unwrap();
+    let after = run_with_args(&dir, &[]);
+    assert!(!after.contains("[flag-argument]"), "{after}");
+    assert!(!after.contains("[unused-ignore]"), "{after}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_ApplyBothSuppressors_When_InlineAndAcceptedMatchSameFinding() {
+    let dir = temp_dir("same-finding");
+    std::fs::write(dir.join("main.go"), COVERED_GO).unwrap();
+    std::fs::create_dir_all(dir.join(".kibitzer/accepted")).unwrap();
+    std::fs::write(
+        dir.join(".kibitzer/accepted/f.json"),
+        r#"{"rule": "flag-argument", "file": "main.go", "line": 4, "content": "func f(b bool) {", "reason": "kept on purpose"}"#,
+    )
+    .unwrap();
+    let default = run_with_args(&dir, &[]);
+    assert!(!default.contains("[flag-argument]"), "{default}");
+    let raw = run_with_args(&dir, &["--no-inline-ignores"]);
+    assert!(
+        !raw.contains("[flag-argument]"),
+        "accepted alone suppresses: {raw}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
