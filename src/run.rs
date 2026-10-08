@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -7,6 +8,7 @@ use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_effective_config};
+use crate::inline_ignores::{InlineIgnoreMode, SuppressionCounts};
 
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
@@ -90,8 +92,8 @@ fn report_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
 /// and must run exactly once per batch invocation, not once per matched file — otherwise an
 /// N-file repo re-runs an already-whole-repo command N times (confirmed: ~22x, >90s, against
 /// design-docs' ~22 markdown files).
-pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) = run_batch_collect(&dir, trigger)?;
+pub fn run_batch(dir: PathBuf, trigger: &str, no_inline_ignores: bool) -> Result<ExitCode> {
+    let (any_blocking_failure, lines) = run_batch_collect(&dir, trigger, no_inline_ignores)?;
     for line in &lines {
         println!("{line}");
     }
@@ -106,7 +108,11 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
 /// it can be exercised end to end in tests without capturing the process's real stdout:
 /// returns whether any check hit a genuine blocking failure, plus every rendered report
 /// line in print order (see `report_lines`).
-fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
+fn run_batch_collect(
+    dir: &Path,
+    trigger: &str,
+    no_inline_ignores: bool,
+) -> Result<(bool, Vec<String>)> {
     let (config, repo_root) = find_effective_config(dir)?;
 
     let arch_config = config.architecture.clone();
@@ -126,7 +132,12 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
     // `accepted_findings::ACCEPTED_FINDINGS_DIR` must surface as one clean error here,
     // before any file's checks run, rather than failing nondeterministically mid-batch
     // depending on file-walk order.
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let mut accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    // One counter per run (never a global) so parallel runs and tests cannot share a count.
+    accepted.inline.counter = Some(Arc::new(SuppressionCounts::default()));
+    if no_inline_ignores {
+        accepted.inline.mode = InlineIgnoreMode::Disabled;
+    }
 
     for check in &repo_checks {
         if !check.triggers.is_empty() && !check.triggers.iter().any(|t| t == trigger) {
@@ -257,7 +268,7 @@ mod tests {
         let dir = tmp_dir("zero-match-under-blocking");
         write_zero_match_only_component_deps_fixture(&dir);
 
-        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual").unwrap();
+        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual", false).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -291,7 +302,7 @@ mod tests {
         let dir = tmp_dir("real-violation-stays-blocking");
         write_real_component_deps_violation_fixture(&dir);
 
-        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual").unwrap();
+        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual", false).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 

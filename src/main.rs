@@ -71,6 +71,9 @@ enum Command {
         dir: PathBuf,
         #[arg(long, default_value = "batch")]
         trigger: String,
+        /// Report findings that `kibitzer:ignore` comments would otherwise hide.
+        #[arg(long)]
+        no_inline_ignores: bool,
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
@@ -335,7 +338,11 @@ enum DaemonAction {
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { dir, trigger } => run::run_batch(dir, &trigger),
+        Command::Run {
+            dir,
+            trigger,
+            no_inline_ignores,
+        } => run::run_batch(dir, &trigger, no_inline_ignores),
         Command::Hook => hook::run_hook(),
         Command::Mcp => {
             let rt = tokio::runtime::Runtime::new()?;

@@ -55,3 +55,26 @@ fn kibitzer_run_should_PrintNoInlineIgnoreOutput_When_DirHasBinaryFiles() {
     assert!(out.status.success(), "{stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const COVERED_GO: &str = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+
+fn run_with_args(dir: &PathBuf, extra: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
+        .arg("run")
+        .arg(dir)
+        .args(extra)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn kibitzer_run_should_PrintCoveredFinding_When_NoInlineIgnoresFlag() {
+    let dir = temp_dir("raw-flag");
+    std::fs::write(dir.join("main.go"), COVERED_GO).unwrap();
+    let raw = run_with_args(&dir, &["--no-inline-ignores"]);
+    assert!(raw.contains("[flag-argument]"), "{raw}");
+    let default = run_with_args(&dir, &[]);
+    assert!(!default.contains("[flag-argument]"), "{default}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
