@@ -155,3 +155,32 @@ fn kibitzer_run_should_PrintHintBeforeFooter_When_FindingAndSuppressionBothPrese
     assert!(lines[hint + 1].contains("suppressed inline"), "{stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const UNKNOWN_RULE_GO: &str =
+    "package main\n\n// kibitzer:ignore made-up-rule -- legacy API, callers pinned\nfunc f() {}\n";
+
+#[test]
+fn kibitzer_run_should_PointToCheckList_When_IgnoreNamesUnknownRule() {
+    let dir = temp_dir("unknown-rule");
+    std::fs::write(dir.join("main.go"), UNKNOWN_RULE_GO).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(
+        stdout.contains(
+            "main.go:3: [unused-ignore] 'made-up-rule' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("remove it"), "{stdout}");
+    // Disabled ignores drop nothing, so every rule would look unknown: stay quiet.
+    assert!(!run_with_args(&dir, &["--no-inline-ignores"]).contains("[unused-ignore]"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_PrintNoUnusedIgnore_When_IgnoreSuppressesFinding() {
+    let dir = temp_dir("known-rule-used");
+    std::fs::write(dir.join("main.go"), COVERED_GO).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -113,6 +113,33 @@ pub(crate) fn judge_unowned(
     kept: &[&(RuleId, Line)],
     rows: Option<&[(usize, usize)]>,
 ) -> Vec<(Line, String)> {
+    unowned_verdicts(directives, dropped, ran_checkers, kept, rows)
+        .into_iter()
+        .map(|v| (v.row, v.message))
+        .collect()
+}
+
+/// Why an unowned rule was reported; `kibitzer run` keeps only the typo kind.
+#[derive(PartialEq, Eq)]
+enum UnownedKind {
+    WrongRow,
+    RemoveIt,
+    UnknownRule,
+}
+
+struct UnownedVerdict {
+    row: Line,
+    kind: UnownedKind,
+    message: String,
+}
+
+fn unowned_verdicts(
+    directives: &[&Directive],
+    dropped: &[&DroppedFinding],
+    ran_checkers: &[&str],
+    kept: &[&(RuleId, Line)],
+    rows: Option<&[(usize, usize)]>,
+) -> Vec<UnownedVerdict> {
     let mut out = Vec::new();
     for d in directives {
         if rows.is_some_and(|r| !rows_intersect(d, r)) {
@@ -131,23 +158,68 @@ pub(crate) fn judge_unowned(
                 .map(|(_, l)| *l)
                 .min_by_key(|l| (l.get().abs_diff(d.start_line.get()), l.get()));
             let name = rule.as_str();
-            let message = if let Some(n) = nearest {
-                Some(wrong_row_message(d, rule, n))
+            let verdict = if let Some(n) = nearest {
+                Some((UnownedKind::WrongRow, wrong_row_message(d, rule, n)))
             } else if ran_checkers.contains(&name) {
-                Some(format!(
-                    "[unused-ignore] kibitzer:ignore {name} suppresses nothing - remove it"
+                Some((
+                    UnownedKind::RemoveIt,
+                    format!(
+                        "[unused-ignore] kibitzer:ignore {name} suppresses nothing - remove it"
+                    ),
                 ))
             } else if !known_rule(name) && did_you_mean(name).is_none() {
-                Some(format!(
-                    "[unused-ignore] '{name}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+                Some((
+                    UnownedKind::UnknownRule,
+                    format!(
+                        "[unused-ignore] '{name}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+                    ),
                 ))
             } else {
                 None
             };
-            out.extend(message.map(|m| (d.start_line, m)));
+            out.extend(verdict.map(|(kind, message)| UnownedVerdict {
+                row: d.start_line,
+                kind,
+                message,
+            }));
         }
     }
     out
+}
+
+/// `kibitzer run` audit (Task 2.2.2e): a typo'd rule must not be silent in the CLI even
+/// though the full unused-ignore audit is deferred. First-pass data only, no rerun.
+pub(crate) fn unknown_rule_advisories(
+    file_path: &Path,
+    results: &[CheckResult],
+    accepted: &AcceptedFindings,
+) -> Vec<CheckResult> {
+    let Ok(source) = read_markered_source(file_path) else {
+        return Vec::new();
+    };
+    let scanned = accepted.inline.scan_memo.scan(file_path, &source);
+    let directives: Vec<&Directive> = scanned
+        .iter()
+        .filter_map(|(_, p)| match p {
+            DirectiveParse::Valid(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let ran: Vec<&str> = results.iter().map(|r| r.check_name.as_str()).collect();
+    let dropped: Vec<&DroppedFinding> = results.iter().flat_map(|r| &r.inline.dropped).collect();
+    let kept: Vec<&(RuleId, Line)> = results.iter().flat_map(|r| &r.inline.kept).collect();
+    unowned_verdicts(&directives, &dropped, &ran, &kept, None)
+        .into_iter()
+        .filter(|v| v.kind == UnownedKind::UnknownRule)
+        .map(|v| {
+            advisory_result(&format!(
+                "{}:{}: {}",
+                file_path.display(),
+                v.row.get(),
+                v.message
+            ))
+        })
+        .collect()
 }
 
 /// The file text, only when it is small enough for the first pass to have judged it and

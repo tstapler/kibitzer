@@ -156,7 +156,7 @@ fn run_batch_collect(
     }
 
     for file in &files {
-        for result in run_checks_for_trigger(
+        let results = run_checks_for_trigger(
             &file_checks,
             trigger,
             &repo_root,
@@ -164,7 +164,14 @@ fn run_batch_collect(
             None,
             &registry,
             &accepted,
-        )? {
+        )?;
+        // With ignores disabled nothing is ever dropped, so every rule would look unknown.
+        let audit = if no_inline_ignores {
+            Vec::new()
+        } else {
+            crate::inline_post_pass::unknown_rule_advisories(file, &results, &accepted)
+        };
+        for result in results.iter().chain(&audit) {
             if !result.passed && has_blocking_finding(&result) {
                 any_blocking_failure = true;
             }
