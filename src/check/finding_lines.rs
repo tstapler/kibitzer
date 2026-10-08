@@ -19,28 +19,24 @@ struct OwnedLine {
 }
 
 impl FindingLines {
-    /// Splits `combined` (the findings rendered and joined with `\n`) the way `str::lines`
-    /// does, tagging each line by the byte span of the finding that produced it.
-    pub(super) fn new(findings: &[Finding], file_path: &Path, combined: &str) -> Self {
-        let mut starts = Vec::with_capacity(findings.len());
-        let mut offset = 0;
-        for finding in findings {
-            starts.push(offset);
-            offset += super::render_finding(file_path, finding).len() + 1;
+    /// Renders each finding and splits its own text into lines, tagged by finding index.
+    /// `text()` equals the findings joined with `\n` and re-split like `str::lines`.
+    pub(super) fn new(findings: &[Finding], file_path: &Path) -> Self {
+        let mut lines: Vec<OwnedLine> = Vec::new();
+        for (index, finding) in findings.iter().enumerate() {
+            let rendered = super::render_finding(file_path, finding);
+            for (n, piece) in rendered.split('\n').enumerate() {
+                lines.push(OwnedLine {
+                    text: piece.strip_suffix('\r').unwrap_or(piece).to_string(),
+                    finding: index,
+                    first: n == 0,
+                });
+            }
         }
-        let base = combined.as_ptr() as usize;
-        let lines = combined
-            .lines()
-            .map(|line| {
-                let at = line.as_ptr() as usize - base;
-                let finding = starts.partition_point(|&s| s <= at).saturating_sub(1);
-                OwnedLine {
-                    text: line.to_string(),
-                    finding,
-                    first: starts.get(finding) == Some(&at),
-                }
-            })
-            .collect();
+        // `str::lines` drops the empty piece after a final newline.
+        if lines.last().is_some_and(|l| l.text.is_empty() && !l.first) {
+            lines.pop();
+        }
         FindingLines {
             lines,
             finding_count: findings.len(),
@@ -90,7 +86,7 @@ mod tests {
             .map(|f| super::super::render_finding(file, f))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = FindingLines::new(findings, file, &combined);
+        let lines = FindingLines::new(findings, file);
         (combined, lines)
     }
 

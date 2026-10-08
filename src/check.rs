@@ -320,7 +320,7 @@ fn run_native_check(
         }
     };
 
-    let mut lines = FindingLines::new(&kept_findings, file_path, &combined);
+    let mut lines = FindingLines::new(&kept_findings, file_path);
     let passed = match changed_lines {
         Some(ranges) => match scope_line_verdicts(&lines.texts(), file_path, ranges, passed_raw) {
             Some(verdicts) => {
