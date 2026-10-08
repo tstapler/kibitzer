@@ -2664,6 +2664,33 @@ mod git_head_integration_tests {
         assert_eq!(result.severity, Severity::Advisory);
         assert!(result.message.unwrap().contains("predates your edits"));
     }
+
+    #[test]
+    fn architecture_check_should_NotApplyInlineIgnores_When_WholeRepoCheck() {
+        let repo = TempRepo::new("arch-no-inline");
+        repo.write_and_commit("go.mod", "module fixture\ngo 1.21\n", "init");
+        repo.write_and_commit(
+            "handlers/handlers.go",
+            "package handlers\n\nfunc Do() {}\n",
+            "add handlers",
+        );
+        repo.write_and_commit(
+            "domain/domain.go",
+            "package domain\n\n// kibitzer:ignore layering -- fixture covers the import\nimport \"fixture/handlers\"\n\n// kibitzer:ignore layering -- fixture covers the call\nfunc Do() { handlers.Do() }\n",
+            "add domain violating layering",
+        );
+        let arch_config = crate::config::ArchitectureConfig {
+            layers: vec!["handlers".to_string(), "domain".to_string()],
+            ..Default::default()
+        };
+        let files = walk_and_collect_files(&repo.dir).unwrap();
+
+        let result =
+            run_architecture_check(&layering_check(), &repo.dir, &files, &arch_config).unwrap();
+
+        assert!(!result.passed, "{result:?}");
+        assert!(result.inline.dropped.is_empty(), "{result:?}");
+    }
 }
 
 #[cfg(test)]
@@ -3667,6 +3694,61 @@ mod inline_seam_tests {
         assert_eq!(at_head(&InlineIgnoreContext::default()), Some(true));
         assert_eq!(at_head(&InlineIgnoreContext::disabled()), Some(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_Suppress_When_RuleAbsentFromKnownRules() {
+        let rule = "some-new-rule";
+        assert!(!crate::inline_ignores::known_rule(rule));
+        let source = format!(
+            "package main\n\n// kibitzer:ignore {rule} -- brand new rule, table not updated\nfunc f() {{}}\n"
+        );
+        let finding = crate::checker::Finding {
+            line: 4,
+            message: format!("[{rule}] something"),
+        };
+        let out = apply_inline_ignores(
+            vec![finding],
+            Path::new("x.go"),
+            &source,
+            "native-checker",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
+        assert_eq!(out.dropped.len(), 1);
+    }
+
+    #[test]
+    fn run_command_check_should_NotApplyInlineIgnores_When_ShellOutCommandCheck() {
+        let dir = tmp_dir("command-no-inline");
+        let file = dir.join("main.go");
+        std::fs::write(&file, go_source(IGNORE, "")).unwrap();
+        let check = Check {
+            name: "shell-lint".to_string(),
+            command: Some(
+                "printf 'main.go:4: [flag-argument] shell finding\\n'; exit 1".to_string(),
+            ),
+            checker: None,
+            ..flag_check(Severity::Advisory)
+        };
+        let result = run_check(
+            &check,
+            &dir,
+            &file,
+            None,
+            &Registry::default(),
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!result.passed);
+        assert!(
+            result.output.contains("main.go:4: [flag-argument]"),
+            "{}",
+            result.output
+        );
+        assert!(result.inline.dropped.is_empty());
     }
 
     fn inline_ignore_check() -> Check {
