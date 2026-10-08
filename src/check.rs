@@ -8,15 +8,19 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::accepted_findings::{AcceptedFindings, FilterOutcome};
+use crate::accepted_findings::{AcceptedFindings, AcceptedLines};
 pub use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 use crate::inline_ignores::{
     InlineIgnoreContext, InlineOutcome, Line, RawFinding, anchor_rule, apply_inline_ignores,
+    capped_anchors,
 };
 use crate::plugin::Registry;
+
+mod finding_lines;
+use finding_lines::FindingLines;
 
 /// Wall-clock ceiling on a single `run_check` command dispatch (see
 /// [`run_command_with_timeout`]). Plugin binaries are the class of `command` check most
@@ -357,21 +361,33 @@ fn run_native_check(
         }
     };
 
-    let passed = if let Some(ranges) = changed_lines {
-        let (scoped, scoped_passed) =
-            scope_output_to_changed_lines(&combined, file_path, ranges, passed_raw);
-        combined = scoped;
-        scoped_passed
-    } else {
-        passed_raw
+    let mut lines = FindingLines::new(&kept_findings, file_path, &combined);
+    let passed = match changed_lines {
+        Some(ranges) => match scope_line_verdicts(&lines.texts(), file_path, ranges, passed_raw) {
+            Some(verdicts) => {
+                lines.retain(&verdicts.keep);
+                combined = lines.text();
+                verdicts.passed
+            }
+            None => passed_raw,
+        },
+        None => passed_raw,
     };
 
     let passed = if passed {
         passed
     } else {
-        let outcome =
-            drop_accepted_findings(&combined, repo_root, file_path, checker_name, accepted);
-        combined = outcome.output;
+        let rel_file = relativize(repo_root, file_path);
+        let accepted_lines = AcceptedLines::for_file(file_path, &rel_file, checker_name, accepted);
+        if let Some(accepted_lines) = accepted_lines {
+            let keep: Vec<bool> = lines
+                .texts()
+                .iter()
+                .map(|line| !accepted_lines.is_accepted(line))
+                .collect();
+            lines.retain(&keep);
+            combined = lines.text();
+        }
         combined.trim().is_empty()
     };
 
@@ -398,23 +414,15 @@ fn run_native_check(
         }
     }
 
-    // `shown` is computed from the final text so a finding scoped out or accepted-dropped
-    // never supplies a hook anchor; matching the rendered first line avoids parsing rules out of text.
-    let shown_lines: std::collections::HashSet<&str> = combined.lines().collect();
-    inline_outcome.shown = kept_findings
-        .iter()
-        .filter(|f| {
-            let rendered = render_finding(file_path, f);
-            shown_lines.contains(rendered.lines().next().unwrap_or_default())
-        })
-        .take(MAX_INLINE_ANCHORS)
-        .map(|f| (anchor_rule(checker_name, f), Line::new(f.line)))
-        .collect();
-    inline_outcome.kept = kept_findings
-        .iter()
-        .take(MAX_INLINE_ANCHORS)
-        .map(|f| (anchor_rule(checker_name, f), Line::new(f.line)))
-        .collect();
+    let visible = lines.visible();
+    inline_outcome.shown = capped_anchors(
+        checker_name,
+        kept_findings
+            .iter()
+            .zip(&visible)
+            .filter_map(|(finding, shown)| shown.then_some(finding)),
+    );
+    inline_outcome.kept = capped_anchors(checker_name, kept_findings.iter());
 
     Ok(CheckResult {
         check_name: check.name.clone(),
@@ -427,27 +435,6 @@ fn run_native_check(
         plugin_missing: false,
         inline: inline_outcome,
     })
-}
-
-/// Drops accepted findings (`accepted_findings::ACCEPTED_FINDINGS_DIR`) from `combined`, run after
-/// diff-scoping so an untouched line never needs this at all. Native-only: a shell-out
-/// check's pass/fail comes from its exit code, not empty output, so this can't safely
-/// recompute pass/fail for it.
-fn drop_accepted_findings(
-    combined: &str,
-    repo_root: &Path,
-    file_path: &Path,
-    checker_name: &str,
-    accepted: &AcceptedFindings,
-) -> FilterOutcome {
-    let rel_file = relativize(repo_root, file_path);
-    crate::accepted_findings::filter_accepted(
-        combined,
-        file_path,
-        &rel_file,
-        checker_name,
-        accepted,
-    )
 }
 
 /// Runs `checker_name` against `source` (as if it were the content of `file_path`),
@@ -518,9 +505,6 @@ impl SourceCheck {
         }
     }
 }
-
-/// Most anchors a `CheckResult` keeps; the footer only names the first and the hook is capped.
-const MAX_INLINE_ANCHORS: usize = 20;
 
 /// Findings of `check`'s native checker as it reported them: inline ignores disabled, and
 /// none of diff-scoping, `accepted/` or the HEAD baseline applied (those live in
@@ -834,19 +818,26 @@ mod sarif_tests {
     }
 }
 
-/// Filter a check's `{file}:{line}: message`-style output down to lines whose line number
-/// falls within `ranges`, and recompute pass/fail from what survives. Lines that don't
-/// follow the `{file}:{line}:` convention are kept as-is (their line can't be attributed to
-/// a range) and count toward a failure if any survive — this is deliberately conservative:
-/// output kibitzer doesn't understand should not be silently swallowed.
-fn scope_output_to_changed_lines(
-    output: &str,
+/// Per-line outcome of diff-scoping: which output lines survive, and whether any failure does.
+struct ScopeVerdicts {
+    keep: Vec<bool>,
+    passed: bool,
+}
+
+/// Decides, per output line, whether it falls within `ranges`; `None` means the output cannot
+/// be scoped (already passing, or no line follows the `{file}:{line}:` convention) and must
+/// be left untouched. Lines that don't follow the convention are kept as-is (their line
+/// can't be attributed to a range) and count toward a failure if any survive — this is
+/// deliberately conservative: output kibitzer doesn't understand should not be silently
+/// swallowed.
+fn scope_line_verdicts(
+    lines: &[&str],
     file_path: &Path,
     ranges: &[(usize, usize)],
     passed_raw: bool,
-) -> (String, bool) {
+) -> Option<ScopeVerdicts> {
     if passed_raw {
-        return (output.to_string(), passed_raw);
+        return None;
     }
     if ranges.is_empty() {
         // Diff-scoping is active (the caller only reaches this function when
@@ -855,52 +846,58 @@ fn scope_output_to_changed_lines(
         // Nothing can be attributed to this edit, so every finding is out of scope,
         // not "unscoped" — unlike the `changed_lines: None` case, this must not fall
         // back to the raw whole-file output.
-        return (String::new(), true);
+        return Some(ScopeVerdicts {
+            keep: vec![false; lines.len()],
+            passed: true,
+        });
     }
 
     let prefix = format!("{}:", file_path.display());
-    let mut kept = Vec::new();
-    let mut any_attributed_line = false;
-    let mut any_kept_finding = false;
-
-    for line in output.lines() {
-        let has_prefix = line.strip_prefix(&prefix).is_some();
-        let line_no = line
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|n| n.parse::<usize>().ok());
-
-        match line_no {
-            Some(n) => {
-                any_attributed_line = true;
-                if ranges.iter().any(|(start, end)| n >= *start && n <= *end) {
-                    any_kept_finding = true;
-                    kept.push(line);
-                }
-            }
-            None if has_prefix && !line.is_empty() => {
-                // Has the file prefix but the line number after it doesn't parse —
-                // can't attribute it to a range, so (per the conservative-keep policy
-                // above) keep it displayed AND count it toward failure, same as a
-                // line with no prefix at all.
-                any_kept_finding = true;
-                kept.push(line);
-            }
-            None => kept.push(line),
-        }
-    }
-
-    if !any_attributed_line {
-        // Output doesn't follow the convention at all — can't scope it, leave untouched.
-        return (output.to_string(), passed_raw);
-    }
-
-    let filtered = kept.join("\n");
-    let unattributed_kept = kept
+    let attributed: Vec<Option<usize>> = lines
         .iter()
-        .any(|l| l.strip_prefix(&prefix).is_none() && !l.is_empty());
-    let passed = !(any_kept_finding || unattributed_kept);
-    (filtered, passed)
+        .map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .collect();
+    if attributed.iter().all(Option::is_none) {
+        // Output doesn't follow the convention at all — can't scope it, leave untouched.
+        return None;
+    }
+    let keep: Vec<bool> = attributed
+        .iter()
+        .map(|line_no| match line_no {
+            Some(n) => ranges.iter().any(|(start, end)| n >= start && n <= end),
+            None => true,
+        })
+        .collect();
+    // Any surviving non-empty line, attributed or not, is a failure.
+    let passed = lines
+        .iter()
+        .zip(&keep)
+        .all(|(line, kept)| !kept || line.is_empty());
+    Some(ScopeVerdicts { keep, passed })
+}
+
+/// Text-level wrapper over [`scope_line_verdicts`] for output that is not tied to structured
+/// findings (shell-out checks).
+fn scope_output_to_changed_lines(
+    output: &str,
+    file_path: &Path,
+    ranges: &[(usize, usize)],
+    passed_raw: bool,
+) -> (String, bool) {
+    let lines: Vec<&str> = output.lines().collect();
+    let Some(verdicts) = scope_line_verdicts(&lines, file_path, ranges, passed_raw) else {
+        return (output.to_string(), passed_raw);
+    };
+    let kept: Vec<&str> = lines
+        .iter()
+        .zip(&verdicts.keep)
+        .filter_map(|(line, kept)| kept.then_some(*line))
+        .collect();
+    (kept.join("\n"), verdicts.passed)
 }
 
 /// Process-wide nonce so concurrent baseline checks (the daemon spawns one thread per
@@ -3314,7 +3311,10 @@ mod inline_seam_tests {
             ..Default::default()
         };
         let result = native(&dir, &three_findings(), Some(&[(3, 3), (9, 9)]), &accepted);
-        let rule = |l: usize| (RuleId::new("flag-argument").unwrap(), Line::new(l));
+        let rule = |l: usize| crate::inline_ignores::Anchor {
+            rule: RuleId::new("flag-argument").unwrap(),
+            line: Line::new(l),
+        };
         assert_eq!(result.inline.shown, vec![rule(3)]);
         assert_eq!(result.inline.first_anchor().map(|(_, l)| l.get()), Some(3));
         assert_eq!(result.inline.kept, vec![rule(3), rule(9), rule(15)]);

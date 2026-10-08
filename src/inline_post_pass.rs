@@ -9,8 +9,8 @@ use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, Severity};
 use crate::inline_ignores::{
-    Directive, FirstPass, InlineOutcome, Line, RawFinding, Reason, RuleId, UnusedKind, owned_by,
-    rows_intersect, span_intersects, unowned_verdicts, unused_ignores, valid_directives,
+    Directive, FirstPass, InlineOutcome, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind,
+    owned_by, rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
 };
 
 /// Reruns one native check against `source` with inline ignores disabled; injected so this
@@ -177,14 +177,14 @@ fn blocking_suppressions(
     results: &[CheckResult],
     changed_lines: &[(usize, usize)],
 ) -> Vec<BlockingSuppression> {
-    let mut found: Vec<((Line, Line), BlockingSuppression)> = Vec::new();
+    let mut found: Vec<(LineSpan, BlockingSuppression)> = Vec::new();
     let blocking_drops = results
         .iter()
         .flat_map(|r| &r.inline.dropped)
         .filter(|d| d.severity == Severity::Blocking);
     for drop in blocking_drops {
-        let rows = (drop.directive_start, drop.directive_end);
-        if !span_intersects(rows, changed_lines) {
+        let rows = drop.directive_span();
+        if !rows.intersects(changed_lines) {
             continue;
         }
         match found.iter_mut().find(|(key, _)| *key == rows) {
@@ -224,7 +224,7 @@ fn advisory_result(output: &str) -> CheckResult {
 mod tests {
     use super::*;
     use crate::config::Severity;
-    use crate::inline_ignores::{DroppedFinding, InlineOutcome, Line, Reason, RuleId};
+    use crate::inline_ignores::{Anchor, DroppedFinding, InlineOutcome, Line, Reason, RuleId};
 
     pub(super) fn result_with_dropped(
         check_name: &str,
@@ -393,7 +393,7 @@ mod tests {
         rule: &str,
         dropped: &[DroppedFinding],
         ran: &[&str],
-        kept: &[(RuleId, Line)],
+        kept: &[Anchor],
     ) -> Vec<(Line, String)> {
         let d = directive_for(rule, 12);
         judge_directives(&[&d], dropped, ran, kept, Some(&[(12, 12)]))
@@ -403,7 +403,7 @@ mod tests {
         directives: &[&Directive],
         dropped: &[DroppedFinding],
         ran: &[&str],
-        kept: &[(RuleId, Line)],
+        kept: &[Anchor],
         rows: Option<&[(usize, usize)]>,
     ) -> Vec<(Line, String)> {
         let first = FirstPass {
@@ -417,8 +417,11 @@ mod tests {
             .collect()
     }
 
-    fn kept_at(rule: &str, row: usize) -> (RuleId, Line) {
-        (RuleId::new(rule).unwrap(), Line::new(row))
+    fn kept_at(rule: &str, row: usize) -> Anchor {
+        Anchor {
+            rule: RuleId::new(rule).unwrap(),
+            line: Line::new(row),
+        }
     }
 
     #[test]

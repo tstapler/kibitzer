@@ -291,7 +291,7 @@ mod registry_invalidation_tests {
     #[test]
     #[allow(non_snake_case)]
     fn cache_roundtrip_should_PreserveInlineOutcome_When_ResultHasFirstAnchorAndDropped() {
-        use crate::inline_ignores::{DroppedFinding, InlineOutcome, Line, Reason, RuleId};
+        use crate::inline_ignores::{Anchor, DroppedFinding, InlineOutcome, Line, Reason, RuleId};
         let file_path = tmp_path("rt-file.rs");
         fs::write(&file_path, "fn main() {}").unwrap();
         let config_path = tmp_path("rt-inspect.json");
@@ -302,8 +302,14 @@ mod registry_invalidation_tests {
         let rule = RuleId::new("flag-argument").unwrap();
         let mut result = sample_result();
         result.inline = InlineOutcome {
-            shown: vec![(rule.clone(), Line::new(7))],
-            kept: vec![(rule.clone(), Line::new(7))],
+            shown: vec![Anchor {
+                rule: rule.clone(),
+                line: Line::new(7),
+            }],
+            kept: vec![Anchor {
+                rule: rule.clone(),
+                line: Line::new(7),
+            }],
             dropped: vec![DroppedFinding {
                 directive_start: Line::new(3),
                 directive_end: Line::new(3),
@@ -334,6 +340,49 @@ mod registry_invalidation_tests {
         assert_eq!(hit[0].inline.first_anchor().map(|(_, l)| l.get()), Some(7));
     }
 
+    #[test]
+    #[allow(non_snake_case)]
+    fn cache_load_should_ReadAnchors_When_WrittenAsTheOldTupleShape() {
+        use crate::inline_ignores::{Anchor, InlineOutcome, Line, RuleId};
+        let file_path = tmp_path("tuple-file.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let config_path = tmp_path("tuple-inspect.json");
+        fs::write(&config_path, "{}").unwrap();
+        let registry_path = tmp_path("tuple-registry.json");
+        let cache_path = tmp_path("tuple-cache.json");
+        let mut result = sample_result();
+        result.inline = InlineOutcome {
+            shown: vec![Anchor {
+                rule: RuleId::new("flag-argument").unwrap(),
+                line: Line::new(7),
+            }],
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cache.put(
+            &file_path,
+            &config_path,
+            &registry_path,
+            "batch",
+            vec![result],
+        );
+        cache.save(&cache_path).unwrap();
+        let current = fs::read_to_string(&cache_path).unwrap();
+        let object_form = r#"{"rule":"flag-argument","line":7}"#;
+        assert!(current.contains(object_form), "{current}");
+        assert_eq!(Cache::load(&cache_path).entries.len(), 1);
+
+        fs::write(
+            &cache_path,
+            current.replace(object_form, r#"["flag-argument",7]"#),
+        )
+        .unwrap();
+        let loaded = Cache::load(&cache_path);
+        let hit = loaded
+            .get(&file_path, &config_path, &registry_path, "batch")
+            .expect("a cache written before the Anchor struct still loads");
+        assert_eq!(hit[0].inline.first_anchor().map(|(_, l)| l.get()), Some(7));
+    }
     #[test]
     #[allow(non_snake_case)]
     fn cache_load_should_DiscardEntries_When_StoredKibitzerVersionDiffers() {

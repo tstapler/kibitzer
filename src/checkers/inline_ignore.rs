@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::inline_ignores::{
-    DirectiveParse, MalformedReason, WeakReason, did_you_mean, echo_parts, known_rule,
+    DirectiveParse, MalformedReason, Scanned, WeakReason, did_you_mean, echo_parts, known_rule,
     near_miss_text, scan_directives,
 };
 
@@ -53,7 +53,7 @@ impl Checker for InlineIgnoreChecker {
         let lines: Vec<&str> = ctx.source.lines().collect();
         let mut findings = Vec::new();
         let mut valid_rows = Vec::new();
-        for (row, parse) in scan_directives(file, ctx.source) {
+        for Scanned { row, parse } in scan_directives(file, ctx.source) {
             let line = lines.get(row.get() - 1).copied().unwrap_or_default();
             match parse {
                 DirectiveParse::Malformed(reason) => {

@@ -3101,10 +3101,10 @@ mod tests {
     fn failing(name: &str, rule: Option<(&str, usize)>) -> CheckResult {
         let mut inline = crate::inline_ignores::InlineOutcome::default();
         if let Some((rule, line)) = rule {
-            inline.shown.push((
-                crate::inline_ignores::RuleId::new(rule).unwrap(),
-                crate::inline_ignores::Line::new(line),
-            ));
+            inline.shown.push(crate::inline_ignores::Anchor {
+                rule: crate::inline_ignores::RuleId::new(rule).unwrap(),
+                line: crate::inline_ignores::Line::new(line),
+            });
         }
         CheckResult {
             check_name: name.to_string(),

@@ -156,6 +156,13 @@ impl Directive {
         on_row || in_head
     }
 
+    pub(crate) fn span(&self) -> LineSpan {
+        LineSpan {
+            start: self.start_line,
+            end: self.end_line,
+        }
+    }
+
     fn placed(mut self, start: Line, end: Line, whole_line: bool) -> Self {
         self.start_line = start;
         self.end_line = end;
@@ -187,13 +194,17 @@ pub enum DirectiveParse {
 }
 
 /// A parse result and the 1-based row of the comment line it came from.
-pub type Scanned = (Line, DirectiveParse);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scanned {
+    pub row: Line,
+    pub parse: DirectiveParse,
+}
 
 /// The well-formed directives among `scanned`, in source order.
 pub(crate) fn valid_directives(scanned: &[Scanned]) -> Vec<&Directive> {
     scanned
         .iter()
-        .filter_map(|(_, parse)| match parse {
+        .filter_map(|s| match &s.parse {
             DirectiveParse::Valid(d) => Some(d),
             _ => None,
         })
@@ -376,11 +387,11 @@ fn scan_text_lines(text: &str, first_row: usize, end_row: usize, whole_line: boo
             let row = Line::new(first_row + i);
             match parse_comment_line(line) {
                 DirectiveParse::NotADirective => None,
-                DirectiveParse::Valid(d) => Some((
+                DirectiveParse::Valid(d) => Some(Scanned {
                     row,
-                    DirectiveParse::Valid(d.placed(row, Line::new(end_row), whole_line)),
-                )),
-                other => Some((row, other)),
+                    parse: DirectiveParse::Valid(d.placed(row, Line::new(end_row), whole_line)),
+                }),
+                other => Some(Scanned { row, parse: other }),
             }
         })
         .collect()
@@ -436,10 +447,11 @@ pub fn scan_leading_comments(source: &str) -> Vec<Scanned> {
             let row = Line::new(i + 1);
             match parse_comment_line(body) {
                 DirectiveParse::NotADirective => None,
-                DirectiveParse::Valid(d) => {
-                    Some((row, DirectiveParse::Valid(d.placed(row, row, true))))
-                }
-                other => Some((row, other)),
+                DirectiveParse::Valid(d) => Some(Scanned {
+                    row,
+                    parse: DirectiveParse::Valid(d.placed(row, row, true)),
+                }),
+                other => Some(Scanned { row, parse: other }),
             }
         })
         .collect()
@@ -719,8 +731,12 @@ pub struct SuppressionCounts {
     pub blocking: AtomicUsize,
 }
 
-/// (path, content hash, scan result)
-type MemoEntry = (PathBuf, u64, Arc<Vec<Scanned>>);
+#[derive(Debug)]
+struct MemoEntry {
+    path: PathBuf,
+    content_hash: u64,
+    scanned: Arc<Vec<Scanned>>,
+}
 
 /// Single-entry scan cache: checks for one file run back to back, so one entry gives about one
 /// scan per file. Content-hash keyed, so an edited file never returns stale directives.
@@ -745,16 +761,20 @@ impl ScanMemo {
         source.hash(&mut hasher);
         let hash = hasher.finish();
         let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((p, h, scanned)) = entry.as_ref()
-            && p == path
-            && *h == hash
+        if let Some(hit) = entry.as_ref()
+            && hit.path == path
+            && hit.content_hash == hash
         {
-            return Arc::clone(scanned);
+            return Arc::clone(&hit.scanned);
         }
         #[cfg(test)]
         self.scans.fetch_add(1, Ordering::Relaxed);
         let scanned = Arc::new(scan_directives(path, source));
-        *entry = Some((path.to_path_buf(), hash, Arc::clone(&scanned)));
+        *entry = Some(MemoEntry {
+            path: path.to_path_buf(),
+            content_hash: hash,
+            scanned: Arc::clone(&scanned),
+        });
         scanned
     }
 }
@@ -796,30 +816,63 @@ pub struct DroppedFinding {
     pub severity: Severity,
 }
 
+/// A finding's rule and the 1-based line it is anchored to; what the hook footer points at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub rule: RuleId,
+    pub line: Line,
+}
+
+/// Most anchors a `CheckResult` keeps; the footer only names the first and the hook is capped.
+const MAX_INLINE_ANCHORS: usize = 20;
+
+/// The first `MAX_INLINE_ANCHORS` of `findings` as anchors, in finding order.
+pub(crate) fn capped_anchors<'a>(
+    checker_name: &str,
+    findings: impl Iterator<Item = &'a Finding>,
+) -> Vec<Anchor> {
+    findings
+        .take(MAX_INLINE_ANCHORS)
+        .map(|f| Anchor {
+            rule: anchor_rule(checker_name, f),
+            line: Line::new(f.line),
+        })
+        .collect()
+}
+
 /// Inline-ignore result carried on `CheckResult`. `shown` lists findings still visible after
 /// scoping and `accepted/` (capped), `kept` every finding that survived inline filtering
 /// (whole file, capped), `dropped` what directives removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineOutcome {
     #[serde(default)]
-    pub shown: Vec<(RuleId, Line)>,
+    pub shown: Vec<Anchor>,
     #[serde(default)]
-    pub kept: Vec<(RuleId, Line)>,
+    pub kept: Vec<Anchor>,
     #[serde(default)]
     pub dropped: Vec<DroppedFinding>,
 }
 
+impl DroppedFinding {
+    pub(crate) fn directive_span(&self) -> LineSpan {
+        LineSpan {
+            start: self.directive_start,
+            end: self.directive_end,
+        }
+    }
+}
+
 impl InlineOutcome {
     pub fn first_anchor(&self) -> Option<(&RuleId, Line)> {
-        self.shown.first().map(|(r, l)| (r, *l))
+        self.shown.first().map(|a| (&a.rule, a.line))
     }
 
     /// Distinct rule ids of the shown findings, in finding order.
     pub fn rule_ids(&self) -> Vec<&RuleId> {
         let mut ids: Vec<&RuleId> = Vec::new();
-        for (rule, _) in &self.shown {
-            if !ids.contains(&rule) {
-                ids.push(rule);
+        for anchor in &self.shown {
+            if !ids.contains(&&anchor.rule) {
+                ids.push(&anchor.rule);
             }
         }
         ids
@@ -888,14 +941,23 @@ pub(crate) fn nearest_finding_line(rule: &RuleId, raw: &[RawFinding], from: Line
         .min_by_key(|l| (l.get().abs_diff(from.get()), l.get()))
 }
 
-pub(crate) fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
-    span_intersects((d.start_line, d.end_line), ranges)
+/// The inclusive rows a directive comment occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineSpan {
+    pub start: Line,
+    pub end: Line,
 }
 
-pub(crate) fn span_intersects((start, end): (Line, Line), ranges: &[(usize, usize)]) -> bool {
-    ranges
-        .iter()
-        .any(|&(s, e)| s <= end.get() && start.get() <= e)
+impl LineSpan {
+    pub(crate) fn intersects(self, ranges: &[(usize, usize)]) -> bool {
+        ranges
+            .iter()
+            .any(|&(s, e)| s <= self.end.get() && self.start.get() <= e)
+    }
+}
+
+pub(crate) fn rows_intersect(d: &Directive, ranges: &[(usize, usize)]) -> bool {
+    d.span().intersects(ranges)
 }
 
 /// Why a directive rule was reported as unused; `kibitzer run` keeps only `UnknownRule`.
@@ -929,7 +991,7 @@ impl UnusedVerdict {
 pub(crate) struct FirstPass<'a> {
     pub ran: Vec<&'a str>,
     pub dropped: Vec<&'a DroppedFinding>,
-    pub kept: Vec<&'a (RuleId, Line)>,
+    pub kept: Vec<&'a Anchor>,
 }
 
 /// Verdicts for the rules of `directives` (limited to those touching `rows`, when given) whose
@@ -1019,8 +1081,8 @@ fn unowned_verdict(d: &Directive, rule: &RuleId, first: &FirstPass) -> Option<Un
     let nearest = first
         .kept
         .iter()
-        .filter(|(r, _)| r == rule)
-        .map(|(_, l)| *l)
+        .filter(|a| a.rule == *rule)
+        .map(|a| a.line)
         .min_by_key(|l| (l.get().abs_diff(d.start_line.get()), l.get()));
     let (kind, message) = if let Some(n) = nearest {
         (UnusedKind::WrongRow, wrong_row_message(d, rule, n))
@@ -1150,7 +1212,13 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(scanned[0], (Line::new(7), DirectiveParse::Valid(expected)));
+        assert_eq!(
+            scanned[0],
+            Scanned {
+                row: Line::new(7),
+                parse: DirectiveParse::Valid(expected)
+            }
+        );
     }
 
     #[test]
@@ -1423,7 +1491,7 @@ mod tests {
             let tree = cache.parse(lang, source).unwrap();
             let scanned = scan_code_comments(lang, &tree, source);
             assert_eq!(scanned.len(), 1, "{lang:?}: {scanned:?}");
-            let DirectiveParse::Valid(d) = &scanned[0].1 else {
+            let DirectiveParse::Valid(d) = &scanned[0].parse else {
                 panic!("{lang:?}: not valid: {scanned:?}");
             };
             assert_eq!(d.rules(), rules(&["flag-argument"]).as_slice(), "{lang:?}");
@@ -1441,7 +1509,7 @@ mod tests {
     fn scan_code_comments_should_RecordWholeLineFalse_When_CommentTrailsCode() {
         let source = "package main\nvar x = f() // kibitzer:ignore a -- two words\n";
         let scanned = go_scan(source);
-        let DirectiveParse::Valid(d) = &scanned[0].1 else {
+        let DirectiveParse::Valid(d) = &scanned[0].parse else {
             panic!("{scanned:?}")
         };
         assert!(!d.whole_line);
@@ -1456,11 +1524,11 @@ mod tests {
         );
         let scanned = scan_directives(Path::new("A.java"), &source);
         assert_eq!(scanned.len(), 1, "{scanned:?}");
-        let DirectiveParse::Valid(d) = &scanned[0].1 else {
+        let DirectiveParse::Valid(d) = &scanned[0].parse else {
             panic!("{scanned:?}")
         };
         assert_eq!(d.start_line, Line::new(11));
-        assert_eq!(scanned[0].0, Line::new(11));
+        assert_eq!(scanned[0].row, Line::new(11));
     }
 
     #[test]
@@ -1470,7 +1538,7 @@ mod tests {
             "\n".repeat(6)
         );
         let scanned = scan_directives(Path::new("a.rs"), &source);
-        let DirectiveParse::Valid(d) = &scanned[0].1 else {
+        let DirectiveParse::Valid(d) = &scanned[0].parse else {
             panic!("{scanned:?}")
         };
         assert_eq!(d.start_line, Line::new(7));
@@ -1482,7 +1550,7 @@ mod tests {
             "# T\n\ntext\n\n<!-- kibitzer:ignore em-dash-overuse -- quoted source -->\n\nmore\n";
         let scanned = scan_directives(Path::new("a.md"), source);
         assert_eq!(scanned.len(), 1, "{scanned:?}");
-        let DirectiveParse::Valid(d) = &scanned[0].1 else {
+        let DirectiveParse::Valid(d) = &scanned[0].parse else {
             panic!("{scanned:?}")
         };
         assert_eq!(d.start_line, Line::new(5));
@@ -1495,7 +1563,7 @@ mod tests {
         let source = "| a | b |\n|---|---|\n| x | <!-- kibitzer:ignore a -- two words --> |\n";
         let scanned = scan_markdown(source);
         assert_eq!(scanned.len(), 1, "{scanned:?}");
-        let DirectiveParse::Valid(d) = &scanned[0].1 else {
+        let DirectiveParse::Valid(d) = &scanned[0].parse else {
             panic!("{scanned:?}")
         };
         assert_eq!(d.start_line, Line::new(3));
@@ -1517,7 +1585,7 @@ mod tests {
         let source = "#!/bin/sh\n# kibitzer:ignore file-size -- vendored script\necho hi\n";
         let scanned = scan_directives(Path::new("x.sh"), source);
         assert_eq!(scanned.len(), 1, "{scanned:?}");
-        let DirectiveParse::Valid(d) = &scanned[0].1 else {
+        let DirectiveParse::Valid(d) = &scanned[0].parse else {
             panic!("{scanned:?}")
         };
         assert_eq!(d.start_line, Line::new(2));
@@ -1909,7 +1977,7 @@ mod tests {
         );
         assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 3);
         let held = ctx.scan_memo.entry.lock().unwrap();
-        assert_eq!(held.as_ref().unwrap().0, PathBuf::from("other.go"));
+        assert_eq!(held.as_ref().unwrap().path, PathBuf::from("other.go"));
     }
 
     const FAST_PATH_CALLS: usize = 1_000;
@@ -1941,9 +2009,18 @@ mod tests {
         let r = |s: &str| RuleId::new(s).unwrap();
         let outcome = InlineOutcome {
             shown: vec![
-                (r("a"), Line::new(5)),
-                (r("b"), Line::new(7)),
-                (r("a"), Line::new(9)),
+                Anchor {
+                    rule: r("a"),
+                    line: Line::new(5),
+                },
+                Anchor {
+                    rule: r("b"),
+                    line: Line::new(7),
+                },
+                Anchor {
+                    rule: r("a"),
+                    line: Line::new(9),
+                },
             ],
             ..Default::default()
         };
@@ -1955,7 +2032,10 @@ mod tests {
     #[test]
     fn inline_outcome_should_RoundTripJson_When_Populated() {
         let outcome = InlineOutcome {
-            shown: vec![(RuleId::new("a").unwrap(), Line::new(5))],
+            shown: vec![Anchor {
+                rule: RuleId::new("a").unwrap(),
+                line: Line::new(5),
+            }],
             kept: vec![],
             dropped: vec![DroppedFinding {
                 directive_start: Line::new(4),
