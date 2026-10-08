@@ -1242,3 +1242,44 @@ fn syntax_hint_limited_should_KeepOneRule_When_LimitIsOne() {
     let hint = syntax_hint_limited(Path::new("a.go"), Some((&a, Line::new(3))), &[&a, &b], 1);
     assert!(hint.contains("Rules: flag-argument, ..."), "{hint}");
 }
+
+#[test]
+fn batch_syntax_hint_should_RenderTheDocumentedFooterLine_When_BuiltFromMarker() {
+    assert_eq!(
+        batch_syntax_hint(),
+        "[kibitzer] to dismiss a finding you judged acceptable: <comment> kibitzer:ignore <rule> -- <why> (docs/suppressing-checks.md)"
+    );
+}
+
+#[test]
+fn batch_syntax_hint_should_ParseAsDirective_When_PlaceholdersFilled() {
+    let hint = batch_syntax_hint();
+    let example = hint
+        .split_once(": ")
+        .map(|(_, rest)| rest.trim_end_matches(" (docs/suppressing-checks.md)"))
+        .unwrap();
+    let filled = example
+        .replace("<comment>", "//")
+        .replace("<rule>", "flag-argument")
+        .replace("<why>", "pinned by public API");
+    assert!(matches!(
+        parse_comment_line(&filled),
+        DirectiveParse::Valid(_)
+    ));
+}
+
+#[test]
+fn rule_id_should_RejectCorruptValue_When_DeserializedFromJson() {
+    assert!(serde_json::from_str::<RuleId>("\"Foo Bar\"").is_err());
+    assert!(serde_json::from_str::<RuleId>("\"\"").is_err());
+    let ok: RuleId = serde_json::from_str("\"flag-argument\"").unwrap();
+    assert_eq!(serde_json::to_string(&ok).unwrap(), "\"flag-argument\"");
+}
+
+#[test]
+fn reason_should_RejectCorruptValue_When_DeserializedFromJson() {
+    assert!(serde_json::from_str::<Reason>("\"  \"").is_err());
+    assert!(serde_json::from_str::<Reason>("\"needed\"").is_err());
+    let ok: Reason = serde_json::from_str("\"legacy api pinned\"").unwrap();
+    assert_eq!(serde_json::to_string(&ok).unwrap(), "\"legacy api pinned\"");
+}

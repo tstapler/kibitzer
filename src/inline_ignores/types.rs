@@ -24,9 +24,9 @@ impl Line {
 }
 
 /// A rule a directive names; `[a-z0-9-]+`, so a doc placeholder like `<rule>` is rejected.
-/// Validated by `new`. `Deserialize` skips that check: the only readers are the result cache
-/// and IPC payloads this binary wrote, which are trusted.
+/// Validated by `new`, and by `Deserialize` through it, so a corrupt cache value is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct RuleId(String);
 
 fn is_rule_char(c: char) -> bool {
@@ -48,6 +48,20 @@ impl RuleId {
     }
 }
 
+impl TryFrom<String> for RuleId {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        RuleId::new(&text).ok_or_else(|| format!("invalid rule id {text:?}: expected [a-z0-9-]+"))
+    }
+}
+
+impl From<RuleId> for String {
+    fn from(rule: RuleId) -> String {
+        rule.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeakReason {
     TooShort,
@@ -63,8 +77,10 @@ pub enum ReasonError {
 /// The justification after ` -- `. The constructor enforces a mechanical floor: not blank,
 /// not an echo of a listed rule id, and more than one word. It stops `-- needed`, not a
 /// determined two-word lie.
-/// Validated by `new`; `Deserialize` skips that check, as for `RuleId`.
+/// Validated by `new`, and by `Deserialize` through it (without the rule-echo check, which
+/// needs the directive's rules), as for `RuleId`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Reason(String);
 
 fn fold_for_echo(text: &str) -> String {
@@ -93,6 +109,20 @@ impl Reason {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for Reason {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        Reason::new(&text, &[]).map_err(|err| format!("invalid reason {text:?}: {err:?}"))
+    }
+}
+
+impl From<Reason> for String {
+    fn from(reason: Reason) -> String {
+        reason.0
     }
 }
 

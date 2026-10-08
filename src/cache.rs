@@ -83,6 +83,8 @@ impl Default for Cache {
 }
 
 impl Cache {
+    /// A version mismatch discards everything, `grace_pending` included, so a first-time
+    /// blocking failure gets its one edit of grace again after an upgrade.
     pub fn load(path: &Path) -> Self {
         fs::read_to_string(path)
             .ok()
@@ -378,6 +380,46 @@ mod registry_invalidation_tests {
             .get(&file_path, &config_path, &registry_path, "batch")
             .expect("a cache written before the Anchor struct still loads");
         assert_eq!(hit[0].inline.first_anchor().map(|(_, l)| l.get()), Some(7));
+    }
+    #[test]
+    #[allow(non_snake_case)]
+    fn cache_load_should_DiscardEntries_When_StoredRuleIdIsCorrupt() {
+        use crate::inline_ignores::{Anchor, InlineOutcome, Line, RuleId};
+        let file_path = tmp_path("corrupt-file.rs");
+        fs::write(&file_path, "fn main() {}").unwrap();
+        let config_path = tmp_path("corrupt-inspect.json");
+        fs::write(&config_path, "{}").unwrap();
+        let registry_path = tmp_path("corrupt-registry.json");
+        let cache_path = tmp_path("corrupt-cache.json");
+        let mut result = sample_result();
+        result.inline = InlineOutcome {
+            shown: vec![Anchor {
+                rule: RuleId::new("flag-argument").unwrap(),
+                line: Line::new(7),
+            }],
+            ..Default::default()
+        };
+        let mut cache = Cache::default();
+        cache.put(
+            &file_path,
+            &config_path,
+            &registry_path,
+            "batch",
+            vec![result],
+        );
+        cache.save(&cache_path).unwrap();
+        let current = fs::read_to_string(&cache_path).unwrap();
+        assert_eq!(Cache::load(&cache_path).entries.len(), 1);
+
+        fs::write(
+            &cache_path,
+            current.replace("\"flag-argument\"", "\"Not A Rule\""),
+        )
+        .unwrap();
+        assert!(
+            Cache::load(&cache_path).entries.is_empty(),
+            "a rule id that fails RuleId::new must not load from cache.json"
+        );
     }
     #[test]
     #[allow(non_snake_case)]

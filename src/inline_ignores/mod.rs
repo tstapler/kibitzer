@@ -16,7 +16,7 @@ mod tests;
 
 pub use apply::{InlineIgnoreContext, InlineIgnoreMode, SuppressionCounts};
 pub(crate) use apply::{apply_inline_ignores, capped_anchors};
-pub(crate) use hint::{HINT_RULE_LIMIT, syntax_hint, syntax_hint_limited};
+pub(crate) use hint::{HINT_RULE_LIMIT, batch_syntax_hint, syntax_hint, syntax_hint_limited};
 pub use parse::is_directive_comment;
 pub(crate) use parse::{echo_parts, near_miss_text};
 pub(crate) use rules::{anchor_rule, did_you_mean, known_rule, owned_by};

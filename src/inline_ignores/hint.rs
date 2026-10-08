@@ -25,6 +25,19 @@ pub(crate) fn comment_leader(path: &Path) -> CommentLeader {
 
 pub(crate) const HINT_RULE_LIMIT: usize = 6;
 
+/// A directive as written in a comment, with `<why>` standing for the reason.
+fn directive_example(open: &str, rule_text: &str, close: &str) -> String {
+    format!("{open} {MARKER} {rule_text} -- <why>{close}")
+}
+
+/// The batch (`kibitzer run`) footer: one generic line, since no single file's comment leader applies.
+pub(crate) fn batch_syntax_hint() -> String {
+    format!(
+        "[kibitzer] to dismiss a finding you judged acceptable: {} (docs/suppressing-checks.md)",
+        directive_example("<comment>", "<rule>", "")
+    )
+}
+
 /// The footer's one-line syntax teaching. `anchor` is the first shown finding; without it the
 /// generic `<rule>` form is rendered and `rule_ids` is ignored.
 pub(crate) fn syntax_hint(
@@ -45,8 +58,8 @@ pub(crate) fn syntax_hint_limited(
     let leader = comment_leader(path);
     let rule_text = anchor.map_or("<rule>", |(rule, _)| rule.as_str());
     let mut hint = format!(
-        "Dismiss a judged finding: {} kibitzer:ignore {rule_text} -- <why>{}, ",
-        leader.open, leader.close
+        "Dismiss a judged finding: {}, ",
+        directive_example(leader.open, rule_text, leader.close)
     );
     match anchor {
         Some((rule, line)) if FILE_SCOPE_RULES.contains(&rule.as_str()) => hint.push_str(&format!(

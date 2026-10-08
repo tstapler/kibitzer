@@ -151,6 +151,7 @@ impl ScanMemo {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
         let hash = hasher.finish();
+        // Held across the scan on purpose: a concurrent caller for the same file waits, then hits the memo.
         let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = entry.as_ref()
             && hit.path == path
