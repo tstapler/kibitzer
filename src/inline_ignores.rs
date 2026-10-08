@@ -686,9 +686,9 @@ fn covering<'a>(
 ) -> Option<(&'a Directive, &'a RuleId)> {
     let line = Line::new(finding.line);
     directives.iter().find_map(|d| {
-        d.rules()
-            .iter()
-            .find_map(|r| rule_covers(d, r, checker_name, &finding.message, line).then_some((*d, r)))
+        d.rules().iter().find_map(|r| {
+            rule_covers(d, r, checker_name, &finding.message, line).then_some((*d, r))
+        })
     })
 }
 
@@ -724,10 +724,13 @@ fn owner_matches(rule: &str, checker: &str) -> Option<bool> {
         "commented-out-code" | "over-commented" | "verbose-comment" => {
             Some(checker.starts_with("comment-quality"))
         }
-        "long-function" | "deep-nesting" | "long-parameter-list" | "flag-argument"
-        | "unreachable-code" | "replace-magic-literal" | "extract-variable" => {
-            Some(checker.starts_with("syntax-rules"))
-        }
+        "long-function"
+        | "deep-nesting"
+        | "long-parameter-list"
+        | "flag-argument"
+        | "unreachable-code"
+        | "replace-magic-literal"
+        | "extract-variable" => Some(checker.starts_with("syntax-rules")),
         "file-size" => Some(checker.ends_with("file-size")),
         _ if crate::checker::lookup(rule).is_some() => Some(checker == rule),
         _ => None,
@@ -780,8 +783,9 @@ fn unused_message(rule: &str, ran_checkers: &[&str]) -> Option<String> {
         let judged = ran_checkers
             .iter()
             .any(|c| owner_matches(rule, c) == Some(true));
-        return judged
-            .then(|| format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it"));
+        return judged.then(|| {
+            format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it")
+        });
     }
     // `[ignore-syntax]` already carries the suggestion for a near miss.
     did_you_mean(rule).is_none().then(|| {
@@ -1811,7 +1815,9 @@ mod tests {
     #[test]
     fn unused_ignores_should_SkipRule_When_OwningCheckerDisabledOrDidNotRun() {
         let d = directive_at(&["flag-argument"], 9, 9, true);
-        assert!(unused_ignores(&[d.clone()], &[], &["em-dash-overuse"], None).is_empty());
+        assert!(
+            unused_ignores(std::slice::from_ref(&d), &[], &["em-dash-overuse"], None).is_empty()
+        );
         assert!(unused_ignores(&[d], &[], &[], None).is_empty());
     }
 
@@ -1832,7 +1838,7 @@ mod tests {
             "[foo] used but never defined",
         );
         let ran = ["markdown-link-integrity"];
-        assert!(unused_ignores(&[d.clone()], &[f], &ran, None).is_empty());
+        assert!(unused_ignores(std::slice::from_ref(&d), &[f], &ran, None).is_empty());
         assert_eq!(unused_ignores(&[d], &[], &ran, None).len(), 1);
     }
 
@@ -1853,7 +1859,12 @@ mod tests {
         let near = directive_at(&["flag-argumnt"], 9, 9, true);
         assert!(unused_ignores(&[near], &[], SYNTAX, None).is_empty());
         let plugin = directive_at(&["plugin-only-rule"], 9, 9, true);
-        let f = raw("plugin-check", "plugin-only-rule", 10, "[plugin-only-rule] x");
+        let f = raw(
+            "plugin-check",
+            "plugin-only-rule",
+            10,
+            "[plugin-only-rule] x",
+        );
         assert!(unused_ignores(&[plugin], &[f], SYNTAX, None).is_empty());
     }
 
@@ -1863,7 +1874,11 @@ mod tests {
         let f = raw("syntax-rules-go", "long-function", 10, "[long-function] x");
         let out = unused_ignores(&[d], &[f], SYNTAX, None);
         assert_eq!(out.len(), 1);
-        assert!(out[0].message.contains("flag-argument"), "{}", out[0].message);
+        assert!(
+            out[0].message.contains("flag-argument"),
+            "{}",
+            out[0].message
+        );
     }
 
     #[test]

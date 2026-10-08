@@ -881,7 +881,11 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[flag-argument]")),
             "backtest must measure raw checker output, ignores included: {:?}",
-            report.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+            report
+                .findings
+                .iter()
+                .map(|f| &f.message)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -145,7 +145,8 @@ fn kibitzer_run_should_PrintSyntaxHintOnce_When_AtLeastOneFindingReported() {
 #[test]
 fn kibitzer_run_should_PrintHintBeforeFooter_When_FindingAndSuppressionBothPresent() {
     let dir = temp_dir("hint-order");
-    let source = format!("{TWO_COVERED_GO}\nfunc h(d bool) {{\n\tif d {{\n\t\tprintln(\"z\")\n\t}}\n}}\n");
+    let source =
+        format!("{TWO_COVERED_GO}\nfunc h(d bool) {{\n\tif d {{\n\t\tprintln(\"z\")\n\t}}\n}}\n");
     std::fs::write(dir.join("main.go"), source).unwrap();
     let stdout = run_with_args(&dir, &[]);
     let lines: Vec<&str> = stdout.lines().collect();
