@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 
@@ -8,7 +9,7 @@ use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_effective_config};
-use crate::inline_ignores::{InlineIgnoreMode, SuppressionCounts};
+use crate::inline_ignores::{InlineIgnoreContext, InlineIgnoreMode, SuppressionCounts};
 
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
@@ -171,7 +172,27 @@ fn run_batch_collect(
         }
     }
 
+    lines.extend(suppression_footer(&accepted.inline));
     Ok((any_blocking_failure, lines))
+}
+
+/// Repo-wide count, so 1-4 ignores per file across many files still add up to a visible total.
+fn suppression_footer(ctx: &InlineIgnoreContext) -> Option<String> {
+    let counts = ctx.counter.as_ref()?;
+    let total = counts.total.load(Ordering::Relaxed);
+    if total == 0 {
+        return None;
+    }
+    let blocking = counts.blocking.load(Ordering::Relaxed);
+    let noun = if total == 1 { "finding" } else { "findings" };
+    let blocking_part = if blocking > 0 {
+        format!(" ({blocking} from blocking checks)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "[kibitzer] {total} {noun} suppressed inline{blocking_part} (rerun with --no-inline-ignores to see them)"
+    ))
 }
 
 #[cfg(test)]

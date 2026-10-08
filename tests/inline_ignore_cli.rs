@@ -78,3 +78,50 @@ fn kibitzer_run_should_PrintCoveredFinding_When_NoInlineIgnoresFlag() {
     assert!(!default.contains("[flag-argument]"), "{default}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const TWO_COVERED_GO: &str = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc g(c bool) {\n\tif c {\n\t\tprintln(\"y\")\n\t}\n}\n";
+const COVERED_MD: &str = "# T\n\n<!-- kibitzer:ignore markdown-link-integrity -- placeholder for later -->\nSee [foo] here.\n";
+
+fn last_line(stdout: &str) -> &str {
+    stdout.lines().last().unwrap_or_default()
+}
+
+#[test]
+fn kibitzer_run_should_PrintFooterWithCount_When_ThreeSuppressed() {
+    let dir = temp_dir("footer-count");
+    std::fs::write(dir.join("main.go"), TWO_COVERED_GO).unwrap();
+    std::fs::write(dir.join("notes.md"), COVERED_MD).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert_eq!(
+        last_line(&stdout),
+        "[kibitzer] 3 findings suppressed inline (1 from blocking checks) (rerun with --no-inline-ignores to see them)",
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_OmitBlockingShare_When_NoBlockingFindingSuppressed() {
+    let dir = temp_dir("footer-no-blocking");
+    std::fs::write(dir.join("main.go"), TWO_COVERED_GO).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert_eq!(
+        last_line(&stdout),
+        "[kibitzer] 2 findings suppressed inline (rerun with --no-inline-ignores to see them)",
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_PrintNoFooter_When_NothingSuppressed() {
+    let dir = temp_dir("footer-none");
+    std::fs::write(dir.join("main.go"), TWO_COVERED_GO).unwrap();
+    let raw = run_with_args(&dir, &["--no-inline-ignores"]);
+    assert!(!raw.contains("suppressed inline"), "{raw}");
+    let clean = temp_dir("footer-clean");
+    std::fs::write(clean.join("main.go"), "package main\n").unwrap();
+    assert!(!run_with_args(&clean, &[]).contains("suppressed inline"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&clean);
+}
