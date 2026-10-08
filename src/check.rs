@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::accepted_findings::{AcceptedFindings, FilterOutcome};
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
-use crate::inline_ignores::InlineOutcome;
+use crate::inline_ignores::{
+    InlineIgnoreContext, InlineOutcome, Line, anchor_rule, apply_inline_ignores,
+};
 use crate::plugin::Registry;
 
 /// Beyond this many lines, `describe()` truncates the command's raw output and points
@@ -465,23 +467,33 @@ fn run_native_check(
     // propagating, matching the shell-out path above where a command's own failure is
     // captured as `passed_raw = false` rather than aborting the whole batch — a single
     // bad file shouldn't kill every other check/file in the run.
-    let (mut combined, passed_raw) =
-        match run_checker_against_file(checker_name, file_path, check.options.as_ref()) {
-            Ok(result) => result,
-            Err(err) => {
-                return Ok(CheckResult {
-                    check_name: check.name.clone(),
-                    severity: check.severity,
-                    passed: false,
-                    output: format!("{err:#}"),
-                    message: check.message.clone(),
-                    command: cmd_str,
-                    findings: Vec::new(),
-                    plugin_missing: false,
-                    inline: InlineOutcome::default(),
-                });
-            }
-        };
+    let SourceCheck {
+        mut combined,
+        passed: passed_raw,
+        findings: kept_findings,
+        inline: mut inline_outcome,
+    } = match run_checker_against_file(
+        checker_name,
+        file_path,
+        check.options.as_ref(),
+        INLINE_SEVERITY_PLACEHOLDER,
+        &accepted.inline,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(CheckResult {
+                check_name: check.name.clone(),
+                severity: check.severity,
+                passed: false,
+                output: format!("{err:#}"),
+                message: check.message.clone(),
+                command: cmd_str,
+                findings: Vec::new(),
+                plugin_missing: false,
+                inline: InlineOutcome::default(),
+            });
+        }
+    };
 
     let passed = if let Some(ranges) = changed_lines {
         let (scoped, scoped_passed) =
@@ -511,6 +523,8 @@ fn run_native_check(
             file_path,
             changed_lines,
             check.options.as_ref(),
+            INLINE_SEVERITY_PLACEHOLDER,
+            &accepted.inline,
         );
         if let Some(false) = baseline {
             severity = Severity::Advisory;
@@ -522,6 +536,24 @@ fn run_native_check(
         }
     }
 
+    // `shown` is computed from the final text so a finding scoped out or accepted-dropped
+    // never supplies a hook anchor; matching the rendered first line avoids parsing rules out of text.
+    let shown_lines: std::collections::HashSet<&str> = combined.lines().collect();
+    inline_outcome.shown = kept_findings
+        .iter()
+        .filter(|f| {
+            let rendered = render_finding(file_path, f);
+            shown_lines.contains(rendered.lines().next().unwrap_or_default())
+        })
+        .take(MAX_INLINE_ANCHORS)
+        .map(|f| (anchor_rule(checker_name, f), Line::new(f.line)))
+        .collect();
+    inline_outcome.kept = kept_findings
+        .iter()
+        .take(MAX_INLINE_ANCHORS)
+        .map(|f| (anchor_rule(checker_name, f), Line::new(f.line)))
+        .collect();
+
     Ok(CheckResult {
         check_name: check.name.clone(),
         severity,
@@ -531,9 +563,12 @@ fn run_native_check(
         command: cmd_str,
         findings: Vec::new(),
         plugin_missing: false,
-        inline: InlineOutcome::default(),
+        inline: inline_outcome,
     })
 }
+
+/// Stands in for the check's real severity until Task 1.2.2b2 threads it through.
+const INLINE_SEVERITY_PLACEHOLDER: Severity = Severity::Advisory;
 
 /// Drops accepted findings (`accepted_findings::ACCEPTED_FINDINGS_DIR`) from `combined`, run after
 /// diff-scoping so an untouched line never needs this at all. Native-only: a shell-out
@@ -565,17 +600,57 @@ fn run_checker_against_source(
     file_path: &Path,
     source: &str,
     options: Option<&serde_json::Value>,
-) -> anyhow::Result<(String, bool)> {
+    severity: Severity,
+    inline_ctx: &InlineIgnoreContext,
+) -> anyhow::Result<SourceCheck> {
     let findings =
         crate::checker::run_checker_configured(checker_name, file_path, source, options)?;
-    let passed = findings.is_empty();
-    let combined = findings
+    let applied = apply_inline_ignores(
+        findings,
+        file_path,
+        source,
+        checker_name,
+        severity,
+        inline_ctx,
+    );
+    let combined = applied
+        .kept
         .iter()
-        .map(|f| format!("{}:{}: {}", file_path.display(), f.line, f.message))
+        .map(|f| render_finding(file_path, f))
         .collect::<Vec<_>>()
         .join("\n");
-    Ok((combined, passed))
+    Ok(SourceCheck {
+        combined,
+        passed: applied.kept.is_empty(),
+        findings: applied.kept,
+        inline: InlineOutcome {
+            dropped: applied.dropped,
+            ..InlineOutcome::default()
+        },
+    })
 }
+
+fn render_finding(file_path: &Path, finding: &crate::checker::Finding) -> String {
+    format!(
+        "{}:{}: {}",
+        file_path.display(),
+        finding.line,
+        finding.message
+    )
+}
+
+/// Result of one native checker run after inline filtering. `findings` is the structured
+/// kept list, so nothing downstream has to parse rule or line back out of `combined`.
+struct SourceCheck {
+    combined: String,
+    passed: bool,
+    findings: Vec<crate::checker::Finding>,
+    /// Only `dropped` is filled here; `shown` and `kept` are computed in `run_native_check`.
+    inline: InlineOutcome,
+}
+
+/// Most anchors a `CheckResult` keeps; the footer only names the first and the hook is capped.
+const MAX_INLINE_ANCHORS: usize = 20;
 
 /// Native per-file checks skip any file at or above this size rather than parsing it.
 /// Now that [`crate::config::default_checks`] turns every native checker on for every
@@ -591,15 +666,29 @@ fn run_checker_against_file(
     checker_name: &str,
     file_path: &Path,
     options: Option<&serde_json::Value>,
-) -> anyhow::Result<(String, bool)> {
+    severity: Severity,
+    inline_ctx: &InlineIgnoreContext,
+) -> anyhow::Result<SourceCheck> {
     if let Ok(metadata) = std::fs::metadata(file_path)
         && metadata.len() > MAX_NATIVE_CHECK_BYTES
     {
-        return Ok((String::new(), true));
+        return Ok(SourceCheck {
+            combined: String::new(),
+            passed: true,
+            findings: Vec::new(),
+            inline: InlineOutcome::default(),
+        });
     }
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("reading {}", file_path.display()))?;
-    run_checker_against_source(checker_name, file_path, &source, options)
+    run_checker_against_source(
+        checker_name,
+        file_path,
+        &source,
+        options,
+        severity,
+        inline_ctx,
+    )
 }
 
 /// Native-checker counterpart to [`check_against_git_head`]: same git-HEAD comparison, but
@@ -611,6 +700,8 @@ fn check_native_against_git_head(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     options: Option<&serde_json::Value>,
+    severity: Severity,
+    inline_ctx: &InlineIgnoreContext,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
     let show = Command::new("git")
@@ -633,8 +724,21 @@ fn check_native_against_git_head(
     }
 
     let source = String::from_utf8(show.stdout).ok()?;
-    let (combined, passed_raw) =
-        run_checker_against_source(checker_name, file_path, &source, options).ok()?;
+    // Replays honor the run's mode but never feed its counter.
+    let replay_ctx = inline_ctx.without_counter();
+    let SourceCheck {
+        combined,
+        passed: passed_raw,
+        ..
+    } = run_checker_against_source(
+        checker_name,
+        file_path,
+        &source,
+        options,
+        severity,
+        &replay_ctx,
+    )
+    .ok()?;
 
     let passed = if let Some(ranges) = &head_ranges {
         let (_, scoped_passed) =
@@ -952,6 +1056,8 @@ pub(crate) fn check_predates_git_head(
             file_path,
             changed_lines,
             check.options.as_ref(),
+            check.severity,
+            &InlineIgnoreContext::default(),
         );
     }
     let command = check.command.as_deref()?;
@@ -3055,5 +3161,318 @@ mod findings_wiring_tests {
             .expect("a pre-`findings`-field CheckResult must still deserialize");
         assert!(result.findings.is_empty());
         assert_eq!(result.check_name, "component-deps");
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod inline_seam_tests {
+    use super::*;
+    use crate::accepted_findings::AcceptedFinding;
+    use crate::inline_ignores::RuleId;
+
+    const IGNORE: &str = "// kibitzer:ignore flag-argument -- legacy api pinned\n";
+    const FUNC_F: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+    const FUNC_G: &str = "func g(c bool) {\n\tif c {\n\t\tprintln(\"y\")\n\t}\n}\n";
+    const FUNC_H: &str = "func h(d bool) {\n\tif d {\n\t\tprintln(\"z\")\n\t}\n}\n";
+
+    /// Two flag-argument findings, at the `func` lines of `f` and `g`.
+    fn go_source(f_prefix: &str, g_prefix: &str) -> String {
+        format!("package main\n\n{f_prefix}{FUNC_F}\n{g_prefix}{FUNC_G}")
+    }
+
+    fn run_src(source: &str, ctx: &InlineIgnoreContext) -> SourceCheck {
+        run_checker_against_source(
+            "syntax-rules",
+            Path::new("x.go"),
+            source,
+            None,
+            Severity::Advisory,
+            ctx,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_checker_against_source_should_DropFinding_When_WholeLineIgnoreAbove() {
+        let out = run_src(&go_source(IGNORE, ""), &InlineIgnoreContext::default());
+        assert!(!out.passed);
+        assert!(
+            out.combined.contains("x.go:10: [flag-argument]"),
+            "{}",
+            out.combined
+        );
+        assert!(!out.combined.contains("x.go:4:"), "{}", out.combined);
+        assert_eq!(out.inline.dropped.len(), 1);
+    }
+
+    #[test]
+    fn run_checker_against_source_should_Pass_When_AllFindingsCovered() {
+        let out = run_src(&go_source(IGNORE, IGNORE), &InlineIgnoreContext::default());
+        assert!(out.passed);
+        assert!(out.combined.is_empty());
+        assert!(out.findings.is_empty());
+        assert_eq!(out.inline.dropped.len(), 2);
+    }
+
+    #[test]
+    fn run_checker_against_source_should_KeepFinding_When_DirectiveTwoLinesAbove() {
+        let out = run_src(
+            &go_source(
+                "// kibitzer:ignore flag-argument -- legacy api pinned\n\n",
+                IGNORE,
+            ),
+            &InlineIgnoreContext::default(),
+        );
+        assert!(out.combined.contains("x.go:5:"), "{}", out.combined);
+    }
+
+    #[test]
+    fn run_checker_against_source_should_KeepFinding_When_DirectiveMalformed() {
+        let out = run_src(
+            &go_source("// kibitzer:ignore flag-argument\n", ""),
+            &InlineIgnoreContext::default(),
+        );
+        assert_eq!(out.findings.len(), 2);
+        assert!(out.inline.dropped.is_empty());
+    }
+
+    #[test]
+    fn run_checker_against_source_should_ReturnRawFindings_When_ModeDisabled() {
+        let out = run_src(&go_source(IGNORE, IGNORE), &InlineIgnoreContext::disabled());
+        assert_eq!(out.findings.len(), 2);
+        assert!(!out.passed);
+    }
+
+    #[test]
+    fn run_checker_against_source_should_MatchCheckerName_When_NoBracketPrefix() {
+        let source = "package main\n\n// kibitzer:ignore primitive-obsession -- ids are plain strings\nfunc f(a, b string) {}\n";
+        let ctx = InlineIgnoreContext::default();
+        let out = run_checker_against_source(
+            "primitive-obsession",
+            Path::new("x.go"),
+            source,
+            None,
+            Severity::Advisory,
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.passed, "{}", out.combined);
+        let raw = run_checker_against_source(
+            "primitive-obsession",
+            Path::new("x.go"),
+            source,
+            None,
+            Severity::Advisory,
+            &InlineIgnoreContext::disabled(),
+        )
+        .unwrap();
+        assert!(!raw.passed);
+    }
+
+    #[test]
+    fn ignore_should_SurviveEdits_When_LinesInsertedAbove() {
+        let source = format!(
+            "// license\n// header\n// lines\n// to\n// add\n{}",
+            go_source(IGNORE, IGNORE)
+        );
+        assert!(run_src(&source, &InlineIgnoreContext::default()).passed);
+    }
+
+    #[test]
+    fn ignore_should_StopSuppressing_When_FindingMovesAwayFromComment() {
+        let source = go_source(&format!("{IGNORE}\n"), IGNORE);
+        let out = run_src(&source, &InlineIgnoreContext::default());
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].line, 5);
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-inline-seam-{}-{name}-{}",
+            std::process::id(),
+            TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn flag_check(severity: Severity) -> Check {
+        Check {
+            name: "syntax-rules-go".to_string(),
+            command: None,
+            checker: Some("syntax-rules".to_string()),
+            architecture_checker: None,
+            severity,
+            scope: vec![],
+            triggers: vec![],
+            message: None,
+            output_format: None,
+            options: None,
+        }
+    }
+
+    fn accept(rule: &str, line: usize, content: &str) -> AcceptedFinding {
+        AcceptedFinding {
+            rule: rule.to_string(),
+            file: "main.go".to_string(),
+            line,
+            content: content.to_string(),
+            reason: "kept on purpose".to_string(),
+        }
+    }
+
+    /// Findings at lines 3, 9 and 15.
+    fn three_findings() -> String {
+        format!("package main\n\n{FUNC_F}\n{FUNC_G}\n{FUNC_H}")
+    }
+
+    fn native(
+        dir: &Path,
+        source: &str,
+        changed: Option<&[(usize, usize)]>,
+        accepted: &AcceptedFindings,
+    ) -> CheckResult {
+        let file = dir.join("main.go");
+        std::fs::write(&file, source).unwrap();
+        run_native_check(
+            &flag_check(Severity::Advisory),
+            "syntax-rules",
+            dir,
+            &file,
+            changed,
+            accepted,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_native_check_should_ExcludeScopedOutAndAcceptedFindings_When_ComputingShown() {
+        let dir = tmp_dir("shown");
+        let accepted = AcceptedFindings {
+            accepted: vec![accept("flag-argument", 9, "func g(c bool) {")],
+            ..Default::default()
+        };
+        let result = native(&dir, &three_findings(), Some(&[(3, 3), (9, 9)]), &accepted);
+        let rule = |l: usize| (RuleId::new("flag-argument").unwrap(), Line::new(l));
+        assert_eq!(result.inline.shown, vec![rule(3)]);
+        assert_eq!(result.inline.first_anchor().map(|(_, l)| l.get()), Some(3));
+        assert_eq!(result.inline.kept, vec![rule(3), rule(9), rule(15)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_native_check_should_ReportDropped_When_IgnoreCovers() {
+        let dir = tmp_dir("dropped");
+        let source = format!("package main\n\n{IGNORE}{FUNC_F}\n{FUNC_G}");
+        let result = native(&dir, &source, None, &AcceptedFindings::default());
+        assert_eq!(result.inline.dropped.len(), 1);
+        assert_eq!(result.inline.dropped[0].finding_line.get(), 4);
+        assert_eq!(result.inline.shown.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_entry_should_StillSuppress_When_NoInlineDirective() {
+        let dir = tmp_dir("accepted-only");
+        let accepted = AcceptedFindings {
+            accepted: vec![
+                accept("flag-argument", 3, "func f(b bool) {"),
+                accept("flag-argument", 9, "func g(c bool) {"),
+            ],
+            ..Default::default()
+        };
+        let result = native(&dir, &go_source("", ""), None, &accepted);
+        assert!(result.passed, "{}", result.output);
+        assert!(result.inline.dropped.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_entry_should_NotBeAffected_When_InlineDisabled() {
+        let dir = tmp_dir("accepted-disabled");
+        let accepted = AcceptedFindings {
+            accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
+            inline: InlineIgnoreContext::disabled(),
+            ..Default::default()
+        };
+        let result = native(&dir, &go_source(IGNORE, IGNORE), None, &accepted);
+        assert!(!result.passed);
+        assert!(result.output.contains("main.go:11:"), "{}", result.output);
+        assert!(!result.output.contains("main.go:4:"), "{}", result.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_should_RunBeforeAccepted_When_BothMatch() {
+        let dir = tmp_dir("both");
+        let accepted = AcceptedFindings {
+            accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
+            ..Default::default()
+        };
+        let result = native(&dir, &go_source(IGNORE, ""), None, &accepted);
+        assert_eq!(
+            result.inline.dropped.len(),
+            1,
+            "inline takes the finding first"
+        );
+        assert!(result.output.contains("main.go:10:"), "{}", result.output);
+        assert!(!result.output.contains("main.go:4:"), "{}", result.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_DropFinding_When_IgnoreCoversChangedLine() {
+        let dir = tmp_dir("trigger");
+        let file = dir.join("main.go");
+        std::fs::write(&file, go_source(IGNORE, "")).unwrap();
+        let results = run_checks_for_trigger(
+            &[flag_check(Severity::Advisory)],
+            "PostToolUse",
+            &dir,
+            &file,
+            Some(&[(4, 4)]),
+            &Registry::default(),
+            &AcceptedFindings::default(),
+        )
+        .unwrap();
+        assert!(results.iter().all(|r| r.passed), "{results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_native_against_git_head_should_HonorIgnore_When_IgnorePresentAtHead() {
+        let dir = tmp_dir("head");
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        let file = dir.join("main.go");
+        std::fs::write(&file, go_source(IGNORE, IGNORE)).unwrap();
+        git(&["add", "main.go"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let at_head = |ctx: &InlineIgnoreContext| {
+            check_native_against_git_head(
+                "syntax-rules",
+                &dir,
+                &file,
+                None,
+                None,
+                Severity::Blocking,
+                ctx,
+            )
+        };
+        assert_eq!(at_head(&InlineIgnoreContext::default()), Some(true));
+        assert_eq!(at_head(&InlineIgnoreContext::disabled()), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

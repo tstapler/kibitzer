@@ -496,11 +496,12 @@ impl InlineIgnoreContext {
         }
     }
 
-    /// Same mode and memo, but replays (HEAD baseline) are not counted.
+    /// Same mode, no counter and a fresh memo: a HEAD-baseline replay scans different
+    /// content for the same path and must neither be counted nor evict the live entry.
     pub fn without_counter(&self) -> Self {
         InlineIgnoreContext {
-            counter: None,
-            ..self.clone()
+            mode: self.mode,
+            ..Default::default()
         }
     }
 }
