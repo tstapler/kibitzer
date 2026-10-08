@@ -49,6 +49,10 @@ impl Checker for InlineIgnoreChecker {
         &GLOBS
     }
 
+    fn tolerates_unreadable_files(&self) -> bool {
+        true
+    }
+
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
         let lines: Vec<&str> = ctx.source.lines().collect();
         let mut findings = Vec::new();

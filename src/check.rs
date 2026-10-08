@@ -507,6 +507,10 @@ fn raw_findings_for_check(
         .collect())
 }
 
+fn tolerates_unreadable_files(checker_name: &str) -> bool {
+    crate::checker::lookup(checker_name).is_some_and(|c| c.tolerates_unreadable_files())
+}
+
 fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<SourceCheck> {
     let checker_name = run.checker_name;
     if let Ok(metadata) = std::fs::metadata(file_path)
@@ -516,8 +520,7 @@ fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<
     }
     let source = match std::fs::read_to_string(file_path) {
         Ok(source) => source,
-        // This checker runs on every walked file, so binary or unreadable ones are not failures.
-        Err(_) if checker_name == crate::checkers::inline_ignore::NAME => {
+        Err(_) if tolerates_unreadable_files(checker_name) => {
             return Ok(SourceCheck::passing());
         }
         Err(err) => {

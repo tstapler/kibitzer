@@ -163,6 +163,12 @@ pub trait Checker {
     fn configure(&self, _options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
         Ok(None)
     }
+
+    /// Whether a file that cannot be read as UTF-8 text is a pass rather than a failure.
+    /// True only for a checker that runs on every walked file, binary ones included.
+    fn tolerates_unreadable_files(&self) -> bool {
+        false
+    }
 }
 
 /// One native checker's self-registration into [`registry`]. A checker's own module
