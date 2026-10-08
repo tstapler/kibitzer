@@ -82,7 +82,7 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
 fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
     let (config, repo_root) = find_effective_config(path)?;
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
     let results = run_checks_for_trigger(
         &config.checks,
         LSP_TRIGGER,
@@ -90,7 +90,7 @@ fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
         path,
         None,
         &registry,
-        &accepted,
+        &run_ctx,
     )?;
     Ok(results
         .iter()

@@ -40,6 +40,7 @@ mod node_kind;
 mod plugin;
 mod root_cause_clusters;
 mod run;
+mod run_context;
 mod schema;
 mod single_call_site_delegation;
 mod status;

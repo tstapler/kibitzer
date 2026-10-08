@@ -133,11 +133,11 @@ fn run_batch_collect(
     // `accepted_findings::ACCEPTED_FINDINGS_DIR` must surface as one clean error here,
     // before any file's checks run, rather than failing nondeterministically mid-batch
     // depending on file-walk order.
-    let mut accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
     // One counter per run (never a global) so parallel runs and tests cannot share a count.
-    accepted.inline.counter = Some(Arc::new(SuppressionCounts::default()));
+    run_ctx.inline.counter = Some(Arc::new(SuppressionCounts::default()));
     if no_inline_ignores {
-        accepted.inline.mode = InlineIgnoreMode::Disabled;
+        run_ctx.inline.mode = InlineIgnoreMode::Disabled;
     }
 
     for check in &repo_checks {
@@ -147,7 +147,7 @@ fn run_batch_collect(
         let result = if check.architecture_checker.is_some() {
             run_architecture_check(check, &repo_root, &files, &arch_config)?
         } else {
-            run_check(check, &repo_root, &repo_root, None, &registry, &accepted)?
+            run_check(check, &repo_root, &repo_root, None, &registry, &run_ctx)?
         };
         if !result.passed && has_blocking_finding(&result) {
             any_blocking_failure = true;
@@ -163,13 +163,13 @@ fn run_batch_collect(
             file,
             None,
             &registry,
-            &accepted,
+            &run_ctx,
         )?;
         // With ignores disabled nothing is ever dropped, so every rule would look unknown.
         let audit = if no_inline_ignores {
             Vec::new()
         } else {
-            crate::inline_post_pass::unknown_rule_advisories(file, &results, &accepted)
+            crate::inline_post_pass::unknown_rule_advisories(file, &results, &run_ctx)
         };
         for result in results.iter().chain(&audit) {
             if !result.passed && has_blocking_finding(result) {
@@ -182,7 +182,7 @@ fn run_batch_collect(
     if !lines.is_empty() {
         lines.push(SYNTAX_HINT.to_string());
     }
-    lines.extend(suppression_footer(&accepted.inline));
+    lines.extend(suppression_footer(&run_ctx.inline));
     Ok((any_blocking_failure, lines))
 }
 

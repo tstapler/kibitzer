@@ -167,7 +167,7 @@ fn handle_run_checks(
     // Loaded once for this request's whole check loop, not once per check — see
     // `run_checks_for_trigger`'s doc comment.
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -175,7 +175,7 @@ fn handle_run_checks(
         file_path,
         changed_lines,
         &registry,
-        &accepted,
+        &run_ctx,
     )?;
 
     if let Ok(mut guard) = cache.lock() {
@@ -347,7 +347,7 @@ fn run_uncached(
     let (config, repo_root) = find_effective_config(cwd)?;
     let config_path = resolve_config_path(&repo_root);
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -355,7 +355,7 @@ fn run_uncached(
         file_path,
         changed_lines,
         &registry,
-        &accepted,
+        &run_ctx,
     )?;
 
     let cache_path = default_cache_path();

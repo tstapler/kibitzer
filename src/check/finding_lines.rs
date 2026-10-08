@@ -134,11 +134,11 @@ mod tests {
     /// that itself spans lines; output must equal what text-level scoping produces.
     #[test]
     fn run_native_check_should_MatchTextScoping_When_MessageSpansLines() {
-        use crate::accepted_findings::AcceptedFindings;
         use crate::check::{
             NativeRun, run_checker_against_file, run_native_check, scope_output_to_changed_lines,
         };
         use crate::config::{Check, Severity};
+        use crate::run_context::RunContext;
         let dir = std::env::temp_dir().join(format!("kibitzer-multiline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.rs");
@@ -182,7 +182,7 @@ mod tests {
             &dir,
             &file,
             Some(&ranges),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         let (expected, expected_passed) =

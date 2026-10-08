@@ -804,7 +804,7 @@ impl KibitzerServer {
         };
         // Loaded once for the whole assessment (every checker, every file below)
         // instead of once per (file, checker) pair — same rationale as `registry`.
-        let accepted = match crate::accepted_findings::find_accepted_findings(&repo_root) {
+        let run_ctx = match crate::run_context::RunContext::load(&repo_root) {
             Ok(a) => a,
             Err(e) => return format!("error reading accepted findings: {e}"),
         };
@@ -912,7 +912,7 @@ impl KibitzerServer {
             let no_plugins = crate::plugin::Registry::default();
             for file in &files {
                 let result =
-                    match run_check(&synthetic, &repo_root, file, None, &no_plugins, &accepted) {
+                    match run_check(&synthetic, &repo_root, file, None, &no_plugins, &run_ctx) {
                         Ok(r) => r,
                         Err(e) => {
                             lines.push(format!(
@@ -997,7 +997,7 @@ impl KibitzerServer {
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CheckResult>> {
             let (config, repo_root) = find_effective_config(&file_path)?;
             let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-            let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+            let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
             run_checks_for_trigger(
                 &config.checks,
                 &trigger,
@@ -1005,7 +1005,7 @@ impl KibitzerServer {
                 &file_path,
                 None,
                 &registry,
-                &accepted,
+                &run_ctx,
             )
         })
         .await;

@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::accepted_findings::{AcceptedFindings, AcceptedLines};
+use crate::accepted_findings::AcceptedLines;
 pub use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, OutputFormat, Severity};
@@ -18,6 +18,7 @@ use crate::inline_ignores::{
     capped_anchors,
 };
 use crate::plugin::Registry;
+use crate::run_context::RunContext;
 
 mod finding_lines;
 use finding_lines::FindingLines;
@@ -34,7 +35,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// 1-indexed inclusive line ranges — see [`scope_output_to_changed_lines`]. `registry`
 /// should be loaded once per batch/request by the caller (see [`run_checks_for_trigger`])
 /// rather than reloaded here — `registry.json` is read on every plugin-missing check
-/// otherwise, even for a repo with zero plugins installed. `accepted` is likewise loaded
+/// otherwise, even for a repo with zero plugins installed. `run_ctx` is likewise loaded
 /// once per batch/request by the caller, for the same reason (see
 /// [`run_checks_for_trigger`]'s doc comment).
 pub fn run_check(
@@ -43,7 +44,7 @@ pub fn run_check(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     registry: &Registry,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
     run_check_with_timeout(
         check,
@@ -52,7 +53,7 @@ pub fn run_check(
         changed_lines,
         COMMAND_TIMEOUT,
         registry,
-        accepted,
+        run_ctx,
     )
 }
 
@@ -66,7 +67,7 @@ fn run_check_with_timeout(
     changed_lines: Option<&[(usize, usize)]>,
     timeout: Duration,
     registry: &Registry,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
     if let Some(checker_name) = &check.checker {
         return run_native_check(
@@ -75,7 +76,7 @@ fn run_check_with_timeout(
             repo_root,
             file_path,
             changed_lines,
-            accepted,
+            run_ctx,
         );
     }
 
@@ -277,7 +278,7 @@ fn run_native_check(
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
     let cmd_str = format!(
         "kibitzer check native {checker_name} {}",
@@ -294,7 +295,7 @@ fn run_native_check(
         }
     }
 
-    let run = NativeRun::for_check(check, checker_name, &accepted.inline);
+    let run = NativeRun::for_check(check, checker_name, &run_ctx.inline);
 
     // Degrade to a failed CheckResult on error (e.g. an unreadable file) instead of
     // propagating, matching the shell-out path above where a command's own failure is
@@ -336,7 +337,8 @@ fn run_native_check(
         passed
     } else {
         let rel_file = relativize(repo_root, file_path);
-        let accepted_lines = AcceptedLines::for_file(file_path, &rel_file, checker_name, accepted);
+        let accepted_lines =
+            AcceptedLines::for_file(file_path, &rel_file, checker_name, &run_ctx.accepted);
         if let Some(accepted_lines) = accepted_lines {
             let keep: Vec<bool> = lines
                 .texts()
@@ -1399,7 +1401,7 @@ fn map_ranges_through_hunks(ranges: &[(usize, usize)], hunks: &[DiffHunk]) -> Ve
 /// `run.rs`) should load it exactly once for the whole batch and pass the same
 /// `&Registry` into every call, instead of reloading and reparsing `registry.json` from
 /// disk once per call (or, if reloaded again inside the per-`check` loop, once per
-/// (file, check) pair). `accepted` (`accepted_findings::ACCEPTED_FINDINGS_DIR`) must be
+/// (file, check) pair). `run_ctx` (holding `accepted_findings::ACCEPTED_FINDINGS_DIR` entries) must be
 /// loaded the same way, by the same caller, for the same reason — and, more importantly,
 /// so that a malformed accepted-findings entry surfaces as one clean error before any
 /// file work starts, rather than a `?` from inside this per-(file, check) loop
@@ -1411,7 +1413,7 @@ pub fn run_checks_for_trigger(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     registry: &Registry,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<Vec<CheckResult>> {
     let rel_path = relativize(repo_root, file_path);
     let mut results = Vec::new();
@@ -1428,7 +1430,7 @@ pub fn run_checks_for_trigger(
             file_path,
             changed_lines,
             registry,
-            accepted,
+            run_ctx,
         )?);
     }
     let extra = crate::inline_post_pass::run(crate::inline_post_pass::PostPassInput {
@@ -1436,7 +1438,7 @@ pub fn run_checks_for_trigger(
         file_path,
         changed_lines,
         results: &results,
-        accepted,
+        run_ctx,
         raw_rerun: &raw_findings_for_check,
     });
     results.extend(extra);
@@ -1620,7 +1622,7 @@ mod sarif_run_check_tests {
             Path::new("src/lib.rs"),
             Some(&[(1, 5)]),
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1641,7 +1643,7 @@ mod sarif_run_check_tests {
             Path::new("src/lib.rs"),
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert_eq!(result.output.trim(), "not sarif at all");
@@ -1683,7 +1685,7 @@ mod timeout_tests {
             None,
             Duration::from_millis(200),
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
 
@@ -1715,7 +1717,7 @@ mod timeout_tests {
             None,
             Duration::from_millis(200),
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
 
@@ -1782,7 +1784,7 @@ mod plugin_missing_tests {
                 Path::new("irrelevant.txt"),
                 None,
                 &registry,
-                &AcceptedFindings::default(),
+                &RunContext::default(),
             )
             .unwrap();
 
@@ -2058,7 +2060,7 @@ mod git_head_integration_tests {
             &repo.path("foo.txt"),
             Some(&[(2, 2)]),
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(!result.passed);
@@ -2161,7 +2163,7 @@ mod git_head_integration_tests {
             &repo.dir,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(!result.passed);
@@ -2529,7 +2531,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .expect("a missing file must not abort the whole check run");
         assert!(!result.passed);
@@ -2550,7 +2552,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(result.passed);
@@ -2588,7 +2590,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(
@@ -2629,7 +2631,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(result.passed);
@@ -2655,14 +2657,14 @@ mod native_check_tests {
         // Line 4 (outside/pre-existing) is excluded; line 5 (inside) is the
         // only changed line, matching this file's `{file}:{line}:` findings.
         let registry = Registry::default();
-        let accepted = AcceptedFindings::default();
+        let run_ctx = RunContext::default();
         let result = run_check(
             &blank_imports_check(),
             &dir,
             &file,
             Some(&[(5, 5)]),
             &registry,
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(!result.passed);
@@ -2677,7 +2679,7 @@ mod native_check_tests {
             &file,
             Some(&[(1, 1)]),
             &registry,
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(clean.passed);
@@ -2703,14 +2705,14 @@ mod native_check_tests {
         // Only line 7 (`LoadTLSConfig`) falls inside the edited range; line 3
         // (`certCurrent`) is pre-existing and untouched.
         let registry = Registry::default();
-        let accepted = AcceptedFindings::default();
+        let run_ctx = RunContext::default();
         let result = run_check(
             &primitive_obsession_check(),
             &dir,
             &file,
             Some(&[(7, 7)]),
             &registry,
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(!result.passed);
@@ -2724,7 +2726,7 @@ mod native_check_tests {
             &file,
             Some(&[(4, 4)]),
             &registry,
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(clean.passed);
@@ -2755,7 +2757,7 @@ mod native_check_tests {
             &file,
             Some(&[]),
             &registry,
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(result.passed, "output: {}", result.output);
@@ -2788,7 +2790,7 @@ mod native_check_tests {
             &dir,
             r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
         );
-        let accepted = crate::accepted_findings::find_accepted_findings(&dir).unwrap();
+        let run_ctx = RunContext::load(&dir).unwrap();
 
         let result = run_check(
             &primitive_obsession_check(),
@@ -2796,7 +2798,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(result.passed, "output: {}", result.output);
@@ -2821,7 +2823,7 @@ mod native_check_tests {
             &dir,
             r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
         );
-        let accepted = crate::accepted_findings::find_accepted_findings(&dir).unwrap();
+        let run_ctx = RunContext::load(&dir).unwrap();
 
         let result = run_check(
             &primitive_obsession_check(),
@@ -2829,7 +2831,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(!result.passed);
@@ -2896,7 +2898,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(result.passed, "output: {}", result.output);
@@ -2920,7 +2922,7 @@ mod native_check_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(!result.passed, "output: {}", result.output);
@@ -3037,7 +3039,7 @@ mod findings_wiring_tests {
 #[allow(non_snake_case)]
 mod inline_seam_tests {
     use super::*;
-    use crate::accepted_findings::AcceptedFinding;
+    use crate::accepted_findings::{AcceptedFinding, AcceptedFindings};
     use crate::inline_ignores::{RuleId, SuppressionCounts};
     use std::sync::Arc;
 
@@ -3235,7 +3237,7 @@ mod inline_seam_tests {
         dir: &Path,
         source: &str,
         changed: Option<&[(usize, usize)]>,
-        accepted: &AcceptedFindings,
+        run_ctx: &RunContext,
     ) -> CheckResult {
         let file = dir.join("main.go");
         std::fs::write(&file, source).unwrap();
@@ -3245,7 +3247,7 @@ mod inline_seam_tests {
             dir,
             &file,
             changed,
-            accepted,
+            run_ctx,
         )
         .unwrap()
     }
@@ -3253,11 +3255,10 @@ mod inline_seam_tests {
     #[test]
     fn run_native_check_should_ExcludeScopedOutAndAcceptedFindings_When_ComputingShown() {
         let dir = tmp_dir("shown");
-        let accepted = AcceptedFindings {
+        let run_ctx = RunContext::new(AcceptedFindings {
             accepted: vec![accept("flag-argument", 9, "func g(c bool) {")],
-            ..Default::default()
-        };
-        let result = native(&dir, &three_findings(), Some(&[(3, 3), (9, 9)]), &accepted);
+        });
+        let result = native(&dir, &three_findings(), Some(&[(3, 3), (9, 9)]), &run_ctx);
         let rule = |l: usize| crate::inline_ignores::Anchor {
             rule: RuleId::new("flag-argument").unwrap(),
             line: Line::new(l),
@@ -3272,7 +3273,7 @@ mod inline_seam_tests {
     fn run_native_check_should_ReportDropped_When_IgnoreCovers() {
         let dir = tmp_dir("dropped");
         let source = format!("package main\n\n{IGNORE}{FUNC_F}\n{FUNC_G}");
-        let result = native(&dir, &source, None, &AcceptedFindings::default());
+        let result = native(&dir, &source, None, &RunContext::default());
         assert_eq!(result.inline.dropped.len(), 1);
         assert_eq!(result.inline.dropped[0].finding_line.get(), 4);
         assert_eq!(result.inline.shown.len(), 1);
@@ -3282,14 +3283,13 @@ mod inline_seam_tests {
     #[test]
     fn accepted_entry_should_StillSuppress_When_NoInlineDirective() {
         let dir = tmp_dir("accepted-only");
-        let accepted = AcceptedFindings {
+        let run_ctx = RunContext::new(AcceptedFindings {
             accepted: vec![
                 accept("flag-argument", 3, "func f(b bool) {"),
                 accept("flag-argument", 9, "func g(c bool) {"),
             ],
-            ..Default::default()
-        };
-        let result = native(&dir, &go_source("", ""), None, &accepted);
+        });
+        let result = native(&dir, &go_source("", ""), None, &run_ctx);
         assert!(result.passed, "{}", result.output);
         assert!(result.inline.dropped.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3298,11 +3298,13 @@ mod inline_seam_tests {
     #[test]
     fn accepted_entry_should_NotBeAffected_When_InlineDisabled() {
         let dir = tmp_dir("accepted-disabled");
-        let accepted = AcceptedFindings {
-            accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
+        let run_ctx = RunContext {
+            accepted: AcceptedFindings {
+                accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
+            },
             inline: InlineIgnoreContext::disabled(),
         };
-        let result = native(&dir, &go_source(IGNORE, IGNORE), None, &accepted);
+        let result = native(&dir, &go_source(IGNORE, IGNORE), None, &run_ctx);
         assert!(!result.passed);
         assert!(result.output.contains("main.go:11:"), "{}", result.output);
         assert!(!result.output.contains("main.go:4:"), "{}", result.output);
@@ -3312,11 +3314,10 @@ mod inline_seam_tests {
     #[test]
     fn inline_should_RunBeforeAccepted_When_BothMatch() {
         let dir = tmp_dir("both");
-        let accepted = AcceptedFindings {
+        let run_ctx = RunContext::new(AcceptedFindings {
             accepted: vec![accept("flag-argument", 4, "func f(b bool) {")],
-            ..Default::default()
-        };
-        let result = native(&dir, &go_source(IGNORE, ""), None, &accepted);
+        });
+        let result = native(&dir, &go_source(IGNORE, ""), None, &run_ctx);
         assert_eq!(
             result.inline.dropped.len(),
             1,
@@ -3353,7 +3354,7 @@ mod inline_seam_tests {
             &file,
             Some(&[(4, 4)]),
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(results.iter().all(|r| r.passed), "{results:?}");
@@ -3365,7 +3366,7 @@ mod inline_seam_tests {
         let dir = tmp_dir("norerun");
         let file = dir.join("main.go");
         std::fs::write(&file, go_source(IGNORE, "")).unwrap();
-        let accepted = AcceptedFindings::default();
+        let run_ctx = RunContext::default();
         run_checks_for_trigger(
             &[flag_check(Severity::Advisory)],
             "PostToolUse",
@@ -3373,26 +3374,26 @@ mod inline_seam_tests {
             &file,
             Some(&[(8, 9)]),
             &Registry::default(),
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            accepted.inline.scan_memo.raw_reruns.load(Ordering::Relaxed),
+            run_ctx.inline.scan_memo.raw_reruns.load(Ordering::Relaxed),
             0
         );
     }
 
-    fn counting_ctx() -> (Arc<SuppressionCounts>, AcceptedFindings) {
+    fn counting_ctx() -> (Arc<SuppressionCounts>, RunContext) {
         let counter = Arc::new(SuppressionCounts::default());
-        let accepted = AcceptedFindings {
+        let run_ctx = RunContext {
             inline: InlineIgnoreContext {
                 counter: Some(Arc::clone(&counter)),
                 ..Default::default()
             },
             ..Default::default()
         };
-        (counter, accepted)
+        (counter, run_ctx)
     }
 
     #[test]
@@ -3400,7 +3401,7 @@ mod inline_seam_tests {
         let dir = tmp_dir("counts");
         let file = dir.join("main.go");
         std::fs::write(&file, format!("package main\n\n{IGNORE}{FUNC_F}")).unwrap();
-        let (counter, accepted) = counting_ctx();
+        let (counter, run_ctx) = counting_ctx();
         let run = |severity| {
             run_native_check(
                 &flag_check(severity),
@@ -3408,7 +3409,7 @@ mod inline_seam_tests {
                 &dir,
                 &file,
                 None,
-                &accepted,
+                &run_ctx,
             )
             .unwrap()
         };
@@ -3441,7 +3442,7 @@ mod inline_seam_tests {
         std::fs::write(&file, go_source(IGNORE, "")).unwrap();
         git(&["add", "main.go"]);
         git(&["commit", "-q", "-m", "init"]);
-        let (counter, accepted) = counting_ctx();
+        let (counter, run_ctx) = counting_ctx();
         // g's finding stays, so the blocking check fails and triggers the HEAD replay.
         let result = run_native_check(
             &flag_check(Severity::Blocking),
@@ -3449,7 +3450,7 @@ mod inline_seam_tests {
             &dir,
             &file,
             None,
-            &accepted,
+            &run_ctx,
         )
         .unwrap();
         assert!(!result.passed);
@@ -3541,7 +3542,7 @@ mod inline_seam_tests {
             &file,
             None,
             &Registry::default(),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3566,15 +3567,8 @@ mod inline_seam_tests {
         let dir = tmp_dir("bytes");
         let path = dir.join(file);
         std::fs::write(&path, bytes).unwrap();
-        let result = run_native_check(
-            check,
-            checker,
-            &dir,
-            &path,
-            None,
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
+        let result =
+            run_native_check(check, checker, &dir, &path, None, &RunContext::default()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         result
     }
@@ -3633,7 +3627,7 @@ mod inline_seam_tests {
             &dir,
             &file,
             Some(&[(40, 40)]),
-            &AcceptedFindings::default(),
+            &RunContext::default(),
         )
         .unwrap();
         assert!(!result.passed);

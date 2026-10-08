@@ -4,7 +4,6 @@
 
 use std::path::Path;
 
-use crate::accepted_findings::AcceptedFindings;
 use crate::check_result::CheckResult;
 use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, Severity};
@@ -12,18 +11,19 @@ use crate::inline_ignores::{
     Directive, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind, owned_by,
     rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
 };
+use crate::run_context::RunContext;
 
 /// Reruns one native check against `source` with inline ignores disabled; injected so this
 /// module does not depend on the check pipeline.
 pub(crate) type RawRerun<'a> = &'a dyn Fn(&Check, &Path, &str) -> anyhow::Result<Vec<RawFinding>>;
 
-/// Everything the post-pass may read; `checks`, `accepted` and `raw_rerun` feed the unused-ignore rerun.
+/// Everything the post-pass may read; `checks`, `run_ctx` and `raw_rerun` feed the unused-ignore rerun.
 pub(crate) struct PostPassInput<'a> {
     pub checks: &'a [Check],
     pub file_path: &'a Path,
     pub changed_lines: Option<&'a [(usize, usize)]>,
     pub results: &'a [CheckResult],
-    pub accepted: &'a AcceptedFindings,
+    pub run_ctx: &'a RunContext,
     pub raw_rerun: RawRerun<'a>,
 }
 
@@ -50,7 +50,7 @@ fn unused_advisories(input: &PostPassInput, changed_lines: &[(usize, usize)]) ->
         return Vec::new();
     };
     let scanned = input
-        .accepted
+        .run_ctx
         .inline
         .scan_memo
         .scan(input.file_path, &source);
@@ -92,12 +92,12 @@ fn located(file_path: &Path, row: Line, message: &str) -> String {
 pub(crate) fn unknown_rule_advisories(
     file_path: &Path,
     results: &[CheckResult],
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> Vec<CheckResult> {
     let Some(source) = read_markered_source(file_path) else {
         return Vec::new();
     };
-    let scanned = accepted.inline.scan_memo.scan(file_path, &source);
+    let scanned = run_ctx.inline.scan_memo.scan(file_path, &source);
     let verdicts = unowned_verdicts(valid_directives(&scanned), &first_pass(results), None);
     verdicts
         .iter()
@@ -139,7 +139,7 @@ fn rerun_owning_checks(
     for check in owners {
         #[cfg(test)]
         input
-            .accepted
+            .run_ctx
             .inline
             .scan_memo
             .raw_reruns
@@ -266,7 +266,7 @@ mod tests {
             file_path: Path::new("/repo/doc.md"),
             changed_lines,
             results,
-            accepted: &AcceptedFindings::default(),
+            run_ctx: &RunContext::default(),
             raw_rerun: &no_rerun,
         })
     }
@@ -493,7 +493,7 @@ mod tests {
             file_path: &file,
             changed_lines: Some(&[(12, 12)]),
             results: &[first],
-            accepted: &AcceptedFindings::default(),
+            run_ctx: &RunContext::default(),
             raw_rerun: &no_rerun,
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -555,7 +555,7 @@ mod tests {
             file_path: &file,
             changed_lines: Some(&[changed]),
             results: &[result_with_dropped("syntax-rules-go", Vec::new())],
-            accepted: &AcceptedFindings::default(),
+            run_ctx: &RunContext::default(),
             raw_rerun: &rerun,
         });
         let _ = std::fs::remove_dir_all(&dir);

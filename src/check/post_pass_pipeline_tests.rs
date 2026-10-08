@@ -25,7 +25,7 @@ fn run_checks_for_trigger_should_EmitBlockingSuppressedAdvisory_When_AddedDirect
         &file,
         Some(&[(3, 3)]),
         &Registry::default(),
-        &AcceptedFindings::default(),
+        &RunContext::default(),
     )
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -64,7 +64,7 @@ fn go_with_directive_at(directive_row: usize, directive: &str) -> String {
 
 struct Hook {
     results: Vec<CheckResult>,
-    accepted: AcceptedFindings,
+    run_ctx: RunContext,
 }
 
 fn run_hook(name: &str, source: &str, changed: Option<&[(usize, usize)]>) -> Hook {
@@ -73,7 +73,7 @@ fn run_hook(name: &str, source: &str, changed: Option<&[(usize, usize)]>) -> Hoo
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("x.go");
     std::fs::write(&file, source).unwrap();
-    let accepted = AcceptedFindings::default();
+    let run_ctx = RunContext::default();
     let results = crate::check::run_checks_for_trigger(
         &crate::config::default_checks(),
         "PostToolUse",
@@ -81,11 +81,11 @@ fn run_hook(name: &str, source: &str, changed: Option<&[(usize, usize)]>) -> Hoo
         &file,
         changed,
         &Registry::default(),
-        &accepted,
+        &run_ctx,
     )
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    Hook { results, accepted }
+    Hook { results, run_ctx }
 }
 
 fn unused_lines(h: &Hook) -> Vec<&str> {
@@ -97,7 +97,7 @@ fn unused_lines(h: &Hook) -> Vec<&str> {
 }
 
 fn reruns(h: &Hook) -> usize {
-    h.accepted
+    h.run_ctx
         .inline
         .scan_memo
         .raw_reruns

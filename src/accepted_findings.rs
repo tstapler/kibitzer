@@ -37,10 +37,6 @@ pub struct AcceptedFinding {
 pub struct AcceptedFindings {
     #[serde(default)]
     pub accepted: Vec<AcceptedFinding>,
-    /// Per-run inline-ignore mode, counter, and scan memo. Rides on this already-threaded
-    /// struct to avoid a new parameter on every check entry point; never read from JSON.
-    #[serde(skip)]
-    pub inline: crate::inline_ignores::InlineIgnoreContext,
 }
 
 impl AcceptedFindings {
@@ -101,10 +97,7 @@ fn read_accepted_dir(dir: &Path) -> Result<AcceptedFindings> {
         }
         accepted.push(entry);
     }
-    Ok(AcceptedFindings {
-        accepted,
-        ..Default::default()
-    })
+    Ok(AcceptedFindings { accepted })
 }
 
 /// The `[rule-id]` a checker self-prefixes its message with, or `fallback` (the
@@ -206,7 +199,7 @@ mod tests {
             serde_json::from_str(r#"{"accepted": [], "inline": {"mode": "Disabled"}}"#).unwrap();
         assert!(parsed.accepted.is_empty());
         assert_eq!(
-            parsed.inline.mode,
+            crate::run_context::RunContext::new(parsed).inline.mode,
             crate::inline_ignores::InlineIgnoreMode::Apply
         );
     }
