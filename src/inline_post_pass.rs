@@ -10,8 +10,9 @@ use crate::accepted_findings::AcceptedFindings;
 use crate::check::{CheckResult, MAX_NATIVE_CHECK_BYTES, raw_findings_for_check};
 use crate::config::{Check, Severity};
 use crate::inline_ignores::{
-    Directive, DirectiveParse, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome, Line, RawFinding,
-    Reason, RuleId, has_owner, nearest_finding_line, owned_by, rows_intersect, unused_ignores,
+    Directive, DirectiveParse, DroppedFinding, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome,
+    Line, RawFinding, Reason, RuleId, did_you_mean, has_owner, known_rule, nearest_finding_line,
+    owned_by, rows_intersect, unused_ignores,
 };
 use crate::plugin::Registry;
 
@@ -82,6 +83,68 @@ fn unused_advisories(input: &PostPassInput, changed_lines: &[(usize, usize)]) ->
                     d.start_line.get()
                 ));
             }
+        }
+    }
+    let dropped: Vec<&DroppedFinding> = input
+        .results
+        .iter()
+        .flat_map(|r| &r.inline.dropped)
+        .collect();
+    let kept: Vec<&(RuleId, Line)> = input.results.iter().flat_map(|r| &r.inline.kept).collect();
+    for (row, msg) in judge_unowned(&touched, &dropped, &ran, &kept, Some(changed_lines)) {
+        out.push(format!(
+            "{}:{}: {msg}",
+            input.file_path.display(),
+            row.get()
+        ));
+    }
+    out
+}
+
+/// Judges rules the ownership table does not cover from first-pass data only (no rerun):
+/// a rule that dropped a finding is used; otherwise the nearest surviving finding of that
+/// rule names the right row, a ran check's own name means "remove it", and a name nothing
+/// recognizes is reported as a probable typo. `rows` limits judgement to touched directives
+/// (`None` judges every directive, for `kibitzer run`). Returns `(directive row, message)`.
+pub(crate) fn judge_unowned(
+    directives: &[&Directive],
+    dropped: &[&DroppedFinding],
+    ran_checkers: &[&str],
+    kept: &[&(RuleId, Line)],
+    rows: Option<&[(usize, usize)]>,
+) -> Vec<(Line, String)> {
+    let mut out = Vec::new();
+    for d in directives {
+        if rows.is_some_and(|r| !rows_intersect(d, r)) {
+            continue;
+        }
+        for rule in d.rules().iter().filter(|r| !has_owner(r.as_str())) {
+            let used = dropped
+                .iter()
+                .any(|f| f.directive_start == d.start_line && f.rule == *rule);
+            if used {
+                continue;
+            }
+            let nearest = kept
+                .iter()
+                .filter(|(r, _)| r == rule)
+                .map(|(_, l)| *l)
+                .min_by_key(|l| (l.get().abs_diff(d.start_line.get()), l.get()));
+            let name = rule.as_str();
+            let message = if let Some(n) = nearest {
+                Some(wrong_row_message(d, rule, n))
+            } else if ran_checkers.contains(&name) {
+                Some(format!(
+                    "[unused-ignore] kibitzer:ignore {name} suppresses nothing - remove it"
+                ))
+            } else if !known_rule(name) && did_you_mean(name).is_none() {
+                Some(format!(
+                    "[unused-ignore] '{name}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+                ))
+            } else {
+                None
+            };
+            out.extend(message.map(|m| (d.start_line, m)));
         }
     }
     out
@@ -574,5 +637,128 @@ mod tests {
         let lines = unused_lines(&h);
         assert_eq!(lines.len(), 1, "{:#?}", h.results);
         assert!(lines[0].contains("first 10 lines"), "{}", lines[0]);
+    }
+    fn directive_for(rule: &str, row: usize) -> Directive {
+        Directive::new(
+            vec![RuleId::new(rule).unwrap()],
+            Reason::new("legacy API, callers pinned", &[]).unwrap(),
+            Line::new(row),
+            Line::new(row),
+            true,
+        )
+        .unwrap()
+    }
+
+    fn judge(
+        rule: &str,
+        dropped: &[DroppedFinding],
+        ran: &[&str],
+        kept: &[(RuleId, Line)],
+    ) -> Vec<(Line, String)> {
+        let d = directive_for(rule, 12);
+        let dropped: Vec<&DroppedFinding> = dropped.iter().collect();
+        let kept: Vec<&(RuleId, Line)> = kept.iter().collect();
+        judge_unowned(&[&d], &dropped, ran, &kept, Some(&[(12, 12)]))
+    }
+
+    fn kept_at(rule: &str, row: usize) -> (RuleId, Line) {
+        (RuleId::new(rule).unwrap(), Line::new(row))
+    }
+
+    #[test]
+    fn judge_unowned_should_NameNearestRow_When_SurvivingFindingOutsideChangedLines() {
+        let out = judge(
+            "acme-rule",
+            &[],
+            &[],
+            &[kept_at("acme-rule", 40), kept_at("acme-rule", 20)],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, Line::new(12));
+        assert!(
+            out[0].1.contains("the finding is at line 20"),
+            "{}",
+            out[0].1
+        );
+        assert!(out[0].1.contains("Move the comment"));
+    }
+
+    #[test]
+    fn judge_unowned_should_StaySilent_When_DirectiveIsInDroppedList() {
+        let hit = dropped(
+            "acme-rule",
+            "legacy API, callers pinned",
+            (12, 12),
+            Severity::Advisory,
+        );
+        assert!(judge("acme-rule", &[hit], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn judge_unowned_should_PointToCheckList_When_NoSurvivingFindingAndNoRanCheckMatch() {
+        let out = judge("made-up-rule", &[], &["file-size"], &[]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.contains("kibitzer check list"), "{}", out[0].1);
+        assert!(!out[0].1.contains("remove it"));
+    }
+
+    #[test]
+    fn judge_unowned_should_SayRemoveIt_When_RuleEqualsRanCheckName() {
+        let out = judge("my-shell-lint", &[], &["my-shell-lint"], &[]);
+        assert_eq!(
+            out[0].1,
+            "[unused-ignore] kibitzer:ignore my-shell-lint suppresses nothing - remove it"
+        );
+    }
+
+    #[test]
+    fn judge_unowned_should_StaySilent_When_RuleIsKnownMetaOrNearMiss() {
+        assert!(judge("ignore-volume", &[], &[], &[]).is_empty());
+        // `[ignore-syntax]` already carries the suggestion for a near miss.
+        assert!(judge("flag-argumnt", &[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn judge_unowned_should_SkipOwnedRulesAndDirectivesOutsideRows() {
+        assert!(judge("flag-argument", &[], &[], &[]).is_empty());
+        let d = directive_for("acme-rule", 50);
+        assert!(judge_unowned(&[&d], &[], &[], &[], Some(&[(1, 3)])).is_empty());
+        assert_eq!(judge_unowned(&[&d], &[], &[], &[], None).len(), 1);
+    }
+
+    #[test]
+    fn run_checks_for_trigger_should_EmitUnusedIgnore_When_UnownedRuleOnWrongRowAndSurvivingFindingExists()
+     {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-post-pass-unowned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.go");
+        std::fs::write(
+            &file,
+            go_with_directive_at(
+                12,
+                "// kibitzer:ignore acme-rule -- legacy API, callers pinned",
+            ),
+        )
+        .unwrap();
+        let mut first = result_with_dropped("acme-lint", Vec::new());
+        first.inline.kept = vec![kept_at("acme-rule", 20)];
+        let out = run(PostPassInput {
+            checks: &[],
+            repo_root: &dir,
+            file_path: &file,
+            changed_lines: Some(&[(12, 12)]),
+            results: &[first],
+            accepted: &AcceptedFindings::default(),
+            registry: &Registry::default(),
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert!(
+            out[0].output.contains("x.go:12: [unused-ignore]"),
+            "{}",
+            out[0].output
+        );
+        assert!(out[0].output.contains("the finding is at line 20"));
     }
 }
