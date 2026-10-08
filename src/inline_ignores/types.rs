@@ -34,9 +34,18 @@ fn is_rule_char(c: char) -> bool {
 }
 
 impl RuleId {
-    /// A checker's registered name used as its own rule id; checker names are trusted.
+    /// A checker's registered name used as its own rule id. A name outside `[a-z0-9-]+` is
+    /// sanitised so the id still round-trips through `Deserialize` (a cache with one that
+    /// does not is discarded whole).
     pub(super) fn from_checker_name(name: &str) -> Self {
-        RuleId(name.to_string())
+        RuleId::new(name).unwrap_or_else(|| {
+            let sanitised: String = name
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if is_rule_char(c) { c } else { '-' })
+                .collect();
+            RuleId::new(&sanitised).unwrap_or_else(|| RuleId("checker".to_string()))
+        })
     }
 
     pub fn new(text: &str) -> Option<Self> {

@@ -1283,3 +1283,27 @@ fn reason_should_RejectCorruptValue_When_DeserializedFromJson() {
     let ok: Reason = serde_json::from_str("\"legacy api pinned\"").unwrap();
     assert_eq!(serde_json::to_string(&ok).unwrap(), "\"legacy api pinned\"");
 }
+
+#[test]
+fn rule_id_should_SatisfyGrammar_When_EveryRegisteredCheckerNameUsed() {
+    for checker in crate::checker::registry() {
+        let name = checker.name();
+        assert!(
+            RuleId::new(name).is_some(),
+            "checker name {name:?} is outside [a-z0-9-]+, so it cannot be a RuleId"
+        );
+    }
+}
+
+#[test]
+fn rule_id_should_RoundTripThroughSerde_When_BuiltFromOddCheckerName() {
+    for name in ["Odd_Name.v2", "", "ünï"] {
+        let id = RuleId::from_checker_name(name);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuleId>(&json).unwrap(),
+            id,
+            "{name:?}"
+        );
+    }
+}
