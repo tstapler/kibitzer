@@ -200,10 +200,9 @@ pub fn run_hook() -> Result<ExitCode> {
         }
         // A malformed or misplaced ignore on the blocked file would otherwise stay invisible
         // exactly when the agent is stuck, so repair text goes out with the blocking lines.
-        for result in failures
-            .iter()
-            .filter(|r| r.check_name == crate::checkers::inline_ignore::NAME && r.severity != Severity::Blocking)
-        {
+        for result in failures.iter().filter(|r| {
+            r.check_name == crate::checkers::inline_ignore::NAME && r.severity != Severity::Blocking
+        }) {
             eprintln!("[kibitzer] inline-ignore: {}", result.describe());
         }
         eprintln!(
