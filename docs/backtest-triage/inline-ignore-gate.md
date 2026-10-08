@@ -99,3 +99,26 @@ and the success ack.
   `kibitzer:ignore` marker (Task 0.1.2 result above), which drops Story 3.2.1 and the marker clause from the footer.
 - Revised post-ship target (from the plan): re-surfacing rate of dismissed findings at most `R - 0.5 x G`, with
   `G = 11.9%` (literal `R`) so the replay-basis target is about `59.33% - 5.95% = 53.4%`; revised at the 30-day review.
+
+## Post-ship review checklist (Task 4.1.1f)
+Owner: tstapler. Due: release tag date + 30 calendar days, entered in the release PR when the tag is cut (the date is not
+set yet). Hard stop: day 44, then run on whatever data exists and note the slip. Single marker only (Amendment 1): no
+`list --inline`, no assumptions B or C, no metric 3.
+- [ ] **Pool the data.** Every repo and session under `~/.claude/projects` where the hook was active. Count directives added
+  in the window (`git log -S 'kibitzer:'` per repo).
+- [ ] **Sample-size rule.** Under 20 directives or under 30 dismissed findings at day 30: kill criteria are INCONCLUSIVE, not
+  triggered. Extend once to day 60 and re-run on pooled data; still short: record "insufficient use" and count it toward
+  kill criterion 2.
+- [ ] **Metric 1, re-surfacing of dismissed findings.** Run `scripts/resurface-baseline.py` on pooled post-ship replay output
+  (as in Method above), dismissed findings only (fixed ones excluded). Compare with the target `R - 0.5 x G` (about 53.4% on
+  the replay basis). A miss is kill criterion 1: revert the footer and hint teaching text first, keep `accepted/`.
+- [ ] **Guardrail.** `[blocking-suppressed]` advisories per 100 directives reviewed, at most 10. Read every one and judge the
+  reason.
+- [ ] **Assumption A, reason quality.** Read a 20-directive sample of reasons and count boilerplate that passes the two-word
+  floor. Over 10% triggers the ADR-002 stricter-reason lever.
+- [ ] **Channel mix.** Inline share of new suppressions (`git log -S 'kibitzer:'` against new `accepted/` entries), cross-checked
+  with the blocking count in the `kibitzer run` footer. Under 30% is kill criterion 2: fix the teaching surfaces (footer, MCP
+  instructions) first.
+- [ ] **Volume.** `[ignore-volume]` or weak-reason fires above 10% of directives is kill criterion 3: apply the ADR-002 levers.
+- [ ] **Record the outcome** (kill criteria in `project_plans/inline-ignore-syntax/requirements.md`, Roadmap Fit) here, with
+  the date, the counts, and whether the review was INCONCLUSIVE.

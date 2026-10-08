@@ -784,6 +784,7 @@ Dropped with the single-marker collapse (gate note `docs/backtest-triage/inline-
 ##### Task 4.1.1b: Corpus and self run (~2h)
 - Clone corpus, run, triage with `scripts/backtest-triage.py`; fix any noise (tighten near-miss regex first). Run `kibitzer run .` on this repo.
 - Files: `docs/backtest-triage/` (as needed)
+- **Phase 4 result**: two plan claims did not hold. (1) A full `kibitzer run <repo>` does not finish for the large repos (deno at 900 s; k8s, cassandra, vscode, servo, mdn, gitlab, stapler-squad at 300 s), so those were covered by a `kibitzer`-string sweep and a non-UTF-8 read-error check instead. (2) None of the 14 public corpus repos contains the string `kibitzer`, so "no false positives on prose or string mentions" was tested on the tstapler repos and the self-run, not on the public corpus. Details: `docs/backtest-triage/inline-ignore-results.md`.
 
 ##### Task 4.1.1c: Fast-path, latency, and footer net-token checks (~1h; the hook-path measurement moved earlier to Task 2.2.3d)
 - Add the structural-counter fast-path test and the relative-ratio sanity check to `src/inline_ignores.rs` (no absolute microsecond threshold). Re-measure the hook-path raw rerun once more on the final code (this repo's largest source file with a marker), compare with the Task 2.2.3d number, and record both in the PR. Measure two alternating marker files through the daemon to see whether the single-entry `ScanMemo` Mutex thrashes (Non-functional budgets). Recompute the footer break-even `p*` with the final measured footer length (Story 4.1.1 AC).
