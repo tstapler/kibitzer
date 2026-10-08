@@ -172,10 +172,10 @@ fn run_batch_collect(
             crate::inline_post_pass::unknown_rule_advisories(file, &results, &accepted)
         };
         for result in results.iter().chain(&audit) {
-            if !result.passed && has_blocking_finding(&result) {
+            if !result.passed && has_blocking_finding(result) {
                 any_blocking_failure = true;
             }
-            lines.extend(report_lines(&file.display().to_string(), &result));
+            lines.extend(report_lines(&file.display().to_string(), result));
         }
     }
 
