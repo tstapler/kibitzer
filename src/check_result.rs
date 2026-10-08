@@ -13,6 +13,13 @@ use crate::inline_ignores::InlineOutcome;
 /// failed check.
 const MAX_SUMMARY_LINES: usize = 20;
 
+/// Whether `CheckResult::summary_line` leads with the severity (`[Advisory] name: ...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryTag {
+    Plain,
+    Severity,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     pub check_name: String,
@@ -121,6 +128,24 @@ impl CheckResult {
         }
     }
 
+    /// One line naming the check and what it found. A result whose plugin is not installed is
+    /// `[skipped]`-prefixed instead of tagged, so an agent does not read "not installed" as
+    /// "ran and found a defect."
+    pub fn summary_line(&self, tag: SummaryTag) -> String {
+        match (self.plugin_missing, tag) {
+            (true, _) => format!("[skipped] {}: {}", self.check_name, self.describe()),
+            (false, SummaryTag::Severity) => {
+                format!(
+                    "[{:?}] {}: {}",
+                    self.severity,
+                    self.check_name,
+                    self.describe()
+                )
+            }
+            (false, SummaryTag::Plain) => format!("{}: {}", self.check_name, self.describe()),
+        }
+    }
+
     fn summarize_output(&self) -> String {
         let lines: Vec<&str> = self.output.trim().lines().collect();
         if lines.len() <= MAX_SUMMARY_LINES {
@@ -191,5 +216,44 @@ mod describe_tests {
     fn short_output_is_not_truncated() {
         let r = result(None, "one\ntwo\nthree");
         assert_eq!(r.describe(), "one\ntwo\nthree");
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod summary_line_tests {
+    use super::*;
+
+    fn failed() -> CheckResult {
+        CheckResult::new("kibitzer-stub-plugin", Severity::Advisory, false, "").with_message(Some(
+            "plugin 'kibitzer-stub-plugin' is not installed".to_string(),
+        ))
+    }
+
+    #[test]
+    fn hook_advisory_context_renders_skipped_prefix_for_plugin_missing_result() {
+        let line = failed()
+            .with_plugin_missing()
+            .summary_line(SummaryTag::Plain);
+        assert!(
+            line.starts_with("[skipped] kibitzer-stub-plugin:"),
+            "got: {line}"
+        );
+    }
+
+    #[test]
+    fn hook_advisory_context_renders_unprefixed_for_a_normal_failure() {
+        let line = failed().summary_line(SummaryTag::Plain);
+        assert!(!line.starts_with("[skipped]"), "got: {line}");
+        assert!(line.starts_with("kibitzer-stub-plugin:"), "got: {line}");
+    }
+
+    #[test]
+    fn summary_line_should_LeadWithSeverity_When_TagIsSeverity() {
+        let line = failed().summary_line(SummaryTag::Severity);
+        assert!(
+            line.starts_with("[Advisory] kibitzer-stub-plugin:"),
+            "got: {line}"
+        );
     }
 }

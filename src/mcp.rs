@@ -296,22 +296,13 @@ fn render_run_checks_report(results: &[CheckResult], path: &Path) -> String {
     }
     let mut lines: Vec<String> = failed
         .iter()
-        .map(|r| {
-            // Task 4.3.1c: a plugin-backed check whose binary is missing
-            // renders `[skipped]`, not `[Advisory]`/`[Blocking]` — an agent
-            // shouldn't read "not installed" as "ran and found a defect."
-            if r.plugin_missing {
-                format!("[skipped] {}: {}", r.check_name, r.describe())
-            } else {
-                format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe())
-            }
-        })
+        .map(|r| r.summary_line(crate::check_result::SummaryTag::Severity))
         .collect();
     let anchor = failed.iter().find_map(|r| r.inline.first_anchor());
     lines.push(crate::inline_ignores::syntax_hint(
         path,
         anchor,
-        &crate::hook::union_rule_ids(&failed),
+        &crate::inline_ignores::InlineOutcome::union_rule_ids(failed.iter().map(|r| &r.inline)),
     ));
     lines.join("\n")
 }

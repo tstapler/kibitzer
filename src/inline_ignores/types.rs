@@ -283,6 +283,21 @@ impl InlineOutcome {
         }
         ids
     }
+
+    /// Distinct shown rule ids across several outcomes, in order.
+    pub fn union_rule_ids<'a>(
+        outcomes: impl IntoIterator<Item = &'a InlineOutcome>,
+    ) -> Vec<&'a RuleId> {
+        let mut ids: Vec<&RuleId> = Vec::new();
+        for outcome in outcomes {
+            for id in outcome.rule_ids() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
 }
 
 /// A finding as the checker reported it, before any directive was applied. Built from

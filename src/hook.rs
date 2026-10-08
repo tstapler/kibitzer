@@ -6,11 +6,11 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::check::CheckResult;
+use crate::check_result::SummaryTag;
 use crate::config::Severity;
 use crate::daemon::run_checks_smart;
 use crate::hook_footer::advisory_footer;
-use crate::inline_ignores::RuleId;
+use crate::inline_ignores::InlineOutcome;
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -216,7 +216,7 @@ pub fn run_hook() -> Result<ExitCode> {
 
     let mut context = failures
         .iter()
-        .map(|r| render_advisory_context_line(r))
+        .map(|r| r.summary_line(SummaryTag::Plain))
         .collect::<Vec<_>>()
         .join("\n");
     context.push_str("\n\n");
@@ -224,7 +224,7 @@ pub fn run_hook() -> Result<ExitCode> {
     context.push_str(&advisory_footer(
         std::path::Path::new(&file_path),
         anchor,
-        &union_rule_ids(&failures),
+        &InlineOutcome::union_rule_ids(failures.iter().map(|r| &r.inline)),
     ));
 
     let payload = json!({
@@ -235,66 +235,6 @@ pub fn run_hook() -> Result<ExitCode> {
     });
     println!("{payload}");
     Ok(ExitCode::SUCCESS)
-}
-
-/// Distinct rule ids across every failing result, in order.
-pub(crate) fn union_rule_ids<'a>(failures: &[&'a CheckResult]) -> Vec<&'a RuleId> {
-    let mut ids: Vec<&RuleId> = Vec::new();
-    for result in failures {
-        for id in result.inline.rule_ids() {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-    }
-    ids
-}
-
-/// One line of the PostToolUse advisory `additionalContext` for a failed, non-blocking
-/// check (Task 4.3.1c). `[skipped]`-prefixed for `result.plugin_missing` — a missing
-/// plugin install, never a real check failure, so an agent shouldn't read it as "ran and
-/// found a defect." A `plugin_missing` result can never reach the *blocking* printer above
-/// instead, since `run_check`'s early return (Task 4.3.1b) forces `Severity::Advisory`.
-fn render_advisory_context_line(result: &CheckResult) -> String {
-    if result.plugin_missing {
-        format!("[skipped] {}: {}", result.check_name, result.describe())
-    } else {
-        format!("{}: {}", result.check_name, result.describe())
-    }
-}
-
-#[cfg(test)]
-mod advisory_context_rendering_tests {
-    use super::*;
-    use crate::config::Severity;
-
-    fn result(plugin_missing: bool) -> CheckResult {
-        let result = CheckResult::new("kibitzer-stub-plugin", Severity::Advisory, false, "")
-            .with_message(Some(
-                "plugin 'kibitzer-stub-plugin' is not installed".to_string(),
-            ));
-        if plugin_missing {
-            result.with_plugin_missing()
-        } else {
-            result
-        }
-    }
-
-    #[test]
-    fn hook_advisory_context_renders_skipped_prefix_for_plugin_missing_result() {
-        let line = render_advisory_context_line(&result(true));
-        assert!(
-            line.starts_with("[skipped] kibitzer-stub-plugin:"),
-            "got: {line}"
-        );
-    }
-
-    #[test]
-    fn hook_advisory_context_renders_unprefixed_for_a_normal_failure() {
-        let line = render_advisory_context_line(&result(false));
-        assert!(!line.starts_with("[skipped]"), "got: {line}");
-        assert!(line.starts_with("kibitzer-stub-plugin:"), "got: {line}");
-    }
 }
 
 #[cfg(test)]
