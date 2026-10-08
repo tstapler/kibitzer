@@ -10,7 +10,6 @@ use serde::Deserialize;
 
 use crate::accepted_findings::AcceptedLines;
 pub use crate::check_result::CheckResult;
-use crate::checker::MAX_NATIVE_CHECK_BYTES;
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 use crate::inline_ignores::{
@@ -576,13 +575,9 @@ fn tolerates_unreadable_files(checker_name: &str) -> bool {
 
 fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<SourceCheck> {
     let checker_name = run.checker_name;
-    if let Ok(metadata) = std::fs::metadata(file_path)
-        && metadata.len() > MAX_NATIVE_CHECK_BYTES
-    {
-        return Ok(SourceCheck::passing());
-    }
-    let source = match std::fs::read_to_string(file_path) {
-        Ok(source) => source,
+    let source = match crate::checker::read_native_source(file_path) {
+        Ok(crate::checker::NativeSource::Text(source)) => source,
+        Ok(crate::checker::NativeSource::TooLarge) => return Ok(SourceCheck::passing()),
         Err(_) if tolerates_unreadable_files(checker_name) => {
             return Ok(SourceCheck::passing());
         }

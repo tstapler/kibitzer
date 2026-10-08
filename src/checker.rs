@@ -15,6 +15,38 @@ use tree_sitter::Tree;
 /// anyway — is worth skipping outright rather than paying that cost every time.
 pub const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
 
+/// What `read_native_source` found at a path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeSource {
+    Text(String),
+    /// Over `MAX_NATIVE_CHECK_BYTES`: skipped, not an error.
+    TooLarge,
+}
+
+/// Reads `path` for a native check. Only regular files are opened (opening a FIFO blocks
+/// until a writer appears, hanging the hook), and the read is hard-capped at
+/// `MAX_NATIVE_CHECK_BYTES` so a file that grows after the size check cannot exhaust memory.
+pub fn read_native_source(path: &Path) -> std::io::Result<NativeSource> {
+    use std::io::{Error, ErrorKind, Read};
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if metadata.len() > MAX_NATIVE_CHECK_BYTES {
+        return Ok(NativeSource::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_NATIVE_CHECK_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_NATIVE_CHECK_BYTES {
+        return Ok(NativeSource::TooLarge);
+    }
+    String::from_utf8(bytes)
+        .map(NativeSource::Text)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e))
+}
+
 /// A finding a [`Checker`] reports against a specific line of a file. Formatted by
 /// callers as `{file}:{line}: {message}` — the convention `check.rs`'s diff-scoping
 /// parser depends on, so don't change this shape without updating that parser too.

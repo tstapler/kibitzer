@@ -482,3 +482,43 @@ fn located_should_StripControlAndBidiAndTruncate_When_PathIsHostile() {
     let long = located(Path::new(&"d/".repeat(1000)), Line::new(1), "m");
     assert!(long.len() < 300, "{} bytes", long.len());
 }
+
+fn marker_source() -> String {
+    "<!-- kibitzer:ignore a-rule -- some real reason -->\n".to_string()
+}
+
+#[test]
+fn read_markered_source_should_ReturnNone_When_FileOverSizeCapOrNotRegular() {
+    use crate::checker::MAX_NATIVE_CHECK_BYTES;
+    let dir = std::env::temp_dir().join(format!("kibitzer-pp-read-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ok = dir.join("ok.md");
+    std::fs::write(&ok, marker_source()).unwrap();
+    assert!(read_markered_source(&ok).is_some());
+
+    let mut big = marker_source().into_bytes();
+    big.resize(MAX_NATIVE_CHECK_BYTES as usize + 1, b' ');
+    let big_path = dir.join("big.md");
+    std::fs::write(&big_path, big).unwrap();
+    assert!(read_markered_source(&big_path).is_none());
+
+    let fifo = dir.join("pipe.md");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fifo2 = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_markered_source(&fifo2));
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+    if got.is_err() {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    assert_eq!(got.expect("read_markered_source hung on a FIFO"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

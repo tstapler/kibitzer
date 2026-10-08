@@ -92,7 +92,7 @@ fn build_edit_summary(tool_input: &ToolInput) -> crate::hook_log::EditSummary {
 /// "deletion-only edit flagged" entry).
 fn compute_changed_lines(
     tool_input: &ToolInput,
-    file_path: &PathBuf,
+    file_path: &std::path::Path,
 ) -> Option<Vec<(usize, usize)>> {
     if tool_input.content.is_some() {
         return None;
@@ -106,7 +106,11 @@ fn compute_changed_lines(
         return None;
     };
 
-    let file_content = std::fs::read_to_string(file_path).ok()?;
+    let Ok(crate::checker::NativeSource::Text(file_content)) =
+        crate::checker::read_native_source(file_path)
+    else {
+        return None;
+    };
     let mut ranges = Vec::new();
     let mut saw_non_empty_needle = false;
     for needle in new_strings {

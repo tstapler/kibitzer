@@ -439,3 +439,75 @@ fn check_options_reach_the_configured_native_checker() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Runs `work` on a thread and fails (instead of hanging the suite) if it does not return in
+/// time; a still-blocked FIFO open is released so the thread can end.
+fn finishes_within<T: Send + 'static>(
+    fifo: &Path,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    let out = rx.recv_timeout(std::time::Duration::from_secs(10)).ok();
+    if out.is_none() {
+        let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+    }
+    out
+}
+
+fn make_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn run_check_does_not_hang_on_a_fifo() {
+    let dir = tmp_dir("fifo");
+    let fifo = dir.join("pipe.go");
+    make_fifo(&fifo);
+    let (check, dir2, fifo2) = (primitive_obsession_check(), dir.clone(), fifo.clone());
+    let result = finishes_within(&fifo, move || {
+        run_check(
+            &check,
+            &dir2,
+            &fifo2,
+            None,
+            &Registry::default(),
+            &RunContext::default(),
+        )
+    })
+    .expect("run_check hung on a FIFO");
+    assert!(result.is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_native_source_rejects_non_regular_and_oversized_files() {
+    use crate::checker::{MAX_NATIVE_CHECK_BYTES, NativeSource, read_native_source};
+    let dir = tmp_dir("read-native");
+    let fifo = dir.join("pipe");
+    make_fifo(&fifo);
+    let fifo2 = fifo.clone();
+    let fifo_read = finishes_within(&fifo, move || read_native_source(&fifo2)).expect("hung");
+    assert!(fifo_read.is_err());
+    assert!(
+        read_native_source(&dir).is_err(),
+        "a directory is not a file"
+    );
+
+    let big = dir.join("big.txt");
+    std::fs::write(&big, vec![b'a'; MAX_NATIVE_CHECK_BYTES as usize + 1]).unwrap();
+    assert_eq!(read_native_source(&big).unwrap(), NativeSource::TooLarge);
+    let at_cap = dir.join("cap.txt");
+    std::fs::write(&at_cap, vec![b'a'; MAX_NATIVE_CHECK_BYTES as usize]).unwrap();
+    assert!(matches!(
+        read_native_source(&at_cap).unwrap(),
+        NativeSource::Text(_)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::check_result::CheckResult;
-use crate::checker::MAX_NATIVE_CHECK_BYTES;
+use crate::checker::{NativeSource, read_native_source};
 use crate::config::{Check, Severity};
 use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo, quote_reason};
 use crate::inline_ignores::{
@@ -150,15 +150,12 @@ pub(crate) fn unknown_rule_advisories(
 /// The file text, only when it is small enough for the first pass to have judged it and
 /// carries the marker; one extra page-cache-hot read per hook call.
 fn read_markered_source(file_path: &Path) -> Option<String> {
-    let too_big = std::fs::metadata(file_path)
-        .map(|m| m.len() > MAX_NATIVE_CHECK_BYTES)
-        .unwrap_or(false);
-    if too_big {
-        return None;
+    match read_native_source(file_path) {
+        Ok(NativeSource::Text(source)) if crate::inline_ignores::has_marker(&source) => {
+            Some(source)
+        }
+        _ => None,
     }
-    std::fs::read_to_string(file_path)
-        .ok()
-        .filter(|source| crate::inline_ignores::has_marker(source))
 }
 
 /// Raw findings from the checks that ran and own a rule some touched directive names.
