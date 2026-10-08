@@ -5,14 +5,18 @@
 //! Items here are not yet called from non-test code; later tasks wire them in.
 #![allow(dead_code)]
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::path::Path;
-use std::sync::LazyLock;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 use tree_sitter::Tree;
 
-use crate::checker::{GrammarCache, Language};
+use crate::checker::{Finding, GrammarCache, Language};
+use crate::config::Severity;
 use crate::markdown_text::{line_for_offset, line_start_offsets};
 use crate::tree_walk::{comment_kinds, walk_preorder};
 
@@ -417,6 +421,173 @@ pub(crate) fn covers(d: &Directive, finding_line: Line, rule_match: bool) -> boo
     rule_match
         && ((d.start_line <= finding_line && finding_line <= d.end_line)
             || (d.whole_line && finding_line.get() == d.end_line.get() + 1))
+}
+
+/// The rule a finding answers to: its leading `[x]` prefix, or the checker name when it has
+/// none or the prefix is data (see `DYNAMIC_PREFIX_CHECKERS`).
+pub(crate) fn anchor_rule(checker_name: &str, finding: &Finding) -> RuleId {
+    let by_name = || RuleId(checker_name.to_string());
+    if DYNAMIC_PREFIX_CHECKERS.contains(&checker_name) {
+        return by_name();
+    }
+    bracket_prefix(&finding.message)
+        .and_then(RuleId::new)
+        .unwrap_or_else(by_name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InlineIgnoreMode {
+    #[default]
+    Apply,
+    /// Raw findings: used by `--no-inline-ignores` and the unused-ignore rerun.
+    Disabled,
+}
+
+/// Findings dropped inline in one run, of which from a blocking check.
+#[derive(Debug, Default)]
+pub struct SuppressionCounts {
+    pub total: AtomicUsize,
+    pub blocking: AtomicUsize,
+}
+
+/// Single-entry scan cache: checks for one file run back to back, so one entry gives about one
+/// scan per file. Content-hash keyed, so an edited file never returns stale directives.
+/// Per-context (never `static`) so parallel tests, the daemon, and LSP cannot interfere.
+#[derive(Debug, Default)]
+pub struct ScanMemo {
+    entry: Mutex<Option<(PathBuf, u64, Arc<Vec<Scanned>>)>>,
+    pub scans: AtomicUsize,
+    pub hash_calls: AtomicUsize,
+}
+
+impl ScanMemo {
+    fn scan(&self, path: &Path, source: &str) -> Arc<Vec<Scanned>> {
+        self.hash_calls.fetch_add(1, Ordering::Relaxed);
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        let hash = hasher.finish();
+        let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((p, h, scanned)) = entry.as_ref() {
+            if p == path && *h == hash {
+                return Arc::clone(scanned);
+            }
+        }
+        self.scans.fetch_add(1, Ordering::Relaxed);
+        let scanned = Arc::new(scan_directives(path, source));
+        *entry = Some((path.to_path_buf(), hash, Arc::clone(&scanned)));
+        scanned
+    }
+}
+
+/// How one run applies inline ignores. Cloning shares the counter and memo.
+#[derive(Debug, Clone, Default)]
+pub struct InlineIgnoreContext {
+    pub mode: InlineIgnoreMode,
+    pub counter: Option<Arc<SuppressionCounts>>,
+    pub scan_memo: Arc<ScanMemo>,
+}
+
+impl InlineIgnoreContext {
+    pub fn disabled() -> Self {
+        InlineIgnoreContext {
+            mode: InlineIgnoreMode::Disabled,
+            ..Default::default()
+        }
+    }
+
+    /// Same mode and memo, but replays (HEAD baseline) are not counted.
+    pub fn without_counter(&self) -> Self {
+        InlineIgnoreContext {
+            counter: None,
+            ..self.clone()
+        }
+    }
+}
+
+/// A finding a directive removed, kept so advisories and counters read one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedFinding {
+    pub directive_start: Line,
+    pub directive_end: Line,
+    pub rule: RuleId,
+    pub reason: Reason,
+    pub finding_line: Line,
+    pub severity: Severity,
+}
+
+#[derive(Debug, Default)]
+pub struct AppliedIgnores {
+    pub kept: Vec<Finding>,
+    pub dropped: Vec<DroppedFinding>,
+}
+
+/// First valid directive rule that matches `finding` and covers its row (or, for file-scope
+/// rules, sits in the file head).
+fn covering<'a>(
+    directives: &'a [&'a Directive],
+    checker_name: &str,
+    finding: &Finding,
+) -> Option<(&'a Directive, &'a RuleId)> {
+    let line = Line::new(finding.line);
+    directives.iter().find_map(|d| {
+        d.rules().iter().find_map(|r| {
+            let matched = rule_matches(r, checker_name, &finding.message);
+            let in_head = d.start_line.get() <= FILE_HEAD_LINES
+                && FILE_SCOPE_RULES.contains(&r.as_str());
+            (covers(d, line, matched) || (matched && in_head)).then_some((*d, r))
+        })
+    })
+}
+
+/// Drops findings covered by a valid directive. The early returns run before any hashing,
+/// locking, or parsing, so the common no-marker hook path stays a substring search.
+pub(crate) fn apply_inline_ignores(
+    findings: Vec<Finding>,
+    file: &Path,
+    source: &str,
+    checker_name: &str,
+    severity: Severity,
+    ctx: &InlineIgnoreContext,
+) -> AppliedIgnores {
+    if findings.is_empty()
+        || ctx.mode == InlineIgnoreMode::Disabled
+        || !source.contains("kibitzer")
+    {
+        return AppliedIgnores {
+            kept: findings,
+            dropped: Vec::new(),
+        };
+    }
+    let scanned = ctx.scan_memo.scan(file, source);
+    let directives: Vec<&Directive> = scanned
+        .iter()
+        .filter_map(|(_, p)| match p {
+            DirectiveParse::Valid(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let mut applied = AppliedIgnores::default();
+    for finding in findings {
+        match covering(&directives, checker_name, &finding) {
+            Some((d, rule)) => applied.dropped.push(DroppedFinding {
+                directive_start: d.start_line,
+                directive_end: d.end_line,
+                rule: rule.clone(),
+                reason: d.reason.clone(),
+                finding_line: Line::new(finding.line),
+                severity,
+            }),
+            None => applied.kept.push(finding),
+        }
+    }
+    if let Some(counter) = &ctx.counter {
+        let n = applied.dropped.len();
+        counter.total.fetch_add(n, Ordering::Relaxed);
+        if severity == Severity::Blocking {
+            counter.blocking.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    applied
 }
 
 // Test names follow the validation plan's should_X_When_Y convention.
@@ -901,5 +1072,265 @@ mod tests {
         let r = |s: &str| RuleId::new(s).unwrap();
         assert!(!rule_matches(&r("ignore-syntax"), "inline-ignore", "[ignore-syntax] bad"));
         assert!(!rule_matches(&r("unused-ignore"), "unused-ignore", "x"));
+    }
+
+    fn finding(line: usize, message: &str) -> Finding {
+        Finding {
+            line,
+            message: message.to_string(),
+        }
+    }
+
+    const GO_IGNORE_ABOVE_10: &str = "package main\n\n\n\n\n\n\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc f(b bool) {}\n";
+
+    fn apply(
+        findings: Vec<Finding>,
+        source: &str,
+        checker: &str,
+        severity: Severity,
+        ctx: &InlineIgnoreContext,
+    ) -> AppliedIgnores {
+        apply_inline_ignores(findings, Path::new("x.go"), source, checker, severity, ctx)
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_ReturnInputUnchanged_When_FindingsEmptyOrNoSubstring() {
+        let ctx = InlineIgnoreContext::default();
+        let out = apply(vec![], GO_IGNORE_ABOVE_10, "c", Severity::Advisory, &ctx);
+        assert!(out.kept.is_empty() && out.dropped.is_empty());
+        let out = apply(
+            vec![finding(10, "[flag-argument] x")],
+            "package main\nfunc f() {}\n",
+            "c",
+            Severity::Advisory,
+            &ctx,
+        );
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 0);
+        assert_eq!(ctx.scan_memo.hash_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_ReturnRaw_When_ModeDisabled() {
+        let ctx = InlineIgnoreContext::disabled();
+        let out = apply(
+            vec![finding(10, "[flag-argument] x")],
+            GO_IGNORE_ABOVE_10,
+            "c",
+            Severity::Advisory,
+            &ctx,
+        );
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(ctx.scan_memo.hash_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_DropAndReport_When_DirectiveCovers() {
+        let ctx = InlineIgnoreContext::default();
+        let out = apply(
+            vec![finding(10, "[flag-argument] x"), finding(30, "[flag-argument] y")],
+            GO_IGNORE_ABOVE_10,
+            "syntax-rules-go",
+            Severity::Blocking,
+            &ctx,
+        );
+        assert_eq!(out.kept, vec![finding(30, "[flag-argument] y")]);
+        assert_eq!(out.dropped.len(), 1);
+        let d = &out.dropped[0];
+        assert_eq!((d.directive_start, d.directive_end), (Line::new(9), Line::new(9)));
+        assert_eq!(d.rule.as_str(), "flag-argument");
+        assert_eq!(d.reason.as_str(), "legacy api pinned");
+        assert_eq!(d.finding_line, Line::new(10));
+        assert_eq!(d.severity, Severity::Blocking);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_MatchCheckerName_When_NoBracketPrefix() {
+        let source = "// kibitzer:ignore primitive-obsession -- ids are plain strings\nfn f(a: String) {}\n";
+        let out = apply(
+            vec![finding(2, "param a is a primitive")],
+            source,
+            "primitive-obsession",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert!(out.kept.is_empty());
+        assert_eq!(out.dropped.len(), 1);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_KeepFinding_When_DirectiveTwoLinesAbove() {
+        let source = "// kibitzer:ignore flag-argument -- legacy api pinned\n\nfunc f() {}\n";
+        let out = apply(
+            vec![finding(3, "[flag-argument] x")],
+            source,
+            "c",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert_eq!(out.kept.len(), 1);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_DropOnlyOwnRow_When_TrailingComment() {
+        let source = "package main\nx := f() // kibitzer:ignore flag-argument -- legacy api\ny := g()\n";
+        let out = apply(
+            vec![finding(2, "[flag-argument] a"), finding(3, "[flag-argument] b")],
+            source,
+            "c",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert_eq!(out.kept, vec![finding(3, "[flag-argument] b")]);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_NeverDrop_When_MetaRuleNamed() {
+        let source = "// kibitzer:ignore ignore-syntax -- hide the repair\nbad\n";
+        let out = apply(
+            vec![finding(2, "[ignore-syntax] bad")],
+            source,
+            "inline-ignore",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert_eq!(out.kept.len(), 1);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_DropAll_When_FileScopeRuleInHead() {
+        let mut source = String::from("// kibitzer:ignore file-complexity -- generated tables\n");
+        source.push_str(&"x\n".repeat(50));
+        let out = apply(
+            vec![finding(20, "[file-complexity] a"), finding(40, "[file-complexity] a")],
+            &source,
+            "file-complexity",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert!(out.kept.is_empty());
+        let out = apply(
+            vec![finding(900, "[file-size] big")],
+            "// kibitzer:ignore file-size -- generated tables\n",
+            "file-size",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert!(out.kept.is_empty());
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_NotHeadScope_When_RuleNotFileScope() {
+        let out = apply(
+            vec![finding(40, "[flag-argument] a")],
+            "// kibitzer:ignore flag-argument -- legacy api\n",
+            "c",
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert_eq!(out.kept.len(), 1);
+    }
+
+    #[test]
+    fn apply_inline_ignores_should_CountDropped_When_CounterPresent() {
+        let counter = Arc::new(SuppressionCounts::default());
+        let ctx = InlineIgnoreContext {
+            counter: Some(Arc::clone(&counter)),
+            ..Default::default()
+        };
+        apply(
+            vec![finding(10, "[flag-argument] x"), finding(30, "[flag-argument] y")],
+            GO_IGNORE_ABOVE_10,
+            "c",
+            Severity::Blocking,
+            &ctx,
+        );
+        apply(
+            vec![finding(10, "[flag-argument] x")],
+            GO_IGNORE_ABOVE_10,
+            "c",
+            Severity::Advisory,
+            &ctx,
+        );
+        assert_eq!(counter.total.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.blocking.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn inline_ignore_context_should_KeepSeparateCounts_When_TwoRunsConcurrent() {
+        let run = |n: usize| {
+            let counter = Arc::new(SuppressionCounts::default());
+            let ctx = InlineIgnoreContext {
+                counter: Some(Arc::clone(&counter)),
+                ..Default::default()
+            };
+            std::thread::spawn(move || {
+                let source = format!(
+                    "{}\nx\n",
+                    (0..n)
+                        .map(|_| "// kibitzer:ignore flag-argument -- legacy api\nf()")
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                let findings = (0..n).map(|i| finding(2 + i * 2, "[flag-argument] a")).collect();
+                apply(findings, &source, "c", Severity::Advisory, &ctx);
+                counter.total.load(Ordering::Relaxed)
+            })
+        };
+        let (a, b) = (run(2), run(3));
+        assert_eq!((a.join().unwrap(), b.join().unwrap()), (2, 3));
+    }
+
+    #[test]
+    fn without_counter_should_NotCount_When_Replay() {
+        let counter = Arc::new(SuppressionCounts::default());
+        let ctx = InlineIgnoreContext {
+            counter: Some(Arc::clone(&counter)),
+            ..Default::default()
+        };
+        apply(
+            vec![finding(10, "[flag-argument] x")],
+            GO_IGNORE_ABOVE_10,
+            "c",
+            Severity::Blocking,
+            &ctx.without_counter(),
+        );
+        assert_eq!(counter.total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn scan_memo_should_ScanOncePerContentAndPath() {
+        let ctx = InlineIgnoreContext::default();
+        let f = || vec![finding(10, "[flag-argument] x")];
+        for _ in 0..30 {
+            apply(f(), GO_IGNORE_ABOVE_10, "c", Severity::Advisory, &ctx);
+        }
+        assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 1);
+        let edited = GO_IGNORE_ABOVE_10.replace("kibitzer:ignore", "removed");
+        let edited = format!("{edited}// kibitzer is mentioned\n");
+        let out = apply(f(), &edited, "c", Severity::Advisory, &ctx);
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 2);
+        apply_inline_ignores(
+            f(),
+            Path::new("other.go"),
+            GO_IGNORE_ABOVE_10,
+            "c",
+            Severity::Advisory,
+            &ctx,
+        );
+        assert_eq!(ctx.scan_memo.scans.load(Ordering::Relaxed), 3);
+        let held = ctx.scan_memo.entry.lock().unwrap();
+        assert_eq!(held.as_ref().unwrap().0, PathBuf::from("other.go"));
+    }
+
+    #[test]
+    fn anchor_rule_should_UseChecker_When_NoPrefixOrDynamic() {
+        assert_eq!(anchor_rule("c", &finding(1, "[a-b] m")).as_str(), "a-b");
+        assert_eq!(anchor_rule("primitive-obsession", &finding(1, "plain")).as_str(), "primitive-obsession");
+        assert_eq!(
+            anchor_rule("markdown-link-integrity", &finding(1, "[foo] used but never defined")).as_str(),
+            "markdown-link-integrity"
+        );
     }
 }
