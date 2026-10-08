@@ -35,6 +35,8 @@ impl Line {
 }
 
 /// A rule a directive names; `[a-z0-9-]+`, so a doc placeholder like `<rule>` is rejected.
+/// Validated by `new`. `Deserialize` skips that check: the only readers are the result cache
+/// and IPC payloads this binary wrote, which are trusted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuleId(String);
 
@@ -67,6 +69,7 @@ pub enum ReasonError {
 /// The justification after ` -- `. The constructor enforces a mechanical floor: not blank,
 /// not an echo of a listed rule id, and more than one word. It stops `-- needed`, not a
 /// determined two-word lie.
+/// Validated by `new`; `Deserialize` skips that check, as for `RuleId`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reason(String);
 
@@ -881,22 +884,28 @@ pub(crate) fn unused_ignores(
     out
 }
 
+pub(crate) fn remove_it_message(rule: &str) -> String {
+    format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it")
+}
+
+pub(crate) fn unknown_rule_message(rule: &str) -> String {
+    format!(
+        "[unused-ignore] '{rule}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
+    )
+}
+
 /// The advisory for a rule that matched no raw finding, or `None` when it cannot be judged.
 fn unused_message(rule: &str, ran_checkers: &[&str]) -> Option<String> {
     if known_rule(rule) {
         let judged = ran_checkers
             .iter()
             .any(|c| owner_matches(rule, c) == Some(true));
-        return judged.then(|| {
-            format!("[unused-ignore] kibitzer:ignore {rule} suppresses nothing - remove it")
-        });
+        return judged.then(|| remove_it_message(rule));
     }
     // `[ignore-syntax]` already carries the suggestion for a near miss.
-    did_you_mean(rule).is_none().then(|| {
-        format!(
-            "[unused-ignore] '{rule}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
-        )
-    })
+    did_you_mean(rule)
+        .is_none()
+        .then(|| unknown_rule_message(rule))
 }
 
 /// Drops findings covered by a valid directive. The early returns run before any hashing,

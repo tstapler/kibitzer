@@ -10,7 +10,8 @@ use crate::config::{Check, Severity};
 use crate::inline_ignores::{
     Directive, DirectiveParse, DroppedFinding, FILE_HEAD_LINES, FILE_SCOPE_RULES, InlineOutcome,
     Line, RawFinding, Reason, RuleId, did_you_mean, has_owner, known_rule, nearest_finding_line,
-    owned_by, rows_intersect, span_intersects, unused_ignores,
+    owned_by, remove_it_message, rows_intersect, span_intersects, unknown_rule_message,
+    unused_ignores,
 };
 
 /// Everything the post-pass may read; `checks` and `accepted` feed the unused-ignore rerun.
@@ -153,19 +154,9 @@ fn unowned_verdicts(
             let verdict = if let Some(n) = nearest {
                 Some((UnownedKind::WrongRow, wrong_row_message(d, rule, n)))
             } else if ran_checkers.contains(&name) {
-                Some((
-                    UnownedKind::RemoveIt,
-                    format!(
-                        "[unused-ignore] kibitzer:ignore {name} suppresses nothing - remove it"
-                    ),
-                ))
+                Some((UnownedKind::RemoveIt, remove_it_message(name)))
             } else if !known_rule(name) && did_you_mean(name).is_none() {
-                Some((
-                    UnownedKind::UnknownRule,
-                    format!(
-                        "[unused-ignore] '{name}' is not a known rule or checker; run 'kibitzer check list' to see valid names"
-                    ),
-                ))
+                Some((UnownedKind::UnknownRule, unknown_rule_message(name)))
             } else {
                 None
             };
@@ -179,7 +170,7 @@ fn unowned_verdicts(
     out
 }
 
-/// `kibitzer run` audit (Task 2.2.2e): a typo'd rule must not be silent in the CLI even
+/// `kibitzer run` audit: a typo'd rule must not be silent in the CLI even
 /// though the full unused-ignore audit is deferred. First-pass data only, no rerun.
 pub(crate) fn unknown_rule_advisories(
     file_path: &Path,

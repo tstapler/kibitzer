@@ -406,7 +406,7 @@ fn anchor_conformance_should_HaveFixtureOrExemption_When_DefaultCheckerAdded() {
     assert!(ANCHOR_PENDING.iter().all(|(_, note)| !note.is_empty()));
 }
 
-// Explicit rows for the awkward anchors in Story 1.2.1.
+// Explicit rows for the awkward anchors (multi-line comments, block comments, file-head rules).
 
 fn check_named(name: &str) -> Check {
     default_checks()
