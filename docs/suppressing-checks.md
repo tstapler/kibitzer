@@ -151,12 +151,21 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   counting identical lines by occurrence. It reports the silenced findings that are new
   relative to HEAD: one that appeared, code that slid under a directive, a duplicate
   of an already-silenced line, or a file-scope finding (`file-size`, `file-complexity`)
-  that the file only now trips. A file git does not know yet has an empty baseline, so
-  everything in it reports. An edit that touches the directive's rows or the silenced
-  row always reports. With no usable baseline (not a git checkout, or an unreadable
-  HEAD), a whole-file `Write` reports every silenced finding and an `Edit` reports
-  only the ones it touched. The baseline is HEAD, not the previous edit, so until
-  you commit, later edits to the same file report the earlier new suppressions again.
+  that the file only now trips. An edit that touches the directive's rows or the silenced
+  row always reports. A staged rename (`git mv`) reads the renamed-from HEAD blob, and a
+  HEAD blob that is not UTF-8 is decoded lossily. When git gives no baseline (no repo, no
+  commits, an untracked, ignored, newly added or submodule path, a git that fails or does
+  not answer within 2 seconds) the baseline is "unknown", never "everything is new": a
+  whole-file `Write` reports every silenced finding, and an `Edit` reports an untouched
+  one only when the edit removed lines (so a finding may have slid under a directive) or the
+  rule is file-scope. The hook passes that "removed lines" flag to the daemon; nothing is
+  stored between calls. The baseline git calls drop `GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE` and the other repo-redirecting variables, so a hook launched from inside
+  another git command still reads the edited repo. The baseline is HEAD, not the previous
+  edit, so until you commit, later edits to the same file report the earlier new
+  suppressions again (at most 10 lines and a count); there is no per-file memory to dedupe
+  that, on purpose, since a memory would hide the advisory from an agent that lost it to
+  context compaction.
   The comparison costs one `git show` plus one extra checker run over the HEAD content,
   and only when the file carries the `kibitzer:ignore` marker and a blocking finding
   was silenced. The advisory shows the reason in quotes, cut to 160 characters.
@@ -168,30 +177,54 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
     composes into its own `[ignore-syntax]`, `[unused-ignore]` and `[blocking-suppressed]`
     lines. Only printable text survives (an allow-list: no control, format,
     variation-selector, tag, bidi, filler or other invisible characters), whitespace
-    collapses to one line, at most two combining marks follow a character, and the text
-    is shortened; a reason is shown in quotes as data. File paths in those lines use
+    collapses to one line, at most two combining marks (any script) follow a character, and
+    the text is shortened; a reason is shown in quotes as data. File paths in those lines use
     `echo_path`: the same limits, but a character the allow-list would drop (and any
     newline or tab) is shown as `\n`, `\t` or `\u{..}`, and spaces are kept as written. A ZWJ
-    or ZWNJ between two non-ASCII graphic characters and a VS16 right after an emoji base
-    (emoji and Persian sequences) are kept as written; a leading, trailing or isolated one
-    is still escaped.
+    between two emoji or between letters of an Arabic, Indic or Myanmar script, a ZWNJ between
+    letters of those scripts, and a VS16 right after an emoji base are kept as written; any
+    other joiner is escaped.
   - *Lenient* (`strip_unsafe`): the finding text other checkers produce, on hook stderr,
     hook `additionalContext` (PostToolUse and Stop), `run_checks` and
-    `architecture_assessment` MCP output, LSP diagnostics, `kibitzer check native` and
-    `kibitzer run` stdout. It removes escapes and other control characters (carriage
-    return included), bidi embeddings, overrides and isolates, line and paragraph
-    separators, the soft hyphen, the grapheme joiner, the Hangul and Khmer fillers,
-    U+2000-U+200A spaces other than U+2009, Unicode tag characters and the deprecated
-    format characters (U+206A-206F, U+FFF9-FFFC). It keeps tabs, newlines, ZWJ, ZWNJ and
-    VS16. A variation selector survives only as one selector directly after a base that
-    has variation sequences (CJK ideographs, emoji and symbol blocks such as arrows, math
-    operators and dingbats; ideographic selectors only after an ideograph; after ASCII
-    only VS15/VS16 after `#`, `*` or a digit). ZWSP, word joiner and BOM survive only
-    alone between two letters or digits that are not both ASCII (Thai and Khmer word
-    breaks, also right after a tone mark or vowel sign). LRM, RLM and the Arabic letter
-    mark survive only alone beside a right-to-left letter. A tag run survives only as the
-    England, Scotland or Wales flag (the black flag U+1F3F4, the tags for `gbeng`,
-    `gbsct` or `gbwls`, then U+E007F).
+    `architecture_assessment` MCP output, LSP diagnostics, `kibitzer check native`,
+    `kibitzer check architecture` and `kibitzer run` stdout. Also an allow-list: printable
+    graphic characters (letters, marks, numbers, punctuation, symbols, emoji), tabs,
+    newlines and the spaces ASCII space, NBSP, U+2009, U+202F and U+3000 survive. Everything
+    else is dropped: controls (carriage return included), unassigned, private-use and
+    noncharacter code points, every Default_Ignorable_Code_Point (soft hyphen, grapheme
+    joiner, fillers, bidi embeddings, overrides and isolates, deprecated format characters,
+    tag characters, Mongolian selectors), and every other format or space character. A
+    small set of invisibles keeps legitimate text and survives only where it does real work,
+    judged from its raw neighbors so a run never helps itself (a second one in the same gap
+    is dropped):
+    - ZWJ between two emoji, or between two letters of one Arabic, Indic or Myanmar script;
+      ZWNJ between two letters of those scripts (Persian, Devanagari, Bengali and so on).
+    - ZWSP and word joiner between two letters or digits of one Thai, Lao, Khmer or Myanmar
+      script (a BOM in the middle of text is dropped).
+    - LRM, RLM and the Arabic letter mark beside a right-to-left letter, one per gap.
+    - A variation selector directly after a base that has variation sequences (CJK
+      ideographs, emoji and symbol blocks; after ASCII only VS15/VS16 after `#`, `*` or a
+      digit), one per base.
+    - The England, Scotland and Wales flags (U+1F3F4, the tags for `gbeng`, `gbsct` or
+      `gbwls`, U+E007F); no other tag run.
+    - Combining marks, at most three in a row (Tier 1: two), on a visible base: a generic
+      diacritic (U+0300-036F and the other combining blocks) after anything, any other mark
+      only after a base of its own script (Thai tone marks after Thai, the Khmer coeng after
+      Khmer, and so on). Alphabetic marks such as Devanagari vowel signs count too.
+
+    Residual covert bandwidth, not none. An attacker who controls finding text can still
+    encode data in what survives, per carrier character: about 8 bits per CJK ideograph
+    (257 selector states: none, U+FE00-FE0F, U+E0100-E01EF), about 1.6 bits per emoji or
+    symbol that takes VS15/VS16, per Arabic/Indic/Myanmar letter pair (none, ZWJ, ZWNJ) and
+    per Thai/Lao/Khmer/Myanmar letter pair (none, ZWSP, word joiner), 2 bits per
+    right-to-left letter (none, LRM, RLM, ALM), about 2.3 bits per space character (five
+    kinds of space), and, as visible accent stacks, up to three generic marks per base
+    (about 25 bits per base at most). A run of invisibles over an ASCII carrier carries
+    nothing: before this design 3,766 invisible code points survived at about 11.9 bits each
+    with no limit. A homoglyph or word-choice channel in visible text is out of scope here.
+    Not kept, because the cost of keeping them is a wider channel: Mongolian free variation
+    selectors, Arabic number signs and other Cf characters, non-ASCII spaces other than the
+    four above, and joiners in scripts not listed.
   - A file path in lenient output has its newlines and other unsafe characters shown as
     escapes (`\n`), so a file name cannot start a forged line. Findings that name another
     file (`duplicate-code-cross-file`, architecture findings) escape that file's path where
@@ -200,9 +233,10 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
     Not covered: an external command check that prints a hostile name from a different
     directory in a form kibitzer does not generate (it still gets the control-character
     strip, but its newlines stay).
-  - Other direct-print subcommands in `src/main.rs` (`kibitzer check architecture`,
-    `duplicates`, and similar diagnostics) print their findings unfiltered, except that
-    `check native` and the architecture finding locations escape paths.
+  - Direct-print subcommands in `src/main.rs`: `kibitzer check architecture` runs finding
+    messages through the lenient tier (with sibling-name escaping for the directory it was
+    given); `check native`, `check duplicates` and `status` escape paths. Other diagnostics
+    there were not audited again.
 - **Footers never suggest meta rules.** When the only failure is an `[ignore-syntax]`
   repair, the footer omits the ignore hint instead of suggesting a directive that
   cannot work.
@@ -222,12 +256,22 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   lock (`kibitzer-<user>.lock` beside the socket, mode 0600, holding its pid) and a
   second `daemon start` exits instead of taking the socket over. The socket and lock
   live in `$XDG_RUNTIME_DIR`, or in a `kibitzer-<uid>` directory (mode 0700) under the
-  temp dir. `$XDG_RUNTIME_DIR` is used only if it is a real directory you own with no
-  group or other access (mode 0700); kibitzer never chmods it. Otherwise (another
-  user's directory, a symlink, mode 0755) the directory is untrusted: hooks run checks
-  in-process and log that once to the hook log (`kibitzer status` shows it),
-  `kibitzer daemon start` exits 1 naming the directory and why, and `daemon status` and
-  `daemon stop` report `runtime dir untrusted: <dir>` instead of "no daemon running".
+  temp dir. `$XDG_RUNTIME_DIR` is used if it is a directory you own that group and others
+  cannot write in (mode 0755 is fine: the socket and lock are 0600, so others can see
+  their names but not connect or replace them), or a symlink (WSLg) whose target is a
+  private directory you own, in which case the resolved path is used. kibitzer never
+  chmods it. Otherwise (another user's directory, group- or other-writable, a symlink to
+  anything else) it falls back to `<tmp>/kibitzer-<uid>` and notes that once an hour in
+  the hook log (`kibitzer status` shows "Runtime directory fallback"). Only when that
+  fallback is untrusted too (a planted symlink or another user's directory) is there no
+  daemon: hooks run checks in-process and note "Hooks ran without the daemon" (at most
+  once an hour per reason and six an hour in all); the note clears itself the next time a
+  hook finds a usable directory, and `kibitzer status` shows only notes still in force.
+  `kibitzer daemon start` exits 1 naming both directories and why, and `daemon status` and
+  `daemon stop` print `runtime dir untrusted: <dir> (...); a daemon started earlier may
+  still be running (pid N in <lock>)`, since the directory may have been loosened after a
+  daemon started. `daemon status` on a stopped or hung daemon prints `daemon not responding
+  (pid N)` and exits 1; `daemon stop` on a holder it cannot verify names its pid.
   A client probes the daemon with a 750 ms ping before
   each request; a daemon that holds its lock but never answers (stopped, deadlocked) is
   skipped for 10 seconds, and a new `daemon start` (or `daemon stop`) terminates it with
