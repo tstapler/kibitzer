@@ -14,7 +14,7 @@ fn nearest_finding_line(rule: &RuleId, raw: &[RawFinding], from: Line) -> Option
         .min_by_key(|l| (l.get().abs_diff(from.get()), l.get()))
 }
 
-/// Why a directive rule was reported as unused; `kibitzer run` keeps only `UnknownRule`.
+/// Why a directive rule was reported as unused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnusedKind {
     WrongRow,

@@ -127,8 +127,8 @@ Malformed ignores (hook, Write payload): no reason gives `[ignore-syntax] kibitz
 kibitzer:ignore flag-argument -- <why this is acceptable>`; `kibitzer:false-positive` gives `'kibitzer:false-positive' not
 recognized; use 'kibitzer:ignore'`, and the finding is still reported. A directive two rows above, sent as an Edit touching it,
 gives `[unused-ignore] ... matches no finding at line 2 or 3; the finding is at line 4. Move the comment to the line directly
-above line 4`. As planned (Task 2.2.2b deferred), `kibitzer run` does not emit `[unused-ignore]`: the same misplaced directive
-there reports the finding only.
+above line 4`. At the time of this backtest `kibitzer run` did not emit `[unused-ignore]` (Task 2.2.2b, since shipped in a follow-up PR):
+the same misplaced directive there reported the finding only.
 
 Final gates: `cargo build` ok; `cargo test` 1426 passed, 0 failed (1381 unit, 9 + 2 + 8 + 10 + 16 integration);
 `cargo clippy --all-targets` no warnings; `cargo fmt --check` clean.
@@ -193,7 +193,7 @@ there could only come from a false directive match, and none of the 111 finished
 - Options struct for the `check.rs` signatures (C7).
 - A single `RuleInfo` table in place of `KNOWN_RULES` plus the ownership table.
 - Index-based `shown` tracking in `InlineOutcome`.
-- From the plan's Amendment 1: Task 2.2.2b (full `kibitzer run` unused-ignore audit), the run-footer false-positive split,
+- From the plan's Amendment 1: Task 2.2.2b (full `kibitzer run` unused-ignore audit; later shipped), the run-footer false-positive split,
   the success acknowledgement, and Story 3.2.1.
 
 ## Phase 6 round 2
