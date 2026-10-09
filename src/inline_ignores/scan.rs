@@ -1,5 +1,6 @@
 //! Finding directive comments in source text, with a single-entry memo per run.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,16 @@ use crate::tree_walk::{comment_kinds, walk_preorder};
 fn only_whitespace_before(source: &str, byte: usize) -> bool {
     let line_start = source[..byte].rfind('\n').map_or(0, |i| i + 1);
     source[line_start..byte].trim().is_empty()
+}
+
+/// True when only whitespace follows `byte` on its line; a node already ending at a line
+/// start (tree-sitter-rust line comments) has nothing after it on its own row.
+fn only_whitespace_after(source: &str, byte: usize) -> bool {
+    if byte > 0 && source.as_bytes()[byte - 1] == b'\n' {
+        return true;
+    }
+    let line_end = source[byte..].find('\n').map_or(source.len(), |i| byte + i);
+    source[byte..line_end].trim().is_empty()
 }
 
 /// The rest of `text` after one list marker (`-`, `*`, `+`, `1.`, `1)`) followed by whitespace.
@@ -95,7 +106,23 @@ fn last_row(node: tree_sitter::Node) -> usize {
 
 /// Stretches each whole-line directive over the whole-line comments stacked directly below it
 /// (no blank row between), so a reason continued on `//` lines still anchors to the code after.
+///
+/// Linear: `comments` arrive in source order and never overlap, so each stack's final row is
+/// computed once, bottom-up, and each directive finds its comment by binary search.
 fn extend_over_stacked_comments(scanned: &mut [Scanned], comments: &[CommentRows]) {
+    let mut start_index: HashMap<usize, usize> = HashMap::new();
+    for (i, c) in comments.iter().enumerate().rev() {
+        if c.whole_line {
+            start_index.insert(c.start, i);
+        }
+    }
+    let mut stack_end = vec![0usize; comments.len()];
+    for i in (0..comments.len()).rev() {
+        stack_end[i] = match start_index.get(&(comments[i].end + 1)) {
+            Some(&next) if next > i => stack_end[next],
+            _ => comments[i].end,
+        };
+    }
     for item in scanned {
         let DirectiveParse::Valid(d) = &mut item.parse else {
             continue;
@@ -103,18 +130,13 @@ fn extend_over_stacked_comments(scanned: &mut [Scanned], comments: &[CommentRows
         if !d.whole_line {
             continue;
         }
-        let Some(own) = comments
-            .iter()
-            .find(|c| c.start <= d.start_line.get() && d.start_line.get() <= c.end)
-        else {
+        let row = d.start_line.get();
+        let after = comments.partition_point(|c| c.start <= row);
+        let Some(own) = after.checked_sub(1).filter(|&i| row <= comments[i].end) else {
             continue;
         };
-        let mut end = own.end;
-        while let Some(next) = comments.iter().find(|c| c.whole_line && c.start == end + 1) {
-            end = next.end;
-        }
-        if end > d.end_line.get() {
-            d.end_line = Line::new(end);
+        if stack_end[own] > d.end_line.get() {
+            d.end_line = Line::new(stack_end[own]);
         }
     }
 }
@@ -131,7 +153,8 @@ pub(super) fn scan_code_comments(lang: Language, tree: &Tree, source: &str) -> V
         let text = node.utf8_text(source.as_bytes()).unwrap_or("");
         let first_row = node.start_position().row + 1;
         let end_row = node.end_position().row + 1;
-        let whole_line = only_whitespace_before(source, node.start_byte());
+        let whole_line = only_whitespace_before(source, node.start_byte())
+            && only_whitespace_after(source, node.end_byte());
         comments.push(CommentRows {
             start: first_row,
             end: last_row(node),

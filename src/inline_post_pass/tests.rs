@@ -175,6 +175,20 @@ fn run_should_EmitNoBlockingAdvisory_When_DirectiveOutsideChangedLinesOrAdvisory
 }
 
 #[test]
+fn run_should_EmitBlockingAdvisory_When_EditAddsFindingBelowPlantedDirective() {
+    // dropped() anchors the finding one row below the directive: (4,4) -> finding row 5.
+    let out = run_with(Some(&[(5, 5)]), &blocking_md_result());
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].output.contains("[blocking-suppressed]"));
+}
+
+#[test]
+fn run_should_EmitBlockingAdvisory_When_PureDeletionLeavesBlockingDropInFile() {
+    let out = run_with(Some(&[]), &blocking_md_result());
+    assert_eq!(out.len(), 1, "{out:?}");
+}
+
+#[test]
 fn run_should_EmitOneAdvisory_When_DirectiveSilencesSeveralBlockingFindings() {
     let two = [result_with_dropped(
         "markdown-link-integrity",
@@ -208,7 +222,9 @@ fn run_should_CoverMultiRowDirective_When_ChangedLinesTouchAnyRow() {
         )],
     )];
     assert_eq!(run_with(Some(&[(6, 6)]), &multi).len(), 1);
-    assert!(run_with(Some(&[(7, 9)]), &multi).is_empty());
+    // Row 7 is the silenced finding itself, so an edit there is reported too.
+    assert_eq!(run_with(Some(&[(7, 9)]), &multi).len(), 1);
+    assert!(run_with(Some(&[(8, 9)]), &multi).is_empty());
 }
 
 fn directive_for(rule: &str, row: usize) -> Directive {

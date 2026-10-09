@@ -146,7 +146,9 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   shows them again. A directive that silences a blocking finding raises
   `[blocking-suppressed]` in the hook so the agent tells the user. That also holds
   for a whole-file `Write`, where every directive counts as just added (at most 10
-  advisories, then one count line). The advisory shows the reason in quotes, cut to
+  advisories, then one count line). The advisory also fires when an edit touches the
+  row of the silenced finding (a directive planted earlier now hiding a new finding),
+  and after a pure deletion for every blocking finding silenced in that file. The advisory shows the reason in quotes, cut to
   160 characters.
 - **Failing CI on a suppressed blocking finding.** `kibitzer run` exits 0 when the
   only blocking finding was suppressed inline. Add `--deny-blocking-suppression` to

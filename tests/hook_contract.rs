@@ -566,3 +566,23 @@ fn hook_should_KeepTabAndZwj_When_CheckOutputIsLegitimate() {
         "{context:?}"
     );
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_EmitBlockingSuppressedAdvisory_When_EditAddsFindingUnderPlantedDirective() {
+    let repo = TempRepo::new(
+        "planted-directive",
+        json!({
+            "name": "mli",
+            "checker": "markdown-link-integrity",
+            "severity": "blocking",
+        }),
+    );
+    let clean = "<!-- kibitzer:ignore markdown-link-integrity -- planned placeholder -->\nsee [x][ok]\n\n[ok]: https://example.com\n";
+    repo.run_hook("doc.md", clean);
+    let edited = "<!-- kibitzer:ignore markdown-link-integrity -- planned placeholder -->\nsee [x][ok] and [y][nope]\n\n[ok]: https://example.com\n";
+    let (code, stdout, stderr) =
+        repo.run_hook_edit("doc.md", edited, "see [x][ok]", "see [x][ok] and [y][nope]");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("[blocking-suppressed]"), "stdout: {stdout}");
+}

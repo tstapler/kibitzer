@@ -210,7 +210,7 @@ impl BlockingSuppression {
     }
 }
 
-/// Directives touching `changed_lines` that dropped a blocking finding, grouped per directive
+/// Directives touching `changed_lines` (or whose silenced finding sits in them) that dropped a blocking finding, grouped per directive
 /// so one comment naming two rules or silencing two findings yields one advisory.
 fn blocking_suppressions(
     results: &[CheckResult],
@@ -223,7 +223,17 @@ fn blocking_suppressions(
         .filter(|d| d.severity == Severity::Blocking);
     for drop in blocking_drops {
         let rows = drop.directive_span();
-        if !rows.intersects(changed_lines) {
+        // A pre-planted directive can silence a finding the edit just introduced, so the
+        // finding's own row counts too. A pure deletion (no changed rows) can slide code under
+        // an existing directive, so every blocking drop in the file is reported then.
+        let finding_row = LineSpan {
+            start: drop.finding_line,
+            end: drop.finding_line,
+        };
+        if !(rows.intersects(changed_lines)
+            || finding_row.intersects(changed_lines)
+            || changed_lines.is_empty())
+        {
             continue;
         }
         match found.iter_mut().find(|(key, _)| *key == rows) {

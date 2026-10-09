@@ -351,6 +351,41 @@ fn scan_code_comments_should_RecordWholeLineFalse_When_CommentTrailsCode() {
 }
 
 #[test]
+fn scan_code_comments_should_RecordWholeLineFalse_When_CodeFollowsBlockCommentOnSameRow() {
+    let source = "package main\nfunc f() {\n\t/* kibitzer:ignore go-ignored-error -- reason given */ a, _ := g()\n\tb, _ := g()\n}\n";
+    let scanned = go_scan(source);
+    let DirectiveParse::Valid(d) = &scanned[0].parse else {
+        panic!("{scanned:?}")
+    };
+    assert!(!d.whole_line);
+    assert!(covers_row(d, 3, true));
+    assert!(!covers_row(d, 4, true), "must not cover the next row");
+}
+
+#[test]
+fn scan_code_comments_should_FinishQuickly_When_TwentyThousandDirectivesAreStacked() {
+    let mut source = String::from("package main\n");
+    for i in 0..20_000 {
+        source.push_str(&format!(
+            "// kibitzer:ignore a{} -- stacked reason {i}\n",
+            "b"
+        ));
+    }
+    source.push_str("func f() {}\n");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let scanned = go_scan(&source);
+        let _ = tx.send((scanned.len(), started.elapsed()));
+    });
+    let (count, elapsed) = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("scan did not finish: stacked-comment extension is superlinear");
+    assert_eq!(count, 20_000);
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+}
+
+#[test]
 fn scan_code_comments_should_ReportBlockCommentLineRow_When_DirectiveOnInnerLine() {
     let source = format!(
         "{}/*\n * kibitzer:ignore long-method -- generated code\n */\nclass A {{}}\n",
