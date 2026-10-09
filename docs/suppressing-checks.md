@@ -97,11 +97,24 @@ In Markdown the comment is an HTML comment:
   comment (a string literal never counts). The directive must start the comment.
 - **`<rule>`** is the finding's `[rule]` prefix, or the checker name. Several
   rules go in one comma-separated list. Findings with no `[rule]` prefix answer to
-  their checker name; the hook footer lists the ids to copy.
-- **`<reason>`** is required: at least two words, and not just the rule id
-  repeated. Use `--`; an em dash is rejected.
+  their checker name; the hook footer lists the ids to copy. Rule ids are lowercase
+  `[a-z0-9-]`, at most 64 characters, and a directive names at most 16 of them.
+- **`<reason>`** is required: at least two words, at most 300 characters, and not
+  just the rule id repeated. Use `--`; an em dash is rejected. An over-long rule id,
+  rule list or reason is reported as `[ignore-syntax]` and suppresses nothing.
+- **Native checkers only.** Directives apply to kibitzer's own per-file checkers (the
+  ones `kibitzer check list` shows). A shell `command` check, a plugin, an
+  architecture check and a file type with no native checker ignore them, so the hook
+  and MCP footers offer the syntax only when a failing native finding could use it.
 - **Scope.** A comment on its own line covers its own rows and the row directly
-  below. A trailing comment after code covers only its own row.
+  below. If comment lines follow it with no blank row between (a reason continued on
+  `//` lines), it covers the first row after that stack. A trailing comment after
+  code covers only its own row. In Markdown, list (`-`, `1.`) and blockquote (`>`)
+  markers before the comment do not make it trailing.
+- **Misplaced directives.** A directive after other text in a comment is reported
+  (`[ignore-syntax]`) only when a bare `TODO`/`FIXME`/`NOTE`-style label precedes it;
+  prose that merely describes the syntax is left alone. An upper-case marker such as
+  `KIBITZER:IGNORE` is reported as a near miss.
 - **Never suppressible:** the directive diagnostics themselves (`inline-ignore`,
   `ignore-syntax`, `unused-ignore`, `ignore-volume`, `blocking-suppressed`).
 - A malformed directive never suppresses; its `[ignore-syntax]` message says the
@@ -114,7 +127,7 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
 
 | Checker | Where the ignore goes |
 |---|---|
-| `file-size` | First 10 lines of the file, or the reported (last) line |
+| `file-size` (also its per-language checker names such as `python-file-size`) | First 10 lines of the file, or the reported (last) line |
 | `file-complexity` | Above one function to dismiss only it; in the first 10 lines to dismiss all of them |
 | `duplicate-code` | On its own row directly above the last block's first line. A trailing comment becomes part of the block text and re-anchors the finding |
 | `duplicate-code-cross-file` | Same, in each file you want quiet; one file's ignore does not cover the other |
@@ -131,7 +144,20 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
 - **Visibility.** `kibitzer run` prints how many findings were suppressed inline
   (and how many came from blocking checks); `kibitzer run --no-inline-ignores`
   shows them again. A directive that silences a blocking finding raises
-  `[blocking-suppressed]` in the hook so the agent tells the user.
+  `[blocking-suppressed]` in the hook so the agent tells the user. That also holds
+  for a whole-file `Write`, where every directive counts as just added (at most 10
+  advisories, then one count line). The advisory shows the reason in quotes, cut to
+  160 characters.
+- **Failing CI on a suppressed blocking finding.** `kibitzer run` exits 0 when the
+  only blocking finding was suppressed inline. Add `--deny-blocking-suppression` to
+  exit 1 instead; the default is unchanged.
+- **Untrusted text.** Directive reasons, rule text and file paths are written by
+  whoever edited the file, so everything echoed into hook output, MCP output or
+  `additionalContext` has control characters (escape, carriage return, bidi
+  overrides) removed and is shortened; a reason is shown in quotes as data.
+- **Footers never suggest meta rules.** When the only failure is an `[ignore-syntax]`
+  repair, the footer omits the ignore hint instead of suggesting a directive that
+  cannot work.
 - **`kibitzer check native <name> <file>`** runs the raw checker and bypasses
   inline ignores (and `accepted/`), so it shows what an ignore is hiding.
 - **Fallback-only files.** The malformed-directive and unused-ignore diagnostics run
@@ -140,7 +166,9 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
 - **Dev builds.** The daemon's `cache.json` is keyed on the package version, so a
   rebuild at the same version can serve stale results. After rebuilding, delete
   `cache.json` (under `$XDG_CACHE_HOME/kibitzer/` or `~/.cache/kibitzer/`) or
-  restart the daemon.
+  restart the daemon. A daemon left running across an upgrade is retired
+  automatically: every reply carries its version, and a client that sees a different
+  one (or none) stops using that daemon and asks it to exit.
 
 ## Accept one specific, correctly-flagged finding
 
