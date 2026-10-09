@@ -145,35 +145,48 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   (and how many came from blocking checks); `kibitzer run --no-inline-ignores`
   shows them again. A directive that silences a blocking finding raises
   `[blocking-suppressed]` in the hook so the agent tells the user. That also holds
-  for a whole-file `Write`, where every directive counts as just added (at most 10
-  advisories, then one count line). The advisory also fires when an edit touches the
-  row of the silenced finding (a directive planted earlier now hiding a new finding),
-  and after a pure deletion for every blocking finding silenced in that file. The advisory shows the reason in quotes, cut to
+  for a whole-file `Write` of a file kibitzer has not reported on before (at most 10
+  advisories, then one count line). After that, the hook remembers per file (under
+  `$XDG_CACHE_HOME/kibitzer/advised/`) which blocking suppressions it has reported and
+  mentions only new ones: a finding that appeared, or code that slid under a directive
+  after an edit removed lines. An edit that touches the directive's rows or the silenced
+  row always reports. With no memory yet, a deletion, an edit that removes lines, and a
+  file-scope finding (`file-size`, `file-complexity`, which a directive in the file head
+  covers wherever it lands) report; other drops outside the edit stay quiet. The advisory shows the reason in quotes, cut to
   160 characters.
 - **Failing CI on a suppressed blocking finding.** `kibitzer run` exits 0 when the
   only blocking finding was suppressed inline. Add `--deny-blocking-suppression` to
   exit 1 instead; the default is unchanged.
 - **Untrusted text.** Two sanitizer tiers (`src/inline_ignores/sanitize.rs`):
-  - *Strict* (`echo`): directive reasons, rule text, near-miss markers and file paths
-    that kibitzer composes into its own `[ignore-syntax]`, `[unused-ignore]` and
-    `[blocking-suppressed]` lines. Only printable text survives (an allow-list: no
-    control, format, variation-selector, tag, bidi, filler or other invisible
-    characters), whitespace collapses to one line, and the text is shortened; a
-    reason is shown in quotes as data.
-  - *Lenient* (`strip_unsafe`): the finding text other checkers produce, on hook
-    stderr, hook `additionalContext`, `run_checks` MCP output and `kibitzer run`
-    stdout. It removes escapes and other control characters (carriage return
-    included), bidi embeddings, overrides and isolates, line and paragraph
-    separators, Unicode tag characters and variation selectors other than VS16. It
-    keeps tabs, newlines, ZWJ, ZWNJ and VS16, which emoji, Persian and Indic text need.
-  - A file path in lenient output has its newlines and other control characters
-    shown as escapes (`\n`), so a file name cannot start a forged line. Paths that a
-    checker prints in a form kibitzer cannot match (for example relative to another
-    directory) are protected only by the lenient pass; a file name's own newline is
-    escaped wherever its base name appears.
-  - Not covered: subcommands that print findings directly (`kibitzer check native`
-    and the other `kibitzer check` diagnostics in `src/main.rs`) show checker output
-    unfiltered.
+  - *Strict* (`echo`): directive reasons, rule text and near-miss markers that kibitzer
+    composes into its own `[ignore-syntax]`, `[unused-ignore]` and `[blocking-suppressed]`
+    lines. Only printable text survives (an allow-list: no control, format,
+    variation-selector, tag, bidi, filler or other invisible characters), whitespace
+    collapses to one line, at most two combining marks follow a character, and the text
+    is shortened; a reason is shown in quotes as data. File paths in those lines use
+    `echo_path`: the same limits, but a character the allow-list would drop (and any
+    newline or tab) is shown as `\n`, `\t` or `\u{..}`, and spaces are kept as written.
+  - *Lenient* (`strip_unsafe`): the finding text other checkers produce, on hook stderr,
+    hook `additionalContext` (PostToolUse and Stop), `run_checks` and
+    `architecture_assessment` MCP output, LSP diagnostics, `kibitzer check native` and
+    `kibitzer run` stdout. It removes escapes and other control characters (carriage
+    return included), bidi embeddings, overrides and isolates, line and paragraph
+    separators, Unicode tag characters and the deprecated format characters
+    (U+206A-206F, U+FFF9-FFFC). It keeps tabs, newlines, ZWJ, ZWNJ and VS16. A variation
+    selector survives only as one selector directly after a graphic base character
+    (ideographic ones only after an ideograph; after ASCII only VS15/VS16 after `#`, `*`
+    or a digit), and ZWSP, word joiner and BOM only alone between two letters or digits.
+  - A file path in lenient output has its newlines and other unsafe characters shown as
+    escapes (`\n`), so a file name cannot start a forged line. Findings that name another
+    file (`duplicate-code-cross-file`, architecture findings) escape that file's path where
+    they print it; in addition the edited file's path and base name, and every entry in
+    its directory whose name needs escaping, are escaped wherever they occur in the text.
+    Not covered: an external command check that prints a hostile name from a different
+    directory in a form kibitzer does not generate (it still gets the control-character
+    strip, but its newlines stay).
+  - Other direct-print subcommands in `src/main.rs` (`kibitzer check architecture`,
+    `duplicates`, and similar diagnostics) print their findings unfiltered, except that
+    `check native` and the architecture finding locations escape paths.
 - **Footers never suggest meta rules.** When the only failure is an `[ignore-syntax]`
   repair, the footer omits the ignore hint instead of suggesting a directive that
   cannot work.
@@ -190,8 +203,15 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   one (or none) stops using that daemon and asks it to exit. A replacement is spawned
   at most once per 10 seconds, so two kibitzer versions on one machine cannot restart
   each other on every hook. Only one daemon runs per socket: it holds an exclusive
-  lock (`kibitzer-<user>.lock` beside the socket) and a second `daemon start` exits
-  instead of taking the socket over.
+  lock (`kibitzer-<user>.lock` beside the socket, mode 0600, holding its pid) and a
+  second `daemon start` exits instead of taking the socket over. The socket and lock
+  live in `$XDG_RUNTIME_DIR`, or in a `kibitzer-<uid>` directory (mode 0700) under the
+  temp dir; a directory that another user owns, or a symlink, is not trusted and the
+  hook then runs checks in-process. A client probes the daemon with a 750 ms ping before
+  each request; a daemon that holds its lock but never answers (stopped, deadlocked) is
+  skipped for 10 seconds, and a new `daemon start` (or `daemon stop`) terminates it with
+  SIGTERM then SIGKILL, but only after checking that the pid in the lock is this user's
+  `kibitzer daemon start` and is older than the lock file.
 
 ## Accept one specific, correctly-flagged finding
 

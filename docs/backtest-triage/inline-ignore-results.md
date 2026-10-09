@@ -220,3 +220,17 @@ Fresh-reviewer findings were fixed test-first, one commit per group. Not done as
 - Daemon: `retire_stale_daemon` no longer clears the spawn debounce, so after an upgrade the new daemon can take up to 10 seconds to appear (hooks run uncached meanwhile). A daemon that predates the owner lock and ignores `shutdown` is left in place rather than displaced.
 - Surviving mutant kept on purpose: the `take(MAX_RULES_PER_DIRECTIVE + 1)` guard in `parse.rs` is equivalent to its absence for correctness (it only bounds work), so no test distinguishes it.
 - Footer comma/em-dash wording (O4): left as is.
+
+
+## Phase 6 round 4
+
+Fresh-reviewer findings F1-F6b, G1-G3 were fixed test-first (a few advisory-logic tests were written alongside the change, then checked to fail against the old rule), one commit per group. Not done as asked, or done differently:
+
+- F1: the fix escapes other files' paths at the source (`duplicate-code-cross-file`, architecture finding locations) plus a backstop that escapes every sibling entry of the edited file's directory. A hostile name in a different directory, printed by an external command check, is still only control-stripped, not newline-escaped.
+- F3/F5: the "was this suppression already reported" memory is a per-file fingerprint store in the cache dir (rule, reason, text of the silenced line), not a comparison against the pre-edit file or git HEAD. Without a stored baseline a scoped edit reports only file-scope findings and deletions; a finding that appears under a pre-planted directive elsewhere in a never-before-seen file is not reported until the second edit. Two silenced lines with identical text under the same reason share one fingerprint, so the second is not reported.
+- F4: a deletion cannot be placed in the post-edit file, so the hook sends a "removed lines" flag (any edit whose `old_string` has more lines than `new_string`) instead of a row; the post-pass treats it like a pure deletion for rows outside the edit.
+- F6: ZWSP/word joiner/BOM survive only alone between two letters or digits; variation selectors survive one per base character with the base-class rules in `docs/suppressing-checks.md`. Smuggling through one selector per base character is bounded (about 4 bits per character) but not closed.
+- F6b: `kibitzer check architecture`, `check duplicates` and similar subcommands in `main.rs` still print checker text unfiltered.
+- G1: the displacement of a wedged holder shells out to `ps` and uses `libc::kill` (new `libc` dependency, already in the lock file). The identity check (user's `kibitzer ... daemon start`, process older than the lock file's last write) is not proof against a hostile same-user process, which can already signal the daemon anyway. Each hook while a daemon is wedged costs one 750 ms probe, then a 10 second skip window.
+- G2: unit tests never contact or spawn a real daemon (`cfg!(test)` guards in `run_checks_smart`, `maybe_spawn_daemon`, `spawn_detached_daemon`), rather than setting `KIBITZER_NO_AUTO_DAEMON`; integration tests still exercise real spawns.
+- G3: moved the default socket location on a machine with no `XDG_RUNTIME_DIR` to `<tmp>/kibitzer-<uid>/`; a daemon started by an older version at the old path is not found and is left running until it exits.
