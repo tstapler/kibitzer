@@ -135,28 +135,6 @@ fn compute_changed_lines(
     }
 }
 
-/// Whether any edit in this tool call removed lines (its `old_string` has more lines than its
-/// `new_string`), so existing findings below the edit may have slid under a directive. A pure
-/// deletion has no row in the post-edit file, and `compute_changed_lines` cannot place any
-/// deletion, so this is reported separately from the changed ranges.
-fn removes_lines(tool_input: &ToolInput) -> bool {
-    let line_count = |text: &str| text.matches('\n').count();
-    let removes =
-        |old: Option<&str>, new: &str| old.is_some_and(|old| line_count(old) > line_count(new));
-    if tool_input.content.is_some() {
-        return false;
-    }
-    if let Some(edits) = &tool_input.edits {
-        return edits
-            .iter()
-            .any(|e| removes(e.old_string.as_deref(), &e.new_string));
-    }
-    tool_input
-        .new_string
-        .as_deref()
-        .is_some_and(|new| removes(tool_input.old_string.as_deref(), new))
-}
-
 /// Implements Claude Code's `PostToolUse` and `Stop` hook contracts, dispatching on
 /// `hook_event_name` — both are wired to the same `kibitzer hook` command (see
 /// `install.rs`), so this is the single entry point Claude Code actually invokes.
@@ -192,7 +170,6 @@ pub fn run_hook() -> Result<ExitCode> {
         &file_path,
         &input.hook_event_name,
         changed_lines.as_deref(),
-        removes_lines(&input.tool_input),
     )?;
 
     let canonical_path = file_path.canonicalize().ok();
@@ -415,35 +392,5 @@ func TestX(t *testing.T) {\n\
         let ranges = compute_changed_lines(&tool_input, &path);
         std::fs::remove_file(&path).ok();
         assert_eq!(ranges, None);
-    }
-
-    #[test]
-    #[allow(non_snake_case)]
-    fn removes_lines_should_BeTrue_When_AnyEditLosesLines() {
-        let edit = |old: &str, new: &str| EditItem {
-            new_string: new.to_string(),
-            old_string: Some(old.to_string()),
-        };
-        let multi = |edits| ToolInput {
-            edits: Some(edits),
-            ..ToolInput::default()
-        };
-        assert!(removes_lines(&multi(vec![
-            edit("a\nb\n", ""),
-            edit("x\n", "y\n")
-        ])));
-        assert!(!removes_lines(&multi(vec![edit("x\n", "y\n")])));
-        assert!(!removes_lines(&multi(vec![edit("x\n", "y\nz\n")])));
-        let single = ToolInput {
-            old_string: Some("a\nb\nc\n".to_string()),
-            new_string: Some("a\n".to_string()),
-            ..ToolInput::default()
-        };
-        assert!(removes_lines(&single));
-        let write = ToolInput {
-            content: Some(String::new()),
-            ..ToolInput::default()
-        };
-        assert!(!removes_lines(&write));
     }
 }

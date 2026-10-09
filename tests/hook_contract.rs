@@ -100,6 +100,32 @@ impl TempRepo {
         self.spawn_hook(&payload)
     }
 
+    /// Makes the scratch repo a git checkout and commits `files` (rel path, content), so the
+    /// hook has a git-HEAD baseline to compare an edit against.
+    fn commit_files(&self, files: &[(&str, &str)]) {
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(&self.dir)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        for (rel, content) in files {
+            std::fs::write(self.path(rel), content).unwrap();
+            git(&["add", rel]);
+        }
+        git(&["commit", "-q", "-m", "baseline"]);
+    }
+
     fn spawn_hook(&self, payload: &serde_json::Value) -> (i32, String, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
             .arg("hook")
@@ -579,7 +605,7 @@ fn hook_should_EmitBlockingSuppressedAdvisory_When_EditAddsFindingUnderPlantedDi
         }),
     );
     let clean = "<!-- kibitzer:ignore markdown-link-integrity -- planned placeholder -->\nsee [x][ok]\n\n[ok]: https://example.com\n";
-    repo.run_hook("doc.md", clean);
+    repo.commit_files(&[("doc.md", clean)]);
     let edited = "<!-- kibitzer:ignore markdown-link-integrity -- planned placeholder -->\nsee [x][ok] and [y][nope]\n\n[ok]: https://example.com\n";
     let (code, stdout, stderr) =
         repo.run_hook_edit("doc.md", edited, "see [x][ok]", "see [x][ok] and [y][nope]");
@@ -609,7 +635,7 @@ fn hook_should_EmitBlockingSuppressedAdvisory_When_MidFileEditGrowsFileUnderHead
         }),
     );
     let small = numbered_go(400);
-    std::fs::write(repo.path("a.go"), &small).unwrap();
+    repo.commit_files(&[("a.go", &small)]);
     let grown = small.replacen(
         "var b200 = 200\n",
         &format!("var b200 = 200\n{}", "var extra = 1\n".repeat(200)),
@@ -633,7 +659,7 @@ fn hook_should_EmitBlockingSuppressedAdvisory_When_MultiEditMixesDeletionWithOth
             "scope": ["**/*.go"],
         }),
     );
-    // The removed comment lines used to separate the directive's covered row from the call.
+    // The removed statements used to separate the directive's covered row from the call.
     let after = "package main\n\nfunc main() {\n\t// kibitzer:ignore go-ignored-error -- fine here ok\n\tv, _ := f()\n\tw := 1\n}\n";
     let payload = json!({
         "cwd": repo.dir,
@@ -641,13 +667,147 @@ fn hook_should_EmitBlockingSuppressedAdvisory_When_MultiEditMixesDeletionWithOth
         "tool_input": {
             "file_path": repo.path("a.go"),
             "edits": [
-                {"old_string": "\t// note\n\t// note two\n", "new_string": ""},
+                {"old_string": "\tx := 0\n\ty := 0\n", "new_string": ""},
                 {"old_string": "\tw := 2\n", "new_string": "\tw := 1\n"},
             ],
         }
     });
+    let before = "package main\n\nfunc main() {\n\t// kibitzer:ignore go-ignored-error -- fine here ok\n\tx := 0\n\ty := 0\n\tv, _ := f()\n\tw := 2\n}\n";
+    repo.commit_files(&[("a.go", before)]);
     std::fs::write(repo.path("a.go"), after).unwrap();
     let (code, stdout, stderr) = repo.spawn_hook(&payload);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("[blocking-suppressed]"), "stdout: {stdout}");
+}
+
+const MD_DIRECTIVE: &str =
+    "<!-- kibitzer:ignore markdown-link-integrity -- planted for later -->\n";
+
+fn mli_repo(name: &str) -> TempRepo {
+    TempRepo::new(
+        name,
+        json!({
+            "name": "mli",
+            "checker": "markdown-link-integrity",
+            "severity": "blocking",
+        }),
+    )
+}
+
+fn suppressed_count(stdout: &str) -> usize {
+    stdout.matches("[blocking-suppressed]").count()
+}
+
+fn pairs(n: usize) -> String {
+    format!("{MD_DIRECTIVE}[t](#nope)\n").repeat(n)
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportOnlyExtraSuppressions_When_WriteAddsIdenticalPairsBeyondHead() {
+    let repo = mli_repo("write-identical-pairs");
+    repo.commit_files(&[("doc.md", &pairs(1))]);
+    let (code, stdout, stderr) = repo.run_hook("doc.md", &pairs(3));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 2, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportSlidFinding_When_DeletionMovesMatchingTextUnderSecondDirective() {
+    let repo = mli_repo("slide-second-directive");
+    let before = format!("{MD_DIRECTIVE}[t](#nope)\n{MD_DIRECTIVE}note\n[t](#nope)\n");
+    repo.commit_files(&[("doc.md", &before)]);
+    let after = format!("{MD_DIRECTIVE}[t](#nope)\n{MD_DIRECTIVE}[t](#nope)\n");
+    let (code, stdout, stderr) = repo.run_hook_edit("doc.md", &after, "note\n", "");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 1, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportKilledAnchor_When_FirstEditRenamesHeadingUnderPlantedDirective() {
+    let repo = mli_repo("rename-heading");
+    let before = format!("# Foo\n\n{MD_DIRECTIVE}[x](#foo)\n");
+    repo.commit_files(&[("doc.md", &before)]);
+    let after = format!("# Bar\n\n{MD_DIRECTIVE}[x](#foo)\n");
+    let (code, stdout, stderr) = repo.run_hook_edit("doc.md", &after, "# Foo", "# Bar");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 1, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportOnce_When_FileGrowsPast500UnderHeadDirectiveThenStayQuiet() {
+    let repo = TempRepo::new(
+        "grow-403-603",
+        json!({
+            "name": "go-file-size",
+            "checker": "go-file-size",
+            "severity": "blocking",
+            "scope": ["**/*.go"],
+        }),
+    );
+    let small = numbered_go(400);
+    repo.commit_files(&[("a.go", &small)]);
+    let extra = "var extra = 1\n".repeat(200);
+    let inserted = format!("var b200 = 200\n{extra}");
+    let grown = small.replacen("var b200 = 200\n", &inserted, 1);
+    let (_, stdout, stderr) = repo.run_hook_edit("a.go", &grown, "var b200 = 200\n", &inserted);
+    assert_eq!(
+        suppressed_count(&stdout),
+        1,
+        "stdout: {stdout} stderr: {stderr}"
+    );
+
+    // Already over the limit and suppressed at HEAD: growing further is not news.
+    let big = grown.clone();
+    let repo = TempRepo::new(
+        "grow-603-803",
+        json!({
+            "name": "go-file-size",
+            "checker": "go-file-size",
+            "severity": "blocking",
+            "scope": ["**/*.go"],
+        }),
+    );
+    repo.commit_files(&[("a.go", &big)]);
+    let inserted = format!("var b200 = 200\n{extra}");
+    let grown = big.replacen("var b200 = 200\n", &inserted, 1);
+    let (code, stdout, stderr) = repo.run_hook_edit("a.go", &grown, "var b200 = 200\n", &inserted);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_NotSpam_When_UnrelatedDeletionAndSuppressionsMatchHead() {
+    let repo = mli_repo("no-spam");
+    let before = format!("{}tail one\ntail two\n", pairs(3));
+    repo.commit_files(&[("doc.md", &before)]);
+    let after = format!("{}tail two\n", pairs(3));
+    let (code, stdout, stderr) = repo.run_hook_edit("doc.md", &after, "tail one\n", "");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportAll_When_EditedFileIsUntrackedInGitRepo() {
+    let repo = mli_repo("untracked");
+    repo.commit_files(&[("other.md", "hello\n")]);
+    let content = format!("{}tail one\n", pairs(2));
+    let after = format!("{}tail two\n", pairs(2));
+    std::fs::write(repo.path("new.md"), &content).unwrap();
+    let (code, stdout, stderr) = repo.run_hook_edit("new.md", &after, "tail one\n", "tail two\n");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 2, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_LeaveNoAdvisedStoreBehind_When_SuppressionsReported() {
+    let repo = mli_repo("no-cache-dir");
+    repo.run_hook("doc.md", &pairs(1));
+    assert!(!repo.cache_dir.join("kibitzer").join("advised").exists());
 }

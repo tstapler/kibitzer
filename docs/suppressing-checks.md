@@ -144,16 +144,22 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
 - **Visibility.** `kibitzer run` prints how many findings were suppressed inline
   (and how many came from blocking checks); `kibitzer run --no-inline-ignores`
   shows them again. A directive that silences a blocking finding raises
-  `[blocking-suppressed]` in the hook so the agent tells the user. That also holds
-  for a whole-file `Write` of a file kibitzer has not reported on before (at most 10
-  advisories, then one count line). After that, the hook remembers per file (under
-  `$XDG_CACHE_HOME/kibitzer/advised/`) which blocking suppressions it has reported and
-  mentions only new ones: a finding that appeared, or code that slid under a directive
-  after an edit removed lines. An edit that touches the directive's rows or the silenced
-  row always reports. With no memory yet, a deletion, an edit that removes lines, and a
-  file-scope finding (`file-size`, `file-complexity`, which a directive in the file head
-  covers wherever it lands) report; other drops outside the edit stay quiet. The advisory shows the reason in quotes, cut to
-  160 characters.
+  `[blocking-suppressed]` in the hook so the agent tells the user (at most 10
+  advisories, then one count line). The hook keeps no state between calls: it compares
+  the blocking findings the file's directives silence now with the ones they silenced in
+  the file's git HEAD content, matching by rule and the text of the silenced line, and
+  counting identical lines by occurrence. It reports the silenced findings that are new
+  relative to HEAD: one that appeared, code that slid under a directive, a duplicate
+  of an already-silenced line, or a file-scope finding (`file-size`, `file-complexity`)
+  that the file only now trips. A file git does not know yet has an empty baseline, so
+  everything in it reports. An edit that touches the directive's rows or the silenced
+  row always reports. With no usable baseline (not a git checkout, or an unreadable
+  HEAD), a whole-file `Write` reports every silenced finding and an `Edit` reports
+  only the ones it touched. The baseline is HEAD, not the previous edit, so until
+  you commit, later edits to the same file report the earlier new suppressions again.
+  The comparison costs one `git show` plus one extra checker run over the HEAD content,
+  and only when the file carries the `kibitzer:ignore` marker and a blocking finding
+  was silenced. The advisory shows the reason in quotes, cut to 160 characters.
 - **Failing CI on a suppressed blocking finding.** `kibitzer run` exits 0 when the
   only blocking finding was suppressed inline. Add `--deny-blocking-suppression` to
   exit 1 instead; the default is unchanged.

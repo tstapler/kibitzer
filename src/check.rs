@@ -14,9 +14,10 @@ use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
 use crate::inline_ignores::sanitize::display_path;
 use crate::inline_ignores::{
-    IgnoreTarget, InlineIgnoreContext, InlineOutcome, Line, RawFinding, anchor_rule,
-    apply_inline_ignores, capped_anchors,
+    DroppedFinding, IgnoreTarget, InlineIgnoreContext, InlineOutcome, Line, RawFinding,
+    anchor_rule, apply_inline_ignores, capped_anchors,
 };
+use crate::inline_post_pass::HeadSnapshot;
 use crate::plugin::Registry;
 use crate::run_context::RunContext;
 
@@ -568,6 +569,59 @@ fn raw_findings_for_check(
             message: f.message,
         })
         .collect())
+}
+
+/// The file's content at git HEAD, for the stateless baseline of the blocking-suppression
+/// advisory. A file git does not know yet is `Absent`; anything that stops git from answering
+/// (no repo, non-UTF-8 blob, file outside the root) is `Unavailable`.
+fn git_head_snapshot(repo_root: &Path, file_path: &Path) -> HeadSnapshot {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let rel = match file_path.strip_prefix(repo_root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => match canonical(file_path).strip_prefix(canonical(repo_root)) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => return HeadSnapshot::Unavailable,
+        },
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let run = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .ok()
+    };
+    let Some(show) = run(&["show", &format!("HEAD:./{rel}")]) else {
+        return HeadSnapshot::Unavailable;
+    };
+    if show.status.success() {
+        return String::from_utf8(show.stdout)
+            .map_or(HeadSnapshot::Unavailable, HeadSnapshot::Source);
+    }
+    match run(&["rev-parse", "--git-dir"]) {
+        Some(out) if out.status.success() => HeadSnapshot::Absent,
+        _ => HeadSnapshot::Unavailable,
+    }
+}
+
+/// What directives drop when `check`'s native checker runs over `head_source`, under the run's
+/// inline mode. Never feeds the run's counter or evicts its scan memo.
+fn head_dropped_findings(
+    check: &Check,
+    file_path: &Path,
+    head_source: &str,
+    inline: &InlineIgnoreContext,
+) -> anyhow::Result<Vec<DroppedFinding>> {
+    let Some(checker_name) = &check.checker else {
+        return Ok(Vec::new());
+    };
+    let replay = inline.without_counter();
+    let checked = run_checker_against_source(
+        NativeRun::for_check(check, checker_name, &replay),
+        file_path,
+        head_source,
+    )?;
+    Ok(checked.inline.dropped)
 }
 
 fn tolerates_unreadable_files(checker_name: &str) -> bool {
@@ -1437,6 +1491,10 @@ pub fn run_checks_for_trigger(
         results: &results,
         run_ctx,
         raw_rerun: &raw_findings_for_check,
+        head: &|path| git_head_snapshot(repo_root, path),
+        head_drops: &|check, path, head_source| {
+            head_dropped_findings(check, path, head_source, &run_ctx.inline)
+        },
     });
     results.extend(extra);
     Ok(results)

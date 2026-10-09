@@ -234,7 +234,7 @@ fn stop_hook_findings_for_files(cwd: &Path, files: &BTreeSet<PathBuf>) -> Result
             // spurious "couldn't read file" finding.
             continue;
         }
-        let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None, false)?;
+        let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None)?;
         for result in results.iter().filter(|r| !r.passed) {
             if predates_git_head(&config, &repo_root, file, result) {
                 continue;

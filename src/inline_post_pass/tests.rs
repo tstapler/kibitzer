@@ -37,6 +37,14 @@ fn no_rerun(_: &Check, _: &Path, _: &str) -> anyhow::Result<Vec<RawFinding>> {
     Ok(Vec::new())
 }
 
+fn no_head(_: &Path) -> HeadSnapshot {
+    HeadSnapshot::Unavailable
+}
+
+fn no_head_drops(_: &Check, _: &Path, _: &str) -> anyhow::Result<Vec<DroppedFinding>> {
+    Ok(Vec::new())
+}
+
 pub(super) fn run_with(
     changed_lines: Option<&[(usize, usize)]>,
     results: &[CheckResult],
@@ -48,6 +56,8 @@ pub(super) fn run_with(
         results,
         run_ctx: &RunContext::default(),
         raw_rerun: &no_rerun,
+        head: &no_head,
+        head_drops: &no_head_drops,
     })
 }
 
@@ -93,6 +103,8 @@ fn run_should_ReturnNothing_When_UnscopedRunAndWholeFileAdvisoriesSkipped() {
         results: &results,
         run_ctx: &ctx,
         raw_rerun: &no_rerun,
+        head: &no_head,
+        head_drops: &no_head_drops,
     });
     assert!(out.is_empty());
 }
@@ -183,9 +195,8 @@ fn run_should_EmitBlockingAdvisory_When_EditAddsFindingBelowPlantedDirective() {
 }
 
 #[test]
-fn run_should_EmitBlockingAdvisory_When_PureDeletionLeavesBlockingDropInFile() {
-    let out = run_with(Some(&[]), &blocking_md_result());
-    assert_eq!(out.len(), 1, "{out:?}");
+fn run_should_StaySilent_When_PureDeletionAndNoBaselineAvailable() {
+    assert!(run_with(Some(&[]), &blocking_md_result()).is_empty());
 }
 
 #[test]
@@ -353,6 +364,8 @@ fn run_should_EmitUnusedIgnore_When_UnownedRuleOnWrongRowAndSurvivingFindingExis
         results: &[first],
         run_ctx: &RunContext::default(),
         raw_rerun: &no_rerun,
+        head: &no_head,
+        head_drops: &no_head_drops,
     });
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(out.len(), 1, "{out:#?}");
@@ -415,6 +428,8 @@ fn run_with_fake_rerun(
         results: &[result_with_dropped("syntax-rules-go", Vec::new())],
         run_ctx: &RunContext::default(),
         raw_rerun: &rerun,
+        head: &no_head,
+        head_drops: &no_head_drops,
     });
     let _ = std::fs::remove_dir_all(&dir);
     (out, calls.get())
@@ -539,47 +554,106 @@ fn read_markered_source_should_ReturnNone_When_FileOverSizeCapOrNotRegular() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A scratch file carrying the marker plus an advised-state dir, for tests of the
-/// baseline-aware blocking advisory.
+/// A scratch markdown file whose rows 2, 4 and 6 are the same dangling link, each under its
+/// own directive row (1, 3, 5), plus the injected git-HEAD baseline the post-pass compares to.
 struct Baselined {
     dir: std::path::PathBuf,
     file: std::path::PathBuf,
+    checks: Vec<Check>,
 }
+
+const LINK_ROW: &str = "[t](#nope)";
 
 impl Baselined {
     fn new(name: &str) -> Self {
         let dir =
-            std::env::temp_dir().join(format!("kibitzer-pp-adv-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("kibitzer-pp-base-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("x.md");
-        let mut rows: Vec<String> = (0..30).map(|i| format!("body {i}")).collect();
-        rows[0] =
-            "<!-- kibitzer:ignore go-file-size, markdown-link-integrity -- planted for later -->"
-                .to_string();
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.push("<!-- kibitzer:ignore markdown-link-integrity -- planted for later -->");
+            rows.push(LINK_ROW);
+        }
+        rows.push("tail");
         std::fs::write(&file, rows.join("\n")).unwrap();
-        Self { dir, file }
+        let checks = vec![
+            owning_check("markdown-link-integrity", "markdown-link-integrity"),
+            owning_check("go-file-size", "go-file-size"),
+        ];
+        Self { dir, file, checks }
+    }
+
+    /// `n` link rows are suppressed now (rows 2, 4, 6); HEAD held `head_drops` of them.
+    fn link_drops(n: usize) -> Vec<CheckResult> {
+        let drops = (0..n)
+            .map(|i| {
+                let mut d = dropped(
+                    "markdown-link-integrity",
+                    "planted for later",
+                    (2 * i + 1, 2 * i + 1),
+                    Severity::Blocking,
+                );
+                d.finding_line = Line::new(2 * i + 2);
+                d
+            })
+            .collect();
+        vec![result_with_dropped("markdown-link-integrity", drops)]
+    }
+
+    fn head_link_drops() -> HeadSnapshot {
+        HeadSnapshot::Source(
+            format!(
+                "<!-- ignore -->
+{LINK_ROW}
+"
+            )
+            .repeat(3),
+        )
     }
 
     fn run(
         &self,
         changed: Option<&[(usize, usize)]>,
-        deletion: bool,
         results: &[CheckResult],
+        head: HeadSnapshot,
+        head_drops: Vec<DroppedFinding>,
     ) -> Vec<CheckResult> {
-        let ctx = RunContext {
-            advised_dir: Some(self.dir.join("advised")),
-            unlocated_deletion: deletion,
-            ..RunContext::default()
+        let head = std::cell::RefCell::new(Some(head));
+        let read_head = |_: &Path| {
+            head.borrow_mut()
+                .take()
+                .unwrap_or(HeadSnapshot::Unavailable)
         };
+        let drops = |_: &Check, _: &Path, _: &str| Ok(head_drops.clone());
         run(PostPassInput {
-            checks: &[],
+            checks: &self.checks,
             file_path: &self.file,
             changed_lines: changed,
             results,
-            run_ctx: &ctx,
+            run_ctx: &RunContext::default(),
             raw_rerun: &no_rerun,
+            head: &read_head,
+            head_drops: &drops,
         })
+    }
+
+    /// HEAD held `n` of the identical suppressed link rows.
+    fn head_with(n: usize) -> (HeadSnapshot, Vec<DroppedFinding>) {
+        let drops = (0..n)
+            .map(|i| {
+                let mut d = dropped(
+                    "markdown-link-integrity",
+                    "planted for later",
+                    (2 * i + 1, 2 * i + 1),
+                    Severity::Blocking,
+                );
+                d.finding_line = Line::new(2 * i + 2);
+                d
+            })
+            .collect();
+        (Self::head_link_drops(), drops)
     }
 }
 
@@ -589,81 +663,140 @@ impl Drop for Baselined {
     }
 }
 
-fn blocking_drop_result(rule: &str, finding_line: usize) -> Vec<CheckResult> {
-    let mut d = dropped(rule, "planted for later", (1, 1), Severity::Blocking);
-    d.finding_line = Line::new(finding_line);
-    vec![result_with_dropped(rule, vec![d])]
+#[test]
+fn run_should_ReportOnlyExtraIdenticalSuppressions_When_WriteAddsMoreThanHeadHad() {
+    let b = Baselined::new("write-multiset");
+    let (head, head_drops) = Baselined::head_with(1);
+    let out = b.run(None, &Baselined::link_drops(3), head, head_drops);
+    assert_eq!(out.len(), 2, "{out:?}");
 }
 
 #[test]
-fn run_should_EmitAdvisory_When_FileScopeFindingAppearsOutsideEditWithoutBaseline() {
-    let b = Baselined::new("filescope");
+fn run_should_ReportEverything_When_WriteCreatesFileGitDoesNotKnow() {
+    let b = Baselined::new("write-untracked");
     let out = b.run(
-        Some(&[(15, 15)]),
-        false,
-        &blocking_drop_result("go-file-size", 30),
+        None,
+        &Baselined::link_drops(3),
+        HeadSnapshot::Absent,
+        Vec::new(),
+    );
+    assert_eq!(out.len(), 3, "{out:?}");
+}
+
+#[test]
+fn run_should_ReportSlidFinding_When_MatchingTextWasAlreadySuppressedAtHead() {
+    // HEAD suppressed one `[t](#nope)`; the edit slid a second identical one under a directive.
+    let b = Baselined::new("slide-same-text");
+    let (head, head_drops) = Baselined::head_with(1);
+    let out = b.run(
+        Some(&[(20, 20)]),
+        &Baselined::link_drops(2),
+        head,
+        head_drops,
     );
     assert_eq!(out.len(), 1, "{out:?}");
+}
+
+#[test]
+fn run_should_ReportFinding_When_FirstEditOnNeverSeenFileMovesFindingUnderPlantedDirective() {
+    // The rename elsewhere killed an anchor the link used; HEAD dropped nothing.
+    let b = Baselined::new("first-edit");
+    let head = HeadSnapshot::Source("clean\n".to_string());
+    let out = b.run(
+        Some(&[(20, 20)]),
+        &Baselined::link_drops(1),
+        head,
+        Vec::new(),
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+}
+
+#[test]
+fn run_should_StaySilent_When_UnrelatedDeletionAndBaselineMatches() {
+    let b = Baselined::new("stable");
+    let (head, head_drops) = Baselined::head_with(3);
     assert!(
-        out[0].output.contains("[blocking-suppressed]"),
-        "{}",
-        out[0].output
+        b.run(Some(&[]), &Baselined::link_drops(3), head, head_drops)
+            .is_empty()
+    );
+    let (head, head_drops) = Baselined::head_with(3);
+    assert!(
+        b.run(
+            Some(&[(20, 20)]),
+            &Baselined::link_drops(3),
+            head,
+            head_drops
+        )
+        .is_empty()
     );
 }
 
 #[test]
-fn run_should_StaySilent_When_RowFindingOutsideEditWithoutBaselineAndNoDeletion() {
-    let b = Baselined::new("rowquiet");
+fn run_should_AlwaysReport_When_EditTouchesDirectiveOrSilencedRowDespiteMatchingBaseline() {
+    let b = Baselined::new("edited-row");
+    let (head, head_drops) = Baselined::head_with(3);
+    let out = b.run(Some(&[(2, 2)]), &Baselined::link_drops(3), head, head_drops);
+    assert_eq!(out.len(), 1, "{out:?}");
+}
+
+fn file_scope_drop(finding_line: usize) -> Vec<CheckResult> {
+    let mut d = dropped(
+        "go-file-size",
+        "will grow later",
+        (1, 1),
+        Severity::Blocking,
+    );
+    d.finding_line = Line::new(finding_line);
+    vec![result_with_dropped("go-file-size", vec![d])]
+}
+
+#[test]
+fn run_should_ReportFileScopeGrowth_When_HeadHeldNoSuchDrop() {
+    let b = Baselined::new("grow-new");
+    let head = HeadSnapshot::Source("small\n".to_string());
+    let out = b.run(Some(&[(15, 15)]), &file_scope_drop(603), head, Vec::new());
+    assert_eq!(out.len(), 1, "{out:?}");
+}
+
+#[test]
+fn run_should_StaySilent_When_FileScopeFindingAlreadyDroppedAtHeadAndFileGrows() {
+    let b = Baselined::new("grow-covered");
+    let head = HeadSnapshot::Source("big\n".to_string());
+    let head_drops = file_scope_drop(603).remove(0).inline.dropped;
+    let out = b.run(Some(&[(15, 15)]), &file_scope_drop(803), head, head_drops);
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn run_should_StaySilent_When_NoBaselineAvailableAndEditLeavesDirectiveRowsAlone() {
+    let b = Baselined::new("no-git");
     let out = b.run(
-        Some(&[(15, 15)]),
-        false,
-        &blocking_drop_result("markdown-link-integrity", 30),
+        Some(&[(20, 20)]),
+        &Baselined::link_drops(3),
+        HeadSnapshot::Unavailable,
+        Vec::new(),
     );
     assert!(out.is_empty(), "{out:?}");
 }
 
 #[test]
-fn run_should_EmitAdvisory_When_MixedEditRemovesLinesWithoutBaseline() {
-    let b = Baselined::new("mixed");
-    let out = b.run(
-        Some(&[(15, 15)]),
-        true,
-        &blocking_drop_result("markdown-link-integrity", 30),
-    );
-    assert_eq!(out.len(), 1, "{out:?}");
-}
-
-#[test]
-fn run_should_ReportOnlyNewSuppression_When_BaselineKnown() {
-    let b = Baselined::new("baseline");
-    let old = blocking_drop_result("markdown-link-integrity", 30);
-    // First sight stores the baseline (a Write reports everything it has no memory of).
-    assert_eq!(b.run(None, false, &old).len(), 1);
-    // A deletion elsewhere must not re-list the suppression the agent already heard about.
-    assert!(b.run(Some(&[]), false, &old).is_empty());
-    // Nor a second Write of the same file, nor an Edit with no located rows.
-    assert!(b.run(None, false, &old).is_empty());
-    // A different finding sliding under the directive is new.
-    let slid = blocking_drop_result("markdown-link-integrity", 29);
-    assert_eq!(b.run(Some(&[]), false, &slid).len(), 1);
-}
-
-#[test]
-fn run_should_EmitAdvisory_When_FileGrowsPastLimitUnderPlantedDirectiveWithBaseline() {
-    let b = Baselined::new("grow");
-    assert!(b.run(Some(&[(15, 15)]), false, &[]).is_empty());
-    let out = b.run(
-        Some(&[(15, 15)]),
-        false,
-        &blocking_drop_result("go-file-size", 30),
-    );
-    assert_eq!(out.len(), 1, "{out:?}");
-    assert!(
-        b.run(
-            Some(&[(16, 16)]),
-            false,
-            &blocking_drop_result("go-file-size", 31)
-        )
-        .is_empty()
-    );
+fn run_should_NotReadHead_When_NoBlockingDropExists() {
+    let b = Baselined::new("no-drops");
+    let read = std::cell::Cell::new(0usize);
+    let read_head = |_: &Path| {
+        read.set(read.get() + 1);
+        HeadSnapshot::Absent
+    };
+    let out = run(PostPassInput {
+        checks: &b.checks,
+        file_path: &b.file,
+        changed_lines: Some(&[(20, 20)]),
+        results: &[result_with_dropped("markdown-link-integrity", Vec::new())],
+        run_ctx: &RunContext::default(),
+        raw_rerun: &no_rerun,
+        head: &read_head,
+        head_drops: &no_head_drops,
+    });
+    assert!(out.is_empty());
+    assert_eq!(read.get(), 0);
 }
