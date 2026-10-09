@@ -67,7 +67,10 @@ struct CacheEntry {
     /// Fingerprint of the config file whose checks produced `results` — a check
     /// definition edit (command/scope/severity) must invalidate cached results even
     /// if the target file itself didn't change.
-    config_stamp: Stamp,
+    /// `None` for a repo with no `inspect.json` (defaults only): "absent" is its own state, so
+    /// creating a config later still invalidates the entry.
+    #[serde(default)]
+    config_stamp: Option<Stamp>,
     /// Fingerprint of `plugin::default_registry_path()` at the time `results` was
     /// produced — a `plugin install`/`remove` rewrites `registry.json`, and without this
     /// a long-running daemon would keep serving pre-install cached results for a file
@@ -129,10 +132,18 @@ impl Cache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        sweep_stale_temp_files(path);
         // Write-then-rename so a concurrent reader (or a crash mid-write) never sees a torn file.
-        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        fs::write(&tmp, serde_json::to_string(self)?)?;
-        fs::rename(&tmp, path).inspect_err(|_| {
+        // The counter keeps two threads of one daemon from sharing a temp file.
+        static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            std::process::id(),
+            SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let write_then_rename =
+            fs::write(&tmp, serde_json::to_string(self)?).and_then(|()| fs::rename(&tmp, path));
+        write_then_rename.inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })?;
         Ok(())
@@ -146,7 +157,7 @@ impl Cache {
         trigger: &str,
     ) -> Option<Vec<CheckResult>> {
         let file_stamp = stamp(file_path)?;
-        let config_stamp = stamp(config_path)?;
+        let config_stamp = stamp(config_path);
         let registry_stamp = stamp(registry_path);
         let entry = self.entries.get(&key(file_path))?;
         if entry.trigger == trigger
@@ -163,9 +174,10 @@ impl Cache {
     /// Stores `results` under the `before` stamps taken ahead of the run. Dropped when a stamp
     /// changed while the checks ran: the results describe content that is already gone.
     pub fn put(&mut self, before: Stamps, trigger: &str, results: Vec<CheckResult>) {
-        let (Some(file_stamp), Some(config_stamp)) = (before.file, before.config) else {
+        let Some(file_stamp) = before.file else {
             return;
         };
+        let config_stamp = before.config;
         if !before.is_current() {
             return;
         }
@@ -209,6 +221,30 @@ impl Cache {
                      failing on the next edit to this file",
                 );
             }
+        }
+    }
+}
+
+/// A temp file this old belongs to a writer that died between write and rename.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn sweep_stale_temp_files(cache_path: &Path) {
+    let (Some(dir), Some(name)) = (cache_path.parent(), cache_path.file_stem()) else {
+        return;
+    };
+    let prefix = format!("{}.json.tmp-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_temp = entry.file_name().to_string_lossy().starts_with(&prefix);
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok());
+        if is_temp && age.is_some_and(|age| age > STALE_TEMP_AGE) {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }
@@ -649,5 +685,91 @@ mod stamp_ordering_tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert_eq!(Cache::load(&path).grace_pending.len(), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod durability_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn scratch(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kibitzer-cache-dur-{}-{name}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample() -> CheckResult {
+        CheckResult::new("c".to_string(), Severity::Advisory, true, String::new())
+    }
+
+    #[test]
+    fn cache_should_HitWithoutConfigFile_When_RepoHasNoInspectJson() {
+        let dir = scratch("absent-config");
+        let file = dir.join("f.go");
+        fs::write(&file, "package main\n").unwrap();
+        let config = dir.join(".kibitzer").join("inspect.json");
+        let registry = dir.join("registry.json");
+        let mut cache = Cache::default();
+        cache.put(
+            Stamps::capture(&file, &config, &registry),
+            "batch",
+            vec![sample()],
+        );
+        assert!(cache.get(&file, &config, &registry, "batch").is_some());
+
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{}").unwrap();
+        assert!(
+            cache.get(&file, &config, &registry, "batch").is_none(),
+            "creating a config must invalidate the defaults-only entry"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_should_ReplaceFileAtomically_When_ReaderHoldsOldHandle() {
+        let dir = scratch("atomic");
+        let path = dir.join("cache.json");
+        fs::write(&path, "OLD-CONTENT").unwrap();
+        let mut held = fs::File::open(&path).unwrap();
+        Cache::default().save(&path).unwrap();
+        let mut seen = String::new();
+        held.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, "OLD-CONTENT",
+            "save must write a temp file and rename it"
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("entries"));
+        let leftovers = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 1, "temp file must not outlive the save");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_should_RemoveStaleTempFiles_When_OlderThanGracePeriod() {
+        let dir = scratch("sweep");
+        let path = dir.join("cache.json");
+        let stale = dir.join("cache.json.tmp-99999990");
+        let fresh = dir.join("cache.json.tmp-99999991");
+        fs::write(&stale, "x").unwrap();
+        fs::write(&fresh, "x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        Cache::default().save(&path).unwrap();
+        assert!(!stale.exists(), "stale temp file must be swept");
+        assert!(fresh.exists(), "a concurrent writer's fresh temp must stay");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

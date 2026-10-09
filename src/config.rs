@@ -677,6 +677,23 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     }
 }
 
+/// The config file path `find_config(start)` will read, or the `CONFIG_DIR` path under `start`
+/// when none exists. Never reads the file, so a caller can fingerprint it before the first read.
+pub fn locate_config_path(start: &Path) -> PathBuf {
+    let first = start_dir(start);
+    let mut dir = first.clone();
+    loop {
+        let candidate = resolve_config_path(&dir);
+        if candidate.is_file() {
+            return candidate;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return resolve_config_path(&first),
+        }
+    }
+}
+
 /// One `checker`-based `Check` running on `PostToolUse`+`batch`+[`crate::task_stop::TRIGGER`],
 /// the shape every per-file entry in `default_checks()` shares. The `Stop`-trigger opt-in
 /// closes a gap `PostToolUse`'s diff-scoping leaves open: a per-edit check only sees the

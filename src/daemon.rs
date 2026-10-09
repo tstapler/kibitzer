@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::{Cache, Stamps, default_cache_path};
 use crate::check::{CheckResult, run_checks_for_trigger};
-use crate::config::{find_effective_config, resolve_config_path};
+use crate::config::{find_effective_config, locate_config_path};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -159,8 +159,15 @@ fn handle_run_checks(
     cache: &Arc<Mutex<Cache>>,
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
+    // Fingerprinted before the first config or registry read, so an edit racing that read
+    // can only make the stamp older than the data (a miss later), never newer (a stale hit).
+    let config_path = locate_config_path(cwd);
+    let before = Stamps::capture(
+        file_path,
+        &config_path,
+        &crate::plugin::default_registry_path(),
+    );
     let (config, repo_root) = find_effective_config(cwd)?;
-    let config_path = resolve_config_path(&repo_root);
 
     // Cached entries aren't keyed by changed_lines — only bypass the cache lookup when a
     // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
@@ -174,13 +181,6 @@ fn handle_run_checks(
     {
         return Ok(cached);
     }
-
-    // Stamped before the checks run; see `Stamps`.
-    let before = Stamps::capture(
-        file_path,
-        &config_path,
-        &crate::plugin::default_registry_path(),
-    );
 
     // Loaded once for this request's whole check loop, not once per check — see
     // `run_checks_for_trigger`'s doc comment.
@@ -398,15 +398,31 @@ fn run_uncached(
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Result<Vec<CheckResult>> {
-    let (config, repo_root) = find_effective_config(cwd)?;
-    let config_path = resolve_config_path(&repo_root);
-    let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    run_uncached_with_cache(
+        cwd,
+        file_path,
+        trigger,
+        changed_lines,
+        &default_cache_path(),
+    )
+}
+
+fn run_uncached_with_cache(
+    cwd: &Path,
+    file_path: &Path,
+    trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
+    cache_path: &Path,
+) -> Result<Vec<CheckResult>> {
+    // Stamped before the first config read and before the checks run; see `Stamps`.
     let before = Stamps::capture(
         file_path,
-        &config_path,
+        &locate_config_path(cwd),
         &crate::plugin::default_registry_path(),
     );
+    let (config, repo_root) = find_effective_config(cwd)?;
+    let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
+    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -417,8 +433,7 @@ fn run_uncached(
         &run_ctx,
     )?;
 
-    let cache_path = default_cache_path();
-    let mut cache = Cache::load(&cache_path);
+    let mut cache = Cache::load(cache_path);
     cache.apply_grace(&mut results, file_path, trigger);
     // See handle_run_checks: don't let a diff-scoped partial result overwrite the
     // full-file cache entry. `grace_pending` isn't part of that cache entry, so it still
@@ -432,7 +447,7 @@ fn run_uncached(
     // subsequent `kibitzer hook` invocation would see an empty `grace_pending` and treat a
     // still-failing check as a fresh "first occurrence" forever, so a Blocking check could
     // never actually escalate back to blocking without a daemon.
-    let _ = cache.save(&cache_path);
+    let _ = cache.save(cache_path);
 
     Ok(results)
 }
@@ -632,6 +647,31 @@ mod stale_daemon_tests {
 mod stale_result_tests {
     use super::*;
 
+    /// Config whose check touches `started` before sleeping, so a test waits on that marker
+    /// instead of guessing how long the slow run needs to begin.
+    fn write_slow_on_bad_config(dir: &Path) {
+        let started = dir.join("started");
+        std::fs::write(
+            dir.join(".kibitzer/inspect.json"),
+            format!(
+                r#"{{"checks": [{{"name": "no-bad", "command": "if grep -q BAD {{file}}; then touch {}; sleep 2; exit 1; fi", "severity": "advisory", "message": "bad"}}]}}"#,
+                started.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn wait_for_slow_check_to_start(dir: &Path) {
+        let started = dir.join("started");
+        for _ in 0..500 {
+            if started.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("slow check never started");
+    }
+
     /// A shell check that sleeps only on BAD content: the slow request on old content is the
     /// one that finishes last, after a fast request already cached the new content's result.
     #[test]
@@ -643,11 +683,7 @@ mod stale_result_tests {
             std::env::temp_dir().join(format!("kibitzer-daemon-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
-        std::fs::write(
-            dir.join(".kibitzer/inspect.json"),
-            r#"{"checks": [{"name": "no-bad", "command": "if grep -q BAD {file}; then sleep 2; exit 1; fi", "severity": "advisory", "message": "bad"}]}"#,
-        )
-        .unwrap();
+        write_slow_on_bad_config(&dir);
         let file = dir.join("notes.txt");
         std::fs::write(&file, "BAD\n").unwrap();
         let cache = Arc::new(Mutex::new(Cache::default()));
@@ -664,7 +700,7 @@ mod stale_result_tests {
                 handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap()
             })
         };
-        std::thread::sleep(Duration::from_millis(500));
+        wait_for_slow_check_to_start(&dir);
         std::fs::write(&file, "GOOD content\n").unwrap();
         let fast = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
         assert!(fast.iter().all(|r| r.passed), "{fast:?}");
@@ -678,6 +714,49 @@ mod stale_result_tests {
         assert!(
             again.iter().all(|r| r.passed),
             "stale BAD result was served for the new content: {again:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The no-daemon fallback has the same stale-result hazard as the daemon path.
+    #[test]
+    fn run_uncached_should_NotCacheStaleResult_When_SlowRunFinishesAfterFileChanged() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-uncached-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        write_slow_on_bad_config(&dir);
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "BAD\n").unwrap();
+        let cache_path = dir.join("cache").join("cache.json");
+
+        let slow = {
+            let (dir, file, cache_path) = (dir.clone(), file.clone(), cache_path.clone());
+            std::thread::spawn(move || {
+                run_uncached_with_cache(&dir, &file, "batch", None, &cache_path).unwrap()
+            })
+        };
+        wait_for_slow_check_to_start(&dir);
+        std::fs::write(&file, "GOOD content\n").unwrap();
+        let fast = run_uncached_with_cache(&dir, &file, "batch", None, &cache_path).unwrap();
+        assert!(fast.iter().all(|r| r.passed), "{fast:?}");
+        let stale = slow.join().unwrap();
+        assert!(stale.iter().any(|r| !r.passed), "slow run saw BAD content");
+
+        let cached = Cache::load(&cache_path)
+            .get(
+                &file,
+                &crate::config::resolve_config_path(&dir),
+                &crate::plugin::default_registry_path(),
+                "batch",
+            )
+            .expect("fast result should be cached");
+        assert!(
+            cached.iter().all(|r| r.passed),
+            "stale BAD cached: {cached:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
