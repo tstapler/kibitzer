@@ -23,6 +23,14 @@ struct HookLogEntry {
     blocked: bool,
 }
 
+/// A line `hook_log::note_daemon_degraded` wrote; not a hook firing.
+#[derive(Deserialize)]
+struct DegradeNote {
+    #[allow(dead_code)]
+    event: String,
+    reason: String,
+}
+
 #[derive(Default)]
 struct CheckStats {
     fired: u64,
@@ -66,9 +74,14 @@ pub fn run_status() -> Result<ExitCode> {
     let mut last_ts = 0u64;
     let mut by_check: HashMap<String, CheckStats> = HashMap::new();
     let mut by_repo: HashMap<String, u64> = HashMap::new();
+    let mut degraded: Option<String> = None;
 
     for line in raw.lines() {
         if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(note) = serde_json::from_str::<DegradeNote>(line) {
+            degraded = Some(note.reason);
             continue;
         }
         let entry: HookLogEntry = match serde_json::from_str(line) {
@@ -135,6 +148,10 @@ pub fn run_status() -> Result<ExitCode> {
     repos.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     for (repo, count) in repos {
         println!("  {count:>5}  {repo}");
+    }
+
+    if let Some(reason) = degraded {
+        println!("\nHooks ran without the daemon: {}", escape_path(&reason));
     }
 
     Ok(ExitCode::SUCCESS)

@@ -171,3 +171,33 @@ pub fn record(
     };
     let _ = writeln!(file, "{line}");
 }
+
+/// Logs, once per distinct reason, that hooks are running without the daemon because its runtime
+/// directory is untrusted; the marker next to the log keeps a hook storm from repeating it.
+pub fn note_daemon_degraded(reason: &str) {
+    let path = log_path();
+    let Some(parent) = path.parent() else { return };
+    let marker = parent.join("daemon-degraded");
+    if std::fs::read_to_string(&marker).is_ok_and(|seen| seen == reason) {
+        return;
+    }
+    let timestamp_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let note = serde_json::json!({
+        "timestamp_unix": timestamp_unix,
+        "event": "daemon_degraded",
+        "reason": reason,
+    });
+    if std::fs::create_dir_all(parent).is_err() || std::fs::write(&marker, reason).is_err() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{note}");
+    }
+}

@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,6 +31,9 @@ impl Scratch {
         let runtime = root.join("rt");
         let repo = root.join("repo");
         std::fs::create_dir_all(&runtime).unwrap();
+        // The daemon only trusts a runtime directory nobody else can reach.
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
         std::fs::create_dir_all(repo.join(".kibitzer")).unwrap();
         std::fs::write(repo.join(".kibitzer/inspect.json"), r#"{"checks": []}"#).unwrap();
         std::fs::write(repo.join("a.txt"), "x\n").unwrap();
@@ -51,6 +55,7 @@ impl Scratch {
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("USER", "spawntest")
+            .env("TMPDIR", self.root.join("tmp"))
             .current_dir(&self.repo);
         cmd
     }
@@ -377,4 +382,102 @@ fn daemon_stop_should_NotSignalAnything_When_SocketIsSilentButLockIsFree() {
     let _ = bystander.kill();
     let _ = bystander.wait();
     drop(listener);
+}
+
+/// Runs `cmd` to completion, killing the child it started if it outlives `limit`.
+fn output_within(mut cmd: Command, limit: Duration) -> std::process::Output {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("command outlived {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn untrusted_leftovers(s: &Scratch) -> Vec<String> {
+    [s.root.join("tmp"), s.runtime.clone(), PathBuf::from("/tmp")]
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("kibitzer-untrusted"))
+        .collect()
+}
+
+fn make_runtime_loose(s: &Scratch) {
+    std::fs::set_permissions(&s.runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn daemon_start_should_Refuse_When_RuntimeDirIsGroupReadable() {
+    let s = Scratch::new("untrusted-start");
+    make_runtime_loose(&s);
+    let mut cmd = s.command();
+    cmd.args(["daemon", "start"]);
+    let out = output_within(cmd, Duration::from_secs(15));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("runtime dir untrusted"), "{stderr}");
+    assert!(
+        stderr.contains(&s.runtime.display().to_string()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("0755"), "{stderr}");
+    assert!(s.daemon_pids().is_empty());
+    assert_eq!(untrusted_leftovers(&s), Vec::<String>::new());
+    // The directory was refused, not repaired.
+    let mode = std::fs::metadata(&s.runtime).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
+#[test]
+fn daemon_status_and_stop_should_NameUntrustedDir_When_RuntimeDirIsASymlink() {
+    let s = Scratch::new("untrusted-symlink");
+    let link = s.root.join("rt-link");
+    std::os::unix::fs::symlink(&s.runtime, &link).unwrap();
+    for action in ["status", "stop"] {
+        let mut cmd = s.command();
+        cmd.env("XDG_RUNTIME_DIR", &link).args(["daemon", action]);
+        let out = output_within(cmd, Duration::from_secs(15));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("runtime dir untrusted: {}", link.display())),
+            "{action}: {stdout}"
+        );
+        assert!(!stdout.contains("no daemon running"), "{action}: {stdout}");
+        assert_eq!(out.status.code(), Some(1), "{action}: {out:?}");
+    }
+    assert_eq!(untrusted_leftovers(&s), Vec::<String>::new());
+}
+
+#[test]
+fn hooks_should_LogDegradeOnce_And_SpawnNothing_When_RuntimeDirIsUntrusted() {
+    let s = Scratch::new("untrusted-hook");
+    make_runtime_loose(&s);
+    s.hook();
+    s.hook();
+    assert!(s.daemon_pids().is_empty());
+    assert_eq!(untrusted_leftovers(&s), Vec::<String>::new());
+    let log = std::fs::read_to_string(s.root.join("cache/kibitzer/hook-log.jsonl")).unwrap();
+    let notes = log
+        .lines()
+        .filter(|l| l.contains("daemon_degraded"))
+        .count();
+    assert_eq!(notes, 1, "{log}");
+    assert!(log.contains("runtime dir untrusted"), "{log}");
+    let mut cmd = s.command();
+    cmd.arg("status");
+    let out = output_within(cmd, Duration::from_secs(15));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Hooks ran without the daemon"), "{stdout}");
+    assert!(stdout.contains("2 firings"), "{stdout}");
 }

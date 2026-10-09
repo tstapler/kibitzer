@@ -212,12 +212,20 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   lock (`kibitzer-<user>.lock` beside the socket, mode 0600, holding its pid) and a
   second `daemon start` exits instead of taking the socket over. The socket and lock
   live in `$XDG_RUNTIME_DIR`, or in a `kibitzer-<uid>` directory (mode 0700) under the
-  temp dir; a directory that another user owns, or a symlink, is not trusted and the
-  hook then runs checks in-process. A client probes the daemon with a 750 ms ping before
+  temp dir. `$XDG_RUNTIME_DIR` is used only if it is a real directory you own with no
+  group or other access (mode 0700); kibitzer never chmods it. Otherwise (another
+  user's directory, a symlink, mode 0755) the directory is untrusted: hooks run checks
+  in-process and log that once to the hook log (`kibitzer status` shows it),
+  `kibitzer daemon start` exits 1 naming the directory and why, and `daemon status` and
+  `daemon stop` report `runtime dir untrusted: <dir>` instead of "no daemon running".
+  A client probes the daemon with a 750 ms ping before
   each request; a daemon that holds its lock but never answers (stopped, deadlocked) is
   skipped for 10 seconds, and a new `daemon start` (or `daemon stop`) terminates it with
   SIGTERM then SIGKILL, but only after checking that the pid in the lock is this user's
-  `kibitzer daemon start` and is older than the lock file.
+  `kibitzer daemon start` (the executable path may contain spaces) and is older than the
+  lock file, and after pinging the holder once more right before signalling. A refused
+  connection while the lock is still held (macOS refuses once a stopped daemon's backlog
+  is full) counts as a wedged daemon, not as no daemon.
 
 ## Accept one specific, correctly-flagged finding
 

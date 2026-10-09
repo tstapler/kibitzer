@@ -42,26 +42,18 @@ struct Response {
     error: Option<String>,
 }
 
+pub(crate) use crate::daemon_lock::DirRejected;
+
 /// Per-user socket path so multiple users on a shared machine never collide, and so a
 /// leftover socket from a previous login session doesn't get reused across reboots
 /// unexpectedly (XDG_RUNTIME_DIR is normally tmpfs, reset on boot).
 ///
 /// Lives in a directory only this user can write (see `daemon_lock::trusted_runtime_dir`). When
-/// no such directory can be had, the path is a per-process one nobody can reach, so every call
-/// falls back to running checks in-process and no daemon is started (`daemon_dir_is_trusted`).
-pub fn default_socket_path() -> PathBuf {
+/// no such directory can be had the error names it: hooks then run checks in-process, and
+/// `daemon start` refuses rather than bind a socket nobody could find again.
+pub fn socket_path() -> Result<PathBuf, DirRejected> {
     let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
-    match crate::daemon_lock::trusted_runtime_dir() {
-        Some(dir) => dir.join(format!("kibitzer-{user}.sock")),
-        None => std::env::temp_dir().join(format!(
-            "kibitzer-untrusted-{}-{user}.sock",
-            std::process::id()
-        )),
-    }
-}
-
-fn daemon_dir_is_trusted() -> bool {
-    crate::daemon_lock::trusted_runtime_dir().is_some()
+    crate::daemon_lock::trusted_runtime_dir().map(|dir| dir.join(format!("kibitzer-{user}.sock")))
 }
 
 /// Run the daemon in the foreground on `socket_path` until it receives a `Shutdown`
@@ -147,7 +139,12 @@ fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
         if std::time::Instant::now() >= deadline {
             let wedged = matches!(probe, Probe::Wedged);
             if wedged
-                && crate::daemon_lock::displace_wedged_holder(&lock_path)
+                && crate::daemon_lock::displace_wedged_holder(&lock_path, &|| {
+                    matches!(
+                        exchange(socket_path, &Request::Ping, PROBE_TIMEOUT),
+                        Probe::Wedged
+                    )
+                })
                 && file.try_lock().is_ok()
             {
                 crate::daemon_lock::record_owner_pid(&file);
@@ -343,9 +340,27 @@ fn connect_within(socket_path: &Path, timeout: Duration) -> Result<UnixStream, P
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(_)) => Err(Probe::Dead),
+        Ok(Err(e)) => Err(classify_connect_error(e.kind(), || {
+            lock_is_live(&owner_lock_path(socket_path))
+        })),
         Err(_) => Err(Probe::Wedged),
     }
+}
+
+/// A refused connect is normally "nothing listening", but macOS also refuses when a stopped
+/// daemon's backlog is full. A refusal while the owner lock is still held is therefore a wedged
+/// holder, so displacement can run.
+fn classify_connect_error(kind: std::io::ErrorKind, lock_held: impl FnOnce() -> bool) -> Probe {
+    if kind == std::io::ErrorKind::ConnectionRefused && lock_held() {
+        Probe::Wedged
+    } else {
+        Probe::Dead
+    }
+}
+
+/// Whether a lock file exists and is held; never creates one.
+fn lock_is_live(lock_path: &Path) -> bool {
+    lock_path.exists() && crate::daemon_lock::lock_is_held(lock_path)
 }
 
 /// Sends `req` and reads one reply line, giving the daemon `timeout` for each step.
@@ -387,9 +402,10 @@ fn request(socket_path: &Path, req: &Request) -> Option<Response> {
     }
 }
 
-/// True if a kibitzer daemon is listening and responds to a ping.
-pub fn is_alive() -> bool {
-    request(&default_socket_path(), &Request::Ping).is_some()
+/// Whether a kibitzer daemon is listening and responds to a ping; an untrusted runtime
+/// directory is an error, not "no daemon".
+pub fn is_alive() -> Result<bool, DirRejected> {
+    Ok(request(&socket_path()?, &Request::Ping).is_some())
 }
 
 /// What `kibitzer daemon stop` accomplished.
@@ -401,10 +417,15 @@ pub enum ShutdownOutcome {
     Killed,
     /// The daemon never answered and its pid could not be verified as a kibitzer daemon.
     Unresponsive,
+    /// The runtime directory is not trusted, so no daemon could have been started there.
+    UntrustedDir(DirRejected),
 }
 
 pub fn shutdown() -> ShutdownOutcome {
-    shutdown_with_lock(&default_socket_path())
+    match socket_path() {
+        Ok(path) => shutdown_with_lock(&path),
+        Err(rejected) => ShutdownOutcome::UntrustedDir(rejected),
+    }
 }
 
 fn shutdown_with_lock(socket_path: &Path) -> ShutdownOutcome {
@@ -414,7 +435,12 @@ fn shutdown_with_lock(socket_path: &Path) -> ShutdownOutcome {
         Probe::Wedged => {
             let lock = owner_lock_path(socket_path);
             if crate::daemon_lock::lock_is_held(&lock)
-                && crate::daemon_lock::displace_wedged_holder(&lock)
+                && crate::daemon_lock::displace_wedged_holder(&lock, &|| {
+                    matches!(
+                        exchange(socket_path, &Request::Ping, PROBE_TIMEOUT),
+                        Probe::Wedged
+                    )
+                })
             {
                 ShutdownOutcome::Killed
             } else {
@@ -453,13 +479,14 @@ pub fn try_run_checks_via_daemon(
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<Vec<CheckResult>> {
-    try_run_checks_at(
-        &default_socket_path(),
-        cwd,
-        file_path,
-        trigger,
-        changed_lines,
-    )
+    let socket = match socket_path() {
+        Ok(socket) => socket,
+        Err(rejected) => {
+            crate::hook_log::note_daemon_degraded(&rejected.to_string());
+            return None;
+        }
+    };
+    try_run_checks_at(&socket, cwd, file_path, trigger, changed_lines)
 }
 
 fn try_run_checks_at(
@@ -541,10 +568,9 @@ fn maybe_spawn_daemon() {
     if cfg!(test) || std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
         return;
     }
-    if !daemon_dir_is_trusted() {
+    let Ok(socket_path) = socket_path() else {
         return;
-    }
-    let socket_path = default_socket_path();
+    };
     let marker = socket_path.with_extension("spawn-attempt");
     // Non-blocking exclusive gate: a hook that loses it knows another is spawning right now.
     // The marker mtime is read and written only under the gate, so concurrent hooks cannot
@@ -1075,6 +1101,56 @@ mod stale_result_tests {
         assert!(cache.lock().is_err(), "setup: mutex must be poisoned");
         let out = handle_run_checks(&dir, &file, "batch", None, &cache, &dir.join("cache.json"));
         assert!(out.is_ok(), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_connect_error_should_ReportWedged_When_RefusedWhileLockHeld() {
+        use std::io::ErrorKind::{ConnectionRefused, NotFound};
+        assert!(matches!(
+            classify_connect_error(ConnectionRefused, || true),
+            Probe::Wedged
+        ));
+        assert!(matches!(
+            classify_connect_error(ConnectionRefused, || false),
+            Probe::Dead
+        ));
+        // No socket at all is "nothing listening" even if a daemon is mid-startup.
+        assert!(matches!(
+            classify_connect_error(NotFound, || panic!("lock must not be probed")),
+            Probe::Dead
+        ));
+    }
+
+    #[test]
+    fn exchange_should_ReportWedged_When_StoppedDaemonBacklogIsSaturatedAndLockHeld() {
+        let dir = std::env::temp_dir().join(format!("kibitzer-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("k.sock");
+        // Bound and listening but never accepting, like a SIGSTOPped daemon.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let lock = open_lock_file(&owner_lock_path(&socket)).unwrap();
+        lock.try_lock().unwrap();
+        // macOS refuses once the backlog fills; Linux blocks the connect. Both must read as wedged.
+        let _clients: Vec<UnixStream> = (0..1024)
+            .map_while(|_| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let path = socket.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(UnixStream::connect(path));
+                });
+                rx.recv_timeout(Duration::from_millis(200)).ok()?.ok()
+            })
+            .collect();
+        let probe = exchange(&socket, &Request::Ping, Duration::from_millis(300));
+        assert!(
+            matches!(probe, Probe::Wedged),
+            "saturated backlog + held lock"
+        );
+        drop(lock);
+        let probe = exchange(&socket, &Request::Ping, Duration::from_millis(300));
+        assert!(matches!(probe, Probe::Wedged | Probe::Dead));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

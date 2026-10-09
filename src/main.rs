@@ -371,10 +371,16 @@ fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon { action } => match action {
-            DaemonAction::Start => {
-                daemon::run_daemon(&daemon::default_socket_path())?;
-                Ok(ExitCode::SUCCESS)
-            }
+            DaemonAction::Start => match daemon::socket_path() {
+                Ok(socket) => {
+                    daemon::run_daemon(&socket)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(rejected) => {
+                    eprintln!("[kibitzer] refusing to start a daemon: {rejected}");
+                    Ok(ExitCode::from(1))
+                }
+            },
             DaemonAction::Stop => {
                 match daemon::shutdown() {
                     daemon::ShutdownOutcome::Stopped => println!("[kibitzer] daemon stopped"),
@@ -390,14 +396,21 @@ fn main() -> Result<ExitCode> {
                     daemon::ShutdownOutcome::NotRunning => {
                         println!("[kibitzer] no daemon was running");
                     }
+                    daemon::ShutdownOutcome::UntrustedDir(rejected) => {
+                        println!("[kibitzer] {rejected}; no daemon can be running there");
+                        return Ok(ExitCode::from(1));
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
             DaemonAction::Status => {
-                if daemon::is_alive() {
-                    println!("[kibitzer] daemon is running");
-                } else {
-                    println!("[kibitzer] no daemon running");
+                match daemon::is_alive() {
+                    Ok(true) => println!("[kibitzer] daemon is running"),
+                    Ok(false) => println!("[kibitzer] no daemon running"),
+                    Err(rejected) => {
+                        println!("[kibitzer] {rejected}");
+                        return Ok(ExitCode::from(1));
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
