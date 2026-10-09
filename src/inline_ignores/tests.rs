@@ -1372,3 +1372,65 @@ fn unused_ignore_unknown_rule_should_TruncateAndStripControls_When_RuleTextIsHos
     assert!(!message.contains('\u{1b}'), "{message:?}");
     assert!(message.len() < 300, "{} bytes", message.len());
 }
+
+const FILE_SCOPE_CHECKERS: &[&str] = &[
+    "go-file-size",
+    "typescript-file-size",
+    "tsx-file-size",
+    "javascript-file-size",
+    "python-file-size",
+    "java-file-size",
+    "kotlin-file-size",
+    "rust-file-size",
+    "file-complexity",
+];
+
+#[test]
+fn apply_inline_ignores_should_HeadScope_When_DirectiveNamesFileScopeCheckerName() {
+    for checker in FILE_SCOPE_CHECKERS {
+        let source = format!("// kibitzer:ignore {checker} -- generated tables\n");
+        let out = apply(
+            vec![finding(900, "[file-size] big")],
+            &source,
+            checker,
+            Severity::Advisory,
+            &InlineIgnoreContext::default(),
+        );
+        assert!(out.kept.is_empty(), "{checker}: {:?}", out.kept);
+        assert_eq!(out.dropped.len(), 1, "{checker}");
+    }
+}
+
+#[test]
+fn apply_inline_ignores_should_NotHeadScope_When_CheckerNameIsNotFileScope() {
+    let out = apply(
+        vec![finding(900, "[flag-argument] a")],
+        "// kibitzer:ignore syntax-rules-go -- legacy api\n",
+        "syntax-rules-go",
+        Severity::Advisory,
+        &InlineIgnoreContext::default(),
+    );
+    assert_eq!(out.kept.len(), 1);
+}
+
+#[test]
+fn unused_ignores_should_SayFileHead_When_FileScopeCheckerNameIsOutsideHead() {
+    let d = directive_at(&["python-file-size"], 300, 300, true);
+    let f = raw("python-file-size", "file-size", 900, "[file-size] big");
+    let out = unused_ignores(&[d], &[f], &["python-file-size"], None);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].kind, UnusedKind::FileHead, "{:?}", out[0].message);
+    assert!(
+        out[0].message.contains("first 10 lines"),
+        "{}",
+        out[0].message
+    );
+    assert!(!out[0].message.contains("Move the comment to the line"));
+}
+
+#[test]
+fn syntax_hint_should_SayFileHead_When_AnchorIsFileScopeCheckerName() {
+    let rule = rid("file-complexity");
+    let hint = syntax_hint(Path::new("a.go"), Some((&rule, Line::new(80))), &[&rule]);
+    assert!(hint.contains("in the first 10 lines"), "{hint}");
+}

@@ -1,6 +1,8 @@
 //! Judging which directive rules suppress nothing, and the repair messages for them.
 
-use super::rules::{did_you_mean, has_owner, known_rule, owner_matches, rule_matches};
+use super::rules::{
+    did_you_mean, has_owner, is_file_scope, known_rule, owner_matches, rule_matches,
+};
 use super::sanitize::{ECHO_RULE_TEXT_CHARS, echo};
 use super::types::*;
 
@@ -97,7 +99,7 @@ fn owned_verdict(
     if used || !judged {
         return None;
     }
-    let (kind, message) = if FILE_SCOPE_RULES.contains(&rule.as_str()) {
+    let (kind, message) = if is_file_scope(rule.as_str()) {
         (UnusedKind::FileHead, file_head_message(rule))
     } else if let Some(n) = nearest_finding_line(rule, raw, d.start_line) {
         (UnusedKind::WrongRow, wrong_row_message(d, rule, n))

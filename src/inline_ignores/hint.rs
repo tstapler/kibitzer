@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use super::rules::is_file_scope;
 use super::types::*;
 use crate::checker::Language;
 
@@ -64,7 +65,7 @@ pub(crate) fn syntax_hint_limited(
         directive_example(leader.open, rule_text, leader.close)
     );
     match anchor {
-        Some((rule, line)) if FILE_SCOPE_RULES.contains(&rule.as_str()) => hint.push_str(&format!(
+        Some((rule, line)) if is_file_scope(rule.as_str()) => hint.push_str(&format!(
             "in the first {FILE_HEAD_LINES} lines or on the anchor line (line {})",
             line.get()
         )),

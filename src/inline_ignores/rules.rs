@@ -110,7 +110,7 @@ fn rule_info(rule: &str) -> Option<&'static RuleInfo> {
     RULES.iter().find(|r| r.id == rule)
 }
 
-fn is_meta_rule(rule: &str) -> bool {
+pub(crate) fn is_meta_rule(rule: &str) -> bool {
     rule_info(rule).is_some_and(|r| r.meta)
 }
 
@@ -199,6 +199,15 @@ pub(crate) fn owned_by(rule: &str, check_name: &str) -> bool {
     owner_matches(rule, check_name) == Some(true)
 }
 
+/// Whether `name` (a rule id or a checker name) is file-scope: its finding is anchored to the
+/// file, not a statement, so a directive in the file head covers it. Derived from
+/// `FILE_SCOPE_RULES` and the owner table, so `python-file-size` counts like `file-size`.
+pub(crate) fn is_file_scope(name: &str) -> bool {
+    FILE_SCOPE_RULES
+        .iter()
+        .any(|rule| *rule == name || owner_matches(rule, name) == Some(true))
+}
+
 impl Directive {
     /// Whether this directive's `rule` silences a finding of `checker_name`/`message` on `line`.
     /// The one definition shared by the apply path and the unused-ignore judgement, so the
@@ -216,8 +225,8 @@ impl Directive {
         }
         let on_row = (self.start_line <= line && line <= self.end_line)
             || (self.whole_line && line.get() == self.end_line.get() + 1);
-        let in_head =
-            self.start_line.get() <= FILE_HEAD_LINES && FILE_SCOPE_RULES.contains(&rule.as_str());
+        let in_head = self.start_line.get() <= FILE_HEAD_LINES
+            && (is_file_scope(rule.as_str()) || is_file_scope(checker_name));
         on_row || in_head
     }
 }
