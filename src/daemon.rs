@@ -119,6 +119,17 @@ use crate::daemon_lock::open_lock_file;
 /// owner did not exit within `PREDECESSOR_WAIT`. A holder that keeps the lock yet never answers
 /// a probe (stopped or deadlocked) is displaced once that wait runs out, if its pid checks out.
 fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
+    acquire_owner_lock_with(socket_path, &crate::daemon_lock::displace_wedged_holder)
+}
+
+/// Frees the lock of a wedged holder: `(lock_path, still_wedged) -> freed`. A parameter so tests
+/// can observe what the re-probe reports at the moment of displacement.
+type Displace<'a> = &'a dyn Fn(&Path, &dyn Fn() -> bool) -> bool;
+
+fn acquire_owner_lock_with(
+    socket_path: &Path,
+    displace: Displace,
+) -> Result<Option<std::fs::File>> {
     let lock_path = owner_lock_path(socket_path);
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir).ok();
@@ -142,7 +153,7 @@ fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
         if std::time::Instant::now() >= deadline {
             let wedged = matches!(probe, Probe::Wedged);
             if wedged
-                && crate::daemon_lock::displace_wedged_holder(&lock_path, &|| {
+                && displace(&lock_path, &|| {
                     matches!(
                         exchange(socket_path, &Request::Ping, PROBE_TIMEOUT),
                         Probe::Wedged
@@ -430,19 +441,19 @@ pub enum ShutdownOutcome {
 
 pub fn shutdown() -> ShutdownOutcome {
     match socket_path() {
-        Ok(path) => shutdown_with_lock(&path),
+        Ok(path) => shutdown_with_lock(&path, &crate::daemon_lock::displace_wedged_holder),
         Err(rejected) => ShutdownOutcome::UntrustedDir(rejected),
     }
 }
 
-fn shutdown_with_lock(socket_path: &Path) -> ShutdownOutcome {
+fn shutdown_with_lock(socket_path: &Path, displace: Displace) -> ShutdownOutcome {
     match exchange(socket_path, &Request::Shutdown, PROBE_TIMEOUT) {
         Probe::Answered(_) => ShutdownOutcome::Stopped,
         Probe::Dead => ShutdownOutcome::NotRunning,
         Probe::Wedged => {
             let lock = owner_lock_path(socket_path);
             if crate::daemon_lock::lock_is_held(&lock)
-                && crate::daemon_lock::displace_wedged_holder(&lock, &|| {
+                && displace(&lock, &|| {
                     matches!(
                         exchange(socket_path, &Request::Ping, PROBE_TIMEOUT),
                         Probe::Wedged
@@ -1188,6 +1199,139 @@ mod stale_result_tests {
         drop(lock);
         let probe = exchange(&socket, &Request::Ping, Duration::from_millis(300));
         assert!(matches!(probe, Probe::Wedged | Probe::Dead));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod displacement_wiring_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A daemon that swallows every request (wedged) until `healthy` is set, then answers like a
+    /// current daemon. Stopped by dropping it.
+    struct Holder {
+        healthy: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Holder {
+        fn spawn(socket: &Path) -> Self {
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let healthy = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (h, s) = (Arc::clone(&healthy), Arc::clone(&stop));
+            let handle = std::thread::spawn(move || {
+                let mut parked = Vec::new();
+                while !s.load(Ordering::SeqCst) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    if h.load(Ordering::SeqCst) {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut line = String::new();
+                        if let Ok(clone) = stream.try_clone() {
+                            let _ = BufReader::new(clone).read_line(&mut line);
+                        }
+                        let mut writer = stream;
+                        let _ = writeln!(
+                            writer,
+                            r#"{{"ok":true,"version":"{DAEMON_VERSION}","results":[]}}"#
+                        );
+                    } else {
+                        parked.push(stream);
+                    }
+                }
+            });
+            Self {
+                healthy,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kz-dw-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What `still_wedged` reports before and after a healthy daemon takes over the socket.
+    fn reprobe_answers(holder: &Holder, still_wedged: &dyn Fn() -> bool) -> Vec<bool> {
+        let before = still_wedged();
+        holder.healthy.store(true, Ordering::SeqCst);
+        vec![before, still_wedged()]
+    }
+
+    #[test]
+    fn acquire_owner_lock_should_PassHealthyReprobe_When_HolderRecoversBeforeDisplacement() {
+        let dir = scratch("acquire");
+        let socket = dir.join("k.sock");
+        let lock = owner_lock_path(&socket);
+        let held = crate::daemon_lock::open_lock_file(&lock).unwrap();
+        held.try_lock().unwrap();
+        let holder = Holder::spawn(&socket);
+        let seen = RefCell::new(Vec::new());
+        let out = acquire_owner_lock_with(&socket, &|_, still_wedged| {
+            seen.borrow_mut()
+                .extend(reprobe_answers(&holder, still_wedged));
+            false
+        })
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(
+            *seen.borrow(),
+            vec![true, false],
+            "re-probe must see a holder that answers after takeover as healthy"
+        );
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_with_lock_should_PassHealthyReprobe_When_HolderRecoversBeforeDisplacement() {
+        let dir = scratch("shutdown");
+        let socket = dir.join("k.sock");
+        let lock = owner_lock_path(&socket);
+        let held = crate::daemon_lock::open_lock_file(&lock).unwrap();
+        held.try_lock().unwrap();
+        let holder = Holder::spawn(&socket);
+        let seen = RefCell::new(Vec::new());
+        let outcome = shutdown_with_lock(&socket, &|_, still_wedged| {
+            seen.borrow_mut()
+                .extend(reprobe_answers(&holder, still_wedged));
+            false
+        });
+        assert_eq!(outcome, ShutdownOutcome::Unresponsive);
+        assert_eq!(*seen.borrow(), vec![true, false]);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_is_live_should_NotCreateLockFile_When_NothingIsRunning() {
+        let dir = scratch("live");
+        let lock = dir.join("k.lock");
+        assert!(!lock_is_live(&lock));
+        assert!(!lock.exists(), "lock_is_live created {}", lock.display());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

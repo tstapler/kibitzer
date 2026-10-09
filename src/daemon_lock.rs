@@ -226,7 +226,17 @@ fn is_our_daemon(info: &ProcInfo, lock_mtime: SystemTime, now: SystemTime) -> bo
 
 /// Whether some process currently holds the lock (an unreadable lock counts as not held).
 pub(crate) fn lock_is_held(lock_path: &Path) -> bool {
-    open_lock_file(lock_path).is_ok_and(|f| f.try_lock().is_err())
+    // Never creates the file: asking whether a daemon is there must not leave a lock behind.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .is_ok_and(|f| {
+            f.metadata()
+                .is_ok_and(|m| m.is_file() && m.uid() == current_uid())
+                && f.try_lock().is_err()
+        })
 }
 
 fn lock_is_free(lock_path: &Path) -> bool {
@@ -581,5 +591,92 @@ mod tests {
             err.reason.contains("owned by uid") || err.reason.contains("mode"),
             "{err}"
         );
+    }
+
+    /// A shell that ignores SIGTERM, so only SIGKILL stops it.
+    fn spawn_term_immune() -> std::process::Child {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+            .spawn()
+            .unwrap();
+        // Let the trap install before the first signal arrives.
+        std::thread::sleep(Duration::from_millis(300));
+        child
+    }
+
+    #[test]
+    fn displace_with_should_NotSigkill_When_PidFailsReverifyAfterTermGrace() {
+        let dir = scratch("reverify");
+        let mut holder = spawn_term_immune();
+        let (lock, _held) = lock_held_by_test_naming(&dir, holder.id());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // Verified before SIGTERM; by the time the grace runs out the pid belongs to someone else.
+        let verify =
+            |_: u32, _: &Path| calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let freed = displace_with(&lock, &|| true, &verify);
+        assert!(!freed, "the lock is still held by the test");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "a recycled pid must not receive SIGKILL"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn displace_with_should_Sigkill_When_PidStillVerifiedAfterTermGrace() {
+        let dir = scratch("sigkill");
+        let mut holder = spawn_term_immune();
+        let (lock, _held) = lock_held_by_test_naming(&dir, holder.id());
+        let _ = displace_with(&lock, &|| true, &|_, _| true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut dead = false;
+        while std::time::Instant::now() < deadline {
+            if holder.try_wait().unwrap().is_some() {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            dead,
+            "a still-verified holder that ignores SIGTERM must be SIGKILLed"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_is_held_should_NotCreateFile_When_PathIsMissing() {
+        let dir = scratch("no-create");
+        let lock = dir.join("k.lock");
+        assert!(!lock_is_held(&lock));
+        assert!(!lock.exists(), "lock_is_held created {}", lock.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_is_held_should_ReportHeldAndFree_When_FileExists() {
+        // A concurrent test's fork can briefly duplicate a probe's descriptor (and so its flock)
+        // until the child execs, so each state is awaited rather than sampled once.
+        let eventually = |what: &str, cond: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "never became {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let dir = scratch("held-free");
+        let lock = dir.join("k.lock");
+        let file = open_lock_file(&lock).unwrap();
+        eventually("free", &|| !lock_is_held(&lock));
+        eventually("locked", &|| file.try_lock().is_ok());
+        assert!(lock_is_held(&lock));
+        drop(file);
+        eventually("free again", &|| !lock_is_held(&lock));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

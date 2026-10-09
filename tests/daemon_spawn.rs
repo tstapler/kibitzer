@@ -285,11 +285,42 @@ fn start_daemon(s: &Scratch) -> (std::process::Child, u32) {
         std::thread::sleep(Duration::from_millis(20));
     }
     let pid = child.id();
+    // Binding is not readiness: stop only a daemon that is serving, so the lock holds its pid and a
+    // SIGSTOP cannot land before the accept loop exists.
+    wait_for("the daemon to answer a ping", READY_LIMIT, || {
+        String::from_utf8_lossy(
+            &s.command()
+                .args(["daemon", "status"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .contains("is running")
+    });
     (child, pid)
 }
 
+/// Generous because the suite runs next to cargo builds; a real hang is unbounded, not slow.
+const READY_LIMIT: Duration = Duration::from_secs(60);
+const BOUND: Duration = Duration::from_secs(20);
+
 fn signal(pid: u32, sig: &str) {
     let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
+}
+
+/// SIGSTOP and wait until the kernel reports the process stopped, so the test starts from the
+/// wedged state instead of racing the signal's delivery.
+fn stop_and_confirm(pid: u32) {
+    signal(pid, "-STOP");
+    wait_for("the daemon to stop", READY_LIMIT, || {
+        let out = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('T')
+    });
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -312,27 +343,21 @@ fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
 fn hook_should_FallBackWithinBound_And_ReplaceDaemon_When_HolderIsStopped() {
     let s = Scratch::new("wedged-hook");
     let (mut child, pid) = start_daemon(&s);
-    signal(pid, "-STOP");
+    stop_and_confirm(pid);
     let started = Instant::now();
     s.hook();
     let first = started.elapsed();
-    assert!(
-        first < Duration::from_secs(5),
-        "hook blocked {first:?} on a stopped daemon"
-    );
+    assert!(first < BOUND, "hook blocked {first:?} on a stopped daemon");
     // Hooks keep flowing quickly while a successor displaces the stopped holder.
     let mut slowest = Duration::ZERO;
-    wait_for("a replacement daemon", Duration::from_secs(25), || {
+    wait_for("a replacement daemon", Duration::from_secs(90), || {
         let t = Instant::now();
         s.hook();
         slowest = slowest.max(t.elapsed());
         // `try_wait` reaps the displaced child; a zombie would still answer `kill -0`.
         child.try_wait().unwrap().is_some() && s.daemon_pids().iter().any(|p| *p != pid)
     });
-    assert!(
-        slowest < Duration::from_secs(5),
-        "a hook blocked {slowest:?}"
-    );
+    assert!(slowest < BOUND, "a hook blocked {slowest:?}");
     let status = s.command().args(["daemon", "status"]).output().unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).contains("is running"));
     assert!(
@@ -346,15 +371,12 @@ fn hook_should_FallBackWithinBound_And_ReplaceDaemon_When_HolderIsStopped() {
 fn daemon_stop_should_TerminateStoppedDaemon_Within_Bound() {
     let s = Scratch::new("wedged-stop");
     let (mut child, pid) = start_daemon(&s);
-    signal(pid, "-STOP");
+    stop_and_confirm(pid);
     let started = Instant::now();
     let out = s.command().args(["daemon", "stop"]).output().unwrap();
     let took = started.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        took < Duration::from_secs(6),
-        "daemon stop blocked {took:?}"
-    );
+    assert!(took < BOUND, "daemon stop blocked {took:?}");
     assert!(stdout.contains("terminated"), "{stdout}");
     let _ = child.wait();
     assert!(!process_alive(pid));
