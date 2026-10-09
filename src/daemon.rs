@@ -55,8 +55,19 @@ pub(crate) use crate::daemon_lock::DirRejected;
 /// no such directory can be had the error names it: hooks then run checks in-process, and
 /// `daemon start` refuses rather than bind a socket nobody could find again.
 pub fn socket_path() -> Result<PathBuf, DirRejected> {
+    runtime_socket().map(|(socket, _)| socket)
+}
+
+/// The socket path, plus the refusal of `XDG_RUNTIME_DIR` when the private fallback directory
+/// stands in for it.
+fn runtime_socket() -> Result<(PathBuf, Option<DirRejected>), DirRejected> {
     let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
-    crate::daemon_lock::trusted_runtime_dir().map(|dir| dir.join(format!("kibitzer-{user}.sock")))
+    crate::daemon_lock::trusted_runtime_dir().map(|dir| {
+        (
+            dir.path.join(format!("kibitzer-{user}.sock")),
+            dir.fallback_for,
+        )
+    })
 }
 
 /// Run the daemon in the foreground on `socket_path` until it receives a `Shutdown`
@@ -420,10 +431,45 @@ fn request(socket_path: &Path, req: &Request) -> Option<Response> {
     }
 }
 
+/// What `kibitzer daemon status` found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DaemonState {
+    Running,
+    NotRunning,
+    /// Something holds the daemon's lock or socket but did not answer a ping (stopped or hung).
+    NotResponding {
+        pid: Option<u32>,
+    },
+}
+
 /// Whether a kibitzer daemon is listening and responds to a ping; an untrusted runtime
 /// directory is an error, not "no daemon".
-pub fn is_alive() -> Result<bool, DirRejected> {
-    Ok(request(&socket_path()?, &Request::Ping).is_some())
+pub fn state() -> Result<DaemonState, DirRejected> {
+    let socket = socket_path()?;
+    Ok(match exchange(&socket, &Request::Ping, PROBE_TIMEOUT) {
+        Probe::Answered(_) => DaemonState::Running,
+        Probe::Dead => DaemonState::NotRunning,
+        Probe::Wedged => DaemonState::NotResponding {
+            pid: crate::daemon_lock::holder_pid(&owner_lock_path(&socket)),
+        },
+    })
+}
+
+/// The refusal as printed by `daemon status` and `daemon stop`: a daemon started before the
+/// directory was loosened (or replaced) may still be running there, so say where its lock is.
+pub fn untrusted_message(rejected: &DirRejected) -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
+    let lock = owner_lock_path(&rejected.dir.join(format!("kibitzer-{user}.sock")));
+    let held_by = crate::daemon_lock::holder_pid(&lock).map(|pid| {
+        format!(
+            " (pid {pid} in {})",
+            crate::inline_ignores::sanitize::display_path(&lock)
+        )
+    });
+    format!(
+        "{rejected}; a daemon started earlier may still be running{}",
+        held_by.unwrap_or_default()
+    )
 }
 
 /// What `kibitzer daemon stop` accomplished.
@@ -434,8 +480,10 @@ pub enum ShutdownOutcome {
     /// The daemon held its lock but never answered, so it was signalled and replaced.
     Killed,
     /// The daemon never answered and its pid could not be verified as a kibitzer daemon.
-    Unresponsive,
-    /// The runtime directory is not trusted, so no daemon could have been started there.
+    Unresponsive {
+        pid: Option<u32>,
+    },
+    /// The runtime directory is not trusted now; a daemon started before that may still run.
     UntrustedDir(DirRejected),
 }
 
@@ -462,7 +510,9 @@ fn shutdown_with_lock(socket_path: &Path, displace: Displace) -> ShutdownOutcome
             {
                 ShutdownOutcome::Killed
             } else {
-                ShutdownOutcome::Unresponsive
+                ShutdownOutcome::Unresponsive {
+                    pid: crate::daemon_lock::holder_pid(&lock),
+                }
             }
         }
     }
@@ -498,10 +548,13 @@ pub fn try_run_checks_via_daemon(
     changed_lines: Option<&[(usize, usize)]>,
     unlocated_deletion: bool,
 ) -> Option<Vec<CheckResult>> {
-    let socket = match socket_path() {
-        Ok(socket) => socket,
+    let socket = match runtime_socket() {
+        Ok((socket, fallback)) => {
+            note_runtime_dir(&socket, fallback);
+            socket
+        }
         Err(rejected) => {
-            crate::hook_log::note_daemon_degraded(&rejected.to_string());
+            crate::hook_log::note(crate::hook_log::NoteKind::Degraded, &rejected.to_string());
             return None;
         }
     };
@@ -513,6 +566,26 @@ pub fn try_run_checks_via_daemon(
         changed_lines,
         unlocated_deletion,
     )
+}
+
+/// Tells the hook log once that a refused `XDG_RUNTIME_DIR` was replaced, and forgets any earlier
+/// "ran without the daemon" note: a usable directory means the daemon is reachable again.
+fn note_runtime_dir(socket: &Path, fallback: Option<DirRejected>) {
+    use crate::hook_log::{NoteKind, clear_notes, note};
+    match fallback {
+        Some(refused) => {
+            let used = socket.parent().unwrap_or(socket);
+            note(
+                NoteKind::Fallback,
+                &format!(
+                    "{refused}; using {}",
+                    crate::inline_ignores::sanitize::display_path(used)
+                ),
+            );
+            clear_notes(&[NoteKind::Degraded]);
+        }
+        None => clear_notes(&[NoteKind::Degraded, NoteKind::Fallback]),
+    }
 }
 
 fn try_run_checks_at(
@@ -1320,7 +1393,7 @@ mod displacement_wiring_tests {
                 .extend(reprobe_answers(&holder, still_wedged));
             false
         });
-        assert_eq!(outcome, ShutdownOutcome::Unresponsive);
+        assert_eq!(outcome, ShutdownOutcome::Unresponsive { pid: None });
         assert_eq!(*seen.borrow(), vec![true, false]);
         drop(holder);
         let _ = std::fs::remove_dir_all(&dir);

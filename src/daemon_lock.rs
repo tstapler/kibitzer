@@ -31,10 +31,31 @@ impl std::fmt::Display for DirRejected {
     }
 }
 
-/// Whether `dir` is a real directory (not a symlink) owned by this user that no one else can
-/// reach. `tighten` lets a directory kibitzer made itself be chmodded back to 0700; a directory
-/// someone else provided (`XDG_RUNTIME_DIR`) is never changed, only refused.
-fn check_private_own_dir(dir: &Path, tighten: bool) -> Result<(), String> {
+/// What a directory must satisfy to hold the socket and lock.
+#[derive(Clone, Copy)]
+enum DirTrust {
+    /// Own, not a symlink, no access for group or others (mode 0700).
+    Private,
+    /// Own, not a symlink, not writable by group or others. Reading and listing is harmless: the
+    /// socket and lock are 0600, so anyone else can see their names but neither connect nor
+    /// replace them. This is what a session manager's `XDG_RUNTIME_DIR` (sometimes 0755) gets.
+    NotWritableByOthers,
+}
+
+impl DirTrust {
+    fn forbidden_bits(self) -> u32 {
+        match self {
+            Self::Private => 0o077,
+            Self::NotWritableByOthers => 0o022,
+        }
+    }
+}
+
+/// Whether `dir` is a real directory (not a symlink) owned by this user that others cannot
+/// replace entries in (and, for `Private`, cannot even reach). `tighten` lets a directory
+/// kibitzer made itself be chmodded back to 0700; a directory someone else provided is never
+/// changed, only refused.
+fn check_own_dir(dir: &Path, trust: DirTrust, tighten: bool) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("cannot stat it: {e}"))?;
     if meta.file_type().is_symlink() {
         return Err("it is a symlink".to_string());
@@ -49,24 +70,40 @@ fn check_private_own_dir(dir: &Path, tighten: bool) -> Result<(), String> {
             current_uid()
         ));
     }
-    if meta.mode() & 0o077 != 0 {
+    if meta.mode() & trust.forbidden_bits() != 0 {
         if tighten && std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok()
         {
             return Ok(());
         }
-        return Err(format!(
-            "its mode {:04o} is open to group or others; run chmod 0700 on it",
-            meta.mode() & 0o7777
-        ));
+        let mode = meta.mode() & 0o7777;
+        return Err(match trust {
+            DirTrust::Private => {
+                format!("its mode {mode:04o} is open to group or others; run chmod 0700 on it")
+            }
+            DirTrust::NotWritableByOthers => {
+                format!(
+                    "its mode {mode:04o} lets group or others write in it; run chmod go-w on it"
+                )
+            }
+        });
     }
     Ok(())
 }
 
-/// Where the socket, lock and markers live: `XDG_RUNTIME_DIR` when set, else a `kibitzer-<uid>`
-/// directory (mode 0700) under the temp dir, so another user on a shared `/tmp` cannot pre-create
-/// our lock or socket. The error names the directory and why it is not ours; callers then run
-/// without a daemon rather than trusting it.
-pub(crate) fn trusted_runtime_dir() -> Result<PathBuf, DirRejected> {
+/// A runtime directory kibitzer will use, and the refusal that led to it when it is the private
+/// fallback for an `XDG_RUNTIME_DIR` that was not acceptable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeDir {
+    pub path: PathBuf,
+    pub fallback_for: Option<DirRejected>,
+}
+
+/// Where the socket, lock and markers live: `XDG_RUNTIME_DIR` when it is acceptable (see
+/// `accept_xdg_dir`), else a `kibitzer-<uid>` directory (mode 0700) under the temp dir, so another
+/// user on a shared `/tmp` cannot pre-create our lock or socket. A refused `XDG_RUNTIME_DIR`
+/// falls back to that directory and is reported in `RuntimeDir::fallback_for`. The error names
+/// the directory and why it is not ours; callers then run without a daemon rather than trusting it.
+pub(crate) fn trusted_runtime_dir() -> Result<RuntimeDir, DirRejected> {
     trusted_runtime_dir_in(
         std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -75,27 +112,62 @@ pub(crate) fn trusted_runtime_dir() -> Result<PathBuf, DirRejected> {
     )
 }
 
-fn trusted_runtime_dir_in(xdg: Option<PathBuf>, temp: &Path) -> Result<PathBuf, DirRejected> {
+/// `XDG_RUNTIME_DIR` as the path to use, or why not. A symlink (WSLg points it at a mount) is
+/// followed once, and its target must be a private directory of ours; the returned path is the
+/// resolved one so nothing re-traverses the link. A plain directory may be 0755 but never
+/// group- or other-writable.
+fn accept_xdg_dir(dir: &Path) -> Result<PathBuf, String> {
+    let is_link = std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return check_own_dir(dir, DirTrust::NotWritableByOthers, false)
+            .map(|()| dir.to_path_buf());
+    }
+    let target =
+        std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve the symlink: {e}"))?;
+    match check_own_dir(&target, DirTrust::Private, false) {
+        Ok(()) => Ok(target),
+        Err(why) => Err(format!(
+            "it is a symlink to {}, and the target is refused: {why}",
+            target.display()
+        )),
+    }
+}
+
+fn trusted_runtime_dir_in(xdg: Option<PathBuf>, temp: &Path) -> Result<RuntimeDir, DirRejected> {
     let reject = |dir: &Path, reason: String| DirRejected {
         dir: dir.to_path_buf(),
         reason,
     };
+    let mut refused_xdg = None;
     if let Some(dir) = xdg {
-        return match check_private_own_dir(&dir, false) {
-            Ok(()) => Ok(dir),
-            Err(reason) => Err(reject(&dir, reason)),
-        };
+        match accept_xdg_dir(&dir) {
+            Ok(path) => {
+                return Ok(RuntimeDir {
+                    path,
+                    fallback_for: None,
+                });
+            }
+            Err(reason) => refused_xdg = Some(reject(&dir, reason)),
+        }
     }
     let dir = temp.join(format!("kibitzer-{}", current_uid()));
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => Ok(dir),
+    let private = match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            match check_private_own_dir(&dir, true) {
-                Ok(()) => Ok(dir),
-                Err(reason) => Err(reject(&dir, reason)),
-            }
+            check_own_dir(&dir, DirTrust::Private, true)
         }
-        Err(e) => Err(reject(&dir, format!("cannot create it: {e}"))),
+        Err(e) => Err(format!("cannot create it: {e}")),
+    };
+    match (private, refused_xdg) {
+        (Ok(()), fallback_for) => Ok(RuntimeDir {
+            path: dir,
+            fallback_for,
+        }),
+        (Err(reason), None) => Err(reject(&dir, reason)),
+        (Err(reason), Some(xdg)) => Err(reject(
+            &dir,
+            format!("{reason}; XDG_RUNTIME_DIR {xdg} was refused too"),
+        )),
     }
 }
 
@@ -273,6 +345,22 @@ fn recorded_pid(lock_path: &Path) -> Option<u32> {
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|&pid| pid > 1 && pid != std::process::id())
+}
+
+/// The pid a lock file records, read without following a symlink and without creating anything;
+/// for messages about a daemon that may still hold a lock in a directory kibitzer no longer trusts.
+pub(crate) fn holder_pid(lock_path: &Path) -> Option<u32> {
+    let mut raw = String::new();
+    std::io::Read::read_to_string(
+        &mut std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(lock_path)
+            .ok()?,
+        &mut raw,
+    )
+    .ok()?;
+    raw.trim().parse::<u32>().ok().filter(|&pid| pid > 1)
 }
 
 fn lock_mtime(lock_path: &Path) -> Option<SystemTime> {
@@ -545,9 +633,11 @@ mod tests {
     #[test]
     fn trusted_runtime_dir_should_CreatePrivateDir_And_RefuseSymlinkOrLooseForeignPath() {
         let temp = scratch("trusted");
-        let dir = trusted_runtime_dir_in(None, &temp).unwrap();
+        let made = trusted_runtime_dir_in(None, &temp).unwrap();
+        let dir = made.path.clone();
+        assert_eq!(made.fallback_for, None);
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
-        assert_eq!(trusted_runtime_dir_in(None, &temp), Ok(dir.clone()));
+        assert_eq!(trusted_runtime_dir_in(None, &temp), Ok(made));
         // A looser mode on the kibitzer-<uid> directory kibitzer made is tightened.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(trusted_runtime_dir_in(None, &temp).is_ok());
@@ -564,33 +654,91 @@ mod tests {
             err.to_string().starts_with("runtime dir untrusted: "),
             "{err}"
         );
+        assert!(err.reason.contains("XDG_RUNTIME_DIR"), "{err}");
         let _ = std::fs::remove_dir_all(&temp);
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
-    fn trusted_runtime_dir_should_RefuseXdgDirWithLooseMode_WithoutChangingIt() {
-        let temp = scratch("xdg-loose");
+    fn trusted_runtime_dir_should_AcceptOwnDirNotWritableByOthers_When_XdgIs0755() {
+        // A session manager may hand out a 0755 directory; the 0600 socket and lock inside stay
+        // unreachable, and nobody else can replace them.
+        let temp = scratch("xdg-0755");
         let xdg = temp.join("xdg");
         std::fs::create_dir(&xdg).unwrap();
-        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = trusted_runtime_dir_in(Some(xdg.clone()), &temp).unwrap_err();
-        assert_eq!(err.dir, xdg);
-        assert!(err.reason.contains("0755"), "{err}");
-        assert_eq!(std::fs::metadata(&xdg).unwrap().mode() & 0o777, 0o755);
-        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(trusted_runtime_dir_in(Some(xdg.clone()), &temp), Ok(xdg));
+        for mode in [0o755, 0o750, 0o700] {
+            std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(mode)).unwrap();
+            let got = trusted_runtime_dir_in(Some(xdg.clone()), &temp).unwrap();
+            assert_eq!(
+                (got.path.as_path(), &got.fallback_for),
+                (xdg.as_path(), &None)
+            );
+            assert_eq!(std::fs::metadata(&xdg).unwrap().mode() & 0o777, mode);
+        }
         let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
-    fn trusted_runtime_dir_should_Refuse_When_DirIsNotOurs() {
+    fn trusted_runtime_dir_should_FallBackToPrivateDir_When_XdgIsWritableByOthers() {
+        let temp = scratch("xdg-writable");
+        let xdg = temp.join("xdg");
+        std::fs::create_dir(&xdg).unwrap();
+        for mode in [0o775, 0o757, 0o777] {
+            std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(mode)).unwrap();
+            let got = trusted_runtime_dir_in(Some(xdg.clone()), &temp).unwrap();
+            assert_eq!(got.path, temp.join(format!("kibitzer-{}", current_uid())));
+            let refused = got.fallback_for.expect("the refusal is reported");
+            assert_eq!(refused.dir, xdg);
+            assert!(refused.reason.contains(&format!("{mode:04o}")), "{refused}");
+            // Refused, not repaired.
+            assert_eq!(std::fs::metadata(&xdg).unwrap().mode() & 0o777, mode);
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn trusted_runtime_dir_should_FollowXdgSymlink_When_TargetIsPrivateOwnDir() {
+        // WSLg points XDG_RUNTIME_DIR at a symlink into a mount.
+        let temp = scratch("xdg-symlink");
+        let target = temp.join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let got = trusted_runtime_dir_in(Some(link.clone()), &temp).unwrap();
+        assert_eq!(got.fallback_for, None);
+        assert_eq!(got.path, std::fs::canonicalize(&target).unwrap());
+        // A symlink to a directory others can enter is refused (fallback), never followed blind.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let got = trusted_runtime_dir_in(Some(link.clone()), &temp).unwrap();
+        assert_eq!(got.path, temp.join(format!("kibitzer-{}", current_uid())));
+        assert!(got.fallback_for.unwrap().reason.contains("symlink"));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn trusted_runtime_dir_should_FallBack_When_DirIsNotOurs() {
         // `/` is owned by root, so it stands in for another user's directory.
-        let err = trusted_runtime_dir_in(Some(PathBuf::from("/")), Path::new("/tmp")).unwrap_err();
-        assert!(
-            err.reason.contains("owned by uid") || err.reason.contains("mode"),
-            "{err}"
-        );
+        let temp = scratch("xdg-foreign");
+        let got = trusted_runtime_dir_in(Some(PathBuf::from("/")), &temp).unwrap();
+        let refused = got.fallback_for.expect("the refusal is reported");
+        assert!(refused.reason.contains("owned by uid"), "{refused}");
+        assert_eq!(got.path, temp.join(format!("kibitzer-{}", current_uid())));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn holder_pid_should_ReadRecordedPid_WithoutCreatingOrFollowing() {
+        let dir = scratch("holder-pid");
+        let lock = dir.join("k.lock");
+        assert_eq!(holder_pid(&lock), None);
+        assert!(!lock.exists());
+        std::fs::write(&lock, "4242").unwrap();
+        assert_eq!(holder_pid(&lock), Some(4242));
+        let link = dir.join("l.lock");
+        std::os::unix::fs::symlink(&lock, &link).unwrap();
+        assert_eq!(holder_pid(&link), None, "a symlinked lock is not read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A shell that ignores SIGTERM, so only SIGKILL stops it.

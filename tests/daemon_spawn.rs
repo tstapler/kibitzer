@@ -436,13 +436,30 @@ fn untrusted_leftovers(s: &Scratch) -> Vec<String> {
 }
 
 fn make_runtime_loose(s: &Scratch) {
-    std::fs::set_permissions(&s.runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Writable by others: the one mode a user-provided runtime directory is refused for.
+    std::fs::set_permissions(&s.runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+}
+
+fn fallback_dir(s: &Scratch) -> PathBuf {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    s.root.join("tmp").join(format!("kibitzer-{uid}"))
+}
+
+/// Plants a symlink where kibitzer's private fallback directory would go, so no directory at all
+/// is trustworthy. Returns the directory the link points at.
+fn make_fallback_untrusted(s: &Scratch) -> PathBuf {
+    let elsewhere = s.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fallback_dir(s)).unwrap();
+    elsewhere
 }
 
 #[test]
-fn daemon_start_should_Refuse_When_RuntimeDirIsGroupReadable() {
+fn daemon_start_should_Refuse_When_NoRuntimeDirIsTrustworthy() {
     let s = Scratch::new("untrusted-start");
     make_runtime_loose(&s);
+    make_fallback_untrusted(&s);
     let mut cmd = s.command();
     cmd.args(["daemon", "start"]);
     let out = output_within(cmd, Duration::from_secs(15));
@@ -451,44 +468,107 @@ fn daemon_start_should_Refuse_When_RuntimeDirIsGroupReadable() {
     assert!(stderr.contains("runtime dir untrusted"), "{stderr}");
     assert!(
         stderr.contains(&s.runtime.display().to_string()),
-        "{stderr}"
+        "the refused XDG_RUNTIME_DIR is named: {stderr}"
     );
-    assert!(stderr.contains("0755"), "{stderr}");
+    assert!(stderr.contains("0777"), "{stderr}");
     assert!(s.daemon_pids().is_empty());
     assert_eq!(untrusted_leftovers(&s), Vec::<String>::new());
     // The directory was refused, not repaired.
     let mode = std::fs::metadata(&s.runtime).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o755);
+    assert_eq!(mode, 0o777);
 }
 
 #[test]
-fn daemon_status_and_stop_should_NameUntrustedDir_When_RuntimeDirIsASymlink() {
+fn hooks_should_UsePrivateFallbackDir_And_NoteItOnce_When_XdgDirIsWritableByOthers() {
+    let s = Scratch::new("fallback-hook");
+    make_runtime_loose(&s);
+    s.hook();
+    s.hook();
+    wait_for("a daemon in the fallback dir", READY_LIMIT, || {
+        fallback_dir(&s).join("kibitzer-spawntest.sock").exists() && !s.daemon_pids().is_empty()
+    });
+    assert!(
+        !s.socket().exists(),
+        "nothing may be bound in the refused dir"
+    );
+    let log = std::fs::read_to_string(s.root.join("cache/kibitzer/hook-log.jsonl")).unwrap();
+    let notes = log
+        .lines()
+        .filter(|l| l.contains("daemon_fallback"))
+        .count();
+    assert_eq!(notes, 1, "{log}");
+    assert!(!log.contains("daemon_degraded"), "{log}");
+    let out = output_within(
+        {
+            let mut c = s.command();
+            c.arg("status");
+            c
+        },
+        Duration::from_secs(15),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Runtime directory fallback"), "{stdout}");
+}
+
+#[test]
+fn daemon_status_and_stop_should_NameUntrustedDirAndLeftoverDaemon_When_NoDirIsTrustworthy() {
     let s = Scratch::new("untrusted-symlink");
     let link = s.root.join("rt-link");
     std::os::unix::fs::symlink(&s.runtime, &link).unwrap();
+    std::fs::set_permissions(&s.runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let elsewhere = make_fallback_untrusted(&s);
+    // A daemon started before the directory went bad left its pid in the lock.
+    std::fs::write(elsewhere.join("kibitzer-spawntest.lock"), "4242").unwrap();
     for action in ["status", "stop"] {
         let mut cmd = s.command();
         cmd.env("XDG_RUNTIME_DIR", &link).args(["daemon", action]);
         let out = output_within(cmd, Duration::from_secs(15));
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.contains(&format!("runtime dir untrusted: {}", link.display())),
+            stdout.contains("runtime dir untrusted: "),
+            "{action}: {stdout}"
+        );
+        assert!(
+            stdout.contains("a daemon started earlier may still be running (pid 4242 in "),
             "{action}: {stdout}"
         );
         assert!(!stdout.contains("no daemon running"), "{action}: {stdout}");
+        assert!(
+            !stdout.contains("no daemon can be running"),
+            "{action}: {stdout}"
+        );
         assert_eq!(out.status.code(), Some(1), "{action}: {out:?}");
     }
-    assert_eq!(untrusted_leftovers(&s), Vec::<String>::new());
 }
 
 #[test]
-fn hooks_should_LogDegradeOnce_And_SpawnNothing_When_RuntimeDirIsUntrusted() {
+fn daemon_start_should_FollowXdgSymlink_When_TargetIsPrivateOwnDir() {
+    let s = Scratch::new("xdg-symlink-ok");
+    let link = s.root.join("rt-link");
+    std::os::unix::fs::symlink(&s.runtime, &link).unwrap();
+    let mut cmd = s.command();
+    cmd.env("XDG_RUNTIME_DIR", &link).args(["daemon", "start"]);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the daemon behind the symlinked dir", READY_LIMIT, || {
+        s.runtime.join("kibitzer-spawntest.sock").exists()
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn hooks_should_LogDegradeOnce_AndStatusShouldForgetIt_When_DirBecomesUsable() {
     let s = Scratch::new("untrusted-hook");
     make_runtime_loose(&s);
+    let planted = make_fallback_untrusted(&s);
     s.hook();
     s.hook();
     assert!(s.daemon_pids().is_empty());
-    assert_eq!(untrusted_leftovers(&s), Vec::<String>::new());
     let log = std::fs::read_to_string(s.root.join("cache/kibitzer/hook-log.jsonl")).unwrap();
     let notes = log
         .lines()
@@ -496,10 +576,79 @@ fn hooks_should_LogDegradeOnce_And_SpawnNothing_When_RuntimeDirIsUntrusted() {
         .count();
     assert_eq!(notes, 1, "{log}");
     assert!(log.contains("runtime dir untrusted"), "{log}");
-    let mut cmd = s.command();
-    cmd.arg("status");
-    let out = output_within(cmd, Duration::from_secs(15));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let status = |s: &Scratch| {
+        let mut cmd = s.command();
+        cmd.arg("status");
+        String::from_utf8_lossy(&output_within(cmd, Duration::from_secs(15)).stdout).into_owned()
+    };
+    let stdout = status(&s);
     assert!(stdout.contains("Hooks ran without the daemon"), "{stdout}");
     assert!(stdout.contains("2 firings"), "{stdout}");
+    // The directory becomes usable: the next hook clears the degrade and `status` stops reporting it.
+    std::fs::remove_file(fallback_dir(&s)).unwrap();
+    std::fs::remove_dir_all(&planted).unwrap();
+    s.hook();
+    let stdout = status(&s);
+    assert!(!stdout.contains("Hooks ran without the daemon"), "{stdout}");
+}
+
+#[test]
+fn daemon_status_should_ReportNotResponding_When_DaemonIsStopped() {
+    let s = Scratch::new("status-stopped");
+    let (mut child, pid) = start_daemon(&s);
+    stop_and_confirm(pid);
+    let mut cmd = s.command();
+    cmd.args(["daemon", "status"]);
+    let started = Instant::now();
+    let out = output_within(cmd, BOUND);
+    assert!(started.elapsed() < BOUND);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("daemon not responding (pid {pid})")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("no daemon running"), "{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    signal(pid, "-KILL");
+    let _ = child.wait();
+}
+
+#[test]
+fn daemon_stop_should_NamePid_When_HolderCannotBeVerified() {
+    let s = Scratch::new("stop-unverified");
+    let _listener = UnixListener::bind(s.socket()).unwrap();
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    // A live holder that is not a kibitzer daemon: the lock is held and records its pid.
+    let lock_path = s.runtime.join("kibitzer-spawntest.lock");
+    let mut lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+    std::io::Write::write_all(&mut lock, bystander.id().to_string().as_bytes()).unwrap();
+    let out = output_within(
+        {
+            let mut c = s.command();
+            c.args(["daemon", "stop"]);
+            c
+        },
+        BOUND,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "daemon (pid {}) is not responding",
+            bystander.id()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        bystander.try_wait().unwrap().is_none(),
+        "bystander was signalled"
+    );
+    let _ = bystander.kill();
+    let _ = bystander.wait();
 }

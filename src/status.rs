@@ -23,12 +23,11 @@ struct HookLogEntry {
     blocked: bool,
 }
 
-/// A line `hook_log::note_daemon_degraded` wrote; not a hook firing.
+/// A daemon note line `hook_log::note` wrote; not a hook firing.
 #[derive(Deserialize)]
 struct DegradeNote {
     #[allow(dead_code)]
     event: String,
-    reason: String,
 }
 
 #[derive(Default)]
@@ -36,6 +35,22 @@ struct CheckStats {
     fired: u64,
     failed: u64,
     blocked: u64,
+}
+
+/// Daemon notes still in force: a degrade clears itself once a hook reaches a usable runtime
+/// directory, so what prints here is current, with its age.
+fn print_current_notes(now: u64) {
+    for (ts, kind, text) in crate::hook_log::current_notes() {
+        let label = match kind {
+            crate::hook_log::NoteKind::Degraded => "Hooks ran without the daemon",
+            crate::hook_log::NoteKind::Fallback => "Runtime directory fallback",
+        };
+        println!(
+            "\n{label} ({}): {}",
+            format_age(now.saturating_sub(ts)),
+            escape_path(&text)
+        );
+    }
 }
 
 fn format_age(secs_ago: u64) -> String {
@@ -74,14 +89,12 @@ pub fn run_status() -> Result<ExitCode> {
     let mut last_ts = 0u64;
     let mut by_check: HashMap<String, CheckStats> = HashMap::new();
     let mut by_repo: HashMap<String, u64> = HashMap::new();
-    let mut degraded: Option<String> = None;
 
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(note) = serde_json::from_str::<DegradeNote>(line) {
-            degraded = Some(note.reason);
+        if serde_json::from_str::<DegradeNote>(line).is_ok() {
             continue;
         }
         let entry: HookLogEntry = match serde_json::from_str(line) {
@@ -150,9 +163,7 @@ pub fn run_status() -> Result<ExitCode> {
         println!("  {count:>5}  {repo}");
     }
 
-    if let Some(reason) = degraded {
-        println!("\nHooks ran without the daemon: {}", escape_path(&reason));
-    }
+    print_current_notes(now);
 
     Ok(ExitCode::SUCCESS)
 }

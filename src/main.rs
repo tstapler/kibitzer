@@ -388,9 +388,10 @@ fn main() -> Result<ExitCode> {
                     daemon::ShutdownOutcome::Killed => {
                         println!("[kibitzer] daemon was not responding; terminated it");
                     }
-                    daemon::ShutdownOutcome::Unresponsive => {
+                    daemon::ShutdownOutcome::Unresponsive { pid } => {
                         println!(
-                            "[kibitzer] daemon is not responding and could not be verified as a kibitzer daemon; stop it by hand"
+                            "[kibitzer] daemon{} is not responding and could not be verified as a kibitzer daemon; stop it by hand",
+                            pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
                         );
                         return Ok(ExitCode::from(1));
                     }
@@ -398,18 +399,25 @@ fn main() -> Result<ExitCode> {
                         println!("[kibitzer] no daemon was running");
                     }
                     daemon::ShutdownOutcome::UntrustedDir(rejected) => {
-                        println!("[kibitzer] {rejected}; no daemon can be running there");
+                        println!("[kibitzer] {}", daemon::untrusted_message(&rejected));
                         return Ok(ExitCode::from(1));
                     }
                 }
                 Ok(ExitCode::SUCCESS)
             }
             DaemonAction::Status => {
-                match daemon::is_alive() {
-                    Ok(true) => println!("[kibitzer] daemon is running"),
-                    Ok(false) => println!("[kibitzer] no daemon running"),
+                match daemon::state() {
+                    Ok(daemon::DaemonState::Running) => println!("[kibitzer] daemon is running"),
+                    Ok(daemon::DaemonState::NotRunning) => println!("[kibitzer] no daemon running"),
+                    Ok(daemon::DaemonState::NotResponding { pid }) => {
+                        println!(
+                            "[kibitzer] daemon not responding{}",
+                            pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+                        );
+                        return Ok(ExitCode::from(1));
+                    }
                     Err(rejected) => {
-                        println!("[kibitzer] {rejected}");
+                        println!("[kibitzer] {}", daemon::untrusted_message(&rejected));
                         return Ok(ExitCode::from(1));
                     }
                 }
