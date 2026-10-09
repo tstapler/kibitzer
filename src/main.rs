@@ -54,6 +54,7 @@ mod unreferenced_symbols;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -425,7 +426,12 @@ fn main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 } else {
                     for finding in &findings {
-                        println!("{}:{}: {}", file.display(), finding.line, finding.message);
+                        println!(
+                            "{}:{}: {}",
+                            display_path(&file),
+                            finding.line,
+                            strip_unsafe_with_paths(&finding.message, &[&file])
+                        );
                     }
                     Ok(ExitCode::from(1))
                 }
@@ -676,8 +682,8 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
 
     for finding in &findings {
         let location = match (&finding.file, finding.line) {
-            (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
-            (Some(file), None) => format!("{}: ", file.display()),
+            (Some(file), Some(line)) => format!("{}:{}: ", display_path(file), line),
+            (Some(file), None) => format!("{}: ", display_path(file)),
             (None, _) => String::new(),
         };
         println!("{location}{}", finding.message);

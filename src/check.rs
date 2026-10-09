@@ -12,6 +12,7 @@ use crate::accepted_findings::AcceptedLines;
 pub use crate::check_result::CheckResult;
 use crate::config::{Check, OutputFormat, Severity};
 use crate::glob::matches_scope;
+use crate::inline_ignores::sanitize::display_path;
 use crate::inline_ignores::{
     IgnoreTarget, InlineIgnoreContext, InlineOutcome, Line, RawFinding, anchor_rule,
     apply_inline_ignores, capped_anchors,
@@ -1178,8 +1179,8 @@ pub fn run_architecture_check(
     let combined = findings
         .iter()
         .map(|f| match (&f.file, f.line) {
-            (Some(file), Some(line)) => format!("{}:{}: {}", file.display(), line, f.message),
-            (Some(file), None) => format!("{}: {}", file.display(), f.message),
+            (Some(file), Some(line)) => format!("{}:{}: {}", display_path(file), line, f.message),
+            (Some(file), None) => format!("{}: {}", display_path(file), f.message),
             (None, _) => f.message.clone(),
         })
         .collect::<Vec<_>>()

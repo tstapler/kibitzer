@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::check_result::CheckResult;
 use crate::checker::{NativeSource, read_native_source};
 use crate::config::{Check, Severity};
-use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo, quote_reason};
+use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo_path, quote_reason};
 use crate::inline_ignores::{
     Directive, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind, owned_by,
     rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
@@ -123,7 +123,7 @@ fn first_pass(results: &[CheckResult]) -> FirstPass<'_> {
 
 /// `{file}:{row}: {message}`, the line shape every advisory shares.
 fn located(file_path: &Path, row: Line, message: &str) -> String {
-    let path = echo(&file_path.display().to_string(), ECHO_PATH_CHARS);
+    let path = echo_path(&file_path.display().to_string(), ECHO_PATH_CHARS);
     format!("{path}:{}: {message}", row.get())
 }
 

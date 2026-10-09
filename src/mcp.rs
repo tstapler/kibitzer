@@ -19,6 +19,7 @@ use crate::check::{
 };
 use crate::config::{Check, Severity, find_config, find_effective_config, find_repo_root};
 use crate::glob::matches_scope;
+use crate::inline_ignores::sanitize::display_path;
 
 #[derive(Debug, Clone)]
 pub struct KibitzerServer {
@@ -867,8 +868,10 @@ impl KibitzerServer {
                         Severity::Advisory => "advisory",
                     };
                     let location = match (&finding.file, finding.line) {
-                        (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
-                        (Some(file), None) => format!("{}: ", file.display()),
+                        (Some(file), Some(line)) => {
+                            format!("{}:{}: ", display_path(file), line)
+                        }
+                        (Some(file), None) => format!("{}: ", display_path(file)),
                         (None, _) => String::new(),
                     };
                     lines.push(format!("[{level}] {location}{}", finding.message));
@@ -974,7 +977,8 @@ impl KibitzerServer {
         } else {
             output.push_str("(omitted: include_diagram was false)\n");
         }
-        output
+        let echoed: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        crate::inline_ignores::sanitize::strip_unsafe_with_paths(&output, &echoed)
     }
 
     #[tool(

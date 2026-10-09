@@ -11,6 +11,7 @@ use crate::arch_model::{self, ArchModel, ModelCache, PackageNode, SymbolNode};
 use crate::check::{CheckResult, run_checks_for_trigger};
 use crate::checker::GrammarCache;
 use crate::config::{Severity, find_effective_config};
+use crate::inline_ignores::sanitize::strip_unsafe_with_paths;
 use crate::symbol_extract::extract_symbols_for_file;
 
 /// Trigger name checks opt into via `.kibitzer/inspect.json`'s `triggers` field to run under
@@ -58,7 +59,7 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
                 },
                 severity: Some(severity),
                 source: Some(result.check_name.clone()),
-                message: message.trim().to_string(),
+                message: strip_unsafe_with_paths(message.trim(), &[file_path]),
                 ..Default::default()
             });
         }
@@ -69,7 +70,7 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
             range: Range::new(Position::new(0, 0), Position::new(0, u32::MAX)),
             severity: Some(severity),
             source: Some(result.check_name.clone()),
-            message: result.describe(),
+            message: strip_unsafe_with_paths(&result.describe(), &[file_path]),
             ..Default::default()
         });
     }

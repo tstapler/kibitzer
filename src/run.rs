@@ -8,7 +8,7 @@ use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_effective_config};
-use crate::inline_ignores::sanitize::strip_unsafe_with_paths;
+use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
 use crate::inline_ignores::{InlineIgnoreMode, batch_syntax_hint};
 
 fn severity_label(severity: Severity) -> &'static str {
@@ -82,8 +82,8 @@ fn finding_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
         .map(|finding| {
             let level = finding.severity_override.unwrap_or(result.severity);
             let location = match (&finding.file, finding.line) {
-                (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
-                (Some(file), None) => format!("{}: ", file.display()),
+                (Some(file), Some(line)) => format!("{}:{}: ", display_path(file), line),
+                (Some(file), None) => format!("{}: ", display_path(file)),
                 (None, _) => String::new(),
             };
             format!(
