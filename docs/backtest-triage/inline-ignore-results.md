@@ -207,3 +207,16 @@ Findings from the idioms, architecture and refactor reviews were addressed in sm
 - `mcp.rs` `run_checks` 185-line extraction: skipped; out of the budget for this pass.
 - Cache old-tuple compatibility test: kept on purpose.
 
+
+## Phase 6 round 3
+
+Fresh-reviewer findings were fixed test-first, one commit per group. Not done as asked, or done differently:
+
+- Tier 1 sanitizer (`echo`) is an allow-list built from printable ASCII, `char::is_alphanumeric` and explicit symbol ranges, not a Unicode general-category lookup (`std` has none and no new dependency was added). Decomposed combining marks outside U+0300-036F (for example Zalgo stacks on other scripts) are dropped.
+- Paths in lenient (Tier 2) output are escaped only where the checker prints the path as `Path::display` of the edited file, its canonical form, or its base name. A checker that prints some other derived form of a hostile name is covered by the control-character strip but not the newline escape.
+- `kibitzer check native` and the other direct-print subcommands in `src/main.rs` are not sanitized.
+- Planted-directive advisory: a pure deletion reports every blocking drop in the file, which can repeat on unrelated deletions. The alternative was silence.
+- Config-read ordering (K5): the stamp is now taken before `find_effective_config`, but no test can inject an edit between those two steps, so only the stamp-before-run ordering is mutation-tested (`run_uncached_should_NotCacheStaleResult_...` kills it).
+- Daemon: `retire_stale_daemon` no longer clears the spawn debounce, so after an upgrade the new daemon can take up to 10 seconds to appear (hooks run uncached meanwhile). A daemon that predates the owner lock and ignores `shutdown` is left in place rather than displaced.
+- Surviving mutant kept on purpose: the `take(MAX_RULES_PER_DIRECTIVE + 1)` guard in `parse.rs` is equivalent to its absence for correctness (it only bounds work), so no test distinguishes it.
+- Footer comma/em-dash wording (O4): left as is.

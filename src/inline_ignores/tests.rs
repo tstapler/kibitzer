@@ -1596,3 +1596,64 @@ fn apply_inline_ignores_should_NotCoverCode_When_BlankRowOrCodeEndsTheCommentSta
     let trailing = "package main\n\nvar x = 1 // kibitzer:ignore flag-argument -- legacy api pinned\n// unrelated\nfunc f(b bool) {}\n";
     assert!(!flag_finding_dropped("x.go", trailing, 5));
 }
+
+fn reason_of_len(n: usize) -> String {
+    "legacy api pinned "
+        .repeat(n / 18 + 1)
+        .chars()
+        .take(n)
+        .collect()
+}
+
+#[test]
+fn parse_comment_line_should_AcceptReasonOf300AndRejectReasonOf301_When_AtCap() {
+    let at_cap = format!("// kibitzer:ignore flag-argument -- {}", reason_of_len(300));
+    assert!(matches!(
+        parse_comment_line(&at_cap),
+        DirectiveParse::Valid(_)
+    ));
+    let over = format!("// kibitzer:ignore flag-argument -- {}", reason_of_len(301));
+    assert_eq!(malformed(&over), MalformedReason::ReasonTooLong);
+}
+
+#[test]
+fn parse_comment_line_should_AcceptRuleIdOf64AndRejectRuleIdOf65_When_AtCap() {
+    let ok = format!("// kibitzer:ignore {} -- legacy api pinned", "a".repeat(64));
+    assert!(matches!(parse_comment_line(&ok), DirectiveParse::Valid(_)));
+    let over = format!("// kibitzer:ignore {} -- legacy api pinned", "a".repeat(65));
+    assert_eq!(malformed(&over), MalformedReason::RuleTooLong);
+}
+
+#[test]
+fn parse_comment_line_should_Accept16RulesAndReject17_When_AtCap() {
+    let list = |n: usize| {
+        (0..n)
+            .map(|i| format!("rule-{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let ok = format!("// kibitzer:ignore {} -- legacy api pinned", list(16));
+    assert!(matches!(parse_comment_line(&ok), DirectiveParse::Valid(_)));
+    let over = format!("// kibitzer:ignore {} -- legacy api pinned", list(17));
+    assert_eq!(malformed(&over), MalformedReason::TooManyRules);
+}
+
+#[test]
+fn covers_should_UseFileHead_When_OnlyCheckerNameIsFileScope() {
+    // A file-size checker whose finding carries its own `[oversized]` prefix: the rule is not
+    // file-scope, the checker is, so the arm for `checker_name` is what covers it from the head.
+    let d = dir(&["oversized"], 1, 1, true);
+    let rule = &d.rules()[0];
+    assert!(d.covers(
+        rule,
+        "python-file-size",
+        "[oversized] too big",
+        Line::new(80)
+    ));
+    assert!(!d.covers(
+        rule,
+        "python-long-thing",
+        "[oversized] too big",
+        Line::new(80)
+    ));
+}
