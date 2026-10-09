@@ -17,8 +17,8 @@ mod tests;
 
 pub(crate) use apply::{IgnoreTarget, apply_inline_ignores, capped_anchors};
 pub(crate) use hint::{HINT_RULE_LIMIT, batch_syntax_hint, syntax_hint, syntax_hint_limited};
-pub use parse::is_directive_comment;
 pub(crate) use parse::{echo_parts, near_miss_text};
+pub use parse::{is_directive_only_comment, without_directive_lines};
 pub(crate) use rules::{anchor_rule, did_you_mean, known_rule, owned_by};
 pub use scan::ScanMemo;
 pub use types::{
@@ -30,7 +30,7 @@ pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores}
 
 // Reached through this module only by tests; production code names the submodule item itself.
 #[cfg(test)]
-pub(crate) use parse::parse_comment_line;
+pub(crate) use parse::{is_directive_comment, parse_comment_line};
 #[cfg(test)]
 pub(crate) use scan::scan_directives;
 #[cfg(test)]

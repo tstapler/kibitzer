@@ -16,15 +16,19 @@ pub(crate) const MARKER: &str = "kibitzer:ignore";
 /// The word every directive-like comment starts with (`kibitzer:ignore`, `kibitzer:disable`, ...).
 pub(crate) const MARKER_PREFIX: &str = "kibitzer";
 
-/// Cheap pre-check: a source without the marker word cannot hold a directive, so nothing is parsed.
+/// Cheap pre-check: a source without the marker word cannot hold a directive, so nothing is
+/// parsed. Two literal searches cover `kibitzer`, `Kibitzer` and `KIBITZER` (the upper-case
+/// near misses) without lower-casing the file; other casings are not recognized.
 pub(crate) fn has_marker(source: &str) -> bool {
-    source.contains(MARKER_PREFIX)
+    source.contains(&MARKER_PREFIX[1..]) || source.contains("IBITZER")
 }
 
-/// Whether `text` begins `kibitzer:`, the start of any directive-family comment.
+/// Whether `text` begins `kibitzer:` (any ASCII case), the start of any directive-family comment.
 pub(crate) fn begins_marker_family(text: &str) -> bool {
-    text.strip_prefix(MARKER_PREFIX)
-        .is_some_and(|rest| rest.starts_with(':'))
+    let bytes = text.as_bytes();
+    bytes.len() > MARKER_PREFIX.len()
+        && bytes[..MARKER_PREFIX.len()].eq_ignore_ascii_case(MARKER_PREFIX.as_bytes())
+        && bytes[MARKER_PREFIX.len()] == b':'
 }
 
 /// 1-based line number; tree-sitter's 0-based rows are converted once at the scan boundary.

@@ -24,21 +24,71 @@ fn strip_comment_syntax(line: &str) -> &str {
 }
 
 /// Whether any line of the comment `text` begins (after its leader) with `kibitzer:`.
-pub fn is_directive_comment(text: &str) -> bool {
+pub(crate) fn is_directive_comment(text: &str) -> bool {
     text.lines()
         .any(|l| begins_marker_family(strip_comment_syntax(l)))
 }
 
+/// Whether `text` is nothing but directive lines (and comment framing): a directive-only
+/// comment is exempt from comment-quality, a comment that also holds prose or code is not.
+pub fn is_directive_only_comment(text: &str) -> bool {
+    let mut saw_directive = false;
+    for line in text.lines() {
+        if matches!(line.trim(), "" | "/*" | "/**" | "*/" | "*" | "<!--" | "-->") {
+            continue;
+        }
+        if !begins_marker_family(strip_comment_syntax(line)) {
+            return false;
+        }
+        saw_directive = true;
+    }
+    saw_directive
+}
+
+/// `text` with each directive line cut back to what precedes the marker (keeping a closing
+/// `*/` or `-->`), so comment-quality judges a comment's other lines but never the directive.
+/// The line count is unchanged; text with no directive line is returned as is.
+pub fn without_directive_lines(text: &str) -> std::borrow::Cow<'_, str> {
+    if !is_directive_comment(text) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            if !begins_marker_family(strip_comment_syntax(line)) {
+                return line.to_string();
+            }
+            let marker_at = line
+                .to_ascii_lowercase()
+                .find(MARKER_PREFIX)
+                .unwrap_or(line.len());
+            let closer = ["*/", "-->"]
+                .into_iter()
+                .find(|c| line.trim_end().ends_with(c))
+                .unwrap_or("");
+            format!("{}{closer}", &line[..marker_at])
+        })
+        .collect();
+    std::borrow::Cow::Owned(lines.join("\n"))
+}
+
 static NEAR_MISS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^kibitzer\s*:\s*(ignore|disable|allow|suppress|false[-_ ]positive)\b").unwrap()
+    Regex::new(r"(?i)^kibitzer\s*:\s*(ignore|disable|allow|suppress|false[-_ ]positive)\b").unwrap()
 });
 
+/// A directive after a bare `TODO`/`FIXME`/`NOTE`-style label (optionally `TODO(owner):`). Prose
+/// that merely describes the syntax ("write kibitzer:ignore x -- why above the func") does not
+/// match, so it is not reported as a misplaced directive.
 static LATER_DIRECTIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bkibitzer:ignore\s+[a-z0-9-]+(?:,[a-z0-9-]+)*\s+--\s+\S").unwrap()
+    Regex::new(
+        r"^(?i:todo|fixme|note|xxx|hack|bug|warn(?:ing)?)(?:\([^)]{0,30}\))?:?\s+kibitzer:ignore\s+[a-z0-9-]+(?:,[a-z0-9-]+)*\s+--\s+\S",
+    )
+    .unwrap()
 });
 
 static NEAR_MISS_ANYWHERE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"kibitzer\s*:\s*(?:ignore|disable|allow|suppress|false[-_ ]positive)\b").unwrap()
+    Regex::new(r"(?i)kibitzer\s*:\s*(?:ignore|disable|allow|suppress|false[-_ ]positive)\b")
+        .unwrap()
 });
 
 /// The near-miss marker as written on a source line, for echoing back in the repair message.

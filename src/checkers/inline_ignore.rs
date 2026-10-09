@@ -132,7 +132,7 @@ fn syntax_finding(line: usize, message: String) -> Finding {
 /// ASCII-only repair text for one malformed directive; the offending line supplies the echo.
 fn malformed_message(reason: MalformedReason, line: &str) -> String {
     let (rules, written_reason) = echo_parts(line);
-    let rules = echo(&rules, ECHO_RULE_TEXT_CHARS);
+    let rules = suggestable(&echo(&rules, ECHO_RULE_TEXT_CHARS));
     let written_reason = echo(&written_reason, ECHO_REASON_CHARS);
     let rules = if rules.is_empty() {
         "<rule>".to_string()
@@ -181,6 +181,22 @@ fn malformed_message(reason: MalformedReason, line: &str) -> String {
             "rule list must be comma-separated with no spaces. Write: kibitzer:ignore {rules} -- <why>"
         ),
     }
+}
+
+/// The echoed rule list as a rule id would be written: lower-cased, other invalid characters
+/// replaced by `-`, so the `Write:` suggestion does not repeat what was rejected.
+fn suggestable(rules: &str) -> String {
+    rules
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == ',' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 const CONCRETE_REASON: &str = "<the concrete constraint that makes this code acceptable>";
@@ -550,5 +566,28 @@ mod sanitize_tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("longer than 300"), "{}", out[0]);
         assert!(out[0].len() < 400, "{} bytes", out[0].len());
+    }
+
+    #[test]
+    fn inline_ignore_should_LowercaseRuleInSuggestion_When_RuleHasUpperCase() {
+        let out = messages("// kibitzer:ignore Flag-Argument -- some real reason");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("lowercase ASCII"), "{}", out[0]);
+        assert!(
+            out[0].contains("Write: kibitzer:ignore flag-argument -- <why>"),
+            "{}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn inline_ignore_should_ReportUpperCaseMarker_When_NearMiss() {
+        let out = messages("// KIBITZER:IGNORE flag-argument -- some real reason");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].contains("'KIBITZER:IGNORE' not recognized; use 'kibitzer:ignore'"),
+            "{}",
+            out[0]
+        );
     }
 }

@@ -6,7 +6,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::rules;
-use crate::inline_ignores::is_directive_comment;
+use crate::inline_ignores::{is_directive_only_comment, without_directive_lines};
 use crate::tree_walk::comment_kinds;
 
 /// `over-commented` fires when a declaration's attached comment lines are at least this
@@ -229,10 +229,12 @@ impl Checker for CommentQualityChecker {
         let mut in_fence = false;
         for comment in &comments {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
-            // The fix an agent adds for a finding must not itself produce one.
-            if is_directive_comment(text) {
+            // The fix an agent adds for a finding must not itself produce one, so directive
+            // lines are blanked; the comment's other lines are still judged.
+            if is_directive_only_comment(text) {
                 continue;
             }
+            let text = &*without_directive_lines(text);
             check_verbose_phrases(*comment, text, &mut findings);
             in_fence =
                 check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
@@ -808,7 +810,7 @@ fn collect_comment_rows(
 /// function stubs immediately before a real, unrelated function was getting folded
 /// into that function's "leading doc comment," inflating its comment-to-code ratio.
 fn is_directive_node(node: Node, src: &[u8]) -> bool {
-    node.utf8_text(src).is_ok_and(is_directive_comment)
+    node.utf8_text(src).is_ok_and(is_directive_only_comment)
 }
 
 fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8]) -> Vec<Node<'a>> {
@@ -827,7 +829,7 @@ fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8])
         };
         // Not counted, but a directive between a doc comment and its function must not
         // split the doc block.
-        if is_directive_comment(text) {
+        if is_directive_only_comment(text) {
             next_start_row = sibling.start_position().row;
             cursor = sibling;
             continue;
@@ -1465,6 +1467,25 @@ mod tests {
                 .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
+    }
+
+    #[test]
+    fn comment_quality_should_StillFlag_When_BlockCommentHoldsDirectiveLineAndCommentedOutCode() {
+        let src = "package main\n\nfunc F() {\n\t/*\n\t * kibitzer:ignore flag-argument -- pinned by public API\n\t * total = compute(a, b)\n\t * if err != nil { return err }\n\t */\n}\n";
+        let findings = run(Language::Go, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "the code lines beside a directive must still be judged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn comment_quality_should_EmitNothing_When_BlockCommentIsOnlyADirective() {
+        let src = "package main\n\n/*\n * kibitzer:ignore flag-argument -- see foo(bar) and x = y\n */\nfunc F() {}\n";
+        let findings = run(Language::Go, src);
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
     }
 
     #[test]
