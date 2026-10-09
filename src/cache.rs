@@ -30,6 +30,37 @@ pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     })
 }
 
+/// The file/config/registry fingerprints a result is stamped with, captured BEFORE the checks
+/// run: stamping after would let a slow run on old content write its stale results under the
+/// stamp of content a faster request had already seen change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamps {
+    file_path: PathBuf,
+    config_path: PathBuf,
+    registry_path: PathBuf,
+    file: Option<Stamp>,
+    config: Option<Stamp>,
+    registry: Option<Stamp>,
+}
+
+impl Stamps {
+    pub fn capture(file_path: &Path, config_path: &Path, registry_path: &Path) -> Self {
+        Stamps {
+            file_path: file_path.to_path_buf(),
+            config_path: config_path.to_path_buf(),
+            registry_path: registry_path.to_path_buf(),
+            file: stamp(file_path),
+            config: stamp(config_path),
+            registry: stamp(registry_path),
+        }
+    }
+
+    /// Whether the files still look as they did at capture time.
+    fn is_current(&self) -> bool {
+        *self == Stamps::capture(&self.file_path, &self.config_path, &self.registry_path)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
     file_stamp: Stamp,
@@ -65,7 +96,8 @@ pub struct Cache {
     grace_pending: HashMap<String, bool>,
     /// Binary version that wrote this cache. Entries are keyed on file/config/registry
     /// stamps only, so a pre-upgrade result would otherwise keep serving findings that
-    /// ignore handling should now hide. Same-version dev builds still share a cache.
+    /// ignore handling should now hide. Dev builds of one `Cargo.toml` version still share a
+    /// cache and a daemon (no build id is embedded); `daemon stop` after rebuilding.
     #[serde(default)]
     kibitzer_version: String,
 }
@@ -97,7 +129,12 @@ impl Cache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_string(self)?)?;
+        // Write-then-rename so a concurrent reader (or a crash mid-write) never sees a torn file.
+        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        fs::write(&tmp, serde_json::to_string(self)?)?;
+        fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
         Ok(())
     }
 
@@ -123,24 +160,21 @@ impl Cache {
         }
     }
 
-    pub fn put(
-        &mut self,
-        file_path: &Path,
-        config_path: &Path,
-        registry_path: &Path,
-        trigger: &str,
-        results: Vec<CheckResult>,
-    ) {
-        let (Some(file_stamp), Some(config_stamp)) = (stamp(file_path), stamp(config_path)) else {
+    /// Stores `results` under the `before` stamps taken ahead of the run. Dropped when a stamp
+    /// changed while the checks ran: the results describe content that is already gone.
+    pub fn put(&mut self, before: Stamps, trigger: &str, results: Vec<CheckResult>) {
+        let (Some(file_stamp), Some(config_stamp)) = (before.file, before.config) else {
             return;
         };
-        let registry_stamp = stamp(registry_path);
+        if !before.is_current() {
+            return;
+        }
         self.entries.insert(
-            key(file_path),
+            key(&before.file_path),
             CacheEntry {
                 file_stamp,
                 config_stamp,
-                registry_stamp,
+                registry_stamp: before.registry,
                 trigger: trigger.to_string(),
                 results,
             },
@@ -231,9 +265,7 @@ mod registry_invalidation_tests {
 
         let mut cache = Cache::default();
         cache.put(
-            &file_path,
-            &config_path,
-            &registry_path,
+            Stamps::capture(&file_path, &config_path, &registry_path),
             "batch",
             vec![sample_result()],
         );
@@ -269,9 +301,7 @@ mod registry_invalidation_tests {
 
         let mut cache = Cache::default();
         cache.put(
-            &file_path,
-            &config_path,
-            &registry_path,
+            Stamps::capture(&file_path, &config_path, &registry_path),
             "batch",
             vec![sample_result()],
         );
@@ -319,9 +349,7 @@ mod registry_invalidation_tests {
         };
         let mut cache = Cache::default();
         cache.put(
-            &file_path,
-            &config_path,
-            &registry_path,
+            Stamps::capture(&file_path, &config_path, &registry_path),
             "batch",
             vec![result.clone()],
         );
@@ -358,9 +386,7 @@ mod registry_invalidation_tests {
         };
         let mut cache = Cache::default();
         cache.put(
-            &file_path,
-            &config_path,
-            &registry_path,
+            Stamps::capture(&file_path, &config_path, &registry_path),
             "batch",
             vec![result],
         );
@@ -401,9 +427,7 @@ mod registry_invalidation_tests {
         };
         let mut cache = Cache::default();
         cache.put(
-            &file_path,
-            &config_path,
-            &registry_path,
+            Stamps::capture(&file_path, &config_path, &registry_path),
             "batch",
             vec![result],
         );
@@ -433,9 +457,7 @@ mod registry_invalidation_tests {
 
         let mut cache = Cache::default();
         cache.put(
-            &file_path,
-            &config_path,
-            &registry_path,
+            Stamps::capture(&file_path, &config_path, &registry_path),
             "batch",
             vec![sample_result()],
         );
@@ -569,5 +591,63 @@ mod grace_tests {
         }];
         cache.apply_grace(&mut second_check, &file(), "Edit");
         assert_eq!(second_check[0].severity, Severity::Advisory);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod stamp_ordering_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-cache-stamps-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn result(output: &str) -> CheckResult {
+        CheckResult::new(
+            "c".to_string(),
+            Severity::Advisory,
+            output.is_empty(),
+            output.to_string(),
+        )
+    }
+
+    #[test]
+    fn put_should_DropResults_When_FileChangedSinceStampsWereCaptured() {
+        let (file, config, registry) = (tmp("f.txt"), tmp("cfg.json"), tmp("reg.json"));
+        fs::write(&file, "old").unwrap();
+        fs::write(&config, "{}").unwrap();
+        let slow_before = Stamps::capture(&file, &config, &registry);
+        fs::write(&file, "new content, different length").unwrap();
+        let fast_before = Stamps::capture(&file, &config, &registry);
+
+        let mut cache = Cache::default();
+        cache.put(fast_before, "batch", vec![result("")]);
+        cache.put(slow_before, "batch", vec![result("stale finding")]);
+
+        let got = cache.get(&file, &config, &registry, "batch").unwrap();
+        assert!(
+            got[0].passed,
+            "the late stale put must not overwrite: {got:?}"
+        );
+    }
+
+    #[test]
+    fn save_should_LeaveNoTempFileAndRoundTrip_When_WritingAtomically() {
+        let path = tmp("atomic").join("cache.json");
+        let mut cache = Cache::default();
+        cache.grace_pending.insert("k::c".to_string(), true);
+        cache.save(&path).unwrap();
+        cache.save(&path).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(Cache::load(&path).grace_pending.len(), 1);
     }
 }

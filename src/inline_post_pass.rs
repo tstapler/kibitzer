@@ -148,7 +148,8 @@ pub(crate) fn unknown_rule_advisories(
 }
 
 /// The file text, only when it is small enough for the first pass to have judged it and
-/// carries the marker; one extra page-cache-hot read per hook call.
+/// carries the marker; one extra page-cache-hot read per hook call. A write landing between
+/// that pass's read and this one can skew an advisory's row; the next edit's hook run corrects it.
 fn read_markered_source(file_path: &Path) -> Option<String> {
     match read_native_source(file_path) {
         Ok(NativeSource::Text(source)) if crate::inline_ignores::has_marker(&source) => {

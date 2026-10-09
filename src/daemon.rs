@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{Cache, default_cache_path};
+use crate::cache::{Cache, Stamps, default_cache_path};
 use crate::check::{CheckResult, run_checks_for_trigger};
 use crate::config::{find_effective_config, resolve_config_path};
 
@@ -26,9 +26,16 @@ enum Request {
     Shutdown,
 }
 
+/// The kibitzer version a daemon answers with. A daemon started before an upgrade keeps
+/// running the old code, so the client compares this to its own and retires a mismatch.
+const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Response {
     ok: bool,
+    /// Absent from a pre-version daemon's replies, which therefore read as a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     results: Option<Vec<CheckResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,12 +97,14 @@ fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path)
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => Response {
                 ok: true,
+                version: Some(DAEMON_VERSION.to_string()),
                 results: None,
                 error: None,
             },
             Ok(Request::Shutdown) => {
                 let ack = Response {
                     ok: true,
+                    version: Some(DAEMON_VERSION.to_string()),
                     results: None,
                     error: None,
                 };
@@ -118,17 +127,20 @@ fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path)
             ) {
                 Ok(results) => Response {
                     ok: true,
+                    version: Some(DAEMON_VERSION.to_string()),
                     results: Some(results),
                     error: None,
                 },
                 Err(e) => Response {
                     ok: false,
+                    version: Some(DAEMON_VERSION.to_string()),
                     results: None,
                     error: Some(e.to_string()),
                 },
             },
             Err(e) => Response {
                 ok: false,
+                version: Some(DAEMON_VERSION.to_string()),
                 results: None,
                 error: Some(format!("bad request: {e}")),
             },
@@ -153,8 +165,7 @@ fn handle_run_checks(
     // Cached entries aren't keyed by changed_lines — only bypass the cache lookup when a
     // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
     if changed_lines.is_none()
-        && let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.get(
+        && let Some(cached) = lock_cache(cache).get(
             file_path,
             &config_path,
             &crate::plugin::default_registry_path(),
@@ -163,6 +174,13 @@ fn handle_run_checks(
     {
         return Ok(cached);
     }
+
+    // Stamped before the checks run; see `Stamps`.
+    let before = Stamps::capture(
+        file_path,
+        &config_path,
+        &crate::plugin::default_registry_path(),
+    );
 
     // Loaded once for this request's whole check loop, not once per check — see
     // `run_checks_for_trigger`'s doc comment.
@@ -178,7 +196,8 @@ fn handle_run_checks(
         &run_ctx,
     )?;
 
-    if let Ok(mut guard) = cache.lock() {
+    {
+        let mut guard = lock_cache(cache);
         guard.apply_grace(&mut results, file_path, trigger);
         // A scoped result only reflects the diffed ranges, not the whole file — writing it
         // to the cache would let a later unscoped (e.g. batch) request read back a partial
@@ -186,13 +205,7 @@ fn handle_run_checks(
         // concern (it's not part of `entries`, the file-results cache `put` populates), so
         // `save` still needs to run unconditionally below to persist it.
         if changed_lines.is_none() {
-            guard.put(
-                file_path,
-                &config_path,
-                &crate::plugin::default_registry_path(),
-                trigger,
-                results.clone(),
-            );
+            guard.put(before, trigger, results.clone());
         }
         // Persist regardless of `changed_lines`: without this, a diff-scoped (Edit-tool)
         // call under this daemon would still work correctly in-memory for as long as the
@@ -203,8 +216,14 @@ fn handle_run_checks(
     Ok(results)
 }
 
-fn connect() -> Option<UnixStream> {
-    let stream = UnixStream::connect(default_socket_path()).ok()?;
+/// A poisoned lock only means another connection thread panicked mid-request; the cache map
+/// is still usable, and a daemon that stops caching for the rest of its life is worse.
+fn lock_cache(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
+    cache.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn connect(socket_path: &Path) -> Option<UnixStream> {
+    let stream = UnixStream::connect(socket_path).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .ok()?;
@@ -213,15 +232,19 @@ fn connect() -> Option<UnixStream> {
 
 /// True if a kibitzer daemon is listening and responds to a ping.
 pub fn is_alive() -> bool {
-    request(&Request::Ping).is_some()
+    request(&default_socket_path(), &Request::Ping).is_some()
 }
 
 pub fn shutdown() -> bool {
-    request(&Request::Shutdown).is_some()
+    shutdown_at(&default_socket_path())
 }
 
-fn request(req: &Request) -> Option<Response> {
-    let mut stream = connect()?;
+fn shutdown_at(socket_path: &Path) -> bool {
+    request(socket_path, &Request::Shutdown).is_some()
+}
+
+fn request(socket_path: &Path, req: &Request) -> Option<Response> {
+    let mut stream = connect(socket_path)?;
     let mut payload = serde_json::to_string(req).ok()?;
     payload.push('\n');
     stream.write_all(payload.as_bytes()).ok()?;
@@ -240,13 +263,44 @@ pub fn try_run_checks_via_daemon(
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<Vec<CheckResult>> {
-    let response = request(&Request::RunChecks {
-        cwd: cwd.to_path_buf(),
-        file_path: file_path.to_path_buf(),
-        trigger: trigger.to_string(),
-        changed_lines: changed_lines.map(|r| r.to_vec()),
-    })?;
+    try_run_checks_at(
+        &default_socket_path(),
+        cwd,
+        file_path,
+        trigger,
+        changed_lines,
+    )
+}
+
+fn try_run_checks_at(
+    socket_path: &Path,
+    cwd: &Path,
+    file_path: &Path,
+    trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
+) -> Option<Vec<CheckResult>> {
+    let response = request(
+        socket_path,
+        &Request::RunChecks {
+            cwd: cwd.to_path_buf(),
+            file_path: file_path.to_path_buf(),
+            trigger: trigger.to_string(),
+            changed_lines: changed_lines.map(|r| r.to_vec()),
+        },
+    )?;
+    if response.version.as_deref() != Some(DAEMON_VERSION) {
+        retire_stale_daemon(socket_path);
+        return None;
+    }
     if response.ok { response.results } else { None }
+}
+
+/// A daemon from another kibitzer version (or from before replies carried one) answers with
+/// code that predates this binary, so its results are discarded: it is asked to exit and the
+/// spawn debounce is cleared so the caller's fallback can start a fresh one.
+fn retire_stale_daemon(socket_path: &Path) {
+    shutdown_at(socket_path);
+    let _ = std::fs::remove_file(socket_path.with_extension("spawn-attempt"));
 }
 
 /// Minimum time between background-spawn attempts, so a daemon that keeps failing to
@@ -348,6 +402,11 @@ fn run_uncached(
     let config_path = resolve_config_path(&repo_root);
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
     let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    let before = Stamps::capture(
+        file_path,
+        &config_path,
+        &crate::plugin::default_registry_path(),
+    );
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -365,13 +424,7 @@ fn run_uncached(
     // full-file cache entry. `grace_pending` isn't part of that cache entry, so it still
     // needs `save` to run unconditionally below.
     if changed_lines.is_none() {
-        cache.put(
-            file_path,
-            &config_path,
-            &crate::plugin::default_registry_path(),
-            trigger,
-            results.clone(),
-        );
+        cache.put(before, trigger, results.clone());
     }
     // Persist regardless of `changed_lines`: this is a fresh `Cache::load` per process
     // (no daemon running), so without an unconditional save here, `apply_grace`'s
@@ -459,6 +512,198 @@ mod inline_cache_tests {
         );
         let second = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
         assert_eq!(anchor(&second), anchor(&first));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod stale_daemon_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A one-connection fake daemon that answers every line with `reply_for(line)`.
+    fn fake_daemon(
+        socket: &Path,
+        reply_for: fn(&str) -> String,
+    ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+        let listener = UnixListener::bind(socket).unwrap();
+        let saw_shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_shutdown);
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let stream = stream.unwrap();
+                let mut line = String::new();
+                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                if line.contains("\"shutdown\"") {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                let mut writer = stream;
+                let _ = writeln!(writer, "{}", reply_for(&line));
+            }
+        });
+        (handle, saw_shutdown)
+    }
+
+    fn old_style_reply(_line: &str) -> String {
+        r#"{"ok":true,"results":[]}"#.to_string()
+    }
+
+    fn current_reply(_line: &str) -> String {
+        format!(r#"{{"ok":true,"version":"{DAEMON_VERSION}","results":[]}}"#)
+    }
+
+    #[test]
+    fn client_should_TreatDaemonAsDeadAndShutItDown_When_ReplyHasNoVersion() {
+        let dir = temp_dir("old-style");
+        let socket = dir.join("k.sock");
+        std::fs::write(socket.with_extension("spawn-attempt"), "").unwrap();
+        let (handle, saw_shutdown) = fake_daemon(&socket, old_style_reply);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        handle.join().unwrap();
+        assert!(out.is_none(), "an old daemon's results must be discarded");
+        assert!(
+            saw_shutdown.load(Ordering::SeqCst),
+            "old daemon must be asked to exit"
+        );
+        assert!(
+            !socket.with_extension("spawn-attempt").exists(),
+            "debounce must be cleared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_should_TreatDaemonAsDead_When_VersionDiffers() {
+        let dir = temp_dir("other-version");
+        let socket = dir.join("k.sock");
+        let (handle, saw_shutdown) = fake_daemon(&socket, |_| {
+            r#"{"ok":true,"version":"0.0.0-old","results":[]}"#.to_string()
+        });
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        handle.join().unwrap();
+        assert!(out.is_none());
+        assert!(saw_shutdown.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_should_UseResults_When_VersionMatches() {
+        let dir = temp_dir("same-version");
+        let socket = dir.join("k.sock");
+        let (handle, saw_shutdown) = fake_daemon(&socket, current_reply);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        // The fake accepts two connections; a matching daemon gets only one.
+        let _ = UnixStream::connect(&socket);
+        handle.join().unwrap();
+        assert_eq!(out.map(|r| r.len()), Some(0));
+        assert!(!saw_shutdown.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ping_reply_should_CarryVersion_When_DaemonAnswers() {
+        let dir = temp_dir("ping");
+        let socket = dir.join("k.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache_path = dir.join("cache.json");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, &cache, &cache_path).unwrap();
+        });
+        let response = request(&socket, &Request::Ping).unwrap();
+        assert_eq!(response.version.as_deref(), Some(DAEMON_VERSION));
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod stale_result_tests {
+    use super::*;
+
+    /// A shell check that sleeps only on BAD content: the slow request on old content is the
+    /// one that finishes last, after a fast request already cached the new content's result.
+    #[test]
+    fn handle_run_checks_should_NotCacheStaleResult_When_SlowRunFinishesAfterFileChanged() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(
+            dir.join(".kibitzer/inspect.json"),
+            r#"{"checks": [{"name": "no-bad", "command": "if grep -q BAD {file}; then sleep 2; exit 1; fi", "severity": "advisory", "message": "bad"}]}"#,
+        )
+        .unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "BAD\n").unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache_path = dir.join("cache.json");
+
+        let slow = {
+            let (dir, file, cache, cache_path) = (
+                dir.clone(),
+                file.clone(),
+                Arc::clone(&cache),
+                cache_path.clone(),
+            );
+            std::thread::spawn(move || {
+                handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(&file, "GOOD content\n").unwrap();
+        let fast = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        assert!(fast.iter().all(|r| r.passed), "{fast:?}");
+        let stale = slow.join().unwrap();
+        assert!(
+            stale.iter().any(|r| !r.passed),
+            "slow run saw the BAD content"
+        );
+
+        let again = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        assert!(
+            again.iter().all(|r| r.passed),
+            "stale BAD result was served for the new content: {again:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_run_checks_should_KeepServing_When_CacheMutexIsPoisoned() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), r#"{"checks": []}"#).unwrap();
+        let file = dir.join("main.go");
+        std::fs::write(&file, "package main\n").unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let poisoner = Arc::clone(&cache);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("poison the cache lock");
+        })
+        .join();
+        assert!(cache.lock().is_err(), "setup: mutex must be poisoned");
+        let out = handle_run_checks(&dir, &file, "batch", None, &cache, &dir.join("cache.json"));
+        assert!(out.is_ok(), "{out:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
