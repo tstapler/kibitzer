@@ -443,3 +443,42 @@ fn kibitzer_run_should_SuppressFileSize_When_DirectiveNamesCheckerNameInHead() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn rust_fn_names_under(dir: &std::path::Path, names: &mut std::collections::HashSet<String>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_fn_names_under(&path, names);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let source = std::fs::read_to_string(&path).unwrap_or_default();
+            for part in source.split("fn ").skip(1) {
+                let name: String = part
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                names.insert(name);
+            }
+        }
+    }
+}
+
+#[test]
+fn validation_md_should_NameOnlyExistingTests_When_Scanned() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut fns = std::collections::HashSet::new();
+    rust_fn_names_under(&root.join("src"), &mut fns);
+    rust_fn_names_under(&root.join("tests"), &mut fns);
+    let plan = std::fs::read_to_string(
+        root.join("project_plans/inline-ignore-syntax/implementation/validation.md"),
+    )
+    .unwrap();
+    let missing: Vec<&str> = plan
+        .lines()
+        .filter(|l| l.starts_with('|'))
+        .filter_map(|l| l.split('|').nth(3))
+        .map(|cell| cell.trim().trim_matches('`'))
+        .filter(|name| name.contains('_') && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .filter(|name| !fns.contains(*name))
+        .collect();
+    assert!(missing.is_empty(), "no fn for: {missing:?}");
+}
