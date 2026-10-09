@@ -72,14 +72,26 @@ fn is_soft_joiner(c: char) -> bool {
 }
 
 /// Tier 2 deny-list: characters with no legitimate place in another checker's finding text,
-/// wherever they sit. ZWJ, ZWNJ and VS16 are deliberately absent: emoji sequences and
-/// Persian/Indic text need them. Soft joiners and variation selectors are context-dependent
-/// (see `strip_unsafe`), so they are not here.
+/// wherever they sit: invisible fillers, the soft hyphen, the grapheme joiner and the odd-width
+/// spaces U+2000-200A (U+2009, the thin space, is real typography and stays). ZWJ, ZWNJ and VS16
+/// are deliberately absent: emoji sequences and Persian/Indic text need them. Soft joiners,
+/// bidi marks, variation selectors and tag runs are context-dependent (see `strip_unsafe`), so
+/// they are not here.
 fn is_hard_unsafe(c: char) -> bool {
     (c.is_control() && c != '\t' && c != '\n')
         || matches!(
             c,
-            '\u{180E}'
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{3164}'
+                | '\u{FFA0}'
+                | '\u{2000}'..='\u{2008}'
+                | '\u{200A}'
+                | '\u{180E}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2061}'..='\u{2064}'
                 | '\u{2066}'..='\u{206F}'
@@ -88,9 +100,74 @@ fn is_hard_unsafe(c: char) -> bool {
         )
 }
 
-/// Everything `escape_path` makes visible: the hard-unsafe set plus every selector and joiner.
+/// Everything `escape_path` makes visible: the hard-unsafe set plus every selector, joiner and
+/// bidi mark, except the ones `echo_path` and `escape_path` keep inside a legitimate sequence.
 fn is_output_unsafe(c: char) -> bool {
-    is_hard_unsafe(c) || is_variation_selector(c) || is_soft_joiner(c)
+    is_hard_unsafe(c) || is_variation_selector(c) || is_soft_joiner(c) || is_bidi_mark(c)
+}
+
+/// LRM, RLM and the Arabic letter mark: meaningful only beside right-to-left letters.
+fn is_bidi_mark(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}')
+}
+
+fn is_rtl_letter(c: char) -> bool {
+    c.is_alphabetic()
+        && matches!(
+            c,
+            '\u{0590}'..='\u{08FF}'
+                | '\u{FB1D}'..='\u{FDFF}'
+                | '\u{FE70}'..='\u{FEFF}'
+                | '\u{10800}'..='\u{10FFF}'
+                | '\u{1E800}'..='\u{1EFFF}'
+        )
+}
+
+/// Nonspacing marks that follow a base letter: the generic combining blocks plus the Thai, Lao,
+/// Khmer and Myanmar vowel and tone signs (tone marks are not `Alphabetic`, vowels often are).
+fn is_nonspacing_mark(c: char) -> bool {
+    is_combining_mark(c)
+        || matches!(
+            c,
+            '\u{0E31}'
+                | '\u{0E34}'..='\u{0E3A}'
+                | '\u{0E47}'..='\u{0E4E}'
+                | '\u{0EB1}'
+                | '\u{0EB4}'..='\u{0EBC}'
+                | '\u{0EC8}'..='\u{0ECD}'
+                | '\u{17B7}'..='\u{17BD}'
+                | '\u{17C6}'
+                | '\u{17C9}'..='\u{17D3}'
+                | '\u{17DD}'
+                | '\u{102D}'..='\u{1030}'
+                | '\u{1032}'..='\u{1037}'
+                | '\u{1039}'..='\u{103A}'
+        )
+}
+
+const WAVING_BLACK_FLAG: char = '\u{1F3F4}';
+const CANCEL_TAG: char = '\u{E007F}';
+
+/// The tag letters of the England, Scotland and Wales subdivision flags (`gbeng`, `gbsct`,
+/// `gbwls`); the only tag sequences that have a legitimate use in text.
+const SUBDIVISION_FLAG_TAGS: [&str; 3] = ["gbeng", "gbsct", "gbwls"];
+
+/// Chars a subdivision flag occupies from the start of `chars` (the black flag, its tag letters
+/// and the cancel tag), or `None` when `chars` does not begin with exactly one.
+fn subdivision_flag_len(chars: &[char]) -> Option<usize> {
+    if chars.first() != Some(&WAVING_BLACK_FLAG) {
+        return None;
+    }
+    SUBDIVISION_FLAG_TAGS.iter().find_map(|code| {
+        let tags = code
+            .chars()
+            .map(|l| char::from_u32(0xE0000 + l as u32))
+            .collect::<Option<Vec<char>>>()?;
+        let end = 1 + tags.len();
+        let matches =
+            chars.get(1..end) == Some(tags.as_slice()) && chars.get(end) == Some(&CANCEL_TAG);
+        matches.then_some(end + 1)
+    })
 }
 
 /// Tier 1 (strict), for text derived from untrusted directive content: one line of at
@@ -124,18 +201,21 @@ fn echo_with(text: &str, max_chars: usize, path: bool) -> String {
         chars += n;
         true
     };
-    for c in text.chars() {
+    let all: Vec<char> = text.chars().collect();
+    for (i, &c) in all.iter().enumerate() {
         if !path && c.is_whitespace() {
             pending_space = !out.is_empty();
             continue;
         }
-        let piece: String = if path && c != ' ' && !is_echo_safe(c) {
-            escape_char(c)
-        } else if !path && !is_echo_safe(c) {
-            continue;
-        } else {
-            c.to_string()
-        };
+        let neighbors = (i.checked_sub(1).map(|p| all[p]), all.get(i + 1).copied());
+        let piece: String =
+            if path && c != ' ' && !is_echo_safe(c) && !is_path_sequence_char(c, neighbors) {
+                escape_char(c)
+            } else if !path && !is_echo_safe(c) {
+                continue;
+            } else {
+                c.to_string()
+            };
         if is_combining_mark(c) {
             marks += 1;
             if marks > MAX_COMBINING_RUN {
@@ -157,6 +237,21 @@ fn echo_with(text: &str, max_chars: usize, path: bool) -> String {
     out
 }
 
+/// Whether a ZWJ, ZWNJ or VS16 in a file name is part of an emoji or Persian/Indic sequence
+/// (between two non-ASCII graphic characters, or VS16 right after an emoji base) and so reads
+/// as written; a leading, trailing or isolated one is still escaped.
+fn is_path_sequence_char(c: char, (prev, next): (Option<char>, Option<char>)) -> bool {
+    let graphic =
+        |n: char| !n.is_ascii() && !n.is_whitespace() && (is_echo_safe(n) || n == '\u{FE0F}');
+    match c {
+        '\u{200C}' | '\u{200D}' => {
+            prev.is_some_and(graphic) && next.is_some_and(|n| graphic(n) && n != '\u{FE0F}')
+        }
+        '\u{FE0F}' => prev.is_some_and(|base| selector_fits(base, c)),
+        _ => false,
+    }
+}
+
 /// `\n`, `\r`, `\t` or `\u{..}` for one character.
 fn escape_char(c: char) -> String {
     match c {
@@ -176,19 +271,36 @@ pub(crate) fn quote_reason(reason: &str) -> String {
 /// Tier 2 (lenient), for another checker's legitimate finding text on hook, MCP and `kibitzer
 /// run` output. Keeps tabs, newlines, ZWJ, ZWNJ and VS16 (emoji and Persian/Indic text); drops
 /// escapes and other controls, bidi overrides/embeddings/isolates, line and paragraph separators,
-/// deprecated format characters and Unicode tag characters. Variation selectors survive only as
-/// one selector directly after a graphic base (ideographic ones only after an ideograph, ASCII
-/// bases only for keycap `#*0-9`); ZWSP, word joiner and BOM survive only alone between two
-/// letters or digits (Thai, Khmer). Anything else of those is a data-smuggling channel.
+/// invisible fillers, the soft hyphen, odd-width spaces, deprecated format characters and Unicode
+/// tag characters (except the three subdivision flags). Context-dependent characters survive
+/// only where they do real work, alone and one at a time: variation selectors directly after a
+/// base that has variation sequences (see `selector_fits`); ZWSP, word joiner and BOM between
+/// two letters or digits unless both are ASCII (Thai and Khmer word breaks, also after a tone
+/// mark); LRM, RLM and the Arabic letter mark beside a right-to-left letter. Anything else of
+/// those is a data-smuggling channel.
 pub(crate) fn strip_unsafe(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut last: Option<char> = None;
+    let mut last_base: Option<char> = None;
     let mut after_modifier = false;
+    let mut skip_to = 0usize;
     for (i, &c) in chars.iter().enumerate() {
+        if i < skip_to {
+            continue;
+        }
+        if let Some(len) = subdivision_flag_len(&chars[i..]) {
+            out.extend(&chars[i..i + len]);
+            skip_to = i + len;
+            last = Some(CANCEL_TAG);
+            last_base = last;
+            after_modifier = false;
+            continue;
+        }
         if is_hard_unsafe(c) {
             continue;
         }
+        let next = chars.get(i + 1).copied();
         if is_variation_selector(c) {
             let ok = !after_modifier && last.is_some_and(|base| selector_fits(base, c));
             if ok {
@@ -197,13 +309,28 @@ pub(crate) fn strip_unsafe(text: &str) -> String {
             }
             continue;
         }
+        if is_bidi_mark(c) {
+            let alone = !after_modifier && !(i > 0 && is_bidi_mark(chars[i - 1]));
+            let beside_rtl = last.is_some_and(is_rtl_letter) || next.is_some_and(is_rtl_letter);
+            if alone && beside_rtl {
+                out.push(c);
+                after_modifier = true;
+            }
+            continue;
+        }
         if is_soft_joiner(c) {
             let alone = i == 0 || !is_soft_joiner(chars[i - 1]);
-            let between_letters = alone
+            let after_word = last.is_some_and(char::is_alphanumeric)
+                || (last.is_some_and(is_nonspacing_mark)
+                    && last_base.is_some_and(|b| b.is_alphanumeric() && !b.is_ascii()));
+            let ascii_pair = last.is_some_and(|l| l.is_ascii_alphanumeric())
+                && next.is_some_and(|n| n.is_ascii_alphanumeric());
+            if alone
                 && !after_modifier
-                && last.is_some_and(char::is_alphanumeric)
-                && chars.get(i + 1).copied().is_some_and(char::is_alphanumeric);
-            if between_letters {
+                && after_word
+                && !ascii_pair
+                && next.is_some_and(char::is_alphanumeric)
+            {
                 out.push(c);
                 after_modifier = true;
             }
@@ -211,35 +338,77 @@ pub(crate) fn strip_unsafe(text: &str) -> String {
         }
         out.push(c);
         last = Some(c);
+        if !is_nonspacing_mark(c) {
+            last_base = Some(c);
+        }
         after_modifier = false;
     }
     out
 }
 
+/// Whether `base` can carry `selector` as a real variation sequence: CJK ideographs (standardized
+/// and ideographic selectors), emoji and symbol bases from Unicode's emoji and standardized-variant
+/// lists (arrows, math operators, geometric shapes, dingbats), and the keycap characters
+/// `#*0-9`. Letters of other scripts take none, so a selector after them is only a payload.
 fn selector_fits(base: char, selector: char) -> bool {
     if base.is_whitespace() || base.is_control() || matches!(base, '\u{200C}' | '\u{200D}') {
         return false;
     }
+    let is_cjk = matches!(
+        base,
+        '\u{2E80}'..='\u{2FDF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{3FFFF}'
+    );
     if matches!(selector, '\u{E0100}'..='\u{E01EF}') {
-        return matches!(base, '\u{2E80}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{3FFFF}');
+        return is_cjk;
     }
     if base.is_ascii() {
         return matches!(selector, '\u{FE0E}' | '\u{FE0F}')
             && matches!(base, '#' | '*' | '0'..='9');
     }
-    true
+    is_cjk || is_symbol_with_variants(base)
+}
+
+fn is_symbol_with_variants(base: char) -> bool {
+    matches!(
+        base,
+        '\u{00A9}'
+            | '\u{00AE}'
+            | '\u{203C}'
+            | '\u{2049}'
+            | '\u{2122}'
+            | '\u{2139}'
+            | '\u{2190}'..='\u{23FF}'
+            | '\u{24C2}'
+            | '\u{25A0}'..='\u{27BF}'
+            | '\u{2900}'..='\u{297F}'
+            | '\u{2A00}'..='\u{2AFF}'
+            | '\u{2B00}'..='\u{2BFF}'
+            | '\u{3030}'
+            | '\u{303D}'
+            | '\u{3297}'
+            | '\u{3299}'
+            | '\u{1F000}'..='\u{1FAFF}'
+    )
 }
 
 /// A path with every Tier 2-unsafe character, newline and tab made visible (`\n`, `\t`, `\u{..}`)
-/// so a hostile file name cannot forge a separate output line.
+/// so a hostile file name cannot forge a separate output line. VS16 directly after an emoji base
+/// stays as written.
 pub(crate) fn escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
+    let mut prev: Option<char> = None;
     for c in path.chars() {
-        if matches!(c, '\n' | '\t' | '\r') || is_output_unsafe(c) {
+        let keep_vs16 = c == '\u{FE0F}' && prev.is_some_and(|base| selector_fits(base, c));
+        if !keep_vs16 && (matches!(c, '\n' | '\t' | '\r') || is_output_unsafe(c)) {
             out.push_str(&escape_char(c));
         } else {
             out.push(c);
         }
+        prev = Some(c);
     }
     out
 }
@@ -437,8 +606,8 @@ mod tests {
     fn echo_path_should_EscapeInsteadOfDelete_When_PathHasSymbolsOrInvisibles() {
         let out = echo_path("Brand\u{2122}/my  file\u{2103}.go", 200);
         assert_eq!(out, "Brand\u{2122}/my  file\u{2103}.go");
-        let out = echo_path("می\u{200C}خواهم/a\nb\u{1b}[31m.go", 200);
-        assert_eq!(out, "می\\u{200c}خواهم/a\\nb\\u{1b}[31m.go");
+        let out = echo_path("a\u{200C}b/a\nb\u{1b}[31m.go", 200);
+        assert_eq!(out, "a\\u{200c}b/a\\nb\\u{1b}[31m.go");
     }
 
     #[test]
@@ -488,11 +657,11 @@ mod tests {
     fn strip_unsafe_should_KeepJoinerBetweenLetters_When_ThaiOrWordJoiner() {
         let thai = "\u{0E2A}\u{200B}\u{0E27}\u{0E31}\u{0E2A}";
         assert_eq!(strip_unsafe(thai), thai);
-        assert_eq!(
-            strip_unsafe("ab\u{2060}cd\u{FEFF}ef"),
-            "ab\u{2060}cd\u{FEFF}ef"
-        );
+        assert_eq!(strip_unsafe("ab\u{2060}cd\u{FEFF}ef"), "abcdef");
+        assert_eq!(strip_unsafe("é\u{2060}ü"), "é\u{2060}ü");
         assert_eq!(strip_unsafe("a\u{200B}\u{200B}b"), "ab");
+        let mixed = "a\u{200B}\u{0E01}";
+        assert_eq!(strip_unsafe(mixed), mixed);
         assert_eq!(strip_unsafe("\u{FEFF}a \u{200B} b\u{200B}"), "a  b");
     }
 
@@ -508,5 +677,125 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(!out.contains("\n[kibitzer]"), "{out:?}");
         assert!(out.contains("b\\n[kibitzer] FORGED"), "{out:?}");
+    }
+
+    #[test]
+    fn strip_unsafe_should_DropFillersSoftHyphenAndOddWidthSpaces_When_Present() {
+        assert_eq!(
+            strip_unsafe("a\u{00AD}b\u{034F}c\u{115F}d\u{1160}e\u{3164}f\u{FFA0}g\u{17B4}h"),
+            "abcdefgh"
+        );
+        for c in ('\u{2000}'..='\u{200A}').filter(|&c| c != '\u{200B}') {
+            let expected = if c == '\u{2009}' {
+                format!("a{c}b")
+            } else {
+                "ab".into()
+            };
+            assert_eq!(
+                strip_unsafe(&format!("a{c}b")),
+                expected,
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        // Ordinary spaces survive.
+        assert_eq!(
+            strip_unsafe("a b\u{00A0}c\u{3000}d"),
+            "a b\u{00A0}c\u{3000}d"
+        );
+    }
+
+    #[test]
+    fn strip_unsafe_should_KeepBidiMarkOnlyBesideRtlLetter_When_LrmRlmOrAlm() {
+        for kept in [
+            "שלום\u{200F}",
+            "\u{200F}שלום",
+            "مرحبا\u{061C}",
+            "ab \u{200F}שלום",
+        ] {
+            assert_eq!(strip_unsafe(kept), kept);
+        }
+        assert_eq!(strip_unsafe("a\u{200E}b"), "ab");
+        assert_eq!(strip_unsafe("a\u{200F} \u{061C}b"), "a b");
+        assert_eq!(strip_unsafe("x\u{200F}"), "x");
+        // A run is a channel: only the first mark beside the letter survives.
+        assert_eq!(strip_unsafe("ש\u{200F}\u{200F}\u{200F}"), "ש\u{200F}");
+    }
+
+    #[test]
+    fn strip_unsafe_should_DropSelectorAfterNonSymbolBase_When_NonAscii() {
+        for stripped in ["é\u{FE0F}", "ж\u{FE00}", "ك\u{FE0F}", "ก\u{FE01}"] {
+            assert_eq!(strip_unsafe(stripped), &stripped[..stripped.len() - 3]);
+        }
+        for kept in [
+            "\u{2764}\u{FE0F}",
+            "\u{2228}\u{FE00}",
+            "\u{1F600}\u{FE0F}",
+            "\u{00A9}\u{FE0E}",
+        ] {
+            assert_eq!(strip_unsafe(kept), kept);
+        }
+    }
+
+    #[test]
+    fn strip_unsafe_should_DropZwspBetweenAsciiButKeepThaiAndToneMarks_When_Joiner() {
+        assert_eq!(strip_unsafe("a\u{200B}b 1\u{200B}2 a\u{200B}1"), "ab 12 a1");
+        let tone = "\u{0E01}\u{0E48}\u{200B}\u{0E02}";
+        assert_eq!(strip_unsafe(tone), tone);
+        let vowel = "\u{0E01}\u{0E34}\u{200B}\u{0E02}";
+        assert_eq!(strip_unsafe(vowel), vowel);
+        // A mark on an ASCII base is not a Thai context.
+        assert_eq!(strip_unsafe("e\u{0301}\u{200B}x"), "e\u{0301}x");
+    }
+
+    #[test]
+    fn strip_unsafe_should_KeepOnlyKnownSubdivisionFlags_When_TagRunsPresent() {
+        let tags = |code: &str| -> String {
+            code.chars()
+                .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+                .collect()
+        };
+        for code in ["gbeng", "gbsct", "gbwls"] {
+            let flag = format!("\u{1F3F4}{}\u{E007F}", tags(code));
+            assert_eq!(strip_unsafe(&format!("x{flag}y")), format!("x{flag}y"));
+        }
+        // Tags with no flag, a different code, no cancel tag, or an extended run are payload.
+        let flag = "\u{1F3F4}";
+        assert_eq!(strip_unsafe(&format!("a{}b", tags("gbeng"))), "ab");
+        assert_eq!(
+            strip_unsafe(&format!("{flag}{}\u{E007F}", tags("usca"))),
+            flag
+        );
+        assert_eq!(strip_unsafe(&format!("{flag}{}", tags("gbeng"))), flag);
+        assert_eq!(
+            strip_unsafe(&format!("{flag}{}\u{E007F}", tags("gbengx"))),
+            flag
+        );
+        assert_eq!(
+            strip_unsafe(&format!("{flag}\u{E0067}x\u{E0062}\u{E007F}")),
+            format!("{flag}x")
+        );
+    }
+
+    #[test]
+    fn echo_path_should_KeepJoinersInSequences_And_EscapeStrays() {
+        let kept =
+            "می\u{200C}خواهم/\u{1F468}\u{200D}\u{1F469}/\u{2764}\u{FE0F}\u{200D}\u{1F525}.md";
+        assert_eq!(echo_path(kept, 200), kept);
+        assert_eq!(echo_path("\u{200C}a", 200), "\\u{200c}a");
+        assert_eq!(echo_path("a\u{200D}", 200), "a\\u{200d}");
+        assert_eq!(echo_path("a\u{200D}b", 200), "a\\u{200d}b");
+        assert_eq!(echo_path("\u{200D}\u{200D}", 200), "\\u{200d}\\u{200d}");
+        assert_eq!(echo_path("a\u{FE0F}", 200), "a\\u{fe0f}");
+        assert_eq!(echo_path("\u{FE0F}", 200), "\\u{fe0f}");
+        assert_eq!(echo_path("é\u{FE0F}", 200), "é\\u{fe0f}");
+        assert_eq!(echo_path("a\u{200B}b", 200), "a\\u{200b}b");
+    }
+
+    #[test]
+    fn escape_path_should_KeepVs16AfterEmojiOnly() {
+        assert_eq!(escape_path("\u{2764}\u{FE0F}.md"), "\u{2764}\u{FE0F}.md");
+        assert_eq!(escape_path("a\u{FE0F}.md"), "a\\u{fe0f}.md");
+        assert_eq!(escape_path("a\u{200F}b"), "a\\u{200f}b");
     }
 }

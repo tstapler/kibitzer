@@ -171,17 +171,27 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
     collapses to one line, at most two combining marks follow a character, and the text
     is shortened; a reason is shown in quotes as data. File paths in those lines use
     `echo_path`: the same limits, but a character the allow-list would drop (and any
-    newline or tab) is shown as `\n`, `\t` or `\u{..}`, and spaces are kept as written.
+    newline or tab) is shown as `\n`, `\t` or `\u{..}`, and spaces are kept as written. A ZWJ
+    or ZWNJ between two non-ASCII graphic characters and a VS16 right after an emoji base
+    (emoji and Persian sequences) are kept as written; a leading, trailing or isolated one
+    is still escaped.
   - *Lenient* (`strip_unsafe`): the finding text other checkers produce, on hook stderr,
     hook `additionalContext` (PostToolUse and Stop), `run_checks` and
     `architecture_assessment` MCP output, LSP diagnostics, `kibitzer check native` and
     `kibitzer run` stdout. It removes escapes and other control characters (carriage
     return included), bidi embeddings, overrides and isolates, line and paragraph
-    separators, Unicode tag characters and the deprecated format characters
-    (U+206A-206F, U+FFF9-FFFC). It keeps tabs, newlines, ZWJ, ZWNJ and VS16. A variation
-    selector survives only as one selector directly after a graphic base character
-    (ideographic ones only after an ideograph; after ASCII only VS15/VS16 after `#`, `*`
-    or a digit), and ZWSP, word joiner and BOM only alone between two letters or digits.
+    separators, the soft hyphen, the grapheme joiner, the Hangul and Khmer fillers,
+    U+2000-U+200A spaces other than U+2009, Unicode tag characters and the deprecated
+    format characters (U+206A-206F, U+FFF9-FFFC). It keeps tabs, newlines, ZWJ, ZWNJ and
+    VS16. A variation selector survives only as one selector directly after a base that
+    has variation sequences (CJK ideographs, emoji and symbol blocks such as arrows, math
+    operators and dingbats; ideographic selectors only after an ideograph; after ASCII
+    only VS15/VS16 after `#`, `*` or a digit). ZWSP, word joiner and BOM survive only
+    alone between two letters or digits that are not both ASCII (Thai and Khmer word
+    breaks, also right after a tone mark or vowel sign). LRM, RLM and the Arabic letter
+    mark survive only alone beside a right-to-left letter. A tag run survives only as the
+    England, Scotland or Wales flag (the black flag U+1F3F4, the tags for `gbeng`,
+    `gbsct` or `gbwls`, then U+E007F).
   - A file path in lenient output has its newlines and other unsafe characters shown as
     escapes (`\n`), so a file name cannot start a forged line. Findings that name another
     file (`duplicate-code-cross-file`, architecture findings) escape that file's path where
