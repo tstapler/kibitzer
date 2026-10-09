@@ -155,11 +155,15 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   row always reports. A staged rename (`git mv`) reads the renamed-from HEAD blob, and a
   HEAD blob that is not UTF-8 is decoded lossily. When git gives no baseline (no repo, no
   commits, an untracked, ignored, newly added or submodule path, a git that fails or does
-  not answer within 2 seconds) the baseline is "unknown", never "everything is new": a
+  not answer in time) the baseline is "unknown", never "everything is new": a
   whole-file `Write` reports every silenced finding, and an `Edit` reports an untouched
   one only when the edit removed lines (so a finding may have slid under a directive) or the
   rule is file-scope. The hook passes that "removed lines" flag to the daemon; nothing is
-  stored between calls. The baseline git calls drop `GIT_DIR`, `GIT_WORK_TREE`,
+  stored between calls. Every baseline git call is bounded: 2 seconds for `show`, `diff` and
+  the rename probe, 10 seconds for the whole-tree `git archive` a repo-wide command check
+  needs, and 5 seconds of git time in total per hook, daemon, MCP or LSP request (after
+  that the remaining calls read as unavailable without running). A timed-out git runs in its
+  own process group, and the whole group is killed. The baseline git calls drop `GIT_DIR`, `GIT_WORK_TREE`,
   `GIT_INDEX_FILE` and the other repo-redirecting variables, so a hook launched from inside
   another git command still reads the edited repo. The baseline is HEAD, not the previous
   edit, so until you commit, later edits to the same file report the earlier new
@@ -175,8 +179,9 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
 - **Untrusted text.** Two sanitizer tiers (`src/inline_ignores/sanitize.rs`):
   - *Strict* (`echo`): directive reasons, rule text and near-miss markers that kibitzer
     composes into its own `[ignore-syntax]`, `[unused-ignore]` and `[blocking-suppressed]`
-    lines. Only printable text survives (an allow-list: no control, format,
-    variation-selector, tag, bidi, filler or other invisible characters), whitespace
+    lines. Only printable text survives (an allow-list over assigned code points: no
+    control, format, unassigned, variation-selector, tag, bidi, filler or other invisible
+    characters), whitespace
     collapses to one line, at most two combining marks (any script) follow a character, and
     the text is shortened; a reason is shown in quotes as data. File paths in those lines use
     `echo_path`: the same limits, but a character the allow-list would drop (and any
@@ -187,9 +192,16 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   - *Lenient* (`strip_unsafe`): the finding text other checkers produce, on hook stderr,
     hook `additionalContext` (PostToolUse and Stop), `run_checks` and
     `architecture_assessment` MCP output, LSP diagnostics, `kibitzer check native`,
-    `kibitzer check architecture` and `kibitzer run` stdout. Also an allow-list: printable
-    graphic characters (letters, marks, numbers, punctuation, symbols, emoji), tabs,
-    newlines and the spaces ASCII space, NBSP, U+2009, U+202F and U+3000 survive. Everything
+    `kibitzer check architecture` and `kibitzer run` stdout. Also an allow-list: every
+    assigned graphic character (general category L*, N*, P* or S*: letters, numbers,
+    punctuation, symbols, emoji, in any script), combining marks (below), tabs, newlines and
+    the spaces ASCII space, NBSP, U+2009, U+202F and U+3000 survive. Six assigned but blank
+    symbols are dropped (Braille blank U+2800, U+303F, U+13441, U+13442, U+1D159, U+FFFC).
+    "Assigned" comes from range tables generated from Unicode 18.0.0
+    (`scripts/gen-unicode-tables.py` writes `src/inline_ignores/unicode_tables.rs`; the script
+    header says how to regenerate). A code point assigned in a later Unicode version is
+    dropped until the tables are regenerated, so the failure is safe: a new letter is lost,
+    never an invisible kept. Everything
     else is dropped: controls (carriage return included), unassigned, private-use and
     noncharacter code points, every Default_Ignorable_Code_Point (soft hyphen, grapheme
     joiner, fillers, bidi embeddings, overrides and isolates, deprecated format characters,
@@ -197,31 +209,43 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
     small set of invisibles keeps legitimate text and survives only where it does real work,
     judged from its raw neighbors so a run never helps itself (a second one in the same gap
     is dropped):
-    - ZWJ between two emoji, or between two letters of one Arabic, Indic or Myanmar script;
-      ZWNJ between two letters of those scripts (Persian, Devanagari, Bengali and so on).
+    - ZWJ between two emoji (arrows such as U+2194 count), or between two letters or digits of
+      one Arabic, Indic or Myanmar script; ZWNJ between two letters or digits of those scripts
+      (Persian, Devanagari, Bengali and so on); either one ending a word right after a
+      script's own mark (the Malayalam chillu `ന്‍` before a space or at the end).
     - ZWSP and word joiner between two letters or digits of one Thai, Lao, Khmer or Myanmar
       script (a BOM in the middle of text is dropped).
-    - LRM, RLM and the Arabic letter mark beside a right-to-left letter, one per gap.
-    - A variation selector directly after a base that has variation sequences (CJK
-      ideographs, emoji and symbol blocks; after ASCII only VS15/VS16 after `#`, `*` or a
-      digit), one per base.
+    - LRM, RLM and the Arabic letter mark beside a right-to-left letter, one per gap: any
+      invisible directly before one, kept or dropped, ends the allowance.
+    - A variation selector directly after a base that has variation sequences, one per base,
+      and only on a base that itself survives: CJK ideographs take VS1-VS16 and the
+      ideographic selectors; emoji and symbol bases take only VS15 and VS16; other bases take
+      the pairs listed in Unicode's `StandardizedVariants.txt` (math operators, a few
+      hieroglyphs); after ASCII only VS15/VS16 after `#`, `*` or a digit.
     - The England, Scotland and Wales flags (U+1F3F4, the tags for `gbeng`, `gbsct` or
       `gbwls`, U+E007F); no other tag run.
-    - Combining marks, at most three in a row (Tier 1: two), on a visible base: a generic
-      diacritic (U+0300-036F and the other combining blocks) after anything, any other mark
-      only after a base of its own script (Thai tone marks after Thai, the Khmer coeng after
-      Khmer, and so on). Alphabetic marks such as Devanagari vowel signs count too.
+    - Combining marks (Mn, Mc and Me, so enclosing marks count), at most three in a row
+      (Tier 1: two), on a visible base; on a Tibetan, Myanmar, Khmer or Indic base up to five,
+      of which at most three are generic accents. A generic diacritic (U+0300-036F and the
+      other combining blocks) may follow anything, any other mark only a base of its own
+      script (Thai tone marks after Thai, the Khmer coeng after Khmer, and so on). Alphabetic
+      marks such as Devanagari vowel signs count too.
 
     Residual covert bandwidth, not none. An attacker who controls finding text can still
     encode data in what survives, per carrier character: about 8 bits per CJK ideograph
     (257 selector states: none, U+FE00-FE0F, U+E0100-E01EF), about 1.6 bits per emoji or
-    symbol that takes VS15/VS16, per Arabic/Indic/Myanmar letter pair (none, ZWJ, ZWNJ) and
-    per Thai/Lao/Khmer/Myanmar letter pair (none, ZWSP, word joiner), 2 bits per
-    right-to-left letter (none, LRM, RLM, ALM), about 2.3 bits per space character (five
-    kinds of space), and, as visible accent stacks, up to three generic marks per base
-    (about 25 bits per base at most). A run of invisibles over an ASCII carrier carries
-    nothing: before this design 3,766 invisible code points survived at about 11.9 bits each
-    with no limit. A homoglyph or word-choice channel in visible text is out of scope here.
+    symbol that takes VS15/VS16 (3 states: none, VS15, VS16; up to 3 bits for the few bases
+    with several listed standardized sequences, such as 8 states on one hieroglyph), per
+    Arabic/Indic/Myanmar letter pair (none, ZWJ, ZWNJ) and per Thai/Lao/Khmer/Myanmar letter
+    pair (none, ZWSP, word joiner), 2 bits per right-to-left letter (none, LRM, RLM, ALM),
+    about 2.3 bits per space character (five kinds of space), and, as visible accent stacks,
+    up to three generic marks per base (289 generic marks, about 8.2 bits each, about 25
+    bits per base) or, on a Tibetan, Myanmar, Khmer or Indic base, three generic and two
+    script marks (about 37 bits per base at most; Tibetan has 77 marks). A run of invisibles
+    over an ASCII carrier carries nothing: before round 6 3,766 invisible code points
+    survived at about 11.9 bits each with no limit, and before round 7 a further 508
+    unassigned code points survived because whole blocks were allowed. A homoglyph or
+    word-choice channel in visible text is out of scope here.
     Not kept, because the cost of keeping them is a wider channel: Mongolian free variation
     selectors, Arabic number signs and other Cf characters, non-ASCII spaces other than the
     four above, and joiners in scripts not listed.
