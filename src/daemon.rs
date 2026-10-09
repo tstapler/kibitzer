@@ -48,12 +48,23 @@ struct Response {
 /// Per-user socket path so multiple users on a shared machine never collide, and so a
 /// leftover socket from a previous login session doesn't get reused across reboots
 /// unexpectedly (XDG_RUNTIME_DIR is normally tmpfs, reset on boot).
+///
+/// Lives in a directory only this user can write (see `daemon_lock::trusted_runtime_dir`). When
+/// no such directory can be had, the path is a per-process one nobody can reach, so every call
+/// falls back to running checks in-process and no daemon is started (`daemon_dir_is_trusted`).
 pub fn default_socket_path() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
     let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
-    base.join(format!("kibitzer-{user}.sock"))
+    match crate::daemon_lock::trusted_runtime_dir() {
+        Some(dir) => dir.join(format!("kibitzer-{user}.sock")),
+        None => std::env::temp_dir().join(format!(
+            "kibitzer-untrusted-{}-{user}.sock",
+            std::process::id()
+        )),
+    }
+}
+
+fn daemon_dir_is_trusted() -> bool {
+    crate::daemon_lock::trusted_runtime_dir().is_some()
 }
 
 /// Run the daemon in the foreground on `socket_path` until it receives a `Shutdown`
@@ -82,6 +93,9 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     std::fs::remove_file(socket_path).ok();
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding daemon socket at {}", socket_path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_file(wedged_marker(socket_path));
     eprintln!("[kibitzer] daemon listening on {}", socket_path.display());
 
     let cache_path = default_cache_path();
@@ -107,17 +121,11 @@ fn owner_lock_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("lock")
 }
 
-fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
+use crate::daemon_lock::open_lock_file;
 
 /// The exclusive daemon lock, or `None` when a live same-version daemon owns it or a previous
-/// owner did not exit within `PREDECESSOR_WAIT`.
+/// owner did not exit within `PREDECESSOR_WAIT`. A holder that keeps the lock yet never answers
+/// a probe (stopped or deadlocked) is displaced once that wait runs out, if its pid checks out.
 fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
     let lock_path = owner_lock_path(socket_path);
     if let Some(dir) = lock_path.parent() {
@@ -128,13 +136,26 @@ fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
     let deadline = std::time::Instant::now() + PREDECESSOR_WAIT;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                crate::daemon_lock::record_owner_pid(&file);
+                return Ok(Some(file));
+            }
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        let owner_is_current = request(socket_path, &Request::Ping)
-            .is_some_and(|r| r.version.as_deref() == Some(DAEMON_VERSION));
-        if owner_is_current || std::time::Instant::now() >= deadline {
+        let probe = exchange(socket_path, &Request::Ping, PROBE_TIMEOUT);
+        if matches!(&probe, Probe::Answered(r) if r.version.as_deref() == Some(DAEMON_VERSION)) {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            let wedged = matches!(probe, Probe::Wedged);
+            if wedged
+                && crate::daemon_lock::displace_wedged_holder(&lock_path)
+                && file.try_lock().is_ok()
+            {
+                crate::daemon_lock::record_owner_pid(&file);
+                return Ok(Some(file));
+            }
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -300,12 +321,77 @@ fn lock_cache(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
     cache.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn connect(socket_path: &Path) -> Option<UnixStream> {
-    let stream = UnixStream::connect(socket_path).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok()?;
-    Some(stream)
+/// How long a liveness probe (ping, shutdown) waits for the daemon to connect and answer. A
+/// healthy daemon answers in well under a millisecond; this only bounds a wedged one.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// How long a check run may take before the client gives up and runs it in-process.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long after a failed probe hooks skip the daemon outright instead of probing again.
+const WEDGED_SKIP_WINDOW: Duration = Duration::from_secs(10);
+
+/// What one request/response exchange with the daemon found.
+enum Probe {
+    /// Nothing listening: no socket, or a refused connection.
+    Dead,
+    /// A peer accepted (or the kernel queued) the connection but never replied in time.
+    Wedged,
+    Answered(Response),
+}
+
+/// Connects within `timeout`; the connect itself can block on a wedged daemon's full backlog,
+/// so it runs on a helper thread that is abandoned on timeout.
+fn connect_within(socket_path: &Path, timeout: Duration) -> Result<UnixStream, Probe> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = socket_path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(path));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(_)) => Err(Probe::Dead),
+        Err(_) => Err(Probe::Wedged),
+    }
+}
+
+/// Sends `req` and reads one reply line, giving the daemon `timeout` for each step.
+fn exchange(socket_path: &Path, req: &Request, timeout: Duration) -> Probe {
+    let mut stream = match connect_within(socket_path, timeout) {
+        Ok(stream) => stream,
+        Err(probe) => return probe,
+    };
+    let (Ok(()), Ok(()), Ok(mut payload)) = (
+        stream.set_read_timeout(Some(timeout)),
+        stream.set_write_timeout(Some(timeout)),
+        serde_json::to_string(req),
+    ) else {
+        return Probe::Dead;
+    };
+    payload.push('\n');
+    if let Err(e) = stream.write_all(payload.as_bytes()) {
+        return classify(&e);
+    }
+    let mut line = String::new();
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(0) => Probe::Dead,
+        Ok(_) => serde_json::from_str(&line).map_or(Probe::Dead, Probe::Answered),
+        Err(e) => classify(&e),
+    }
+}
+
+fn classify(error: &std::io::Error) -> Probe {
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Probe::Wedged,
+        _ => Probe::Dead,
+    }
+}
+
+fn request(socket_path: &Path, req: &Request) -> Option<Response> {
+    match exchange(socket_path, req, PROBE_TIMEOUT) {
+        Probe::Answered(response) => Some(response),
+        Probe::Dead | Probe::Wedged => None,
+    }
 }
 
 /// True if a kibitzer daemon is listening and responds to a ping.
@@ -313,23 +399,56 @@ pub fn is_alive() -> bool {
     request(&default_socket_path(), &Request::Ping).is_some()
 }
 
-pub fn shutdown() -> bool {
-    shutdown_at(&default_socket_path())
+/// What `kibitzer daemon stop` accomplished.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    NotRunning,
+    Stopped,
+    /// The daemon held its lock but never answered, so it was signalled and replaced.
+    Killed,
+    /// The daemon never answered and its pid could not be verified as a kibitzer daemon.
+    Unresponsive,
+}
+
+pub fn shutdown() -> ShutdownOutcome {
+    shutdown_with_lock(&default_socket_path())
+}
+
+fn shutdown_with_lock(socket_path: &Path) -> ShutdownOutcome {
+    match exchange(socket_path, &Request::Shutdown, PROBE_TIMEOUT) {
+        Probe::Answered(_) => ShutdownOutcome::Stopped,
+        Probe::Dead => ShutdownOutcome::NotRunning,
+        Probe::Wedged => {
+            let lock = owner_lock_path(socket_path);
+            if crate::daemon_lock::lock_is_held(&lock)
+                && crate::daemon_lock::displace_wedged_holder(&lock)
+            {
+                ShutdownOutcome::Killed
+            } else {
+                ShutdownOutcome::Unresponsive
+            }
+        }
+    }
 }
 
 fn shutdown_at(socket_path: &Path) -> bool {
     request(socket_path, &Request::Shutdown).is_some()
 }
 
-fn request(socket_path: &Path, req: &Request) -> Option<Response> {
-    let mut stream = connect(socket_path)?;
-    let mut payload = serde_json::to_string(req).ok()?;
-    payload.push('\n');
-    stream.write_all(payload.as_bytes()).ok()?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
+fn wedged_marker(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("wedged")
+}
+
+fn recently_wedged(socket_path: &Path) -> bool {
+    std::fs::metadata(wedged_marker(socket_path))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < WEDGED_SKIP_WINDOW)
+}
+
+fn mark_wedged(socket_path: &Path) {
+    let _ = std::fs::write(wedged_marker(socket_path), "");
 }
 
 /// Ask the daemon to run checks for `file_path`/`trigger`, if one is reachable.
@@ -360,16 +479,38 @@ fn try_run_checks_at(
     changed_lines: Option<&[(usize, usize)]>,
     unlocated_deletion: bool,
 ) -> Option<Vec<CheckResult>> {
-    let response = request(
-        socket_path,
-        &Request::RunChecks {
-            cwd: cwd.to_path_buf(),
-            file_path: file_path.to_path_buf(),
-            trigger: trigger.to_string(),
-            changed_lines: changed_lines.map(|r| r.to_vec()),
-            unlocated_deletion,
-        },
-    )?;
+    if recently_wedged(socket_path) {
+        return None;
+    }
+    // A short ping first: a stopped daemon still accepts connections into the kernel queue, and
+    // would otherwise cost the whole check timeout on every hook.
+    match exchange(socket_path, &Request::Ping, PROBE_TIMEOUT) {
+        Probe::Dead => return None,
+        Probe::Wedged => {
+            mark_wedged(socket_path);
+            return None;
+        }
+        Probe::Answered(pong) if pong.version.as_deref() != Some(DAEMON_VERSION) => {
+            retire_stale_daemon(socket_path);
+            return None;
+        }
+        Probe::Answered(_) => {}
+    }
+    let run = Request::RunChecks {
+        cwd: cwd.to_path_buf(),
+        file_path: file_path.to_path_buf(),
+        trigger: trigger.to_string(),
+        changed_lines: changed_lines.map(|r| r.to_vec()),
+        unlocated_deletion,
+    };
+    let response = match exchange(socket_path, &run, CHECK_TIMEOUT) {
+        Probe::Answered(response) => response,
+        Probe::Wedged => {
+            mark_wedged(socket_path);
+            return None;
+        }
+        Probe::Dead => return None,
+    };
     if response.version.as_deref() != Some(DAEMON_VERSION) {
         retire_stale_daemon(socket_path);
         return None;
@@ -408,7 +549,10 @@ fn spawn_is_debounced(marker_modified: Option<SystemTime>, now: SystemTime) -> b
 /// since it exercises the deterministic no-daemon fallback path itself and a real daemon
 /// racing to life mid-test would otherwise answer later calls instead.
 fn maybe_spawn_daemon() {
-    if std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
+    if cfg!(test) || std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
+        return;
+    }
+    if !daemon_dir_is_trusted() {
         return;
     }
     let socket_path = default_socket_path();
@@ -435,12 +579,28 @@ fn maybe_spawn_daemon() {
     spawn_detached_daemon();
 }
 
+/// Whether `exe` is an installed kibitzer binary rather than a cargo test harness (named
+/// `kibitzer-<hash>` under `target/*/deps`), which would answer `daemon start` by running tests.
+fn may_spawn_daemon_from(exe: &Path) -> bool {
+    let named_kibitzer = exe
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("kibitzer"));
+    let is_test_harness = exe.components().any(|c| c.as_os_str() == "deps");
+    named_kibitzer && !is_test_harness
+}
+
 /// The actual `kibitzer daemon start` spawn, split out of `maybe_spawn_daemon` so that
 /// function's debounce/marker logic stays readable on its own.
 fn spawn_detached_daemon() {
+    if cfg!(test) {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    if !may_spawn_daemon_from(&exe) {
+        return;
+    }
     // `process_group(0)` detaches the child into its own session/process group so it
     // outlives this short-lived hook process even if the hook's whole group gets
     // signaled (e.g. on a hook timeout) — otherwise the "background" daemon would die
@@ -466,8 +626,10 @@ pub fn run_checks_smart(
     changed_lines: Option<&[(usize, usize)]>,
     unlocated_deletion: bool,
 ) -> Result<Vec<CheckResult>> {
-    if let Some(results) =
-        try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines, unlocated_deletion)
+    // Unit tests never reach a user's real daemon: a version mismatch would retire it.
+    if !cfg!(test)
+        && let Some(results) =
+            try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines, unlocated_deletion)
     {
         return Ok(results);
     }
@@ -628,6 +790,49 @@ mod inline_cache_tests {
 mod stale_daemon_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn client_should_GiveUpWithinProbeBound_And_SkipDaemonBriefly_When_DaemonNeverReplies() {
+        let dir = temp_dir("silent");
+        let socket = dir.join("k.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
+        assert!(out.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            recently_wedged(&socket),
+            "a failed probe must be remembered"
+        );
+        let again = std::time::Instant::now();
+        assert!(
+            try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false).is_none()
+        );
+        assert!(
+            again.elapsed() < Duration::from_millis(200),
+            "the skip window must avoid a second probe"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn may_spawn_daemon_from_should_RefuseTestHarnessAndForeignBinaries() {
+        assert!(may_spawn_daemon_from(Path::new(
+            "/opt/homebrew/bin/kibitzer"
+        )));
+        assert!(may_spawn_daemon_from(Path::new(
+            "/tmp/ks/kibitzer-under-test"
+        )));
+        assert!(!may_spawn_daemon_from(Path::new(
+            "/repo/target/debug/deps/kibitzer-4536938b3797b58f"
+        )));
+        assert!(!may_spawn_daemon_from(Path::new("/usr/bin/python3")));
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =

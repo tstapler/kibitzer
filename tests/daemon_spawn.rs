@@ -264,3 +264,117 @@ fn hooks_should_NotStealSocketOrStorm_When_StaleDaemonIgnoresShutdown() {
     let ping = s.command().args(["daemon", "status"]).output().unwrap();
     assert!(String::from_utf8_lossy(&ping.stdout).contains("is running"));
 }
+
+fn start_daemon(s: &Scratch) -> (std::process::Child, u32) {
+    let child = s
+        .command()
+        .args(["daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !s.socket().exists() {
+        assert!(Instant::now() < deadline, "daemon never bound");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = child.id();
+    (child, pid)
+}
+
+fn signal(pid: u32, sig: &str) {
+    let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn hook_should_FallBackWithinBound_And_ReplaceDaemon_When_HolderIsStopped() {
+    let s = Scratch::new("wedged-hook");
+    let (mut child, pid) = start_daemon(&s);
+    signal(pid, "-STOP");
+    let started = Instant::now();
+    s.hook();
+    let first = started.elapsed();
+    assert!(
+        first < Duration::from_secs(5),
+        "hook blocked {first:?} on a stopped daemon"
+    );
+    // Hooks keep flowing quickly while a successor displaces the stopped holder.
+    let mut slowest = Duration::ZERO;
+    wait_for("a replacement daemon", Duration::from_secs(25), || {
+        let t = Instant::now();
+        s.hook();
+        slowest = slowest.max(t.elapsed());
+        // `try_wait` reaps the displaced child; a zombie would still answer `kill -0`.
+        child.try_wait().unwrap().is_some() && s.daemon_pids().iter().any(|p| *p != pid)
+    });
+    assert!(
+        slowest < Duration::from_secs(5),
+        "a hook blocked {slowest:?}"
+    );
+    let status = s.command().args(["daemon", "status"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("is running"));
+    assert!(
+        s.daemon_pids().len() <= 1,
+        "unbounded spawns: {:?}",
+        s.daemon_pids()
+    );
+}
+
+#[test]
+fn daemon_stop_should_TerminateStoppedDaemon_Within_Bound() {
+    let s = Scratch::new("wedged-stop");
+    let (mut child, pid) = start_daemon(&s);
+    signal(pid, "-STOP");
+    let started = Instant::now();
+    let out = s.command().args(["daemon", "stop"]).output().unwrap();
+    let took = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        took < Duration::from_secs(6),
+        "daemon stop blocked {took:?}"
+    );
+    assert!(stdout.contains("terminated"), "{stdout}");
+    let _ = child.wait();
+    assert!(!process_alive(pid));
+}
+
+#[test]
+fn daemon_stop_should_NotSignalAnything_When_SocketIsSilentButLockIsFree() {
+    let s = Scratch::new("silent-socket");
+    let listener = UnixListener::bind(s.socket()).unwrap();
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    // Names an unrelated process in a lock nobody holds, as a recycled pid would.
+    std::fs::write(
+        s.runtime.join("kibitzer-spawntest.lock"),
+        bystander.id().to_string(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let out = s.command().args(["daemon", "stop"]).output().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("terminated"));
+    assert!(
+        bystander.try_wait().unwrap().is_none(),
+        "bystander was signalled"
+    );
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    drop(listener);
+}

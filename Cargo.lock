@@ -719,6 +719,7 @@ dependencies = [
  "clap",
  "inventory",
  "kibitzer-stub-plugin",
+ "libc",
  "pulldown-cmark",
  "regex",
  "rmcp",

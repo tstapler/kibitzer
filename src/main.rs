@@ -13,6 +13,7 @@ mod checker;
 mod checkers;
 mod config;
 mod daemon;
+mod daemon_lock;
 mod declaration_checks;
 mod declarations;
 mod dedup;
@@ -375,10 +376,20 @@ fn main() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
             DaemonAction::Stop => {
-                if daemon::shutdown() {
-                    println!("[kibitzer] daemon stopped");
-                } else {
-                    println!("[kibitzer] no daemon was running");
+                match daemon::shutdown() {
+                    daemon::ShutdownOutcome::Stopped => println!("[kibitzer] daemon stopped"),
+                    daemon::ShutdownOutcome::Killed => {
+                        println!("[kibitzer] daemon was not responding; terminated it");
+                    }
+                    daemon::ShutdownOutcome::Unresponsive => {
+                        println!(
+                            "[kibitzer] daemon is not responding and could not be verified as a kibitzer daemon; stop it by hand"
+                        );
+                        return Ok(ExitCode::from(1));
+                    }
+                    daemon::ShutdownOutcome::NotRunning => {
+                        println!("[kibitzer] no daemon was running");
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
