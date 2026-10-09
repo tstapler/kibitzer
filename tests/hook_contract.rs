@@ -978,3 +978,55 @@ fn hook_should_FallBackConservatively_When_GitHangs() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(suppressed_count(&stdout), 2, "stdout: {stdout}");
 }
+
+/// A git that answers everything except `archive` (which sleeps) must not hang a blocking
+/// whole-repo command check: the baseline snapshot is bounded and fails conservatively.
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_NotHang_When_GitArchiveHangsForWholeRepoCheck() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = TempRepo::new(
+        "hung-archive",
+        json!({
+            "name": "no-bad-marker-repo",
+            "command": "! grep -rq BAD --exclude-dir=.git --exclude-dir=.kibitzer --exclude-dir=shim-bin .",
+            "severity": "blocking",
+            "message": "found a BAD marker",
+        }),
+    );
+    repo.commit_files(&[("foo.txt", "BAD\n")]);
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let shim_dir = repo.path("shim-bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *archive*) exec sleep 60;; esac\nexec {} \"$@\"\n",
+            real_git.trim()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    std::fs::write(repo.path("foo.txt"), "BAD\nmore\n").unwrap();
+    let payload = repo.edit_payload("foo.txt", "BAD\n", "BAD\nmore\n");
+    let started = std::time::Instant::now();
+    let (code, _stdout, stderr) = repo.spawn_hook_with(&payload, &[("PATH", path.as_ref())]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "hook hung on git archive: {:?} (code {code}, stderr {stderr})",
+        started.elapsed()
+    );
+}

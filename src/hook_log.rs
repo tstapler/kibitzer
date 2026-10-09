@@ -137,12 +137,16 @@ pub fn record(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let (git_commit, git_branch) =
+        crate::git_cmd::with_git_budget(crate::git_cmd::HOOK_GIT_BUDGET, || {
+            (git_head(cwd), git_branch(cwd))
+        });
     let entry = HookLogEntry {
         timestamp_unix,
         tool_use_id,
         cwd,
-        git_commit: git_head(cwd),
-        git_branch: git_branch(cwd),
+        git_commit,
+        git_branch,
         hook_event_name,
         file_path,
         changed_lines,

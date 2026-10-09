@@ -11,7 +11,10 @@ use serde::Deserialize;
 use crate::accepted_findings::AcceptedLines;
 pub use crate::check_result::CheckResult;
 use crate::config::{Check, OutputFormat, Severity};
-use crate::git_cmd::{BASELINE_TIMEOUT, bounded_output, git_command};
+use crate::git_cmd::{
+    ARCHIVE_TIMEOUT, BASELINE_TIMEOUT, HOOK_GIT_BUDGET, bounded_output, git_command,
+    with_git_budget,
+};
 use crate::glob::matches_scope;
 use crate::inline_ignores::sanitize::display_path;
 use crate::inline_ignores::{
@@ -48,15 +51,17 @@ pub fn run_check(
     registry: &Registry,
     run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
-    run_check_with_timeout(
-        check,
-        repo_root,
-        file_path,
-        changed_lines,
-        COMMAND_TIMEOUT,
-        registry,
-        run_ctx,
-    )
+    with_git_budget(HOOK_GIT_BUDGET, || {
+        run_check_with_timeout(
+            check,
+            repo_root,
+            file_path,
+            changed_lines,
+            COMMAND_TIMEOUT,
+            registry,
+            run_ctx,
+        )
+    })
 }
 
 /// Parameterized-timeout counterpart to [`run_check`] — the real entry point calls this
@@ -992,13 +997,15 @@ pub(crate) fn check_predates_git_head(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
-    if let Some(checker_name) = &check.checker {
-        let ctx = InlineIgnoreContext::default();
-        let run = NativeRun::for_check(check, checker_name, &ctx);
-        return check_native_against_git_head(run, repo_root, file_path, changed_lines);
-    }
-    let command = check.command.as_deref()?;
-    command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+    with_git_budget(HOOK_GIT_BUDGET, || {
+        if let Some(checker_name) = &check.checker {
+            let ctx = InlineIgnoreContext::default();
+            let run = NativeRun::for_check(check, checker_name, &ctx);
+            return check_native_against_git_head(run, repo_root, file_path, changed_lines);
+        }
+        let command = check.command.as_deref()?;
+        command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+    })
 }
 
 /// Re-run `check` against the file's `git show HEAD:<relpath>` content to determine
@@ -1103,12 +1110,11 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = match git_command(repo_root).args(["archive", "HEAD"]).output() {
-        Ok(archive) => archive,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&snapshot_dir);
-            return None;
-        }
+    let mut archive_cmd = git_command(repo_root);
+    archive_cmd.args(["archive", "HEAD"]);
+    let Some(archive) = bounded_output(archive_cmd, ARCHIVE_TIMEOUT) else {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
     };
     if !archive.status.success() {
         let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1304,12 +1310,11 @@ fn check_native_against_git_head_repo(
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = match git_command(repo_root).args(["archive", "HEAD"]).output() {
-        Ok(archive) => archive,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&snapshot_dir);
-            return None;
-        }
+    let mut archive_cmd = git_command(repo_root);
+    archive_cmd.args(["archive", "HEAD"]);
+    let Some(archive) = bounded_output(archive_cmd, ARCHIVE_TIMEOUT) else {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
     };
     if !archive.status.success() {
         let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1485,6 +1490,28 @@ fn map_ranges_through_hunks(ranges: &[(usize, usize)], hunks: &[DiffHunk]) -> Ve
 /// file work starts, rather than a `?` from inside this per-(file, check) loop
 /// nondeterministically discarding every result already accumulated for the batch.
 pub fn run_checks_for_trigger(
+    checks: &[Check],
+    trigger: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    registry: &Registry,
+    run_ctx: &RunContext,
+) -> anyhow::Result<Vec<CheckResult>> {
+    with_git_budget(HOOK_GIT_BUDGET, || {
+        run_checks_for_trigger_unbudgeted(
+            checks,
+            trigger,
+            repo_root,
+            file_path,
+            changed_lines,
+            registry,
+            run_ctx,
+        )
+    })
+}
+
+fn run_checks_for_trigger_unbudgeted(
     checks: &[Check],
     trigger: &str,
     repo_root: &Path,

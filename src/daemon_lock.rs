@@ -166,7 +166,11 @@ fn trusted_runtime_dir_in(xdg: Option<PathBuf>, temp: &Path) -> Result<RuntimeDi
         (Err(reason), None) => Err(reject(&dir, reason)),
         (Err(reason), Some(xdg)) => Err(reject(
             &dir,
-            format!("{reason}; XDG_RUNTIME_DIR {xdg} was refused too"),
+            format!(
+                "{reason}; XDG_RUNTIME_DIR {} was refused too ({})",
+                crate::inline_ignores::sanitize::display_path(&xdg.dir),
+                xdg.reason
+            ),
         )),
     }
 }
@@ -655,6 +659,7 @@ mod tests {
             "{err}"
         );
         assert!(err.reason.contains("XDG_RUNTIME_DIR"), "{err}");
+        assert_eq!(err.to_string().matches("untrusted").count(), 1, "{err}");
         let _ = std::fs::remove_dir_all(&temp);
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
