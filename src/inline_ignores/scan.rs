@@ -74,10 +74,56 @@ fn scan_text_lines(text: &str, first_row: usize, end_row: usize, whole_line: boo
         .collect()
 }
 
+/// Rows one comment node occupies (1-based, inclusive) and whether code precedes it.
+#[derive(Clone, Copy)]
+struct CommentRows {
+    start: usize,
+    end: usize,
+    whole_line: bool,
+}
+
+/// A line comment's span can run to column 0 of the next row (tree-sitter-rust); its own
+/// last row is the one before.
+fn last_row(node: tree_sitter::Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row
+    } else {
+        end.row + 1
+    }
+}
+
+/// Stretches each whole-line directive over the whole-line comments stacked directly below it
+/// (no blank row between), so a reason continued on `//` lines still anchors to the code after.
+fn extend_over_stacked_comments(scanned: &mut [Scanned], comments: &[CommentRows]) {
+    for item in scanned {
+        let DirectiveParse::Valid(d) = &mut item.parse else {
+            continue;
+        };
+        if !d.whole_line {
+            continue;
+        }
+        let Some(own) = comments
+            .iter()
+            .find(|c| c.start <= d.start_line.get() && d.start_line.get() <= c.end)
+        else {
+            continue;
+        };
+        let mut end = own.end;
+        while let Some(next) = comments.iter().find(|c| c.whole_line && c.start == end + 1) {
+            end = next.end;
+        }
+        if end > d.end_line.get() {
+            d.end_line = Line::new(end);
+        }
+    }
+}
+
 /// Directives in the real comment nodes of a parsed file; string literals never match.
 pub(super) fn scan_code_comments(lang: Language, tree: &Tree, source: &str) -> Vec<Scanned> {
     let kinds = comment_kinds(lang);
     let mut out = Vec::new();
+    let mut comments = Vec::new();
     walk_preorder(tree.root_node(), &mut |node| {
         if !kinds.contains(&node.kind()) {
             return true;
@@ -86,9 +132,15 @@ pub(super) fn scan_code_comments(lang: Language, tree: &Tree, source: &str) -> V
         let first_row = node.start_position().row + 1;
         let end_row = node.end_position().row + 1;
         let whole_line = only_whitespace_before(source, node.start_byte());
+        comments.push(CommentRows {
+            start: first_row,
+            end: last_row(node),
+            whole_line,
+        });
         out.extend(scan_text_lines(text, first_row, end_row, whole_line));
         false
     });
+    extend_over_stacked_comments(&mut out, &comments);
     out
 }
 

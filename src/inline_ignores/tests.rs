@@ -1529,3 +1529,35 @@ fn without_directive_lines_should_BlankOnlyDirectiveLines_When_CommentIsMixed() 
     assert!(out.contains("x = f(y)"), "{out}");
     assert_eq!(without_directive_lines("// prose"), "// prose");
 }
+
+fn flag_finding_dropped(path: &str, source: &str, line: usize) -> bool {
+    let out = apply_inline_ignores(
+        vec![finding(line, "[flag-argument] boolean parameter")],
+        IgnoreTarget {
+            file: Path::new(path),
+            source,
+            checker_name: "syntax-rules-x",
+            severity: Severity::Advisory,
+        },
+        &InlineIgnoreContext::default(),
+    );
+    out.kept.is_empty()
+}
+
+#[test]
+fn apply_inline_ignores_should_CoverCode_When_ContinuationCommentsSitBetweenDirectiveAndCode() {
+    let go = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\n// callers cannot change the signature\n// without a major release\nfunc f(b bool) {}\n";
+    assert!(flag_finding_dropped("x.go", go, 6));
+    let py = "# kibitzer:ignore flag-argument -- legacy api pinned\n# callers cannot change it\ndef f(b): pass\n";
+    assert!(flag_finding_dropped("x.py", py, 3));
+    let rs = "// kibitzer:ignore flag-argument -- legacy api pinned\n// callers cannot change it\nfn f(b: bool) {}\n";
+    assert!(flag_finding_dropped("x.rs", rs, 3));
+}
+
+#[test]
+fn apply_inline_ignores_should_NotCoverCode_When_BlankRowOrCodeEndsTheCommentStack() {
+    let blank = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\n// continued\n\nfunc f(b bool) {}\n";
+    assert!(!flag_finding_dropped("x.go", blank, 6));
+    let trailing = "package main\n\nvar x = 1 // kibitzer:ignore flag-argument -- legacy api pinned\n// unrelated\nfunc f(b bool) {}\n";
+    assert!(!flag_finding_dropped("x.go", trailing, 5));
+}

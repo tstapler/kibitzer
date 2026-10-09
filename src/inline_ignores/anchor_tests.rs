@@ -466,7 +466,8 @@ fn file_size_ignore_should_Suppress_When_DirectiveInFirstTenLines() {
 
 #[test]
 fn file_size_ignore_should_NotSuppress_When_DirectiveBelowRowTen() {
-    let mut lines: Vec<String> = vec!["// filler".to_string(); 899];
+    // Code filler: a comment filler would stack under the directive and reach the anchor row.
+    let mut lines: Vec<String> = vec!["var filler = 1".to_string(); 899];
     lines.insert(10, ignore_line("file-size").trim_end().to_string());
     let source = format!("{}\n", lines.join("\n"));
     let kept = kept_for_real_run("go-file-size", "x.go", &source);
