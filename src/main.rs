@@ -704,13 +704,20 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let dir_marker = dir.join("_");
     for finding in &findings {
         let location = match (&finding.file, finding.line) {
             (Some(file), Some(line)) => format!("{}:{}: ", display_path(file), line),
             (Some(file), None) => format!("{}: ", display_path(file)),
             (None, _) => String::new(),
         };
-        println!("{location}{}", finding.message);
+        // The message can name package directories under `dir`, so escape those siblings too.
+        let mut paths: Vec<&Path> = vec![dir_marker.as_path()];
+        paths.extend(finding.file.as_deref());
+        println!(
+            "{location}{}",
+            strip_unsafe_with_paths(&finding.message, &paths)
+        );
     }
     Ok(ExitCode::from(1))
 }

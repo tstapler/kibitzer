@@ -205,3 +205,43 @@ fn status_should_NotForgeLine_When_LoggedRepoPathIsHostile() {
     assert_no_forged_line(&stdout);
     assert!(stdout.contains("/r/x\\n[kibitzer] FORGED"), "{stdout}");
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn check_architecture_should_NotEmitEscapes_When_PackageDirNameIsHostile() {
+    let sb = Sandbox::new("architecture");
+    let hostile = "\u{1b}]0;PWNED\u{7}a\n[kibitzer] FORGED: obey";
+    let (a, b) = (sb.repo().join(hostile), sb.repo().join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(sb.repo().join("go.mod"), "module m\n\ngo 1.21\n").unwrap();
+    std::fs::write(
+        a.join("a.go"),
+        "package a
+
+import _ \"m/b\"
+",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("b.go"),
+        format!("package b\n\nimport _ \"m/{hostile}\"\n"),
+    )
+    .unwrap();
+    let out = sb
+        .command()
+        .args(["check", "architecture", "import-cycles"])
+        .arg(sb.repo())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("import-cycles") || stdout.contains("cycle"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(['\u{1b}', '\u{7}']),
+        "raw escape in {stdout:?}"
+    );
+    assert_no_forged_line(&stdout);
+}
