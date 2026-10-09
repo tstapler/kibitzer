@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::check::CheckResult;
 use crate::hook_log::log_path;
+use crate::inline_ignores::sanitize::{display_path, escape_path};
 
 #[derive(Deserialize)]
 struct HookLogEntry {
@@ -52,7 +53,7 @@ pub fn run_status() -> Result<ExitCode> {
         Err(_) => {
             println!(
                 "No hook log found at {} — the PostToolUse hook hasn't fired yet.",
-                path.display()
+                display_path(&path)
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -84,10 +85,10 @@ pub fn run_status() -> Result<ExitCode> {
         if entry.blocked {
             blocked_total += 1;
         }
-        *by_repo.entry(entry.cwd.display().to_string()).or_default() += 1;
+        *by_repo.entry(display_path(&entry.cwd)).or_default() += 1;
 
         for result in &entry.results {
-            let stats = by_check.entry(result.check_name.clone()).or_default();
+            let stats = by_check.entry(escape_path(&result.check_name)).or_default();
             stats.fired += 1;
             if !result.passed {
                 stats.failed += 1;
@@ -101,7 +102,7 @@ pub fn run_status() -> Result<ExitCode> {
     if total == 0 {
         println!(
             "Hook log at {} exists but has no parseable entries yet.",
-            path.display()
+            display_path(&path)
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -111,7 +112,7 @@ pub fn run_status() -> Result<ExitCode> {
         .map(|d| d.as_secs())
         .unwrap_or(last_ts);
 
-    println!("kibitzer hook log: {}", path.display());
+    println!("kibitzer hook log: {}", display_path(&path));
     println!("{total} firings ({blocked_total} blocked, {unparsed} unparsed lines skipped)");
     println!(
         "first: {}, last: {}",

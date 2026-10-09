@@ -877,7 +877,7 @@ fn print_cross_file_duplicates(duplicates: &[checkers::duplicate_code::CrossFile
         let locations: Vec<String> = dup
             .occurrences
             .iter()
-            .map(|o| format!("{}:{}", o.file.display(), o.line))
+            .map(|o| format!("{}:{}", display_path(&o.file), o.line))
             .collect();
         let file_count = dup
             .occurrences
@@ -888,7 +888,7 @@ fn print_cross_file_duplicates(duplicates: &[checkers::duplicate_code::CrossFile
         let first = &dup.occurrences[0];
         println!(
             "{}:{}: block repeated {} times across {file_count} files (locations: {}) — consider extracting a shared function",
-            first.file.display(),
+            display_path(&first.file),
             first.line,
             dup.occurrences.len(),
             locations.join(", ")
