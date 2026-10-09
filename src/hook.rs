@@ -11,7 +11,7 @@ use crate::config::Severity;
 use crate::daemon::run_checks_smart;
 use crate::hook_footer::advisory_footer;
 use crate::inline_ignores::InlineOutcome;
-use crate::inline_ignores::sanitize::strip_unsafe;
+use crate::inline_ignores::sanitize::strip_unsafe_with_paths;
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -172,6 +172,10 @@ pub fn run_hook() -> Result<ExitCode> {
         changed_lines.as_deref(),
     )?;
 
+    let canonical_path = file_path.canonicalize().ok();
+    let echoed_paths: Vec<&std::path::Path> = std::iter::once(file_path.as_path())
+        .chain(canonical_path.as_deref())
+        .collect();
     let failures: Vec<_> = results.iter().filter(|r| !r.passed).collect();
     let blocking: Vec<_> = failures
         .iter()
@@ -201,7 +205,7 @@ pub fn run_hook() -> Result<ExitCode> {
             eprintln!(
                 "[kibitzer] {} (blocking): {}",
                 result.check_name,
-                strip_unsafe(&result.describe())
+                strip_unsafe_with_paths(&result.describe(), &echoed_paths)
             );
         }
         // A malformed or misplaced ignore on the blocked file would otherwise stay invisible
@@ -211,7 +215,7 @@ pub fn run_hook() -> Result<ExitCode> {
         }) {
             eprintln!(
                 "[kibitzer] inline-ignore: {}",
-                strip_unsafe(&result.describe())
+                strip_unsafe_with_paths(&result.describe(), &echoed_paths)
             );
         }
         // Directives only suppress native per-file findings; a shell check or an
@@ -244,7 +248,7 @@ pub fn run_hook() -> Result<ExitCode> {
     let payload = json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": strip_unsafe(&context),
+            "additionalContext": strip_unsafe_with_paths(&context, &echoed_paths),
         }
     });
     println!("{payload}");

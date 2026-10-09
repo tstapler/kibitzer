@@ -306,7 +306,9 @@ fn render_run_checks_report(results: &[CheckResult], path: &Path) -> String {
             &crate::inline_ignores::InlineOutcome::union_rule_ids(failed.iter().map(|r| &r.inline)),
         ));
     }
-    crate::inline_ignores::sanitize::strip_unsafe(&lines.join("\n"))
+    let canonical = path.canonicalize().ok();
+    let echoed: Vec<&Path> = std::iter::once(path).chain(canonical.as_deref()).collect();
+    crate::inline_ignores::sanitize::strip_unsafe_with_paths(&lines.join("\n"), &echoed)
 }
 
 /// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain

@@ -8,6 +8,7 @@ use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_effective_config};
+use crate::inline_ignores::sanitize::strip_unsafe_with_paths;
 use crate::inline_ignores::{InlineIgnoreMode, batch_syntax_hint};
 
 fn severity_label(severity: Severity) -> &'static str {
@@ -49,19 +50,32 @@ fn has_blocking_finding(result: &CheckResult) -> bool {
 /// non-empty (architecture/declaration checkers), one line PER FINDING using that
 /// finding's own effective severity, instead of a single line stamped with
 /// `result.severity` for the whole check — see `has_blocking_finding` above for why.
-fn report_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
+fn report_lines(file: &Path, result: &CheckResult) -> Vec<String> {
     if result.passed {
         return Vec::new();
     }
-    if result.findings.is_empty() {
-        return vec![format!(
+    let file_display = file.display();
+    let mut lines = if result.findings.is_empty() {
+        vec![format!(
             "[{}] {} — {}: {}",
             severity_label(result.severity),
             file_display,
             result.check_name,
             result.describe()
-        )];
+        )]
+    } else {
+        finding_lines(&file_display.to_string(), result)
+    };
+    // Findings are another checker's text and may echo a hostile file name or ref label.
+    let mut paths: Vec<&Path> = vec![file];
+    paths.extend(result.findings.iter().filter_map(|f| f.file.as_deref()));
+    for line in &mut lines {
+        *line = strip_unsafe_with_paths(line, &paths);
     }
+    lines
+}
+
+fn finding_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
     result
         .findings
         .iter()
@@ -131,6 +145,8 @@ fn run_batch_collect(
 
     let mut any_blocking_failure = false;
     let mut lines = Vec::new();
+    // Only a native, anchored finding can be dismissed by a directive (as in the hook and MCP).
+    let mut any_dismissible = false;
 
     let files = walk_and_collect_files(dir)?;
     // Loaded once for the whole batch (every repo-level check below, every file-level
@@ -156,7 +172,8 @@ fn run_batch_collect(
         if !result.passed && has_blocking_finding(&result) {
             any_blocking_failure = true;
         }
-        lines.extend(report_lines(&repo_root.display().to_string(), &result));
+        any_dismissible |= !result.passed && result.inline.first_anchor().is_some();
+        lines.extend(report_lines(&repo_root, &result));
     }
 
     for file in &files {
@@ -179,11 +196,12 @@ fn run_batch_collect(
             if !result.passed && has_blocking_finding(result) {
                 any_blocking_failure = true;
             }
-            lines.extend(report_lines(&file.display().to_string(), result));
+            any_dismissible |= !result.passed && result.inline.first_anchor().is_some();
+            lines.extend(report_lines(file, result));
         }
     }
 
-    if !lines.is_empty() {
+    if any_dismissible {
         // Teaches the syntax where developers see findings; otherwise it is only in the docs.
         lines.push(batch_syntax_hint());
     }

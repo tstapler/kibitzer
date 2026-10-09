@@ -151,10 +151,27 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
 - **Failing CI on a suppressed blocking finding.** `kibitzer run` exits 0 when the
   only blocking finding was suppressed inline. Add `--deny-blocking-suppression` to
   exit 1 instead; the default is unchanged.
-- **Untrusted text.** Directive reasons, rule text and file paths are written by
-  whoever edited the file, so everything echoed into hook output, MCP output or
-  `additionalContext` has control characters (escape, carriage return, bidi
-  overrides) removed and is shortened; a reason is shown in quotes as data.
+- **Untrusted text.** Two sanitizer tiers (`src/inline_ignores/sanitize.rs`):
+  - *Strict* (`echo`): directive reasons, rule text, near-miss markers and file paths
+    that kibitzer composes into its own `[ignore-syntax]`, `[unused-ignore]` and
+    `[blocking-suppressed]` lines. Only printable text survives (an allow-list: no
+    control, format, variation-selector, tag, bidi, filler or other invisible
+    characters), whitespace collapses to one line, and the text is shortened; a
+    reason is shown in quotes as data.
+  - *Lenient* (`strip_unsafe`): the finding text other checkers produce, on hook
+    stderr, hook `additionalContext`, `run_checks` MCP output and `kibitzer run`
+    stdout. It removes escapes and other control characters (carriage return
+    included), bidi embeddings, overrides and isolates, line and paragraph
+    separators, Unicode tag characters and variation selectors other than VS16. It
+    keeps tabs, newlines, ZWJ, ZWNJ and VS16, which emoji, Persian and Indic text need.
+  - A file path in lenient output has its newlines and other control characters
+    shown as escapes (`\n`), so a file name cannot start a forged line. Paths that a
+    checker prints in a form kibitzer cannot match (for example relative to another
+    directory) are protected only by the lenient pass; a file name's own newline is
+    escaped wherever its base name appears.
+  - Not covered: subcommands that print findings directly (`kibitzer check native`
+    and the other `kibitzer check` diagnostics in `src/main.rs`) show checker output
+    unfiltered.
 - **Footers never suggest meta rules.** When the only failure is an `[ignore-syntax]`
   repair, the footer omits the ignore hint instead of suggesting a directive that
   cannot work.
