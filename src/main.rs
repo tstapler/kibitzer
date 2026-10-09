@@ -19,6 +19,7 @@ mod declarations;
 mod dedup;
 mod extract_class;
 mod false_positive;
+mod git_cmd;
 mod glob;
 mod go_call_resolution;
 mod god_class;

@@ -10,7 +10,7 @@ use crate::config::{Check, Severity};
 use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo_path, quote_reason};
 use crate::inline_ignores::{
     Directive, DroppedFinding, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind,
-    owned_by, rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
+    is_file_scope, owned_by, rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
 };
 use crate::run_context::RunContext;
 
@@ -232,8 +232,10 @@ fn touched_by_edit(drop: &DroppedFinding, changed_lines: &[(usize, usize)]) -> b
 /// Which `drops` the agent should hear about. A drop whose directive or silenced row an
 /// `Edit`/`MultiEdit` touched always reports. The rest report only when the file now drops more
 /// of that kind than at git HEAD (see `baseline`): a finding that appeared, slid under a
-/// directive, or was duplicated. With no usable baseline, a whole-file `Write` reports
-/// everything (a new file had nothing before) and an `Edit` stays quiet about untouched rows.
+/// directive, or was duplicated. With no usable baseline (`HeadSnapshot::Unavailable`), a
+/// whole-file `Write` reports everything and an `Edit` reports an untouched drop only when it
+/// could have slid there (the edit removed lines, or left no changed range) or its rule is
+/// file-scope.
 fn rows_to_report(
     input: &PostPassInput,
     drops: &[&DroppedFinding],
@@ -265,7 +267,13 @@ fn rows_to_report(
             mark_new(&keys, &baseline, &mut report);
         }
         None if !scoped => report.fill(true),
-        None => {}
+        None => {
+            // No baseline: report what an edit could plausibly have exposed, never every drop.
+            let slide_possible = changed_lines.is_empty() || input.run_ctx.unlocated_deletion;
+            for (flag, drop) in report.iter_mut().zip(drops) {
+                *flag |= slide_possible || is_file_scope(drop.rule.as_str());
+            }
+        }
     }
     report
 }

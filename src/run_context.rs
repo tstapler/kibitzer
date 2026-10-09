@@ -16,6 +16,8 @@ pub struct RunContext {
     /// Skip the post-pass advisories for an unscoped (whole-file) run: `kibitzer run` and the
     /// LSP report suppressions through their own footer or not at all, and have no agent to tell.
     pub skip_whole_file_advisories: bool,
+    /// The edit removed text whose position is unknown, so a finding may have slid under a directive.
+    pub unlocated_deletion: bool,
 }
 
 impl RunContext {
@@ -24,6 +26,7 @@ impl RunContext {
             accepted,
             inline: InlineIgnoreContext::default(),
             skip_whole_file_advisories: false,
+            unlocated_deletion: false,
         }
     }
 

@@ -6,7 +6,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -25,11 +24,9 @@ pub(crate) fn log_path() -> PathBuf {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let mut cmd = crate::git_cmd::git_command(cwd);
+    cmd.args(args);
+    let output = crate::git_cmd::bounded_output(cmd, crate::git_cmd::BASELINE_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }

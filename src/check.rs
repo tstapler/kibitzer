@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::accepted_findings::AcceptedLines;
 pub use crate::check_result::CheckResult;
 use crate::config::{Check, OutputFormat, Severity};
+use crate::git_cmd::{BASELINE_TIMEOUT, bounded_output, git_command};
 use crate::glob::matches_scope;
 use crate::inline_ignores::sanitize::display_path;
 use crate::inline_ignores::{
@@ -572,8 +573,10 @@ fn raw_findings_for_check(
 }
 
 /// The file's content at git HEAD, for the stateless baseline of the blocking-suppression
-/// advisory. A file git does not know yet is `Absent`; anything that stops git from answering
-/// (no repo, non-UTF-8 blob, file outside the root) is `Unavailable`.
+/// advisory. A staged rename reads the renamed-from blob; a non-UTF-8 blob is decoded lossily.
+/// Anything else (no repo, no commits, an untracked, ignored, newly added or submodule path, a
+/// file outside the root, a git that errors or exceeds `BASELINE_TIMEOUT`) is `Unavailable`:
+/// "not known to be new", never "everything is new".
 fn git_head_snapshot(repo_root: &Path, file_path: &Path) -> HeadSnapshot {
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let rel = match file_path.strip_prefix(repo_root) {
@@ -585,23 +588,53 @@ fn git_head_snapshot(repo_root: &Path, file_path: &Path) -> HeadSnapshot {
     };
     let rel = rel.to_string_lossy().replace('\\', "/");
     let run = |args: &[&str]| {
-        Command::new("git")
-            .args(args)
-            .current_dir(repo_root)
-            .output()
-            .ok()
+        let mut cmd = git_command(repo_root);
+        cmd.args(args);
+        bounded_output(cmd, BASELINE_TIMEOUT).filter(|out| out.status.success())
     };
-    let Some(show) = run(&["show", &format!("HEAD:./{rel}")]) else {
-        return HeadSnapshot::Unavailable;
-    };
-    if show.status.success() {
-        return String::from_utf8(show.stdout)
-            .map_or(HeadSnapshot::Unavailable, HeadSnapshot::Source);
+    let head_blob = |path: &str| run(&["show", &format!("HEAD:./{path}")]);
+    let blob = head_blob(&rel).or_else(|| {
+        let from = staged_rename_source(&run, &rel)?;
+        head_blob(&from)
+    });
+    blob.map_or(HeadSnapshot::Unavailable, |out| {
+        HeadSnapshot::Source(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
+
+/// Most staged files rename detection pairs up; bounds the cost on a huge `git mv`.
+const RENAME_DETECTION_LIMIT: &str = "-l200";
+
+/// The path `rel` was renamed or copied from in the index (`git mv`), relative to the repo root
+/// the hook runs in; `None` when `rel` is not the target of a staged rename.
+fn staged_rename_source(
+    run: &dyn Fn(&[&str]) -> Option<std::process::Output>,
+    rel: &str,
+) -> Option<String> {
+    let diff = run(&[
+        "diff",
+        "--cached",
+        "--no-ext-diff",
+        "-M",
+        RENAME_DETECTION_LIMIT,
+        "--name-status",
+        "--relative",
+        "-z",
+        "HEAD",
+    ])?;
+    let text = String::from_utf8_lossy(&diff.stdout);
+    let mut fields = text.split('\0');
+    while let Some(status) = fields.next() {
+        if status.starts_with(['R', 'C']) {
+            let (from, to) = (fields.next()?, fields.next()?);
+            if to == rel {
+                return Some(from.to_string());
+            }
+        } else {
+            fields.next();
+        }
     }
-    match run(&["rev-parse", "--git-dir"]) {
-        Some(out) if out.status.success() => HeadSnapshot::Absent,
-        _ => HeadSnapshot::Unavailable,
-    }
+    None
 }
 
 /// What directives drop when `check`'s native checker runs over `head_source`, under the run's
@@ -653,11 +686,9 @@ fn check_native_against_git_head(
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
-    let show = Command::new("git")
-        .args(["show", &format!("HEAD:{rel_path}")])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut show_cmd = git_command(repo_root);
+    show_cmd.args(["show", &format!("HEAD:{rel_path}")]);
+    let show = bounded_output(show_cmd, BASELINE_TIMEOUT)?;
     if !show.status.success() {
         return None;
     }
@@ -990,11 +1021,9 @@ fn check_against_git_head(
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
-    let show = Command::new("git")
-        .args(["show", &format!("HEAD:{rel_path}")])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut show_cmd = git_command(repo_root);
+    show_cmd.args(["show", &format!("HEAD:{rel_path}")]);
+    let show = bounded_output(show_cmd, BASELINE_TIMEOUT)?;
     if !show.status.success() {
         return None;
     }
@@ -1074,11 +1103,7 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = match Command::new("git")
-        .args(["archive", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-    {
+    let archive = match git_command(repo_root).args(["archive", "HEAD"]).output() {
         Ok(archive) => archive,
         Err(_) => {
             let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1279,11 +1304,7 @@ fn check_native_against_git_head_repo(
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = match Command::new("git")
-        .args(["archive", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-    {
+    let archive = match git_command(repo_root).args(["archive", "HEAD"]).output() {
         Ok(archive) => archive,
         Err(_) => {
             let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1393,11 +1414,17 @@ fn map_ranges_to_head(
     rel_path: &str,
     ranges: &[(usize, usize)],
 ) -> Option<Vec<(usize, usize)>> {
-    let diff = Command::new("git")
-        .args(["diff", "--no-color", "-U0", "HEAD", "--", rel_path])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut diff_cmd = git_command(repo_root);
+    diff_cmd.args([
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "-U0",
+        "HEAD",
+        "--",
+        rel_path,
+    ]);
+    let diff = bounded_output(diff_cmd, BASELINE_TIMEOUT)?;
     if !diff.status.success() {
         return None;
     }

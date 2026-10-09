@@ -100,6 +100,36 @@ impl TempRepo {
         self.spawn_hook(&payload)
     }
 
+    fn git(&self, args: &[&str]) {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(&self.dir)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// An `Edit` payload for `rel_path` as it already is on disk, for tests that arrange the
+    /// working tree (renames, submodules) themselves.
+    fn edit_payload(&self, rel_path: &str, old: &str, new: &str) -> serde_json::Value {
+        json!({
+            "cwd": self.dir,
+            "hook_event_name": "PostToolUse",
+            "tool_input": {
+                "file_path": self.path(rel_path),
+                "old_string": old,
+                "new_string": new,
+            }
+        })
+    }
+
     /// Makes the scratch repo a git checkout and commits `files` (rel path, content), so the
     /// hook has a git-HEAD baseline to compare an edit against.
     fn commit_files(&self, files: &[(&str, &str)]) {
@@ -127,9 +157,19 @@ impl TempRepo {
     }
 
     fn spawn_hook(&self, payload: &serde_json::Value) -> (i32, String, String) {
+        self.spawn_hook_with(payload, &[])
+    }
+
+    /// `spawn_hook` with extra environment variables for the hook process.
+    fn spawn_hook_with(
+        &self,
+        payload: &serde_json::Value,
+        envs: &[(&str, &std::ffi::OsStr)],
+    ) -> (i32, String, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
             .arg("hook")
             .current_dir(&self.dir)
+            .envs(envs.iter().copied())
             .env("XDG_CACHE_HOME", &self.cache_dir)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("KIBITZER_NO_AUTO_DAEMON", "1")
@@ -793,7 +833,7 @@ fn hook_should_NotSpam_When_UnrelatedDeletionAndSuppressionsMatchHead() {
 
 #[test]
 #[allow(non_snake_case)]
-fn hook_should_ReportAll_When_EditedFileIsUntrackedInGitRepo() {
+fn hook_should_NotSpam_When_UnrelatedEditToUntrackedFileInGitRepo() {
     let repo = mli_repo("untracked");
     repo.commit_files(&[("other.md", "hello\n")]);
     let content = format!("{}tail one\n", pairs(2));
@@ -801,6 +841,9 @@ fn hook_should_ReportAll_When_EditedFileIsUntrackedInGitRepo() {
     std::fs::write(repo.path("new.md"), &content).unwrap();
     let (code, stdout, stderr) = repo.run_hook_edit("new.md", &after, "tail one\n", "tail two\n");
     assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+    // A whole-file Write of the same untracked file has no baseline and reports everything.
+    let (_, stdout, _) = repo.run_hook("new.md", &after);
     assert_eq!(suppressed_count(&stdout), 2, "stdout: {stdout}");
 }
 
@@ -810,4 +853,128 @@ fn hook_should_LeaveNoAdvisedStoreBehind_When_SuppressionsReported() {
     let repo = mli_repo("no-cache-dir");
     repo.run_hook("doc.md", &pairs(1));
     assert!(!repo.cache_dir.join("kibitzer").join("advised").exists());
+}
+
+const SLIDE_BEFORE: &str = "<!-- kibitzer:ignore markdown-link-integrity -- planted for later -->\n[t](#nope)\n<!-- kibitzer:ignore markdown-link-integrity -- planted for later -->\nnote\n[t](#nope)\n";
+const SLIDE_AFTER: &str = "<!-- kibitzer:ignore markdown-link-integrity -- planted for later -->\n[t](#nope)\n<!-- kibitzer:ignore markdown-link-integrity -- planted for later -->\n[t](#nope)\n";
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportSlide_When_NoGitAndEditRemovesLines() {
+    let repo = mli_repo("no-git-slide");
+    let (code, stdout, stderr) = repo.run_hook_edit("doc.md", SLIDE_AFTER, "note\n", "");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 2, "stdout: {stdout}");
+    // The same file, edited without removing anything, stays quiet.
+    let (_, stdout, _) = repo.run_hook_edit("doc.md", &format!("{SLIDE_AFTER}x\n"), "", "x\n");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_ReportSlide_When_HeadBlobIsNotUtf8() {
+    let repo = mli_repo("non-utf8-head");
+    let mut before = SLIDE_BEFORE.replace("note", "note \u{0}").into_bytes();
+    before.extend_from_slice(b"\xff\n");
+    repo.git(&["init", "-q"]);
+    std::fs::write(repo.path("doc.md"), &before).unwrap();
+    repo.git(&["add", "doc.md"]);
+    repo.git(&["commit", "-q", "-m", "baseline"]);
+    let (code, stdout, stderr) = repo.run_hook_edit("doc.md", SLIDE_AFTER, "note \u{0}", "");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 1, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_UseRepoUnderEdit_When_GitDirEnvPointsElsewhere() {
+    let repo = mli_repo("poisoned-git-dir");
+    let before = format!("{MD_DIRECTIVE}[t](#nope)\nnote\n");
+    repo.commit_files(&[("doc.md", &before)]);
+    let after = format!("{MD_DIRECTIVE}[t](#nope)\n{MD_DIRECTIVE}[t](#nope)\nnote\n");
+    // Another repo whose HEAD already holds both pairs would hide the advisory.
+    let other = mli_repo("poisoned-git-dir-other");
+    other.commit_files(&[("doc.md", &after)]);
+    let git_dir = other.path(".git");
+    let git_work = other.dir.clone();
+    std::fs::write(repo.path("doc.md"), &after).unwrap();
+    let payload = repo.edit_payload("doc.md", "note", "note");
+    let (code, stdout, stderr) = repo.spawn_hook_with(
+        &payload,
+        &[
+            ("GIT_DIR", git_dir.as_os_str()),
+            ("GIT_WORK_TREE", git_work.as_os_str()),
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 1, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_StaySilent_When_GitMvRenamedFileAndEditIsUnrelated() {
+    let repo = mli_repo("git-mv");
+    repo.commit_files(&[("a.md", &format!("{}tail\n", pairs(8)))]);
+    repo.git(&["mv", "a.md", "b.md"]);
+    std::fs::write(repo.path("b.md"), format!("{}tail2\n", pairs(8))).unwrap();
+    let payload = repo.edit_payload("b.md", "tail", "tail2");
+    let (code, stdout, stderr) = repo.spawn_hook(&payload);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_StaySilent_When_RepoHasNoCommitsAndEditIsUnrelated() {
+    let repo = mli_repo("no-commits");
+    repo.git(&["init", "-q"]);
+    std::fs::write(repo.path("doc.md"), format!("{}tail2\n", pairs(8))).unwrap();
+    let payload = repo.edit_payload("doc.md", "tail", "tail2");
+    let (code, stdout, stderr) = repo.spawn_hook(&payload);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_StaySilent_When_FileLivesInSubmoduleAndEditIsUnrelated() {
+    let sub = mli_repo("submodule-inner");
+    sub.commit_files(&[("doc.md", &format!("{}tail\n", pairs(8)))]);
+    let repo = mli_repo("submodule-outer");
+    repo.commit_files(&[("other.md", "hello\n")]);
+    repo.git(&["submodule", "add", "-q", sub.dir.to_str().unwrap(), "sub"]);
+    std::fs::write(repo.path("sub/doc.md"), format!("{}tail2\n", pairs(8))).unwrap();
+    let payload = repo.edit_payload("sub/doc.md", "tail", "tail2");
+    let (code, stdout, stderr) = repo.spawn_hook(&payload);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 0, "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_FallBackConservatively_When_GitHangs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = mli_repo("hung-git");
+    repo.commit_files(&[("doc.md", SLIDE_BEFORE)]);
+    let shim_dir = repo.path("shim-bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    std::fs::write(&shim, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    std::fs::write(repo.path("doc.md"), SLIDE_AFTER).unwrap();
+    let payload = repo.edit_payload("doc.md", "note\n", "");
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = repo.spawn_hook_with(&payload, &[("PATH", path.as_ref())]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "hook hung on git: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(suppressed_count(&stdout), 2, "stdout: {stdout}");
 }

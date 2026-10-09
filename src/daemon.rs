@@ -21,6 +21,9 @@ enum Request {
         trigger: String,
         #[serde(default)]
         changed_lines: Option<Vec<(usize, usize)>>,
+        /// The edit removed text at an unknown position (see `RunContext::unlocated_deletion`).
+        #[serde(default)]
+        unlocated_deletion: bool,
     },
     Ping,
     Shutdown,
@@ -206,11 +209,13 @@ fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path)
                 file_path,
                 trigger,
                 changed_lines,
+                unlocated_deletion,
             }) => match handle_run_checks(
                 &cwd,
                 &file_path,
                 &trigger,
                 changed_lines.as_deref(),
+                unlocated_deletion,
                 cache,
                 cache_path,
             ) {
@@ -245,6 +250,7 @@ fn handle_run_checks(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
     cache: &Arc<Mutex<Cache>>,
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
@@ -274,7 +280,8 @@ fn handle_run_checks(
     // Loaded once for this request's whole check loop, not once per check — see
     // `run_checks_for_trigger`'s doc comment.
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    run_ctx.unlocated_deletion = unlocated_deletion;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -478,6 +485,7 @@ pub fn try_run_checks_via_daemon(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Option<Vec<CheckResult>> {
     let socket = match socket_path() {
         Ok(socket) => socket,
@@ -486,7 +494,14 @@ pub fn try_run_checks_via_daemon(
             return None;
         }
     };
-    try_run_checks_at(&socket, cwd, file_path, trigger, changed_lines)
+    try_run_checks_at(
+        &socket,
+        cwd,
+        file_path,
+        trigger,
+        changed_lines,
+        unlocated_deletion,
+    )
 }
 
 fn try_run_checks_at(
@@ -495,6 +510,7 @@ fn try_run_checks_at(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Option<Vec<CheckResult>> {
     if recently_wedged(socket_path) {
         return None;
@@ -518,6 +534,7 @@ fn try_run_checks_at(
         file_path: file_path.to_path_buf(),
         trigger: trigger.to_string(),
         changed_lines: changed_lines.map(|r| r.to_vec()),
+        unlocated_deletion,
     };
     let response = match exchange(socket_path, &run, CHECK_TIMEOUT) {
         Probe::Answered(response) => response,
@@ -639,15 +656,17 @@ pub fn run_checks_smart(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Result<Vec<CheckResult>> {
     // Unit tests never reach a user's real daemon: a version mismatch would retire it.
     if !cfg!(test)
-        && let Some(results) = try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines)
+        && let Some(results) =
+            try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines, unlocated_deletion)
     {
         return Ok(results);
     }
     maybe_spawn_daemon();
-    run_uncached(cwd, file_path, trigger, changed_lines)
+    run_uncached(cwd, file_path, trigger, changed_lines, unlocated_deletion)
 }
 
 /// The no-daemon-reachable path of `run_checks_smart`: run checks in-process and persist
@@ -658,12 +677,14 @@ fn run_uncached(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Result<Vec<CheckResult>> {
     run_uncached_with_cache(
         cwd,
         file_path,
         trigger,
         changed_lines,
+        unlocated_deletion,
         &default_cache_path(),
     )
 }
@@ -673,6 +694,7 @@ fn run_uncached_with_cache(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
     // Stamped before the first config read and before the checks run; see `Stamps`.
@@ -683,7 +705,8 @@ fn run_uncached_with_cache(
     );
     let (config, repo_root) = find_effective_config(cwd)?;
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    run_ctx.unlocated_deletion = unlocated_deletion;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -770,7 +793,8 @@ mod inline_cache_tests {
                         .map(|(rule, line)| (rule.as_str().to_string(), line.get()))
                 })
         };
-        let first = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        let first =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
         assert_eq!(anchor(&first), Some(("flag-argument".to_string(), 3)));
         // Unchanged file and config: the second call must be a cache hit that still carries the anchor.
         assert!(
@@ -786,7 +810,8 @@ mod inline_cache_tests {
                 .is_some(),
             "second request would not be a cache hit"
         );
-        let second = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        let second =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
         assert_eq!(anchor(&second), anchor(&first));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -804,7 +829,7 @@ mod stale_daemon_tests {
         let socket = dir.join("k.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let started = std::time::Instant::now();
-        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
         assert!(out.is_none());
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -816,7 +841,9 @@ mod stale_daemon_tests {
             "a failed probe must be remembered"
         );
         let again = std::time::Instant::now();
-        assert!(try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None).is_none());
+        assert!(
+            try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false).is_none()
+        );
         assert!(
             again.elapsed() < Duration::from_millis(200),
             "the skip window must avoid a second probe"
@@ -900,7 +927,7 @@ mod stale_daemon_tests {
         let socket = dir.join("k.sock");
         std::fs::write(socket.with_extension("spawn-attempt"), "").unwrap();
         let (handle, saw_shutdown) = fake_daemon(&socket, old_style_reply);
-        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
         handle.join().unwrap();
         assert!(out.is_none(), "an old daemon's results must be discarded");
         assert!(
@@ -921,7 +948,7 @@ mod stale_daemon_tests {
         let (handle, saw_shutdown) = fake_daemon(&socket, |_| {
             r#"{"ok":true,"version":"0.0.0-old","results":[]}"#.to_string()
         });
-        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
         handle.join().unwrap();
         assert!(out.is_none());
         assert!(saw_shutdown.load(Ordering::SeqCst));
@@ -933,7 +960,7 @@ mod stale_daemon_tests {
         let dir = temp_dir("same-version");
         let socket = dir.join("k.sock");
         let (handle, saw_shutdown) = fake_daemon(&socket, current_reply);
-        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
         // The fake accepts two connections; a matching daemon gets only one.
         let _ = UnixStream::connect(&socket);
         handle.join().unwrap();
@@ -1015,12 +1042,13 @@ mod stale_result_tests {
                 cache_path.clone(),
             );
             std::thread::spawn(move || {
-                handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap()
+                handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap()
             })
         };
         wait_for_slow_check_to_start(&dir);
         std::fs::write(&file, "GOOD content\n").unwrap();
-        let fast = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        let fast =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
         assert!(fast.iter().all(|r| r.passed), "{fast:?}");
         let stale = slow.join().unwrap();
         assert!(
@@ -1028,7 +1056,8 @@ mod stale_result_tests {
             "slow run saw the BAD content"
         );
 
-        let again = handle_run_checks(&dir, &file, "batch", None, &cache, &cache_path).unwrap();
+        let again =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
         assert!(
             again.iter().all(|r| r.passed),
             "stale BAD result was served for the new content: {again:?}"
@@ -1054,12 +1083,12 @@ mod stale_result_tests {
         let slow = {
             let (dir, file, cache_path) = (dir.clone(), file.clone(), cache_path.clone());
             std::thread::spawn(move || {
-                run_uncached_with_cache(&dir, &file, "batch", None, &cache_path).unwrap()
+                run_uncached_with_cache(&dir, &file, "batch", None, false, &cache_path).unwrap()
             })
         };
         wait_for_slow_check_to_start(&dir);
         std::fs::write(&file, "GOOD content\n").unwrap();
-        let fast = run_uncached_with_cache(&dir, &file, "batch", None, &cache_path).unwrap();
+        let fast = run_uncached_with_cache(&dir, &file, "batch", None, false, &cache_path).unwrap();
         assert!(fast.iter().all(|r| r.passed), "{fast:?}");
         let stale = slow.join().unwrap();
         assert!(stale.iter().any(|r| !r.passed), "slow run saw BAD content");
@@ -1099,7 +1128,15 @@ mod stale_result_tests {
         })
         .join();
         assert!(cache.lock().is_err(), "setup: mutex must be poisoned");
-        let out = handle_run_checks(&dir, &file, "batch", None, &cache, &dir.join("cache.json"));
+        let out = handle_run_checks(
+            &dir,
+            &file,
+            "batch",
+            None,
+            false,
+            &cache,
+            &dir.join("cache.json"),
+        );
         assert!(out.is_ok(), "{out:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

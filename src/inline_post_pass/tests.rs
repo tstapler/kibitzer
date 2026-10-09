@@ -195,8 +195,8 @@ fn run_should_EmitBlockingAdvisory_When_EditAddsFindingBelowPlantedDirective() {
 }
 
 #[test]
-fn run_should_StaySilent_When_PureDeletionAndNoBaselineAvailable() {
-    assert!(run_with(Some(&[]), &blocking_md_result()).is_empty());
+fn run_should_Report_When_PureDeletionAndNoBaselineAvailable() {
+    assert_eq!(run_with(Some(&[]), &blocking_md_result()).len(), 1);
 }
 
 #[test]
@@ -620,6 +620,17 @@ impl Baselined {
         head: HeadSnapshot,
         head_drops: Vec<DroppedFinding>,
     ) -> Vec<CheckResult> {
+        self.run_in(&RunContext::default(), changed, results, head, head_drops)
+    }
+
+    fn run_in(
+        &self,
+        run_ctx: &RunContext,
+        changed: Option<&[(usize, usize)]>,
+        results: &[CheckResult],
+        head: HeadSnapshot,
+        head_drops: Vec<DroppedFinding>,
+    ) -> Vec<CheckResult> {
         let head = std::cell::RefCell::new(Some(head));
         let read_head = |_: &Path| {
             head.borrow_mut()
@@ -632,7 +643,7 @@ impl Baselined {
             file_path: &self.file,
             changed_lines: changed,
             results,
-            run_ctx: &RunContext::default(),
+            run_ctx,
             raw_rerun: &no_rerun,
             head: &read_head,
             head_drops: &drops,
@@ -672,12 +683,12 @@ fn run_should_ReportOnlyExtraIdenticalSuppressions_When_WriteAddsMoreThanHeadHad
 }
 
 #[test]
-fn run_should_ReportEverything_When_WriteCreatesFileGitDoesNotKnow() {
+fn run_should_ReportEverything_When_WriteHasNoBaseline() {
     let b = Baselined::new("write-untracked");
     let out = b.run(
         None,
         &Baselined::link_drops(3),
-        HeadSnapshot::Absent,
+        HeadSnapshot::Unavailable,
         Vec::new(),
     );
     assert_eq!(out.len(), 3, "{out:?}");
@@ -785,7 +796,7 @@ fn run_should_NotReadHead_When_NoBlockingDropExists() {
     let read = std::cell::Cell::new(0usize);
     let read_head = |_: &Path| {
         read.set(read.get() + 1);
-        HeadSnapshot::Absent
+        HeadSnapshot::Unavailable
     };
     let out = run(PostPassInput {
         checks: &b.checks,
@@ -799,4 +810,48 @@ fn run_should_NotReadHead_When_NoBlockingDropExists() {
     });
     assert!(out.is_empty());
     assert_eq!(read.get(), 0);
+}
+
+fn after_deletion() -> RunContext {
+    RunContext {
+        unlocated_deletion: true,
+        ..RunContext::default()
+    }
+}
+
+#[test]
+fn run_should_ReportSlide_When_NoBaselineAndEditRemovedLines() {
+    let b = Baselined::new("no-git-slide");
+    let out = b.run_in(
+        &after_deletion(),
+        Some(&[(20, 20)]),
+        &Baselined::link_drops(3),
+        HeadSnapshot::Unavailable,
+        Vec::new(),
+    );
+    assert_eq!(out.len(), 3, "{out:?}");
+}
+
+#[test]
+fn run_should_ReportSlide_When_NoBaselineAndPureDeletionLeftNoChangedRange() {
+    let b = Baselined::new("no-git-pure-delete");
+    let out = b.run(
+        Some(&[]),
+        &Baselined::link_drops(2),
+        HeadSnapshot::Unavailable,
+        Vec::new(),
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+}
+
+#[test]
+fn run_should_ReportFileScopeDrop_When_NoBaselineEvenIfEditRemovedNothing() {
+    let b = Baselined::new("no-git-file-scope");
+    let out = b.run(
+        Some(&[(15, 15)]),
+        &file_scope_drop(603),
+        HeadSnapshot::Unavailable,
+        Vec::new(),
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
 }

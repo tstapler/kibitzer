@@ -10,10 +10,10 @@ use crate::inline_ignores::{DroppedFinding, is_file_scope};
 
 /// What git holds for the edited file.
 pub(crate) enum HeadSnapshot {
-    /// Not a git checkout, or HEAD unreadable: nothing to compare against.
+    /// No usable baseline: not a git checkout, no commits, a path HEAD does not hold (new,
+    /// untracked, ignored, submodule), or a git that failed or timed out. Never "new": the
+    /// caller falls back to the conservative rule.
     Unavailable,
-    /// The file is new to git, so nothing was suppressed before the edit.
-    Absent,
     Source(String),
 }
 
@@ -55,7 +55,6 @@ pub(super) fn head_counts(
 ) -> Option<Counts> {
     let source = match head {
         HeadSnapshot::Unavailable => return None,
-        HeadSnapshot::Absent => return Some(Counts::new()),
         HeadSnapshot::Source(source) => source,
     };
     let mut counts = Counts::new();
