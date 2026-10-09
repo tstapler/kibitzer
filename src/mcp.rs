@@ -19,6 +19,7 @@ use crate::check::{
 };
 use crate::config::{Check, Severity, find_config, find_effective_config, find_repo_root};
 use crate::glob::matches_scope;
+use crate::inline_ignores::sanitize::display_path;
 
 #[derive(Debug, Clone)]
 pub struct KibitzerServer {
@@ -285,6 +286,30 @@ struct TypeHierarchyResponse {
     node_kind: Option<SymbolKind>,
     hint: Option<String>,
     edges: Vec<TypeRelationEdge>,
+}
+
+/// `run_checks` prose: one line per failure, then (only when something failed) the one-line
+/// `kibitzer:ignore` syntax for `path`'s comment leader, so an agent needs no doc fetch.
+fn render_run_checks_report(results: &[CheckResult], path: &Path) -> String {
+    let failed: Vec<&CheckResult> = results.iter().filter(|r| !r.passed).collect();
+    if failed.is_empty() {
+        return "all checks passed".to_string();
+    }
+    let mut lines: Vec<String> = failed
+        .iter()
+        .map(|r| r.summary_line(crate::check_result::SummaryTag::Severity))
+        .collect();
+    // Only a native, anchored finding can be dismissed by a directive; omit the hint otherwise.
+    if let Some(anchor) = failed.iter().find_map(|r| r.inline.first_anchor()) {
+        lines.push(crate::inline_ignores::syntax_hint(
+            path,
+            Some(anchor),
+            &crate::inline_ignores::InlineOutcome::union_rule_ids(failed.iter().map(|r| &r.inline)),
+        ));
+    }
+    let canonical = path.canonicalize().ok();
+    let echoed: Vec<&Path> = std::iter::once(path).chain(canonical.as_deref()).collect();
+    crate::inline_ignores::sanitize::strip_unsafe_with_paths(&lines.join("\n"), &echoed)
 }
 
 /// Serializes an ad hoc `{"error": "..."}` JSON object — kept as JSON (not a plain
@@ -775,7 +800,7 @@ impl KibitzerServer {
         };
         // Loaded once for the whole assessment (every checker, every file below)
         // instead of once per (file, checker) pair — same rationale as `registry`.
-        let accepted = match crate::accepted_findings::find_accepted_findings(&repo_root) {
+        let run_ctx = match crate::run_context::RunContext::load(&repo_root) {
             Ok(a) => a,
             Err(e) => return format!("error reading accepted findings: {e}"),
         };
@@ -843,8 +868,10 @@ impl KibitzerServer {
                         Severity::Advisory => "advisory",
                     };
                     let location = match (&finding.file, finding.line) {
-                        (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
-                        (Some(file), None) => format!("{}: ", file.display()),
+                        (Some(file), Some(line)) => {
+                            format!("{}:{}: ", display_path(file), line)
+                        }
+                        (Some(file), None) => format!("{}: ", display_path(file)),
                         (None, _) => String::new(),
                     };
                     lines.push(format!("[{level}] {location}{}", finding.message));
@@ -883,7 +910,7 @@ impl KibitzerServer {
             let no_plugins = crate::plugin::Registry::default();
             for file in &files {
                 let result =
-                    match run_check(&synthetic, &repo_root, file, None, &no_plugins, &accepted) {
+                    match run_check(&synthetic, &repo_root, file, None, &no_plugins, &run_ctx) {
                         Ok(r) => r,
                         Err(e) => {
                             lines.push(format!(
@@ -950,7 +977,8 @@ impl KibitzerServer {
         } else {
             output.push_str("(omitted: include_diagram was false)\n");
         }
-        output
+        let echoed: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        crate::inline_ignores::sanitize::strip_unsafe_with_paths(&output, &echoed)
     }
 
     #[tool(
@@ -958,6 +986,7 @@ impl KibitzerServer {
     )]
     async fn run_checks(&self, req: Parameters<RunChecksRequest>) -> String {
         let file_path = PathBuf::from(&req.0.file_path);
+        let req_path = file_path.clone();
         let trigger = req.0.trigger;
         // Command-based checks can each block for up to `COMMAND_TIMEOUT` — run the
         // whole synchronous dispatch on a blocking-pool thread (the same pattern
@@ -967,7 +996,7 @@ impl KibitzerServer {
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CheckResult>> {
             let (config, repo_root) = find_effective_config(&file_path)?;
             let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-            let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+            let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
             run_checks_for_trigger(
                 &config.checks,
                 &trigger,
@@ -975,33 +1004,13 @@ impl KibitzerServer {
                 &file_path,
                 None,
                 &registry,
-                &accepted,
+                &run_ctx,
             )
         })
         .await;
 
         match outcome {
-            Ok(Ok(results)) => {
-                let failures: Vec<String> = results
-                    .iter()
-                    .filter(|r| !r.passed)
-                    .map(|r| {
-                        // Task 4.3.1c: a plugin-backed check whose binary is missing
-                        // renders `[skipped]`, not `[Advisory]`/`[Blocking]` — an agent
-                        // shouldn't read "not installed" as "ran and found a defect."
-                        if r.plugin_missing {
-                            format!("[skipped] {}: {}", r.check_name, r.describe())
-                        } else {
-                            format!("[{:?}] {}: {}", r.severity, r.check_name, r.describe())
-                        }
-                    })
-                    .collect();
-                if failures.is_empty() {
-                    "all checks passed".to_string()
-                } else {
-                    failures.join("\n")
-                }
-            }
+            Ok(Ok(results)) => render_run_checks_report(&results, &req_path),
             Ok(Err(e)) => format!("error running checks: {e}"),
             Err(e) => format!("run_checks task failed: {e}"),
         }
@@ -1436,7 +1445,9 @@ impl ServerHandler for KibitzerServer {
                  symbol by exact reference), or list_callers/list_callees (function-level \
                  call-graph traversal, Go/TS/JS only) — all four return JSON, not prose. If a \
                  check fires on an edit that didn't actually introduce the problem it claims, \
-                 call report_false_positive instead of just noting it in the transcript."
+                 call report_false_positive instead of just noting it in the transcript. To \
+                 dismiss a finding you judged acceptable, add a `kibitzer:ignore <rule> -- \
+                 <why>` comment above the flagged line."
                     .to_string(),
             ),
             ..Default::default()
@@ -1453,6 +1464,7 @@ pub async fn run_mcp_server() -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(non_snake_case)]
 mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3070,6 +3082,95 @@ mod tests {
     }
 
     #[test]
+    fn get_info_instructions_should_MentionInlineIgnore_When_Read() {
+        let instructions = KibitzerServer::new()
+            .get_info()
+            .instructions
+            .expect("has instructions");
+        assert!(
+            instructions.contains("kibitzer:ignore"),
+            "got: {instructions}"
+        );
+        assert!(
+            !instructions.contains("kibitzer:false-positive"),
+            "got: {instructions}"
+        );
+    }
+
+    fn failing(name: &str, rule: Option<(&str, usize)>) -> CheckResult {
+        let mut inline = crate::inline_ignores::InlineOutcome::default();
+        if let Some((rule, line)) = rule {
+            inline.shown.push(crate::inline_ignores::Anchor {
+                rule: crate::inline_ignores::RuleId::new(rule).unwrap(),
+                line: crate::inline_ignores::Line::new(line),
+            });
+        }
+        CheckResult::new(
+            name.to_string(),
+            Severity::Advisory,
+            false,
+            "x.go:4: [flag-argument] boolean parameter".to_string(),
+        )
+        .with_inline(inline)
+    }
+
+    #[test]
+    fn run_checks_report_should_EndWithSyntaxHint_When_FindingsPresent() {
+        let report = render_run_checks_report(
+            &[failing("go-flag-argument", Some(("flag-argument", 4)))],
+            Path::new("x.go"),
+        );
+        let last = report.lines().last().unwrap();
+        assert!(
+            last.contains("// kibitzer:ignore flag-argument -- <why>")
+                && last.contains("above line 4"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
+    fn run_checks_report_should_OmitHint_When_NoNativeAnchoredFinding() {
+        let report = render_run_checks_report(&[failing("shell", None)], Path::new("notes.md"));
+        assert!(!report.contains("kibitzer:ignore"), "got: {report}");
+    }
+
+    #[test]
+    fn run_checks_report_should_OmitHint_When_OnlyMetaRuleAnchor() {
+        let report = render_run_checks_report(
+            &[failing("inline-ignore", Some(("ignore-syntax", 4)))],
+            Path::new("x.go"),
+        );
+        assert!(!report.contains("kibitzer:ignore"), "got: {report}");
+    }
+
+    #[test]
+    fn run_checks_report_should_SuggestNonMetaRule_When_MetaAnchorComesFirst() {
+        let report = render_run_checks_report(
+            &[
+                failing("inline-ignore", Some(("ignore-syntax", 2))),
+                failing("go-flag-argument", Some(("flag-argument", 4))),
+            ],
+            Path::new("x.go"),
+        );
+        let last = report.lines().last().unwrap();
+        assert!(
+            last.contains("kibitzer:ignore flag-argument -- <why>")
+                && !last.contains("ignore-syntax"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
+    fn run_checks_report_should_OmitHint_When_AllPass() {
+        let mut ok = failing("go-flag-argument", None);
+        ok.passed = true;
+        assert_eq!(
+            render_run_checks_report(&[ok], Path::new("x.go")),
+            "all checks passed"
+        );
+    }
+
+    #[test]
     fn call_traversal_tools_are_registered_with_json_descriptions() {
         let router = KibitzerServer::tool_router();
         let tools = router.list_all();
@@ -3226,6 +3327,33 @@ mod tests {
     /// Task 4.3.1c/d: `list_checks`/`run_checks` render a distinct, actionable signal for a
     /// plugin-backed check whose binary is missing, instead of raw shell noise a real
     /// command failure would look like.
+    #[tokio::test]
+    async fn run_checks_should_OmitCoveredFinding_When_InlineIgnoreAboveIt() {
+        const FUNC: &str = "func f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+        let dir = tmp_dir("run-checks-inline");
+        let report = |file: &str, source: String| {
+            let path = dir.join(file);
+            std::fs::write(&path, source).unwrap();
+            let server = KibitzerServer::new();
+            let req = RunChecksRequest {
+                file_path: path.display().to_string(),
+                trigger: "batch".to_string(),
+            };
+            async move { server.run_checks(Parameters(req)).await }
+        };
+        let control = report("control.go", format!("package main\n\n{FUNC}")).await;
+        let covered = report(
+            "covered.go",
+            format!(
+                "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\n{FUNC}"
+            ),
+        )
+        .await;
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(control.contains("[flag-argument]"), "got: {control}");
+        assert!(!covered.contains("[flag-argument]"), "got: {covered}");
+    }
+
     mod plugin_missing_rendering_tests {
         use super::*;
         use crate::config::OutputFormat;

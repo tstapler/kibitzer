@@ -77,9 +77,9 @@ out of scope; they report at package/component (or, for `lcom`, whole-type) gran
 not a specific line, so this directory's `(rule, file, line, content)` key doesn't fit
 them.
 
-There's still no inline suppression comment (`// kibitzer:accept ...`) — this directory
-is the mechanism, kept checked-in and reviewable rather than scattered through source,
-and consistent with `docs/suppressing-checks.md`'s existing config-based-only stance.
+Inline `kibitzer:ignore` comments are the default way to dismiss a finding (see
+`docs/suppressing-checks.md`). This directory is the fallback for locations that cannot
+hold a comment, such as generated files, and it stays checked-in and reviewable.
 
 ## Removing an entry
 

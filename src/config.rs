@@ -677,6 +677,23 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     }
 }
 
+/// The config file path `find_config(start)` will read, or the `CONFIG_DIR` path under `start`
+/// when none exists. Never reads the file, so a caller can fingerprint it before the first read.
+pub fn locate_config_path(start: &Path) -> PathBuf {
+    let first = start_dir(start);
+    let mut dir = first.clone();
+    loop {
+        let candidate = resolve_config_path(&dir);
+        if candidate.is_file() {
+            return candidate;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return resolve_config_path(&first),
+        }
+    }
+}
+
 /// One `checker`-based `Check` running on `PostToolUse`+`batch`+[`crate::task_stop::TRIGGER`],
 /// the shape every per-file entry in `default_checks()` shares. The `Stop`-trigger opt-in
 /// closes a gap `PostToolUse`'s diff-scoping leaves open: a per-edit check only sees the
@@ -776,7 +793,14 @@ fn prose_checks() -> Vec<Check> {
 }
 
 fn core_checks() -> Vec<Check> {
+    let inline_ignore_scope = crate::checkers::inline_ignore::scope_globs();
+    let inline_ignore_scope: Vec<&str> = inline_ignore_scope.iter().map(String::as_str).collect();
     vec![
+        native_check(
+            crate::checkers::inline_ignore::NAME,
+            Severity::Advisory,
+            &inline_ignore_scope,
+        ),
         Check {
             message: Some("broken markdown link/anchor".to_string()),
             ..native_check("markdown-link-integrity", Severity::Blocking, &["**/*.md"])
@@ -1799,5 +1823,38 @@ mod tests {
             properties.get("affected").is_some(),
             "expected Config's schema to contain an 'affected' property, got: {schema}"
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn default_checks_should_ScopeInlineIgnoreToGrammarExtensionsAndMd_When_Read() {
+        let defaults = default_checks();
+        let check = defaults
+            .iter()
+            .find(|c| c.name == "inline-ignore")
+            .expect("inline-ignore must be a default check");
+        assert_eq!(check.severity, Severity::Advisory);
+        let mut expected: Vec<String> = crate::checker::Language::ALL
+            .iter()
+            .flat_map(|lang| lang.extensions())
+            .map(|ext| format!("**/*.{ext}"))
+            .collect();
+        expected.push("**/*.md".to_string());
+        assert_eq!(check.scope, expected);
+        assert!(!check.scope.iter().any(|g| g == "**/*"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn inline_ignore_findings_should_BeAdvisory_When_FileHasBlockingChecks() {
+        let severity_of = |name: &str| {
+            default_checks()
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .severity
+        };
+        assert_eq!(severity_of("markdown-link-integrity"), Severity::Blocking);
+        assert_eq!(severity_of("inline-ignore"), Severity::Advisory);
     }
 }

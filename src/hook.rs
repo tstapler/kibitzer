@@ -6,9 +6,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::check::CheckResult;
+use crate::check_result::SummaryTag;
 use crate::config::Severity;
 use crate::daemon::run_checks_smart;
+use crate::hook_footer::advisory_footer;
+use crate::inline_ignores::InlineOutcome;
+use crate::inline_ignores::sanitize::strip_unsafe_with_paths;
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -89,7 +92,7 @@ fn build_edit_summary(tool_input: &ToolInput) -> crate::hook_log::EditSummary {
 /// "deletion-only edit flagged" entry).
 fn compute_changed_lines(
     tool_input: &ToolInput,
-    file_path: &PathBuf,
+    file_path: &std::path::Path,
 ) -> Option<Vec<(usize, usize)>> {
     if tool_input.content.is_some() {
         return None;
@@ -103,7 +106,11 @@ fn compute_changed_lines(
         return None;
     };
 
-    let file_content = std::fs::read_to_string(file_path).ok()?;
+    let Ok(crate::checker::NativeSource::Text(file_content)) =
+        crate::checker::read_native_source(file_path)
+    else {
+        return None;
+    };
     let mut ranges = Vec::new();
     let mut saw_non_empty_needle = false;
     for needle in new_strings {
@@ -126,6 +133,28 @@ fn compute_changed_lines(
     } else {
         Some(ranges)
     }
+}
+
+/// Whether any edit in this tool call removed lines (its `old_string` has more lines than its
+/// `new_string`), so existing findings below the edit may have slid under a directive. A pure
+/// deletion has no row in the post-edit file, and `compute_changed_lines` cannot place any
+/// deletion, so this is reported separately from the changed ranges.
+fn removes_lines(tool_input: &ToolInput) -> bool {
+    let line_count = |text: &str| text.matches('\n').count();
+    let removes =
+        |old: Option<&str>, new: &str| old.is_some_and(|old| line_count(old) > line_count(new));
+    if tool_input.content.is_some() {
+        return false;
+    }
+    if let Some(edits) = &tool_input.edits {
+        return edits
+            .iter()
+            .any(|e| removes(e.old_string.as_deref(), &e.new_string));
+    }
+    tool_input
+        .new_string
+        .as_deref()
+        .is_some_and(|new| removes(tool_input.old_string.as_deref(), new))
 }
 
 /// Implements Claude Code's `PostToolUse` and `Stop` hook contracts, dispatching on
@@ -163,8 +192,13 @@ pub fn run_hook() -> Result<ExitCode> {
         &file_path,
         &input.hook_event_name,
         changed_lines.as_deref(),
+        removes_lines(&input.tool_input),
     )?;
 
+    let canonical_path = file_path.canonicalize().ok();
+    let echoed_paths: Vec<&std::path::Path> = std::iter::once(file_path.as_path())
+        .chain(canonical_path.as_deref())
+        .collect();
     let failures: Vec<_> = results.iter().filter(|r| !r.passed).collect();
     let blocking: Vec<_> = failures
         .iter()
@@ -194,11 +228,28 @@ pub fn run_hook() -> Result<ExitCode> {
             eprintln!(
                 "[kibitzer] {} (blocking): {}",
                 result.check_name,
-                result.describe()
+                strip_unsafe_with_paths(&result.describe(), &echoed_paths)
             );
         }
+        // A malformed or misplaced ignore on the blocked file would otherwise stay invisible
+        // exactly when the agent is stuck, so repair text goes out with the blocking lines.
+        for result in failures.iter().filter(|r| {
+            r.check_name == crate::checkers::inline_ignore::NAME && r.severity != Severity::Blocking
+        }) {
+            eprintln!(
+                "[kibitzer] inline-ignore: {}",
+                strip_unsafe_with_paths(&result.describe(), &echoed_paths)
+            );
+        }
+        // Directives only suppress native per-file findings; a shell check or an
+        // `[ignore-syntax]` repair has nothing a directive could dismiss.
+        let dismiss = if failures.iter().any(|r| r.inline.first_anchor().is_some()) {
+            "to dismiss a judged finding, add `kibitzer:ignore <rule> -- <why>`; "
+        } else {
+            ""
+        };
         eprintln!(
-            "[kibitzer] to disable a check or exclude a file, see \
+            "[kibitzer] {dismiss}to disable a check or exclude a file, see \
              https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md"
         );
         return Ok(ExitCode::from(2));
@@ -206,74 +257,25 @@ pub fn run_hook() -> Result<ExitCode> {
 
     let mut context = failures
         .iter()
-        .map(|r| render_advisory_context_line(r))
+        .map(|r| r.summary_line(SummaryTag::Plain))
         .collect::<Vec<_>>()
         .join("\n");
-    context.push_str(
-        "\n\nIf any of the above looks like a false positive (fired on content the edit \
-         didn't actually introduce, or on a pattern the check misidentifies), see \
-         https://github.com/tstapler/kibitzer/blob/master/docs/reporting-false-positives.md \
-         for how to file it — don't just note it in passing. To turn a check off (repo-wide) \
-         or exclude a specific file, see \
-         https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md.",
-    );
+    context.push_str("\n\n");
+    let anchor = failures.iter().find_map(|r| r.inline.first_anchor());
+    context.push_str(&advisory_footer(
+        std::path::Path::new(&file_path),
+        anchor,
+        &InlineOutcome::union_rule_ids(failures.iter().map(|r| &r.inline)),
+    ));
 
     let payload = json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": context,
+            "additionalContext": strip_unsafe_with_paths(&context, &echoed_paths),
         }
     });
     println!("{payload}");
     Ok(ExitCode::SUCCESS)
-}
-
-/// One line of the PostToolUse advisory `additionalContext` for a failed, non-blocking
-/// check (Task 4.3.1c). `[skipped]`-prefixed for `result.plugin_missing` — a missing
-/// plugin install, never a real check failure, so an agent shouldn't read it as "ran and
-/// found a defect." A `plugin_missing` result can never reach the *blocking* printer above
-/// instead, since `run_check`'s early return (Task 4.3.1b) forces `Severity::Advisory`.
-fn render_advisory_context_line(result: &CheckResult) -> String {
-    if result.plugin_missing {
-        format!("[skipped] {}: {}", result.check_name, result.describe())
-    } else {
-        format!("{}: {}", result.check_name, result.describe())
-    }
-}
-
-#[cfg(test)]
-mod advisory_context_rendering_tests {
-    use super::*;
-    use crate::config::Severity;
-
-    fn result(plugin_missing: bool) -> CheckResult {
-        CheckResult {
-            check_name: "kibitzer-stub-plugin".to_string(),
-            severity: Severity::Advisory,
-            passed: false,
-            output: String::new(),
-            message: Some("plugin 'kibitzer-stub-plugin' is not installed".to_string()),
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing,
-        }
-    }
-
-    #[test]
-    fn hook_advisory_context_renders_skipped_prefix_for_plugin_missing_result() {
-        let line = render_advisory_context_line(&result(true));
-        assert!(
-            line.starts_with("[skipped] kibitzer-stub-plugin:"),
-            "got: {line}"
-        );
-    }
-
-    #[test]
-    fn hook_advisory_context_renders_unprefixed_for_a_normal_failure() {
-        let line = render_advisory_context_line(&result(false));
-        assert!(!line.starts_with("[skipped]"), "got: {line}");
-        assert!(line.starts_with("kibitzer-stub-plugin:"), "got: {line}");
-    }
 }
 
 #[cfg(test)]
@@ -413,5 +415,35 @@ func TestX(t *testing.T) {\n\
         let ranges = compute_changed_lines(&tool_input, &path);
         std::fs::remove_file(&path).ok();
         assert_eq!(ranges, None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn removes_lines_should_BeTrue_When_AnyEditLosesLines() {
+        let edit = |old: &str, new: &str| EditItem {
+            new_string: new.to_string(),
+            old_string: Some(old.to_string()),
+        };
+        let multi = |edits| ToolInput {
+            edits: Some(edits),
+            ..ToolInput::default()
+        };
+        assert!(removes_lines(&multi(vec![
+            edit("a\nb\n", ""),
+            edit("x\n", "y\n")
+        ])));
+        assert!(!removes_lines(&multi(vec![edit("x\n", "y\n")])));
+        assert!(!removes_lines(&multi(vec![edit("x\n", "y\nz\n")])));
+        let single = ToolInput {
+            old_string: Some("a\nb\nc\n".to_string()),
+            new_string: Some("a\n".to_string()),
+            ..ToolInput::default()
+        };
+        assert!(removes_lines(&single));
+        let write = ToolInput {
+            content: Some(String::new()),
+            ..ToolInput::default()
+        };
+        assert!(!removes_lines(&write));
     }
 }

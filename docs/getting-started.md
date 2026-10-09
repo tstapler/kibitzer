@@ -62,7 +62,7 @@ running. Manage it directly if you want:
 ```bash
 kibitzer daemon start   # runs in the foreground — background it yourself
                          # ('&', a systemd unit, a launchd agent)
-kibitzer daemon status  # "daemon is running" / "no daemon running"
+kibitzer daemon status  # "daemon is running" / "no daemon running" / "daemon not responding (pid N)"
 kibitzer daemon stop
 ```
 

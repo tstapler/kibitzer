@@ -5,6 +5,48 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Tree;
 
+/// Native per-file checks skip any file at or above this size rather than parsing it.
+/// Now that [`crate::config::default_checks`] turns every native checker on for every
+/// repo with no `.kibitzer/inspect.json` of its own, this is what keeps that on-by-default
+/// behavior cheap: vendored bundles, generated code, and minified assets can be
+/// megabytes, and every native checker pays a full read plus (for most of them) a
+/// tree-sitter parse. `PostToolUse` runs this path on every single edit, so a file this
+/// large — which a "long file"/"long function" checker has nothing useful to say about
+/// anyway — is worth skipping outright rather than paying that cost every time.
+pub const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What `read_native_source` found at a path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeSource {
+    Text(String),
+    /// Over `MAX_NATIVE_CHECK_BYTES`: skipped, not an error.
+    TooLarge,
+}
+
+/// Reads `path` for a native check. Only regular files are opened (opening a FIFO blocks
+/// until a writer appears, hanging the hook), and the read is hard-capped at
+/// `MAX_NATIVE_CHECK_BYTES` so a file that grows after the size check cannot exhaust memory.
+pub fn read_native_source(path: &Path) -> std::io::Result<NativeSource> {
+    use std::io::{Error, ErrorKind, Read};
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if metadata.len() > MAX_NATIVE_CHECK_BYTES {
+        return Ok(NativeSource::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_NATIVE_CHECK_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_NATIVE_CHECK_BYTES {
+        return Ok(NativeSource::TooLarge);
+    }
+    String::from_utf8(bytes)
+        .map(NativeSource::Text)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e))
+}
+
 /// A finding a [`Checker`] reports against a specific line of a file. Formatted by
 /// callers as `{file}:{line}: {message}` — the convention `check.rs`'s diff-scoping
 /// parser depends on, so don't change this shape without updating that parser too.
@@ -79,7 +121,7 @@ impl Language {
     /// added, so every `.rs` file was skipped for architecture-export/LSP-symbol
     /// purposes with no error, only an easy-to-miss stat. `arch_export.rs`'s copy had
     /// the identical gap, independently. Nothing forced any of them to stay in sync.
-    fn extensions(self) -> &'static [&'static str] {
+    pub(crate) fn extensions(self) -> &'static [&'static str] {
         match self {
             Language::Go => &["go"],
             Language::TypeScript => &["ts"],
@@ -90,6 +132,16 @@ impl Language {
             Language::Kotlin => &["kt", "kts"],
             Language::Rust => &["rs"],
         }
+    }
+
+    /// A `**/*.<ext>` glob for every extension of every language, for checks that apply to
+    /// all grammar-backed files.
+    pub(crate) fn all_globs() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .flat_map(|lang| lang.extensions())
+            .map(|ext| format!("**/*.{ext}"))
+            .collect()
     }
 
     /// Maps a file extension (no leading `.`) to the `Language` that parses it.
@@ -131,6 +183,17 @@ pub trait Checker {
     /// Run the check against `file`'s already-loaded `ctx`.
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>>;
 
+    /// [`check`](Checker::check) given the run's directive-scan memo, so a checker that reads
+    /// inline directives shares the scan the ignore pass does. Defaults to `check`.
+    fn check_with_scans(
+        &self,
+        file: &Path,
+        ctx: &CheckContext,
+        _scans: &crate::inline_ignores::ScanMemo,
+    ) -> Result<Vec<Finding>> {
+        self.check(file, ctx)
+    }
+
     /// Reconfigures this checker using a project's per-check `options` object
     /// (`config::Check::options`, from `.kibitzer/inspect.json`). The default,
     /// inherited by every checker that doesn't override it, ignores `options` and
@@ -142,6 +205,12 @@ pub trait Checker {
     /// specifically so a typo fails loudly there instead of silently at check time.
     fn configure(&self, _options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
         Ok(None)
+    }
+
+    /// Whether a file that cannot be read as UTF-8 text is a pass rather than a failure.
+    /// True only for a checker that runs on every walked file, binary ones included.
+    fn tolerates_unreadable_files(&self) -> bool {
+        false
     }
 }
 
@@ -194,11 +263,29 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
 /// per-project `Check` in scope (`backtest.rs`'s reconstructed-history runs, most tests)
 /// use [`run_checker_with_cache`] directly instead, passing `None`-equivalent behavior by
 /// simply not calling `configure` at all.
+#[cfg(test)]
 pub fn run_checker_configured(
     checker_name: &str,
     file: &Path,
     source: &str,
     options: Option<&serde_json::Value>,
+) -> Result<Vec<Finding>> {
+    run_checker_configured_with_scans(
+        checker_name,
+        file,
+        source,
+        options,
+        &crate::inline_ignores::ScanMemo::default(),
+    )
+}
+
+/// [`run_checker_configured`] sharing `scans` with the caller's inline-ignore pass.
+pub fn run_checker_configured_with_scans(
+    checker_name: &str,
+    file: &Path,
+    source: &str,
+    options: Option<&serde_json::Value>,
+    scans: &crate::inline_ignores::ScanMemo,
 ) -> Result<Vec<Finding>> {
     let checker = lookup(checker_name)
         .ok_or_else(|| anyhow::anyhow!("no checker named '{checker_name}' registered"))?;
@@ -207,7 +294,7 @@ pub fn run_checker_configured(
         None => checker,
     };
     let cache = GrammarCache::new();
-    run_checker_with_cache(checker.as_ref(), file, source, &cache)
+    run_checker_on_tree(checker.as_ref(), file, source, &cache, scans)
 }
 
 /// The parse-then-check step [`run_checker_configured`] delegates to once it has a
@@ -223,6 +310,22 @@ pub fn run_checker_with_cache(
     source: &str,
     cache: &GrammarCache,
 ) -> Result<Vec<Finding>> {
+    run_checker_on_tree(
+        checker,
+        file,
+        source,
+        cache,
+        &crate::inline_ignores::ScanMemo::default(),
+    )
+}
+
+fn run_checker_on_tree(
+    checker: &dyn Checker,
+    file: &Path,
+    source: &str,
+    cache: &GrammarCache,
+    scans: &crate::inline_ignores::ScanMemo,
+) -> Result<Vec<Finding>> {
     let tree = match checker.language() {
         Some(language) => Some(cache.parse(language, source)?),
         None => None,
@@ -231,7 +334,7 @@ pub fn run_checker_with_cache(
         source,
         tree: tree.as_ref(),
     };
-    checker.check(file, &ctx)
+    checker.check_with_scans(file, &ctx, scans)
 }
 
 /// Parses at most once per [`Language`] over this cache instance's lifetime, regardless

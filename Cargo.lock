@@ -719,6 +719,7 @@ dependencies = [
  "clap",
  "inventory",
  "kibitzer-stub-plugin",
+ "libc",
  "pulldown-cmark",
  "regex",
  "rmcp",
@@ -736,6 +737,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "unicode-ident",
  "ureq",
 ]
 

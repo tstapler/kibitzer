@@ -109,76 +109,100 @@ fn extract_rule<'a>(message: &'a str, fallback: &'a str) -> &'a str {
         .unwrap_or(fallback)
 }
 
-/// Output of [`filter_accepted`]: the filtered text plus whether anything was
-/// actually dropped from it, so a caller recomputing `passed` can tell "genuinely
-/// clean" from "clean only because every finding was accepted away."
-pub(crate) struct FilterOutcome {
-    pub output: String,
-    // `drop_accepted_findings` derives `passed` from `output` alone (empty vs.
-    // non-empty) rather than from this flag — read by this module's own tests, not
-    // yet consumed by any production caller, hence `#[allow(dead_code)]`.
-    #[allow(dead_code)]
-    pub dropped_any: bool,
+/// The lines of one file an [`AcceptedFinding`] may match, ready to test output lines one at
+/// a time.
+pub(crate) struct AcceptedLines<'a> {
+    accepted: &'a AcceptedFindings,
+    rel_file: &'a str,
+    checker_name: &'a str,
+    prefix: String,
+    source_lines: Vec<String>,
 }
 
-/// Drops any line of `output` (the `{file}:{line}: {message}` convention every native
-/// and shell-out check's output follows) matching an [`AcceptedFinding`] whose
-/// recorded `content` still agrees with `file_path`'s current line — same
-/// line-oriented parsing as `check::scope_output_to_changed_lines`, since
-/// `CheckResult` carries no structured per-finding data for these check kinds (only
-/// architecture checks do, via `ArchFinding`, out of scope here — see
-/// `docs/accepting-findings.md`).
-pub fn filter_accepted(
-    output: &str,
-    file_path: &Path,
-    rel_file: &str,
-    checker_name: &str,
-    accepted: &AcceptedFindings,
-) -> FilterOutcome {
-    // Only worth reading the file at all if some entry actually names it — most
-    // repos' accepted-findings entries, if any exist, are scattered across many
-    // files, so this skips a disk read for every other file being checked.
-    if !accepted.accepted.iter().any(|e| e.file == rel_file) {
-        return FilterOutcome {
-            output: output.to_string(),
-            dropped_any: false,
-        };
+impl<'a> AcceptedLines<'a> {
+    /// `None` when no entry names `rel_file`: most repos' entries are scattered across many
+    /// files, so this skips a disk read for every other file being checked.
+    pub(crate) fn for_file(
+        file_path: &Path,
+        rel_file: &'a str,
+        checker_name: &'a str,
+        accepted: &'a AcceptedFindings,
+    ) -> Option<Self> {
+        if !accepted.accepted.iter().any(|e| e.file == rel_file) {
+            return None;
+        }
+        let source = std::fs::read_to_string(file_path).unwrap_or_default();
+        Some(AcceptedLines {
+            accepted,
+            rel_file,
+            checker_name,
+            prefix: format!("{}:", file_path.display()),
+            source_lines: source.lines().map(str::to_string).collect(),
+        })
     }
-    let source = std::fs::read_to_string(file_path).unwrap_or_default();
-    let source_lines: Vec<&str> = source.lines().collect();
 
-    let prefix = format!("{}:", file_path.display());
-    let mut kept = Vec::new();
-    let mut dropped_any = false;
-
-    for line in output.lines() {
-        let matched = (|| {
-            let rest = line.strip_prefix(&prefix)?;
+    /// Whether `line` (`{file}:{line}: {message}`) matches an entry whose recorded `content`
+    /// still agrees with the file's current line.
+    pub(crate) fn is_accepted(&self, line: &str) -> bool {
+        (|| {
+            let rest = line.strip_prefix(&self.prefix)?;
             let (line_no_str, message) = rest.split_once(": ")?;
             let line_no: usize = line_no_str.parse().ok()?;
-            let entry =
-                accepted.candidate(extract_rule(message, checker_name), rel_file, line_no)?;
-            let current = source_lines.get(line_no.saturating_sub(1))?.trim();
+            let entry = self.accepted.candidate(
+                extract_rule(message, self.checker_name),
+                self.rel_file,
+                line_no,
+            )?;
+            let current = self.source_lines.get(line_no.saturating_sub(1))?.trim();
             (entry.content.trim() == current).then_some(())
         })()
-        .is_some();
-
-        if matched {
-            dropped_any = true;
-        } else {
-            kept.push(line);
-        }
-    }
-
-    FilterOutcome {
-        output: kept.join("\n"),
-        dropped_any,
+        .is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FilterOutcome {
+        output: String,
+        dropped_any: bool,
+    }
+
+    /// Text-level view of [`AcceptedLines`]: `output` minus the accepted lines.
+    fn filter_accepted(
+        output: &str,
+        file_path: &Path,
+        rel_file: &str,
+        checker_name: &str,
+        accepted: &AcceptedFindings,
+    ) -> FilterOutcome {
+        let Some(lines) = AcceptedLines::for_file(file_path, rel_file, checker_name, accepted)
+        else {
+            return FilterOutcome {
+                output: output.to_string(),
+                dropped_any: false,
+            };
+        };
+        let (dropped, kept): (Vec<&str>, Vec<&str>) =
+            output.lines().partition(|line| lines.is_accepted(line));
+        FilterOutcome {
+            output: kept.join("\n"),
+            dropped_any: !dropped.is_empty(),
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn accepted_findings_should_DeserializeUnchanged_When_UnknownInlineKeyPresent() {
+        let parsed: AcceptedFindings =
+            serde_json::from_str(r#"{"accepted": [], "inline": {"mode": "Disabled"}}"#).unwrap();
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(
+            crate::run_context::RunContext::new(parsed).inline.mode,
+            crate::inline_ignores::InlineIgnoreMode::Apply
+        );
+    }
 
     #[test]
     fn extract_rule_reads_the_bracket_prefix() {

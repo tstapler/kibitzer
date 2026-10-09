@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 
@@ -7,6 +8,8 @@ use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
 use crate::config::{Check, Severity, find_effective_config};
+use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
+use crate::inline_ignores::{InlineIgnoreMode, batch_syntax_hint};
 
 fn severity_label(severity: Severity) -> &'static str {
     match severity {
@@ -47,27 +50,40 @@ fn has_blocking_finding(result: &CheckResult) -> bool {
 /// non-empty (architecture/declaration checkers), one line PER FINDING using that
 /// finding's own effective severity, instead of a single line stamped with
 /// `result.severity` for the whole check — see `has_blocking_finding` above for why.
-fn report_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
+fn report_lines(file: &Path, result: &CheckResult) -> Vec<String> {
     if result.passed {
         return Vec::new();
     }
-    if result.findings.is_empty() {
-        return vec![format!(
+    let file_display = file.display();
+    let mut lines = if result.findings.is_empty() {
+        vec![format!(
             "[{}] {} — {}: {}",
             severity_label(result.severity),
             file_display,
             result.check_name,
             result.describe()
-        )];
+        )]
+    } else {
+        finding_lines(&file_display.to_string(), result)
+    };
+    // Findings are another checker's text and may echo a hostile file name or ref label.
+    let mut paths: Vec<&Path> = vec![file];
+    paths.extend(result.findings.iter().filter_map(|f| f.file.as_deref()));
+    for line in &mut lines {
+        *line = strip_unsafe_with_paths(line, &paths);
     }
+    lines
+}
+
+fn finding_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
     result
         .findings
         .iter()
         .map(|finding| {
             let level = finding.severity_override.unwrap_or(result.severity);
             let location = match (&finding.file, finding.line) {
-                (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
-                (Some(file), None) => format!("{}: ", file.display()),
+                (Some(file), Some(line)) => format!("{}:{}: ", display_path(file), line),
+                (Some(file), None) => format!("{}: ", display_path(file)),
                 (None, _) => String::new(),
             };
             format!(
@@ -90,8 +106,17 @@ fn report_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
 /// and must run exactly once per batch invocation, not once per matched file — otherwise an
 /// N-file repo re-runs an already-whole-repo command N times (confirmed: ~22x, >90s, against
 /// design-docs' ~22 markdown files).
-pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) = run_batch_collect(&dir, trigger)?;
+///
+/// `deny_blocking_suppression` also fails the run (exit 1) when any finding of a blocking
+/// check was suppressed inline, so CI can refuse a `kibitzer:ignore` on a blocking check.
+pub fn run_batch(
+    dir: PathBuf,
+    trigger: &str,
+    mode: InlineIgnoreMode,
+    deny_blocking_suppression: bool,
+) -> Result<ExitCode> {
+    let (any_blocking_failure, lines) =
+        run_batch_collect(&dir, trigger, mode, deny_blocking_suppression)?;
     for line in &lines {
         println!("{line}");
     }
@@ -106,7 +131,12 @@ pub fn run_batch(dir: PathBuf, trigger: &str) -> Result<ExitCode> {
 /// it can be exercised end to end in tests without capturing the process's real stdout:
 /// returns whether any check hit a genuine blocking failure, plus every rendered report
 /// line in print order (see `report_lines`).
-fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
+fn run_batch_collect(
+    dir: &Path,
+    trigger: &str,
+    mode: InlineIgnoreMode,
+    deny_blocking_suppression: bool,
+) -> Result<(bool, Vec<String>)> {
     let (config, repo_root) = find_effective_config(dir)?;
 
     let arch_config = config.architecture.clone();
@@ -115,6 +145,8 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
 
     let mut any_blocking_failure = false;
     let mut lines = Vec::new();
+    // Only a native, anchored finding can be dismissed by a directive (as in the hook and MCP).
+    let mut any_dismissible = false;
 
     let files = walk_and_collect_files(dir)?;
     // Loaded once for the whole batch (every repo-level check below, every file-level
@@ -126,7 +158,7 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
     // `accepted_findings::ACCEPTED_FINDINGS_DIR` must surface as one clean error here,
     // before any file's checks run, rather than failing nondeterministically mid-batch
     // depending on file-walk order.
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let run_ctx = crate::run_context::RunContext::for_batch(&repo_root, mode)?;
 
     for check in &repo_checks {
         if !check.triggers.is_empty() && !check.triggers.iter().any(|t| t == trigger) {
@@ -135,31 +167,53 @@ fn run_batch_collect(dir: &Path, trigger: &str) -> Result<(bool, Vec<String>)> {
         let result = if check.architecture_checker.is_some() {
             run_architecture_check(check, &repo_root, &files, &arch_config)?
         } else {
-            run_check(check, &repo_root, &repo_root, None, &registry, &accepted)?
+            run_check(check, &repo_root, &repo_root, None, &registry, &run_ctx)?
         };
         if !result.passed && has_blocking_finding(&result) {
             any_blocking_failure = true;
         }
-        lines.extend(report_lines(&repo_root.display().to_string(), &result));
+        any_dismissible |= !result.passed && result.inline.first_anchor().is_some();
+        lines.extend(report_lines(&repo_root, &result));
     }
 
     for file in &files {
-        for result in run_checks_for_trigger(
+        let results = run_checks_for_trigger(
             &file_checks,
             trigger,
             &repo_root,
             file,
             None,
             &registry,
-            &accepted,
-        )? {
-            if !result.passed && has_blocking_finding(&result) {
+            &run_ctx,
+        )?;
+        // With ignores disabled nothing is ever dropped, so every rule would look unknown.
+        let audit = if mode == InlineIgnoreMode::Disabled {
+            Vec::new()
+        } else {
+            crate::inline_post_pass::unknown_rule_advisories(file, &results, &run_ctx)
+        };
+        for result in results.iter().chain(&audit) {
+            if !result.passed && has_blocking_finding(result) {
                 any_blocking_failure = true;
             }
-            lines.extend(report_lines(&file.display().to_string(), &result));
+            any_dismissible |= !result.passed && result.inline.first_anchor().is_some();
+            lines.extend(report_lines(file, result));
         }
     }
 
+    if any_dismissible {
+        // Teaches the syntax where developers see findings; otherwise it is only in the docs.
+        lines.push(batch_syntax_hint());
+    }
+    let counts = run_ctx.inline.counter.as_ref();
+    lines.extend(counts.and_then(|counts| counts.footer()));
+    let blocking_suppressed = counts.map_or(0, |c| c.blocking.load(Ordering::Relaxed));
+    if deny_blocking_suppression && blocking_suppressed > 0 {
+        any_blocking_failure = true;
+        lines.push(format!(
+            "[kibitzer] failing: {blocking_suppressed} blocking finding(s) suppressed inline and --deny-blocking-suppression is set"
+        ));
+    }
     Ok((any_blocking_failure, lines))
 }
 
@@ -171,6 +225,7 @@ mod tests {
     use crate::config::{Check, Severity};
 
     use super::run_batch_collect;
+    use crate::inline_ignores::InlineIgnoreMode;
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -257,7 +312,8 @@ mod tests {
         let dir = tmp_dir("zero-match-under-blocking");
         write_zero_match_only_component_deps_fixture(&dir);
 
-        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual").unwrap();
+        let (any_blocking_failure, lines) =
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -291,7 +347,8 @@ mod tests {
         let dir = tmp_dir("real-violation-stays-blocking");
         write_real_component_deps_violation_fixture(&dir);
 
-        let (any_blocking_failure, lines) = run_batch_collect(&dir, "manual").unwrap();
+        let (any_blocking_failure, lines) =
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 

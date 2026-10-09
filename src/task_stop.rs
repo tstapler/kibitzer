@@ -26,6 +26,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
+
 /// The trigger name `Stop`-hook checks run under — distinct from `"batch"` (manual/CI
 /// whole-repo sweeps) and `"PostToolUse"` (per-edit, diff-scoped) even though, like
 /// batch, it runs checks unscoped. Only per-file checks that opt in via
@@ -201,6 +203,8 @@ fn run_stop_hook_with_offsets_path(
         files.len()
     );
     context.push_str(&lines_out.join("\n"));
+    let echoed: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    let context = strip_unsafe_with_paths(&context, &echoed);
 
     let payload = serde_json::json!({
         "hookSpecificOutput": {
@@ -230,14 +234,14 @@ fn stop_hook_findings_for_files(cwd: &Path, files: &BTreeSet<PathBuf>) -> Result
             // spurious "couldn't read file" finding.
             continue;
         }
-        let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None)?;
+        let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None, false)?;
         for result in results.iter().filter(|r| !r.passed) {
             if predates_git_head(&config, &repo_root, file, result) {
                 continue;
             }
             lines_out.push(format!(
                 "{}: {}: {}",
-                file.display(),
+                display_path(file),
                 result.check_name,
                 result.describe()
             ));

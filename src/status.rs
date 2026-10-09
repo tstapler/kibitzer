@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::check::CheckResult;
 use crate::hook_log::log_path;
+use crate::inline_ignores::sanitize::{display_path, escape_path};
 
 #[derive(Deserialize)]
 struct HookLogEntry {
@@ -22,11 +23,34 @@ struct HookLogEntry {
     blocked: bool,
 }
 
+/// A daemon note line `hook_log::note` wrote; not a hook firing.
+#[derive(Deserialize)]
+struct DegradeNote {
+    #[allow(dead_code)]
+    event: String,
+}
+
 #[derive(Default)]
 struct CheckStats {
     fired: u64,
     failed: u64,
     blocked: u64,
+}
+
+/// Daemon notes still in force: a degrade clears itself once a hook reaches a usable runtime
+/// directory, so what prints here is current, with its age.
+fn print_current_notes(now: u64) {
+    for (ts, kind, text) in crate::hook_log::current_notes() {
+        let label = match kind {
+            crate::hook_log::NoteKind::Degraded => "Hooks ran without the daemon",
+            crate::hook_log::NoteKind::Fallback => "Runtime directory fallback",
+        };
+        println!(
+            "\n{label} ({}): {}",
+            format_age(now.saturating_sub(ts)),
+            escape_path(&text)
+        );
+    }
 }
 
 fn format_age(secs_ago: u64) -> String {
@@ -52,7 +76,7 @@ pub fn run_status() -> Result<ExitCode> {
         Err(_) => {
             println!(
                 "No hook log found at {} — the PostToolUse hook hasn't fired yet.",
-                path.display()
+                display_path(&path)
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -70,6 +94,9 @@ pub fn run_status() -> Result<ExitCode> {
         if line.trim().is_empty() {
             continue;
         }
+        if serde_json::from_str::<DegradeNote>(line).is_ok() {
+            continue;
+        }
         let entry: HookLogEntry = match serde_json::from_str(line) {
             Ok(entry) => entry,
             Err(_) => {
@@ -84,10 +111,10 @@ pub fn run_status() -> Result<ExitCode> {
         if entry.blocked {
             blocked_total += 1;
         }
-        *by_repo.entry(entry.cwd.display().to_string()).or_default() += 1;
+        *by_repo.entry(display_path(&entry.cwd)).or_default() += 1;
 
         for result in &entry.results {
-            let stats = by_check.entry(result.check_name.clone()).or_default();
+            let stats = by_check.entry(escape_path(&result.check_name)).or_default();
             stats.fired += 1;
             if !result.passed {
                 stats.failed += 1;
@@ -101,7 +128,7 @@ pub fn run_status() -> Result<ExitCode> {
     if total == 0 {
         println!(
             "Hook log at {} exists but has no parseable entries yet.",
-            path.display()
+            display_path(&path)
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -111,7 +138,7 @@ pub fn run_status() -> Result<ExitCode> {
         .map(|d| d.as_secs())
         .unwrap_or(last_ts);
 
-    println!("kibitzer hook log: {}", path.display());
+    println!("kibitzer hook log: {}", display_path(&path));
     println!("{total} firings ({blocked_total} blocked, {unparsed} unparsed lines skipped)");
     println!(
         "first: {}, last: {}",
@@ -135,6 +162,8 @@ pub fn run_status() -> Result<ExitCode> {
     for (repo, count) in repos {
         println!("  {count:>5}  {repo}");
     }
+
+    print_current_notes(now);
 
     Ok(ExitCode::SUCCESS)
 }

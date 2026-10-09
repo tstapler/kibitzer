@@ -8,22 +8,28 @@ mod backtest;
 mod cache;
 mod change_coupling;
 mod check;
+mod check_result;
 mod checker;
 mod checkers;
 mod config;
 mod daemon;
+mod daemon_lock;
 mod declaration_checks;
 mod declarations;
 mod dedup;
 mod extract_class;
 mod false_positive;
+mod git_cmd;
 mod glob;
 mod go_call_resolution;
 mod god_class;
 mod hook;
+mod hook_footer;
 mod hook_log;
 mod hotspots;
 mod import_graph;
+mod inline_ignores;
+mod inline_post_pass;
 mod install;
 mod isp_fat_interface;
 mod jaccard;
@@ -35,6 +41,7 @@ mod node_kind;
 mod plugin;
 mod root_cause_clusters;
 mod run;
+mod run_context;
 mod schema;
 mod single_call_site_delegation;
 mod status;
@@ -49,6 +56,7 @@ mod unreferenced_symbols;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -67,6 +75,12 @@ enum Command {
         dir: PathBuf,
         #[arg(long, default_value = "batch")]
         trigger: String,
+        /// Report findings that `kibitzer:ignore` comments would otherwise hide.
+        #[arg(long)]
+        no_inline_ignores: bool,
+        /// Exit nonzero when any finding of a blocking check was suppressed inline.
+        #[arg(long)]
+        deny_blocking_suppression: bool,
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
@@ -331,7 +345,21 @@ enum DaemonAction {
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { dir, trigger } => run::run_batch(dir, &trigger),
+        Command::Run {
+            dir,
+            trigger,
+            no_inline_ignores,
+            deny_blocking_suppression,
+        } => run::run_batch(
+            dir,
+            &trigger,
+            if no_inline_ignores {
+                inline_ignores::InlineIgnoreMode::Disabled
+            } else {
+                inline_ignores::InlineIgnoreMode::Apply
+            },
+            deny_blocking_suppression,
+        ),
         Command::Hook => hook::run_hook(),
         Command::Mcp => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -344,23 +372,54 @@ fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon { action } => match action {
-            DaemonAction::Start => {
-                daemon::run_daemon(&daemon::default_socket_path())?;
-                Ok(ExitCode::SUCCESS)
-            }
+            DaemonAction::Start => match daemon::socket_path() {
+                Ok(socket) => {
+                    daemon::run_daemon(&socket)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(rejected) => {
+                    eprintln!("[kibitzer] refusing to start a daemon: {rejected}");
+                    Ok(ExitCode::from(1))
+                }
+            },
             DaemonAction::Stop => {
-                if daemon::shutdown() {
-                    println!("[kibitzer] daemon stopped");
-                } else {
-                    println!("[kibitzer] no daemon was running");
+                match daemon::shutdown() {
+                    daemon::ShutdownOutcome::Stopped => println!("[kibitzer] daemon stopped"),
+                    daemon::ShutdownOutcome::Killed => {
+                        println!("[kibitzer] daemon was not responding; terminated it");
+                    }
+                    daemon::ShutdownOutcome::Unresponsive { pid } => {
+                        println!(
+                            "[kibitzer] daemon{} is not responding and could not be verified as a kibitzer daemon; stop it by hand",
+                            pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+                        );
+                        return Ok(ExitCode::from(1));
+                    }
+                    daemon::ShutdownOutcome::NotRunning => {
+                        println!("[kibitzer] no daemon was running");
+                    }
+                    daemon::ShutdownOutcome::UntrustedDir(rejected) => {
+                        println!("[kibitzer] {}", daemon::untrusted_message(&rejected));
+                        return Ok(ExitCode::from(1));
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
             DaemonAction::Status => {
-                if daemon::is_alive() {
-                    println!("[kibitzer] daemon is running");
-                } else {
-                    println!("[kibitzer] no daemon running");
+                match daemon::state() {
+                    Ok(daemon::DaemonState::Running) => println!("[kibitzer] daemon is running"),
+                    Ok(daemon::DaemonState::NotRunning) => println!("[kibitzer] no daemon running"),
+                    Ok(daemon::DaemonState::NotResponding { pid }) => {
+                        println!(
+                            "[kibitzer] daemon not responding{}",
+                            pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+                        );
+                        return Ok(ExitCode::from(1));
+                    }
+                    Err(rejected) => {
+                        println!("[kibitzer] {}", daemon::untrusted_message(&rejected));
+                        return Ok(ExitCode::from(1));
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -400,7 +459,12 @@ fn main() -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 } else {
                     for finding in &findings {
-                        println!("{}:{}: {}", file.display(), finding.line, finding.message);
+                        println!(
+                            "{}:{}: {}",
+                            display_path(&file),
+                            finding.line,
+                            strip_unsafe_with_paths(&finding.message, &[&file])
+                        );
                     }
                     Ok(ExitCode::from(1))
                 }
@@ -649,13 +713,20 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let dir_marker = dir.join("_");
     for finding in &findings {
         let location = match (&finding.file, finding.line) {
-            (Some(file), Some(line)) => format!("{}:{}: ", file.display(), line),
-            (Some(file), None) => format!("{}: ", file.display()),
+            (Some(file), Some(line)) => format!("{}:{}: ", display_path(file), line),
+            (Some(file), None) => format!("{}: ", display_path(file)),
             (None, _) => String::new(),
         };
-        println!("{location}{}", finding.message);
+        // The message can name package directories under `dir`, so escape those siblings too.
+        let mut paths: Vec<&Path> = vec![dir_marker.as_path()];
+        paths.extend(finding.file.as_deref());
+        println!(
+            "{location}{}",
+            strip_unsafe_with_paths(&finding.message, &paths)
+        );
     }
     Ok(ExitCode::from(1))
 }
@@ -835,7 +906,7 @@ fn print_cross_file_duplicates(duplicates: &[checkers::duplicate_code::CrossFile
         let locations: Vec<String> = dup
             .occurrences
             .iter()
-            .map(|o| format!("{}:{}", o.file.display(), o.line))
+            .map(|o| format!("{}:{}", display_path(&o.file), o.line))
             .collect();
         let file_count = dup
             .occurrences
@@ -846,7 +917,7 @@ fn print_cross_file_duplicates(duplicates: &[checkers::duplicate_code::CrossFile
         let first = &dup.occurrences[0];
         println!(
             "{}:{}: block repeated {} times across {file_count} files (locations: {}) — consider extracting a shared function",
-            first.file.display(),
+            display_path(&first.file),
             first.line,
             dup.occurrences.len(),
             locations.join(", ")

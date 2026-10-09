@@ -11,6 +11,7 @@ use crate::arch_model::{self, ArchModel, ModelCache, PackageNode, SymbolNode};
 use crate::check::{CheckResult, run_checks_for_trigger};
 use crate::checker::GrammarCache;
 use crate::config::{Severity, find_effective_config};
+use crate::inline_ignores::sanitize::strip_unsafe_with_paths;
 use crate::symbol_extract::extract_symbols_for_file;
 
 /// Trigger name checks opt into via `.kibitzer/inspect.json`'s `triggers` field to run under
@@ -58,7 +59,7 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
                 },
                 severity: Some(severity),
                 source: Some(result.check_name.clone()),
-                message: message.trim().to_string(),
+                message: strip_unsafe_with_paths(message.trim(), &[file_path]),
                 ..Default::default()
             });
         }
@@ -69,7 +70,7 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
             range: Range::new(Position::new(0, 0), Position::new(0, u32::MAX)),
             severity: Some(severity),
             source: Some(result.check_name.clone()),
-            message: result.describe(),
+            message: strip_unsafe_with_paths(&result.describe(), &[file_path]),
             ..Default::default()
         });
     }
@@ -82,7 +83,8 @@ fn diagnostics_from_result(result: &CheckResult, file_path: &Path) -> Vec<Diagno
 fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
     let (config, repo_root) = find_effective_config(path)?;
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    run_ctx.skip_whole_file_advisories = true;
     let results = run_checks_for_trigger(
         &config.checks,
         LSP_TRIGGER,
@@ -90,7 +92,7 @@ fn diagnostics_for_file(path: &Path) -> anyhow::Result<Vec<Diagnostic>> {
         path,
         None,
         &registry,
-        &accepted,
+        &run_ctx,
     )?;
     Ok(results
         .iter()
@@ -577,16 +579,14 @@ mod tests {
     use std::sync::atomic::AtomicU64 as TestAtomicU64;
 
     fn result(severity: Severity, passed: bool, output: &str) -> CheckResult {
-        CheckResult {
-            check_name: "test-check".to_string(),
+        CheckResult::new(
+            "test-check".to_string(),
             severity,
             passed,
-            output: output.to_string(),
-            message: None,
-            command: "true".to_string(),
-            findings: Vec::new(),
-            plugin_missing: false,
-        }
+            output.to_string(),
+        )
+        .with_command("true".to_string())
+        .with_inline(crate::inline_ignores::InlineOutcome::default())
     }
 
     #[test]

@@ -6,19 +6,27 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::accepted_findings::{AcceptedFindings, FilterOutcome};
+use crate::accepted_findings::AcceptedLines;
+pub use crate::check_result::CheckResult;
 use crate::config::{Check, OutputFormat, Severity};
+use crate::git_cmd::{
+    ARCHIVE_TIMEOUT, BASELINE_TIMEOUT, HOOK_GIT_BUDGET, bounded_output, git_command,
+    with_git_budget,
+};
 use crate::glob::matches_scope;
+use crate::inline_ignores::sanitize::display_path;
+use crate::inline_ignores::{
+    DroppedFinding, IgnoreTarget, InlineIgnoreContext, InlineOutcome, Line, RawFinding,
+    anchor_rule, apply_inline_ignores, capped_anchors,
+};
+use crate::inline_post_pass::HeadSnapshot;
 use crate::plugin::Registry;
+use crate::run_context::RunContext;
 
-/// Beyond this many lines, `describe()` truncates the command's raw output and points
-/// the agent at `command` to see the rest, instead of dumping everything inline —
-/// checks like whole-repo doc-structure reports can emit hundreds of lines, which
-/// buries the actionable part of the message and burns the agent's context on a single
-/// failed check.
-const MAX_SUMMARY_LINES: usize = 20;
+mod finding_lines;
+use finding_lines::FindingLines;
 
 /// Wall-clock ceiling on a single `run_check` command dispatch (see
 /// [`run_command_with_timeout`]). Plugin binaries are the class of `command` check most
@@ -27,139 +35,12 @@ const MAX_SUMMARY_LINES: usize = 20;
 /// plugin-backed ones.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckResult {
-    pub check_name: String,
-    pub severity: Severity,
-    pub passed: bool,
-    pub output: String,
-    pub message: Option<String>,
-    /// The shell command that produced `output`, substitutions already applied — shown
-    /// in the truncation note so the agent can re-run it directly to see everything.
-    /// `serde(default)` so a `cache.json` written before this field existed deserializes
-    /// (with an empty command) instead of `Cache::load` silently discarding the whole
-    /// cache on the first run after upgrade.
-    #[serde(default)]
-    pub command: String,
-    /// Structured findings behind `output`'s flattened text, populated by
-    /// [`run_architecture_check`] from the checker's own `Vec<ArchFinding>` return value —
-    /// empty for every other `CheckResult` source (shell-out `run_check`, native
-    /// `run_native_check`, `SYNTAX_RULES_CHECKERS` in `mcp.rs`), none of which produce
-    /// `ArchFinding`s. Exists so a renderer can read each finding's own
-    /// `severity_override` instead of only the one `severity` flattened uniformly across
-    /// all of `output` — see `mcp.rs::architecture_assessment`. `#[serde(default)]` for
-    /// the same reason as `command` above: a `cache.json` written before this field
-    /// existed must still deserialize (as an empty `Vec`) instead of `Cache::load`
-    /// silently discarding the whole cache on the first run after upgrade.
-    #[serde(default)]
-    pub findings: Vec<crate::architecture_checks::ArchFinding>,
-    /// `true` iff this result is `run_check`'s early-return for a plugin-backed check
-    /// whose binary is missing from disk (Task 4.3.1b) — distinct from a check that ran
-    /// and failed, so `mcp.rs`/`hook.rs` can render `[skipped]` instead of
-    /// `[Advisory]`/`[Blocking]` and an agent doesn't misdiagnose a missing install as a
-    /// code defect. `#[serde(default)]` for the same cache-compatibility reason as
-    /// `command`/`findings` above.
-    #[serde(default)]
-    pub plugin_missing: bool,
-}
-
-impl CheckResult {
-    /// Text to show the agent for a failed check: a top-level summary by default, with
-    /// an explicit path to the full detail on demand. The config `message` explains
-    /// *why* the rule exists / is blocking; the command's own `output` says *where* the
-    /// violation is. Neither alone is enough to act on, so show both whenever both are
-    /// present — but cap `output` at [`MAX_SUMMARY_LINES`] rather than concatenating an
-    /// unbounded wall of text, and tell the agent how to drill into the rest.
-    pub fn describe(&self) -> String {
-        let summary = self.summarize_output();
-        match (&self.message, summary.is_empty()) {
-            (Some(message), false) => format!("{message}\n{summary}"),
-            (Some(message), true) => message.clone(),
-            (None, _) => summary,
-        }
-    }
-
-    fn summarize_output(&self) -> String {
-        let lines: Vec<&str> = self.output.trim().lines().collect();
-        if lines.len() <= MAX_SUMMARY_LINES {
-            return lines.join("\n");
-        }
-        let shown = lines[..MAX_SUMMARY_LINES].join("\n");
-        let hidden = lines.len() - MAX_SUMMARY_LINES;
-        format!(
-            "{shown}\n… {hidden} more line(s) truncated — see everything, run: {}",
-            self.command
-        )
-    }
-}
-
-#[cfg(test)]
-mod describe_tests {
-    use super::*;
-
-    fn result(message: Option<&str>, output: &str) -> CheckResult {
-        CheckResult {
-            check_name: "test-check".to_string(),
-            severity: Severity::Blocking,
-            passed: false,
-            output: output.to_string(),
-            message: message.map(String::from),
-            command: "some-check-command".to_string(),
-            findings: Vec::new(),
-            plugin_missing: false,
-        }
-    }
-
-    #[test]
-    fn combines_message_and_output_when_both_present() {
-        let r = result(Some("why this is blocking"), "file.md:12: bad anchor");
-        assert_eq!(r.describe(), "why this is blocking\nfile.md:12: bad anchor");
-    }
-
-    #[test]
-    fn falls_back_to_message_when_output_is_empty() {
-        let r = result(Some("why this is blocking"), "");
-        assert_eq!(r.describe(), "why this is blocking");
-    }
-
-    #[test]
-    fn falls_back_to_output_when_no_message_configured() {
-        let r = result(None, "file.md:12: bad anchor");
-        assert_eq!(r.describe(), "file.md:12: bad anchor");
-    }
-
-    #[test]
-    fn truncates_long_output_and_points_to_full_command() {
-        let lines: Vec<String> = (1..=30)
-            .map(|n| format!("file.md:{n}: violation"))
-            .collect();
-        let r = result(None, &lines.join("\n"));
-        let described = r.describe();
-        let described_lines: Vec<&str> = described.lines().collect();
-        assert_eq!(described_lines.len(), MAX_SUMMARY_LINES + 1);
-        assert!(
-            described_lines[..MAX_SUMMARY_LINES]
-                .iter()
-                .zip(&lines)
-                .all(|(a, b)| a == b)
-        );
-        assert!(described.contains("10 more line(s) truncated"));
-        assert!(described.contains("some-check-command"));
-    }
-
-    #[test]
-    fn short_output_is_not_truncated() {
-        let r = result(None, "one\ntwo\nthree");
-        assert_eq!(r.describe(), "one\ntwo\nthree");
-    }
-}
-
 /// Run a single check against `file_path` (already confirmed in-scope by the caller).
 /// `changed_lines`, when present, scopes the result to findings that fall within those
 /// 1-indexed inclusive line ranges — see [`scope_output_to_changed_lines`]. `registry`
 /// should be loaded once per batch/request by the caller (see [`run_checks_for_trigger`])
 /// rather than reloaded here — `registry.json` is read on every plugin-missing check
-/// otherwise, even for a repo with zero plugins installed. `accepted` is likewise loaded
+/// otherwise, even for a repo with zero plugins installed. `run_ctx` is likewise loaded
 /// once per batch/request by the caller, for the same reason (see
 /// [`run_checks_for_trigger`]'s doc comment).
 pub fn run_check(
@@ -168,17 +49,19 @@ pub fn run_check(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     registry: &Registry,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
-    run_check_with_timeout(
-        check,
-        repo_root,
-        file_path,
-        changed_lines,
-        COMMAND_TIMEOUT,
-        registry,
-        accepted,
-    )
+    with_git_budget(HOOK_GIT_BUDGET, || {
+        run_check_with_timeout(
+            check,
+            repo_root,
+            file_path,
+            changed_lines,
+            COMMAND_TIMEOUT,
+            registry,
+            run_ctx,
+        )
+    })
 }
 
 /// Parameterized-timeout counterpart to [`run_check`] — the real entry point calls this
@@ -191,7 +74,7 @@ fn run_check_with_timeout(
     changed_lines: Option<&[(usize, usize)]>,
     timeout: Duration,
     registry: &Registry,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
     if let Some(checker_name) = &check.checker {
         return run_native_check(
@@ -200,7 +83,7 @@ fn run_check_with_timeout(
             repo_root,
             file_path,
             changed_lines,
-            accepted,
+            run_ctx,
         );
     }
 
@@ -213,16 +96,7 @@ fn run_check_with_timeout(
         // than falling through to the `command`-only branch below, which would panic on
         // `check.command` being unset (an architecture check has neither `command` nor
         // `checker`).
-        return Ok(CheckResult {
-            check_name: check.name.clone(),
-            severity: check.severity,
-            passed: true,
-            output: String::new(),
-            message: None,
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: false,
-        });
+        return Ok(CheckResult::passing(check.name.clone(), check.severity));
     }
 
     // Task 4.3.1b: a plugin-backed check (always `command`-based, never `checker`) whose
@@ -232,23 +106,28 @@ fn run_check_with_timeout(
     // indistinguishable from a real check failure. Severity is forced to `Advisory`
     // regardless of `check.severity` so a missing install never blocks an edit.
     if let Some(binary_path) = registry.missing_binary_for(&check.name) {
-        return Ok(CheckResult {
-            check_name: check.name.clone(),
-            severity: Severity::Advisory,
-            passed: false,
-            output: String::new(),
-            message: Some(format!(
+        return Ok(CheckResult::new(check.name.clone(), Severity::Advisory, false, String::new())
+.with_message(Some(format!(
                 "plugin '{}' is not installed (expected binary at {}) — run `kibitzer plugin install {}`",
                 check.name,
                 binary_path.display(),
                 check.name
-            )),
-            command: String::new(),
-            findings: Vec::new(),
-            plugin_missing: true,
-        });
+            )))
+.with_plugin_missing());
     }
 
+    run_shell_command_check(check, repo_root, file_path, changed_lines, timeout)
+}
+
+/// The `command`-based path: runs the shell command (killed after `timeout`), renders its
+/// output, diff-scopes it, and downgrades a blocking failure that predates the edit.
+fn run_shell_command_check(
+    check: &Check,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    timeout: Duration,
+) -> anyhow::Result<CheckResult> {
     let command = check
         .command
         .as_deref()
@@ -258,23 +137,21 @@ fn run_check_with_timeout(
     let output = match run_command_with_timeout(&cmd_str, repo_root, timeout)? {
         CommandOutcome::Completed(output) => output,
         CommandOutcome::TimedOut => {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: false,
-                output: format!("command timed out after {timeout:?} and was killed: {cmd_str}"),
-                message: Some(format!(
-                    "{}check timed out after {timeout:?} and was killed",
-                    check
-                        .message
-                        .as_ref()
-                        .map(|m| format!("{m} — "))
-                        .unwrap_or_default()
-                )),
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-            });
+            return Ok(CheckResult::new(
+                check.name.clone(),
+                check.severity,
+                false,
+                format!("command timed out after {timeout:?} and was killed: {cmd_str}"),
+            )
+            .with_message(Some(format!(
+                "{}check timed out after {timeout:?} and was killed",
+                check
+                    .message
+                    .as_ref()
+                    .map(|m| format!("{m} — "))
+                    .unwrap_or_default()
+            )))
+            .with_command(cmd_str));
         }
     };
 
@@ -310,32 +187,16 @@ fn run_check_with_timeout(
         passed_raw
     };
 
-    let mut severity = check.severity;
-    let mut message = check.message.clone();
+    let (severity, message) =
+        downgrade_if_predates(passed, check.severity, check.message.clone(), || {
+            command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+        });
 
-    if !passed && severity == Severity::Blocking {
-        let baseline =
-            command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines);
-        if let Some(false) = baseline {
-            severity = Severity::Advisory;
-            message = Some(format!(
-                "{} (downgraded: this violation predates your edits — already present \
-                 at the git HEAD commit)",
-                message.unwrap_or_default()
-            ));
-        }
-    }
-
-    Ok(CheckResult {
-        check_name: check.name.clone(),
-        severity,
-        passed,
-        output: combined,
-        message,
-        command: cmd_str,
-        findings: Vec::new(),
-        plugin_missing: false,
-    })
+    Ok(
+        CheckResult::new(check.name.clone(), severity, passed, combined)
+            .with_message(message)
+            .with_command(cmd_str),
+    )
 }
 
 /// Outcome of [`run_command_with_timeout`]: either the child exited (successfully or not —
@@ -425,121 +286,188 @@ fn run_native_check(
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<CheckResult> {
     let cmd_str = format!(
         "kibitzer check native {checker_name} {}",
         file_path.display()
     );
+    let rel_path = relativize(repo_root, file_path);
 
     if let Some(checker) = crate::checker::lookup(checker_name) {
         let globs: Vec<String> = checker.file_globs().iter().map(|g| g.to_string()).collect();
-        let rel_path = relativize(repo_root, file_path);
         if !matches_scope(&rel_path, &globs) {
-            return Ok(CheckResult {
-                check_name: check.name.clone(),
-                severity: check.severity,
-                passed: true,
-                output: String::new(),
-                message: None,
-                command: cmd_str,
-                findings: Vec::new(),
-                plugin_missing: false,
-            });
+            return Ok(
+                CheckResult::passing(check.name.clone(), check.severity).with_command(cmd_str)
+            );
         }
     }
+
+    let run = NativeRun::for_check(check, checker_name, &run_ctx.inline);
 
     // Degrade to a failed CheckResult on error (e.g. an unreadable file) instead of
     // propagating, matching the shell-out path above where a command's own failure is
     // captured as `passed_raw = false` rather than aborting the whole batch — a single
     // bad file shouldn't kill every other check/file in the run.
-    let (mut combined, passed_raw) =
-        match run_checker_against_file(checker_name, file_path, check.options.as_ref()) {
-            Ok(result) => result,
-            Err(err) => {
-                return Ok(CheckResult {
-                    check_name: check.name.clone(),
-                    severity: check.severity,
-                    passed: false,
-                    output: format!("{err:#}"),
-                    message: check.message.clone(),
-                    command: cmd_str,
-                    findings: Vec::new(),
-                    plugin_missing: false,
-                });
-            }
-        };
-
-    let passed = if let Some(ranges) = changed_lines {
-        let (scoped, scoped_passed) =
-            scope_output_to_changed_lines(&combined, file_path, ranges, passed_raw);
-        combined = scoped;
-        scoped_passed
-    } else {
-        passed_raw
+    let SourceCheck {
+        combined,
+        passed: passed_raw,
+        findings: kept_findings,
+        inline: mut inline_outcome,
+    } = match run_checker_against_file(run, file_path) {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(CheckResult::new(
+                check.name.clone(),
+                check.severity,
+                false,
+                format!("{err:#}"),
+            )
+            .with_message(check.message.clone())
+            .with_command(cmd_str));
+        }
     };
 
-    let passed = if passed {
-        passed
-    } else {
-        let outcome =
-            drop_accepted_findings(&combined, repo_root, file_path, checker_name, accepted);
-        combined = outcome.output;
-        combined.trim().is_empty()
-    };
-
-    let mut severity = check.severity;
-    let mut message = check.message.clone();
-
-    if !passed && severity == Severity::Blocking {
-        let baseline = check_native_against_git_head(
-            checker_name,
-            repo_root,
+    let mut lines = FindingLines::new(&kept_findings, file_path);
+    let passed = apply_diff_scope(&mut lines, file_path, changed_lines, passed_raw);
+    let passed = passed
+        || apply_accepted(
+            &mut lines,
             file_path,
-            changed_lines,
-            check.options.as_ref(),
+            &rel_path,
+            checker_name,
+            &run_ctx.accepted,
         );
-        if let Some(false) = baseline {
-            severity = Severity::Advisory;
-            message = Some(format!(
+    let combined = if lines.is_filtered() {
+        lines.text()
+    } else {
+        combined
+    };
+
+    let (severity, message) =
+        downgrade_if_predates(passed, check.severity, check.message.clone(), || {
+            check_native_against_git_head(run, repo_root, file_path, changed_lines)
+        });
+
+    capture_inline_anchors(&mut inline_outcome, checker_name, &kept_findings, &lines);
+
+    Ok(
+        CheckResult::new(check.name.clone(), severity, passed, combined)
+            .with_message(message)
+            .with_command(cmd_str)
+            .with_inline(inline_outcome),
+    )
+}
+
+/// Drops the lines outside `changed_lines` (when the edit is diff-scoped) and returns whether
+/// the check still passes; output that cannot be scoped is left untouched.
+fn apply_diff_scope(
+    lines: &mut FindingLines,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    passed_raw: bool,
+) -> bool {
+    let Some(ranges) = changed_lines else {
+        return passed_raw;
+    };
+    match scope_line_verdicts(&lines.texts(), file_path, ranges, passed_raw) {
+        Some(verdicts) => {
+            lines.retain(&verdicts.keep);
+            verdicts.passed
+        }
+        None => passed_raw,
+    }
+}
+
+/// Drops the lines an `accepted/` entry covers and returns whether nothing is left.
+fn apply_accepted(
+    lines: &mut FindingLines,
+    file_path: &Path,
+    rel_path: &str,
+    checker_name: &str,
+    accepted: &crate::accepted_findings::AcceptedFindings,
+) -> bool {
+    if let Some(accepted_lines) =
+        AcceptedLines::for_file(file_path, rel_path, checker_name, accepted)
+    {
+        let keep: Vec<bool> = lines
+            .texts()
+            .iter()
+            .map(|line| !accepted_lines.is_accepted(line))
+            .collect();
+        lines.retain(&keep);
+    }
+    lines.text().trim().is_empty()
+}
+
+/// Records which findings were shown (survived scoping and `accepted/`) and kept (survived
+/// inline ignores) as capped anchors, so the footer can name the first one.
+fn capture_inline_anchors(
+    outcome: &mut InlineOutcome,
+    checker_name: &str,
+    kept_findings: &[crate::checker::Finding],
+    lines: &FindingLines,
+) {
+    let visible = lines.visible();
+    outcome.shown = capped_anchors(
+        checker_name,
+        kept_findings
+            .iter()
+            .zip(&visible)
+            .filter_map(|(finding, shown)| shown.then_some(finding)),
+    );
+    outcome.kept = capped_anchors(checker_name, kept_findings.iter());
+}
+
+/// A blocking failure that was already present at the git HEAD commit predates the edit, so it
+/// is reported as advisory. `baseline` runs only for a failing blocking check and reports
+/// whether the check passed at HEAD: `Some(false)` means it already failed there, `None`
+/// means that could not be determined.
+fn downgrade_if_predates(
+    passed: bool,
+    severity: Severity,
+    message: Option<String>,
+    baseline: impl FnOnce() -> Option<bool>,
+) -> (Severity, Option<String>) {
+    if passed || severity != Severity::Blocking {
+        return (severity, message);
+    }
+    match baseline() {
+        Some(false) => (
+            Severity::Advisory,
+            Some(format!(
                 "{} (downgraded: this violation predates your edits — already present \
                  at the git HEAD commit)",
                 message.unwrap_or_default()
-            ));
-        }
+            )),
+        ),
+        _ => (severity, message),
     }
-
-    Ok(CheckResult {
-        check_name: check.name.clone(),
-        severity,
-        passed,
-        output: combined,
-        message,
-        command: cmd_str,
-        findings: Vec::new(),
-        plugin_missing: false,
-    })
 }
 
-/// Drops accepted findings (`accepted_findings::ACCEPTED_FINDINGS_DIR`) from `combined`, run after
-/// diff-scoping so an untouched line never needs this at all. Native-only: a shell-out
-/// check's pass/fail comes from its exit code, not empty output, so this can't safely
-/// recompute pass/fail for it.
-fn drop_accepted_findings(
-    combined: &str,
-    repo_root: &Path,
-    file_path: &Path,
-    checker_name: &str,
-    accepted: &AcceptedFindings,
-) -> FilterOutcome {
-    let rel_file = relativize(repo_root, file_path);
-    crate::accepted_findings::filter_accepted(
-        combined,
-        file_path,
-        &rel_file,
-        checker_name,
-        accepted,
-    )
+/// What one in-process checker run needs besides the file: which checker, its options, the
+/// check's severity (recorded on dropped findings) and the inline-ignore context.
+#[derive(Clone, Copy)]
+struct NativeRun<'a> {
+    checker_name: &'a str,
+    options: Option<&'a serde_json::Value>,
+    severity: Severity,
+    inline_ctx: &'a InlineIgnoreContext,
+}
+
+impl<'a> NativeRun<'a> {
+    fn for_check(
+        check: &'a Check,
+        checker_name: &'a str,
+        inline_ctx: &'a InlineIgnoreContext,
+    ) -> Self {
+        NativeRun {
+            checker_name,
+            options: check.options.as_ref(),
+            severity: check.severity,
+            inline_ctx,
+        }
+    }
 }
 
 /// Runs `checker_name` against `source` (as if it were the content of `file_path`),
@@ -547,63 +475,225 @@ fn drop_accepted_findings(
 /// command output would follow, so downstream diff-scoping and baseline logic can treat
 /// native and shell-out checks identically.
 fn run_checker_against_source(
-    checker_name: &str,
+    run: NativeRun,
     file_path: &Path,
     source: &str,
-    options: Option<&serde_json::Value>,
-) -> anyhow::Result<(String, bool)> {
-    let findings =
-        crate::checker::run_checker_configured(checker_name, file_path, source, options)?;
-    let passed = findings.is_empty();
-    let combined = findings
+) -> anyhow::Result<SourceCheck> {
+    let NativeRun {
+        checker_name,
+        options,
+        severity,
+        inline_ctx,
+    } = run;
+    let findings = crate::checker::run_checker_configured_with_scans(
+        checker_name,
+        file_path,
+        source,
+        options,
+        &inline_ctx.scan_memo,
+    )?;
+    let applied = apply_inline_ignores(
+        findings,
+        IgnoreTarget {
+            file: file_path,
+            source,
+            checker_name,
+            severity,
+        },
+        inline_ctx,
+    );
+    let combined = applied
+        .kept
         .iter()
-        .map(|f| format!("{}:{}: {}", file_path.display(), f.line, f.message))
+        .map(|f| render_finding(file_path, f))
         .collect::<Vec<_>>()
         .join("\n");
-    Ok((combined, passed))
+    Ok(SourceCheck {
+        combined,
+        passed: applied.kept.is_empty(),
+        findings: applied.kept,
+        inline: InlineOutcome {
+            dropped: applied.dropped,
+            ..InlineOutcome::default()
+        },
+    })
 }
 
-/// Native per-file checks skip any file at or above this size rather than parsing it.
-/// Now that [`crate::config::default_checks`] turns every native checker on for every
-/// repo with no `.kibitzer/inspect.json` of its own, this is what keeps that on-by-default
-/// behavior cheap: vendored bundles, generated code, and minified assets can be
-/// megabytes, and every native checker pays a full read plus (for most of them) a
-/// tree-sitter parse. `PostToolUse` runs this path on every single edit, so a file this
-/// large — which a "long file"/"long function" checker has nothing useful to say about
-/// anyway — is worth skipping outright rather than paying that cost every time.
-const MAX_NATIVE_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+fn render_finding(file_path: &Path, finding: &crate::checker::Finding) -> String {
+    format!(
+        "{}:{}: {}",
+        file_path.display(),
+        finding.line,
+        finding.message
+    )
+}
 
-fn run_checker_against_file(
-    checker_name: &str,
-    file_path: &Path,
-    options: Option<&serde_json::Value>,
-) -> anyhow::Result<(String, bool)> {
-    if let Ok(metadata) = std::fs::metadata(file_path)
-        && metadata.len() > MAX_NATIVE_CHECK_BYTES
-    {
-        return Ok((String::new(), true));
+/// Result of one native checker run after inline filtering. `findings` is the structured
+/// kept list, so nothing downstream has to parse rule or line back out of `combined`.
+struct SourceCheck {
+    combined: String,
+    passed: bool,
+    findings: Vec<crate::checker::Finding>,
+    /// Only `dropped` is filled here; `shown` and `kept` are computed in `run_native_check`.
+    inline: InlineOutcome,
+}
+
+impl SourceCheck {
+    fn passing() -> Self {
+        SourceCheck {
+            combined: String::new(),
+            passed: true,
+            findings: Vec::new(),
+            inline: InlineOutcome::default(),
+        }
     }
-    let source = std::fs::read_to_string(file_path)
-        .with_context(|| format!("reading {}", file_path.display()))?;
-    run_checker_against_source(checker_name, file_path, &source, options)
+}
+
+/// Findings of `check`'s native checker as it reported them: inline ignores disabled, and
+/// none of diff-scoping, `accepted/` or the HEAD baseline applied (those live in
+/// `run_native_check`, which this deliberately bypasses). Empty for a non-native check.
+fn raw_findings_for_check(
+    check: &Check,
+    file_path: &Path,
+    source: &str,
+) -> anyhow::Result<Vec<RawFinding>> {
+    let Some(checker_name) = &check.checker else {
+        return Ok(Vec::new());
+    };
+    let raw = run_checker_against_source(
+        NativeRun::for_check(check, checker_name, &InlineIgnoreContext::disabled()),
+        file_path,
+        source,
+    )?;
+    Ok(raw
+        .findings
+        .into_iter()
+        .map(|f| RawFinding {
+            line: Line::new(f.line),
+            checker: checker_name.clone(),
+            rule: anchor_rule(checker_name, &f),
+            message: f.message,
+        })
+        .collect())
+}
+
+/// The file's content at git HEAD, for the stateless baseline of the blocking-suppression
+/// advisory. A staged rename reads the renamed-from blob; a non-UTF-8 blob is decoded lossily.
+/// Anything else (no repo, no commits, an untracked, ignored, newly added or submodule path, a
+/// file outside the root, a git that errors or exceeds `BASELINE_TIMEOUT`) is `Unavailable`:
+/// "not known to be new", never "everything is new".
+fn git_head_snapshot(repo_root: &Path, file_path: &Path) -> HeadSnapshot {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let rel = match file_path.strip_prefix(repo_root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => match canonical(file_path).strip_prefix(canonical(repo_root)) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => return HeadSnapshot::Unavailable,
+        },
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let run = |args: &[&str]| {
+        let mut cmd = git_command(repo_root);
+        cmd.args(args);
+        bounded_output(cmd, BASELINE_TIMEOUT).filter(|out| out.status.success())
+    };
+    let head_blob = |path: &str| run(&["show", &format!("HEAD:./{path}")]);
+    let blob = head_blob(&rel).or_else(|| {
+        let from = staged_rename_source(&run, &rel)?;
+        head_blob(&from)
+    });
+    blob.map_or(HeadSnapshot::Unavailable, |out| {
+        HeadSnapshot::Source(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
+
+/// Most staged files rename detection pairs up; bounds the cost on a huge `git mv`.
+const RENAME_DETECTION_LIMIT: &str = "-l200";
+
+/// The path `rel` was renamed or copied from in the index (`git mv`), relative to the repo root
+/// the hook runs in; `None` when `rel` is not the target of a staged rename.
+fn staged_rename_source(
+    run: &dyn Fn(&[&str]) -> Option<std::process::Output>,
+    rel: &str,
+) -> Option<String> {
+    let diff = run(&[
+        "diff",
+        "--cached",
+        "--no-ext-diff",
+        "-M",
+        RENAME_DETECTION_LIMIT,
+        "--name-status",
+        "--relative",
+        "-z",
+        "HEAD",
+    ])?;
+    let text = String::from_utf8_lossy(&diff.stdout);
+    let mut fields = text.split('\0');
+    while let Some(status) = fields.next() {
+        if status.starts_with(['R', 'C']) {
+            let (from, to) = (fields.next()?, fields.next()?);
+            if to == rel {
+                return Some(from.to_string());
+            }
+        } else {
+            fields.next();
+        }
+    }
+    None
+}
+
+/// What directives drop when `check`'s native checker runs over `head_source`, under the run's
+/// inline mode. Never feeds the run's counter or evicts its scan memo.
+fn head_dropped_findings(
+    check: &Check,
+    file_path: &Path,
+    head_source: &str,
+    inline: &InlineIgnoreContext,
+) -> anyhow::Result<Vec<DroppedFinding>> {
+    let Some(checker_name) = &check.checker else {
+        return Ok(Vec::new());
+    };
+    let replay = inline.without_counter();
+    let checked = run_checker_against_source(
+        NativeRun::for_check(check, checker_name, &replay),
+        file_path,
+        head_source,
+    )?;
+    Ok(checked.inline.dropped)
+}
+
+fn tolerates_unreadable_files(checker_name: &str) -> bool {
+    crate::checker::lookup(checker_name).is_some_and(|c| c.tolerates_unreadable_files())
+}
+
+fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<SourceCheck> {
+    let checker_name = run.checker_name;
+    let source = match crate::checker::read_native_source(file_path) {
+        Ok(crate::checker::NativeSource::Text(source)) => source,
+        Ok(crate::checker::NativeSource::TooLarge) => return Ok(SourceCheck::passing()),
+        Err(_) if tolerates_unreadable_files(checker_name) => {
+            return Ok(SourceCheck::passing());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", file_path.display()));
+        }
+    };
+    run_checker_against_source(run, file_path, &source)
 }
 
 /// Native-checker counterpart to [`check_against_git_head`]: same git-HEAD comparison, but
 /// runs the checker in-process against the HEAD content instead of shelling out to a
 /// substituted command.
 fn check_native_against_git_head(
-    checker_name: &str,
+    run: NativeRun,
     repo_root: &Path,
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
-    options: Option<&serde_json::Value>,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
-    let show = Command::new("git")
-        .args(["show", &format!("HEAD:{rel_path}")])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut show_cmd = git_command(repo_root);
+    show_cmd.args(["show", &format!("HEAD:{rel_path}")]);
+    let show = bounded_output(show_cmd, BASELINE_TIMEOUT)?;
     if !show.status.success() {
         return None;
     }
@@ -619,8 +709,21 @@ fn check_native_against_git_head(
     }
 
     let source = String::from_utf8(show.stdout).ok()?;
-    let (combined, passed_raw) =
-        run_checker_against_source(checker_name, file_path, &source, options).ok()?;
+    // Replays honor the run's mode but never feed its counter.
+    let replay_ctx = run.inline_ctx.without_counter();
+    let SourceCheck {
+        combined,
+        passed: passed_raw,
+        ..
+    } = run_checker_against_source(
+        NativeRun {
+            inline_ctx: &replay_ctx,
+            ..run
+        },
+        file_path,
+        &source,
+    )
+    .ok()?;
 
     let passed = if let Some(ranges) = &head_ranges {
         let (_, scoped_passed) =
@@ -770,71 +873,28 @@ fn render_sarif_output(stdout: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod sarif_tests {
-    use super::*;
+mod sarif_tests;
 
-    fn sarif_log(results_json: &str) -> String {
-        format!(r#"{{"version": "2.1.0", "runs": [{{"results": [{results_json}]}}]}}"#)
-    }
-
-    #[test]
-    fn renders_counts_and_findings() {
-        let log = sarif_log(
-            r#"{"level": "error", "ruleId": "no-foo", "message": {"text": "found a foo"},
-                "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/lib.rs"},
-                "region": {"startLine": 12}}}]}"#,
-        );
-        let rendered = render_sarif_output(log.as_bytes()).unwrap();
-        assert_eq!(
-            rendered,
-            "1 error(s)\nsrc/lib.rs:12: [error] found a foo (no-foo)"
-        );
-    }
-
-    #[test]
-    fn defaults_missing_level_to_warning() {
-        let log = sarif_log(r#"{"message": {"text": "no level given"}, "locations": []}"#);
-        let rendered = render_sarif_output(log.as_bytes()).unwrap();
-        assert_eq!(rendered, "1 warning(s)\n[warning] no level given");
-    }
-
-    #[test]
-    fn empty_results_render_as_zero_findings() {
-        let log = r#"{"version": "2.1.0", "runs": [{"results": []}]}"#;
-        let rendered = render_sarif_output(log.as_bytes()).unwrap();
-        assert_eq!(rendered, "0 findings");
-    }
-
-    #[test]
-    fn counts_multiple_levels_separately() {
-        let log = sarif_log(
-            r#"{"level": "error", "message": {"text": "e1"}, "locations": []},
-               {"level": "error", "message": {"text": "e2"}, "locations": []},
-               {"level": "note", "message": {"text": "n1"}, "locations": []}"#,
-        );
-        let rendered = render_sarif_output(log.as_bytes()).unwrap();
-        assert!(rendered.starts_with("2 error(s), 1 note(s)\n"));
-    }
-
-    #[test]
-    fn returns_none_for_invalid_json() {
-        assert!(render_sarif_output(b"not json").is_none());
-    }
+/// Per-line outcome of diff-scoping: which output lines survive, and whether any failure does.
+struct ScopeVerdicts {
+    keep: Vec<bool>,
+    passed: bool,
 }
 
-/// Filter a check's `{file}:{line}: message`-style output down to lines whose line number
-/// falls within `ranges`, and recompute pass/fail from what survives. Lines that don't
-/// follow the `{file}:{line}:` convention are kept as-is (their line can't be attributed to
-/// a range) and count toward a failure if any survive — this is deliberately conservative:
-/// output kibitzer doesn't understand should not be silently swallowed.
-fn scope_output_to_changed_lines(
-    output: &str,
+/// Decides, per output line, whether it falls within `ranges`; `None` means the output cannot
+/// be scoped (already passing, or no line follows the `{file}:{line}:` convention) and must
+/// be left untouched. Lines that don't follow the convention are kept as-is (their line
+/// can't be attributed to a range) and count toward a failure if any survive — this is
+/// deliberately conservative: output kibitzer doesn't understand should not be silently
+/// swallowed.
+fn scope_line_verdicts(
+    lines: &[&str],
     file_path: &Path,
     ranges: &[(usize, usize)],
     passed_raw: bool,
-) -> (String, bool) {
+) -> Option<ScopeVerdicts> {
     if passed_raw {
-        return (output.to_string(), passed_raw);
+        return None;
     }
     if ranges.is_empty() {
         // Diff-scoping is active (the caller only reaches this function when
@@ -843,52 +903,58 @@ fn scope_output_to_changed_lines(
         // Nothing can be attributed to this edit, so every finding is out of scope,
         // not "unscoped" — unlike the `changed_lines: None` case, this must not fall
         // back to the raw whole-file output.
-        return (String::new(), true);
+        return Some(ScopeVerdicts {
+            keep: vec![false; lines.len()],
+            passed: true,
+        });
     }
 
     let prefix = format!("{}:", file_path.display());
-    let mut kept = Vec::new();
-    let mut any_attributed_line = false;
-    let mut any_kept_finding = false;
-
-    for line in output.lines() {
-        let has_prefix = line.strip_prefix(&prefix).is_some();
-        let line_no = line
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|n| n.parse::<usize>().ok());
-
-        match line_no {
-            Some(n) => {
-                any_attributed_line = true;
-                if ranges.iter().any(|(start, end)| n >= *start && n <= *end) {
-                    any_kept_finding = true;
-                    kept.push(line);
-                }
-            }
-            None if has_prefix && !line.is_empty() => {
-                // Has the file prefix but the line number after it doesn't parse —
-                // can't attribute it to a range, so (per the conservative-keep policy
-                // above) keep it displayed AND count it toward failure, same as a
-                // line with no prefix at all.
-                any_kept_finding = true;
-                kept.push(line);
-            }
-            None => kept.push(line),
-        }
-    }
-
-    if !any_attributed_line {
-        // Output doesn't follow the convention at all — can't scope it, leave untouched.
-        return (output.to_string(), passed_raw);
-    }
-
-    let filtered = kept.join("\n");
-    let unattributed_kept = kept
+    let attributed: Vec<Option<usize>> = lines
         .iter()
-        .any(|l| l.strip_prefix(&prefix).is_none() && !l.is_empty());
-    let passed = !(any_kept_finding || unattributed_kept);
-    (filtered, passed)
+        .map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .collect();
+    if attributed.iter().all(Option::is_none) {
+        // Output doesn't follow the convention at all — can't scope it, leave untouched.
+        return None;
+    }
+    let keep: Vec<bool> = attributed
+        .iter()
+        .map(|line_no| match line_no {
+            Some(n) => ranges.iter().any(|(start, end)| n >= start && n <= end),
+            None => true,
+        })
+        .collect();
+    // Any surviving non-empty line, attributed or not, is a failure.
+    let passed = lines
+        .iter()
+        .zip(&keep)
+        .all(|(line, kept)| !kept || line.is_empty());
+    Some(ScopeVerdicts { keep, passed })
+}
+
+/// Text-level wrapper over [`scope_line_verdicts`] for output that is not tied to structured
+/// findings (shell-out checks).
+fn scope_output_to_changed_lines(
+    output: &str,
+    file_path: &Path,
+    ranges: &[(usize, usize)],
+    passed_raw: bool,
+) -> (String, bool) {
+    let lines: Vec<&str> = output.lines().collect();
+    let Some(verdicts) = scope_line_verdicts(&lines, file_path, ranges, passed_raw) else {
+        return (output.to_string(), passed_raw);
+    };
+    let kept: Vec<&str> = lines
+        .iter()
+        .zip(&verdicts.keep)
+        .filter_map(|(line, kept)| kept.then_some(*line))
+        .collect();
+    (kept.join("\n"), verdicts.passed)
 }
 
 /// Process-wide nonce so concurrent baseline checks (the daemon spawns one thread per
@@ -931,17 +997,15 @@ pub(crate) fn check_predates_git_head(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
-    if let Some(checker_name) = &check.checker {
-        return check_native_against_git_head(
-            checker_name,
-            repo_root,
-            file_path,
-            changed_lines,
-            check.options.as_ref(),
-        );
-    }
-    let command = check.command.as_deref()?;
-    command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+    with_git_budget(HOOK_GIT_BUDGET, || {
+        if let Some(checker_name) = &check.checker {
+            let ctx = InlineIgnoreContext::default();
+            let run = NativeRun::for_check(check, checker_name, &ctx);
+            return check_native_against_git_head(run, repo_root, file_path, changed_lines);
+        }
+        let command = check.command.as_deref()?;
+        command_baseline_against_git_head(check, command, repo_root, file_path, changed_lines)
+    })
 }
 
 /// Re-run `check` against the file's `git show HEAD:<relpath>` content to determine
@@ -964,11 +1028,9 @@ fn check_against_git_head(
     changed_lines: Option<&[(usize, usize)]>,
 ) -> Option<bool> {
     let rel_path = relativize(repo_root, file_path);
-    let show = Command::new("git")
-        .args(["show", &format!("HEAD:{rel_path}")])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut show_cmd = git_command(repo_root);
+    show_cmd.args(["show", &format!("HEAD:{rel_path}")]);
+    let show = bounded_output(show_cmd, BASELINE_TIMEOUT)?;
     if !show.status.success() {
         return None;
     }
@@ -1048,16 +1110,11 @@ fn check_against_git_head_repo(check: &Check, repo_root: &Path) -> Option<bool> 
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = match Command::new("git")
-        .args(["archive", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-    {
-        Ok(archive) => archive,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&snapshot_dir);
-            return None;
-        }
+    let mut archive_cmd = git_command(repo_root);
+    archive_cmd.args(["archive", "HEAD"]);
+    let Some(archive) = bounded_output(archive_cmd, ARCHIVE_TIMEOUT) else {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
     };
     if !archive.status.success() {
         let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1164,15 +1221,10 @@ pub fn run_architecture_check(
         .expect("config-load validation guarantees architecture_checker is set");
 
     let cmd_str = format!("kibitzer check architecture {arch_name}");
-    let error_result = |output: String| CheckResult {
-        check_name: check.name.clone(),
-        severity: check.severity,
-        passed: false,
-        output,
-        message: check.message.clone(),
-        command: cmd_str.clone(),
-        findings: Vec::new(),
-        plugin_missing: false,
+    let error_result = |output: String| {
+        CheckResult::new(check.name.clone(), check.severity, false, output)
+            .with_message(check.message.clone())
+            .with_command(cmd_str.clone())
     };
 
     let Some(any_checker) = lookup_any_architecture_checker(arch_name) else {
@@ -1212,38 +1264,24 @@ pub fn run_architecture_check(
     let combined = findings
         .iter()
         .map(|f| match (&f.file, f.line) {
-            (Some(file), Some(line)) => format!("{}:{}: {}", file.display(), line, f.message),
-            (Some(file), None) => format!("{}: {}", file.display(), f.message),
+            (Some(file), Some(line)) => format!("{}:{}: {}", display_path(file), line, f.message),
+            (Some(file), None) => format!("{}: {}", display_path(file), f.message),
             (None, _) => f.message.clone(),
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    let mut severity = check.severity;
-    let mut message = check.message.clone();
+    let (severity, message) =
+        downgrade_if_predates(passed, check.severity, check.message.clone(), || {
+            check_native_against_git_head_repo(arch_name, repo_root, arch_config)
+        });
 
-    if !passed && severity == Severity::Blocking {
-        let baseline = check_native_against_git_head_repo(arch_name, repo_root, arch_config);
-        if let Some(false) = baseline {
-            severity = Severity::Advisory;
-            message = Some(format!(
-                "{} (downgraded: this violation predates your edits — already present \
-                 at the git HEAD commit)",
-                message.unwrap_or_default()
-            ));
-        }
-    }
-
-    Ok(CheckResult {
-        check_name: check.name.clone(),
-        severity,
-        passed,
-        output: combined,
-        message,
-        command: cmd_str,
-        findings,
-        plugin_missing: false,
-    })
+    Ok(
+        CheckResult::new(check.name.clone(), severity, passed, combined)
+            .with_message(message)
+            .with_command(cmd_str)
+            .with_findings(findings),
+    )
 }
 
 /// Native-checker counterpart to [`check_against_git_head_repo`]: snapshots HEAD the same
@@ -1272,16 +1310,11 @@ fn check_native_against_git_head_repo(
     ));
     std::fs::create_dir_all(&snapshot_dir).ok()?;
 
-    let archive = match Command::new("git")
-        .args(["archive", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-    {
-        Ok(archive) => archive,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&snapshot_dir);
-            return None;
-        }
+    let mut archive_cmd = git_command(repo_root);
+    archive_cmd.args(["archive", "HEAD"]);
+    let Some(archive) = bounded_output(archive_cmd, ARCHIVE_TIMEOUT) else {
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        return None;
     };
     if !archive.status.success() {
         let _ = std::fs::remove_dir_all(&snapshot_dir);
@@ -1386,11 +1419,17 @@ fn map_ranges_to_head(
     rel_path: &str,
     ranges: &[(usize, usize)],
 ) -> Option<Vec<(usize, usize)>> {
-    let diff = Command::new("git")
-        .args(["diff", "--no-color", "-U0", "HEAD", "--", rel_path])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut diff_cmd = git_command(repo_root);
+    diff_cmd.args([
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "-U0",
+        "HEAD",
+        "--",
+        rel_path,
+    ]);
+    let diff = bounded_output(diff_cmd, BASELINE_TIMEOUT)?;
     if !diff.status.success() {
         return None;
     }
@@ -1445,7 +1484,7 @@ fn map_ranges_through_hunks(ranges: &[(usize, usize)], hunks: &[DiffHunk]) -> Ve
 /// `run.rs`) should load it exactly once for the whole batch and pass the same
 /// `&Registry` into every call, instead of reloading and reparsing `registry.json` from
 /// disk once per call (or, if reloaded again inside the per-`check` loop, once per
-/// (file, check) pair). `accepted` (`accepted_findings::ACCEPTED_FINDINGS_DIR`) must be
+/// (file, check) pair). `run_ctx` (holding `accepted_findings::ACCEPTED_FINDINGS_DIR` entries) must be
 /// loaded the same way, by the same caller, for the same reason — and, more importantly,
 /// so that a malformed accepted-findings entry surfaces as one clean error before any
 /// file work starts, rather than a `?` from inside this per-(file, check) loop
@@ -1457,7 +1496,29 @@ pub fn run_checks_for_trigger(
     file_path: &Path,
     changed_lines: Option<&[(usize, usize)]>,
     registry: &Registry,
-    accepted: &AcceptedFindings,
+    run_ctx: &RunContext,
+) -> anyhow::Result<Vec<CheckResult>> {
+    with_git_budget(HOOK_GIT_BUDGET, || {
+        run_checks_for_trigger_unbudgeted(
+            checks,
+            trigger,
+            repo_root,
+            file_path,
+            changed_lines,
+            registry,
+            run_ctx,
+        )
+    })
+}
+
+fn run_checks_for_trigger_unbudgeted(
+    checks: &[Check],
+    trigger: &str,
+    repo_root: &Path,
+    file_path: &Path,
+    changed_lines: Option<&[(usize, usize)]>,
+    registry: &Registry,
+    run_ctx: &RunContext,
 ) -> anyhow::Result<Vec<CheckResult>> {
     let rel_path = relativize(repo_root, file_path);
     let mut results = Vec::new();
@@ -1474,9 +1535,22 @@ pub fn run_checks_for_trigger(
             file_path,
             changed_lines,
             registry,
-            accepted,
+            run_ctx,
         )?);
     }
+    let extra = crate::inline_post_pass::run(crate::inline_post_pass::PostPassInput {
+        checks,
+        file_path,
+        changed_lines,
+        results: &results,
+        run_ctx,
+        raw_rerun: &raw_findings_for_check,
+        head: &|path| git_head_snapshot(repo_root, path),
+        head_drops: &|check, path, head_source| {
+            head_dropped_findings(check, path, head_source, &run_ctx.inline)
+        },
+    });
+    results.extend(extra);
     Ok(results)
 }
 
@@ -1543,1501 +1617,31 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod diff_scoping_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn file() -> PathBuf {
-        PathBuf::from("src/foo.go")
-    }
-
-    #[test]
-    fn substitute_command_fills_changed_lines() {
-        let cmd = substitute_command(
-            "kibitzer check native primitive-obsession {file} --lines={changed_lines}",
-            &file(),
-            Some(&[(12, 15), (40, 40)]),
-        );
-        assert_eq!(
-            cmd,
-            "kibitzer check native primitive-obsession src/foo.go --lines=12-15,40-40"
-        );
-    }
-
-    #[test]
-    fn substitute_command_empty_changed_lines_when_none() {
-        let cmd = substitute_command("cmd {file} {changed_lines}", &file(), None);
-        assert_eq!(cmd, "cmd src/foo.go ");
-    }
-
-    #[test]
-    fn scope_output_keeps_findings_inside_changed_ranges() {
-        let output = "src/foo.go:5: unrelated finding\nsrc/foo.go:13: newtype me\n";
-        let (filtered, passed) = scope_output_to_changed_lines(output, &file(), &[(12, 15)], false);
-        assert!(!passed);
-        assert_eq!(filtered, "src/foo.go:13: newtype me");
-    }
-
-    #[test]
-    fn scope_output_passes_when_all_findings_outside_changed_ranges() {
-        let output = "src/foo.go:5: pre-existing finding\n";
-        let (filtered, passed) = scope_output_to_changed_lines(output, &file(), &[(12, 15)], false);
-        assert!(passed);
-        assert_eq!(filtered, "");
-    }
-
-    #[test]
-    fn scope_output_leaves_unconventional_output_untouched() {
-        let output = "some linter crashed with no file:line prefix\n";
-        let (filtered, passed) = scope_output_to_changed_lines(output, &file(), &[(12, 15)], false);
-        assert!(!passed);
-        assert_eq!(filtered, output);
-    }
-
-    #[test]
-    fn scope_output_noop_when_already_passing() {
-        let (filtered, passed) = scope_output_to_changed_lines("", &file(), &[(12, 15)], true);
-        assert!(passed);
-        assert_eq!(filtered, "");
-    }
-
-    #[test]
-    fn scope_output_empty_ranges_suppresses_all_findings() {
-        // Regression for docs/go-primitive-obsession-false-positives.md's
-        // "deletion-only edit flagged" entry: `changed_lines` present but empty
-        // (a pure-deletion edit — see `hook::compute_changed_lines`) must suppress
-        // every finding, not fall back to raw whole-file output.
-        let output = "src/foo.go:5: pre-existing finding\n";
-        let (filtered, passed) = scope_output_to_changed_lines(output, &file(), &[], false);
-        assert!(passed);
-        assert_eq!(filtered, "");
-    }
-
-    #[test]
-    fn scope_output_counts_malformed_prefixed_line_as_failure() {
-        // Has the file prefix but the text after it isn't a line number — can't be
-        // attributed to a range, so it must count toward failure, not just be displayed.
-        let output = "src/foo.go:note: continued from previous finding\n";
-        let (filtered, passed) = scope_output_to_changed_lines(output, &file(), &[(12, 15)], false);
-        assert!(!passed);
-        assert_eq!(filtered, output);
-    }
-}
+mod diff_scoping_tests;
 
 #[cfg(test)]
-mod sarif_run_check_tests {
-    use super::*;
-    use crate::config::OutputFormat;
-
-    fn sarif_check(sarif_json: &str) -> Check {
-        Check {
-            name: "sarif-linter".to_string(),
-            command: Some(format!("cat <<'EOF'\n{sarif_json}\nEOF")),
-            checker: None,
-            architecture_checker: None,
-            severity: Severity::Advisory,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("linter found issues".to_string()),
-            output_format: Some(OutputFormat::Sarif),
-            options: None,
-        }
-    }
-
-    #[test]
-    fn renders_sarif_output_and_ignores_diff_scoping() {
-        let sarif_json = r#"{"version": "2.1.0", "runs": [{"results": [
-            {"level": "error", "ruleId": "no-foo", "message": {"text": "found a foo"},
-             "locations": [{"physicalLocation": {"artifactLocation": {"uri": "src/lib.rs"},
-             "region": {"startLine": 12}}}]}
-        ]}]}"#;
-        let result = run_check(
-            &sarif_check(sarif_json),
-            Path::new("."),
-            Path::new("src/lib.rs"),
-            Some(&[(1, 5)]),
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            result.output,
-            "1 error(s)\nsrc/lib.rs:12: [error] found a foo (no-foo)"
-        );
-    }
-
-    #[test]
-    fn falls_back_to_raw_output_when_stdout_is_not_sarif() {
-        let check = Check {
-            command: Some("echo 'not sarif at all'".to_string()),
-            ..sarif_check("{}")
-        };
-        let result = run_check(
-            &check,
-            Path::new("."),
-            Path::new("src/lib.rs"),
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert_eq!(result.output.trim(), "not sarif at all");
-    }
-}
-
-/// Epic 4.2 (Tech Debt item a): a hung `command` check must be killed and reported as a
-/// timeout instead of blocking `run_check` forever, while a normal fast-exiting command is
-/// completely unaffected. Exercises [`run_check_with_timeout`] directly with a short
-/// duration so the hang test doesn't actually wait out a real-world timeout.
-#[cfg(test)]
-mod timeout_tests {
-    use super::*;
-    use crate::config::Severity;
-    use std::time::Instant;
-
-    fn command_check(command: &str) -> Check {
-        Check {
-            name: "hangy".to_string(),
-            command: Some(command.to_string()),
-            checker: None,
-            architecture_checker: None,
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("command check".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    #[test]
-    fn run_check_reports_timeout_and_kills_process_when_command_hangs() {
-        let started = Instant::now();
-        let result = run_check_with_timeout(
-            &command_check("sleep 60"),
-            Path::new("."),
-            Path::new("irrelevant.txt"),
-            None,
-            Duration::from_millis(200),
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "run_check_with_timeout should return in well under 1s, took {:?}",
-            started.elapsed()
-        );
-        assert!(!result.passed);
-        assert!(
-            result
-                .message
-                .as_deref()
-                .unwrap_or("")
-                .contains("timed out")
-                || result.output.contains("timed out"),
-            "expected 'timed out' in message or output, got message={:?} output={:?}",
-            result.message,
-            result.output
-        );
-    }
-
-    #[test]
-    fn run_check_behaves_unchanged_when_command_exits_quickly() {
-        let result = run_check_with_timeout(
-            &command_check("true"),
-            Path::new("."),
-            Path::new("irrelevant.txt"),
-            None,
-            Duration::from_millis(200),
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-
-        assert!(result.passed);
-        assert!(!result.output.to_lowercase().contains("timed out"));
-    }
-}
-
-/// Task 4.3.1b: a plugin-backed check whose registered binary is missing from disk must
-/// short-circuit with `plugin_missing: true` and a forced `Advisory` severity — regardless
-/// of the check's own configured severity — without ever spawning the command.
-#[cfg(test)]
-mod plugin_missing_tests {
-    use super::*;
-    use crate::config::{OutputFormat, Severity};
-    use crate::plugin::test_support::with_xdg_data_home;
-    use crate::plugin::{InstalledPlugin, PluginName, Registry};
-    use std::time::Instant;
-
-    #[test]
-    fn run_check_returns_plugin_missing_result_with_advisory_severity_when_binary_absent() {
-        with_xdg_data_home("check-plugin-missing", |dir| {
-            let missing_binary = dir.join("kibitzer-check-plugin-missing-test-nonexistent-binary");
-            let plugin = InstalledPlugin {
-                name: PluginName::parse("kibitzer-stub-plugin").unwrap(),
-                version: "0.1.0".to_string(),
-                min_kibitzer_version: "0.1.0".to_string(),
-                sha256: "deadbeef".to_string(),
-                binary_path: missing_binary,
-                severity: Severity::Advisory,
-                scope: vec!["**/*".to_string()],
-                triggers: vec!["batch".to_string()],
-                output_format: OutputFormat::Sarif,
-            };
-            Registry::save(
-                &crate::plugin::default_registry_path(),
-                &Registry {
-                    plugins: vec![plugin],
-                },
-            )
-            .unwrap();
-
-            // Configured `Blocking`, even though a real plugin manifest would normally
-            // set its own severity — proves the forced-Advisory downgrade happens
-            // regardless of what the `Check` itself is configured with.
-            let check = Check {
-                name: "kibitzer-stub-plugin".to_string(),
-                command: Some("echo should-never-run {file}".to_string()),
-                checker: None,
-                architecture_checker: None,
-                severity: Severity::Blocking,
-                scope: vec![],
-                triggers: vec![],
-                message: None,
-                output_format: None,
-                options: None,
-            };
-
-            let registry = Registry::load(&crate::plugin::default_registry_path());
-            let started = Instant::now();
-            let result = run_check(
-                &check,
-                Path::new("."),
-                Path::new("irrelevant.txt"),
-                None,
-                &registry,
-                &AcceptedFindings::default(),
-            )
-            .unwrap();
-
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "should return near-instantly without spawning a process"
-            );
-            assert!(result.plugin_missing);
-            assert!(!result.passed);
-            assert_eq!(result.severity, Severity::Advisory);
-            assert!(result.output.is_empty(), "no subprocess should have run");
-            assert!(
-                result.command.is_empty(),
-                "short-circuit result carries no substituted command"
-            );
-            assert!(
-                result
-                    .message
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("is not installed"),
-                "message: {:?}",
-                result.message
-            );
-        });
-    }
-}
+mod sarif_run_check_tests;
 
 #[cfg(test)]
-mod head_mapping_tests {
-    use super::*;
-
-    fn hunk(old_start: usize, old_count: usize, new_start: usize, new_count: usize) -> DiffHunk {
-        DiffHunk {
-            old_start,
-            old_count,
-            new_start,
-            new_count,
-        }
-    }
-
-    #[test]
-    fn parses_unified_diff_hunk_headers() {
-        let diff = "diff --git a/foo.go b/foo.go\n\
-                     --- a/foo.go\n\
-                     +++ b/foo.go\n\
-                     @@ -10,2 +10,5 @@ func Foo() {\n\
-                     -old line\n\
-                     +new line 1\n";
-        let hunks = parse_diff_hunks(diff).unwrap();
-        assert_eq!(hunks.len(), 1);
-        assert_eq!(hunks[0].old_start, 10);
-        assert_eq!(hunks[0].old_count, 2);
-        assert_eq!(hunks[0].new_start, 10);
-        assert_eq!(hunks[0].new_count, 5);
-    }
-
-    #[test]
-    fn range_before_any_hunk_is_unshifted() {
-        let hunks = vec![hunk(20, 1, 20, 6)];
-        let mapped = map_ranges_through_hunks(&[(1, 3)], &hunks);
-        assert_eq!(mapped, vec![(1, 3)]);
-    }
-
-    #[test]
-    fn range_after_a_growing_hunk_is_shifted_back() {
-        // A 1-line -> 6-line edit at old line 20 pushes everything after it down by 5 in
-        // the current file. A changed_lines range of (30, 30) in current-file coordinates
-        // must map back to (25, 25) in HEAD.
-        let hunks = vec![hunk(20, 1, 20, 6)];
-        let mapped = map_ranges_through_hunks(&[(30, 30)], &hunks);
-        assert_eq!(mapped, vec![(25, 25)]);
-    }
-
-    #[test]
-    fn range_inside_the_edited_hunk_maps_to_its_old_span() {
-        let hunks = vec![hunk(20, 1, 20, 6)];
-        let mapped = map_ranges_through_hunks(&[(21, 23)], &hunks);
-        assert_eq!(mapped, vec![(20, 20)]);
-    }
-
-    #[test]
-    fn range_inside_a_pure_insertion_has_no_head_counterpart() {
-        let hunks = vec![hunk(20, 0, 21, 4)];
-        let mapped = map_ranges_through_hunks(&[(21, 24)], &hunks);
-        assert!(mapped.is_empty());
-    }
-}
+mod timeout_tests;
 
 #[cfg(test)]
-mod git_head_integration_tests {
-    use super::*;
-    use crate::config::Severity;
-
-    struct TempRepo {
-        dir: PathBuf,
-    }
-
-    impl TempRepo {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "kibitzer-check-test-{}-{name}-{}",
-                std::process::id(),
-                TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            run(&dir, &["init", "-q"]);
-            run(&dir, &["config", "user.email", "test@example.com"]);
-            run(&dir, &["config", "user.name", "test"]);
-            Self { dir }
-        }
-
-        fn write_and_commit(&self, rel_path: &str, content: &str, msg: &str) {
-            let path = self.dir.join(rel_path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            std::fs::write(&path, content).unwrap();
-            run(&self.dir, &["add", rel_path]);
-            run(&self.dir, &["commit", "-q", "-m", msg]);
-        }
-
-        fn write_uncommitted(&self, rel_path: &str, content: &str) {
-            std::fs::write(self.dir.join(rel_path), content).unwrap();
-        }
-
-        fn path(&self, rel_path: &str) -> PathBuf {
-            self.dir.join(rel_path)
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("git available");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    /// A "check" that fails whenever the file contains the string "BAD".
-    fn bad_marker_check() -> Check {
-        Check {
-            name: "no-bad-marker".to_string(),
-            command: Some("! grep -n BAD {file}".to_string()),
-            checker: None,
-            architecture_checker: None,
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("found BAD marker".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    /// A whole-repo counterpart to `bad_marker_check`: no `{file}` in the command, so it
-    /// scans the whole tree it's run from rather than a single file.
-    fn repo_wide_bad_marker_check() -> Check {
-        Check {
-            name: "no-bad-marker-repo".to_string(),
-            command: Some("! grep -rn BAD .".to_string()),
-            checker: None,
-            architecture_checker: None,
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("found BAD marker in repo".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    #[test]
-    fn baseline_passes_when_violation_is_genuinely_new() {
-        let repo = TempRepo::new("genuinely-new");
-        repo.write_and_commit("foo.txt", "line1\nline2\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
-
-        let result = check_against_git_head(
-            &bad_marker_check(),
-            &repo.dir,
-            &repo.path("foo.txt"),
-            Some(&[(2, 2)]),
-        );
-        assert_eq!(result, Some(true));
-    }
-
-    #[test]
-    fn baseline_fails_when_violation_predates_the_edit() {
-        let repo = TempRepo::new("pre-existing");
-        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
-
-        let result = check_against_git_head(
-            &bad_marker_check(),
-            &repo.dir,
-            &repo.path("foo.txt"),
-            Some(&[(2, 2)]),
-        );
-        assert_eq!(result, Some(false));
-    }
-
-    #[test]
-    fn baseline_ignores_unrelated_violation_shifted_by_earlier_insertion() {
-        // HEAD has a BAD marker at line 2. The current file inserts 3 new lines before
-        // it (pushing it to line 5) and introduces a brand-new BAD marker at line 6 via
-        // the edit under test. Without line-shift mapping, scoping the baseline to
-        // current-file lines (6,6) would land on HEAD's line 6 (out of range / not the
-        // marker), or — depending on direction of the bug — could accidentally line up
-        // with the pre-existing marker. This asserts the new marker is correctly reported
-        // as genuinely new despite the unrelated shifted violation elsewhere in the file.
-        let repo = TempRepo::new("shifted");
-        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\nline4\n", "init");
-        repo.write_uncommitted(
-            "foo.txt",
-            "line1\ninserted1\ninserted2\ninserted3\nBAD\nline3\nBAD-new\nline4\n",
-        );
-
-        let result = check_against_git_head(
-            &bad_marker_check(),
-            &repo.dir,
-            &repo.path("foo.txt"),
-            Some(&[(7, 7)]),
-        );
-        assert_eq!(result, Some(true));
-    }
-
-    #[test]
-    fn baseline_is_none_when_there_is_no_head_commit() {
-        let repo = TempRepo::new("no-head");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
-
-        let result = check_against_git_head(
-            &bad_marker_check(),
-            &repo.dir,
-            &repo.path("foo.txt"),
-            Some(&[(2, 2)]),
-        );
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn baseline_is_none_when_the_file_is_untracked_at_head() {
-        let repo = TempRepo::new("untracked-file");
-        repo.write_and_commit("committed.txt", "line1\n", "init");
-        repo.write_uncommitted("new.txt", "line1\nBAD\n");
-
-        let result = check_against_git_head(
-            &bad_marker_check(),
-            &repo.dir,
-            &repo.path("new.txt"),
-            Some(&[(2, 2)]),
-        );
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn run_check_downgrades_severity_when_violation_predates_edit() {
-        let repo = TempRepo::new("run-check-downgrade");
-        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
-
-        let result = run_check(
-            &bad_marker_check(),
-            &repo.dir,
-            &repo.path("foo.txt"),
-            Some(&[(2, 2)]),
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(!result.passed);
-        assert_eq!(result.severity, Severity::Advisory);
-        assert!(result.message.unwrap().contains("predates your edits"));
-    }
-
-    #[test]
-    fn repo_wide_baseline_fails_when_violation_predates_the_edit() {
-        let repo = TempRepo::new("repo-wide-pre-existing");
-        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
-
-        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
-        assert_eq!(result, Some(false));
-    }
-
-    #[test]
-    fn repo_wide_baseline_passes_when_violation_is_genuinely_new() {
-        let repo = TempRepo::new("repo-wide-genuinely-new");
-        repo.write_and_commit("foo.txt", "line1\nline2\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
-
-        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
-        assert_eq!(result, Some(true));
-    }
-
-    #[test]
-    fn repo_wide_baseline_is_none_when_there_is_no_head_commit() {
-        let repo = TempRepo::new("repo-wide-no-head");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3\n");
-
-        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &repo.dir);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn repo_wide_baseline_concurrent_calls_do_not_interfere() {
-        let repo = TempRepo::new("repo-wide-concurrent");
-        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
-
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let dir = repo.dir.clone();
-                std::thread::spawn(move || {
-                    check_against_git_head_repo(&repo_wide_bad_marker_check(), &dir)
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            assert_eq!(handle.join().unwrap(), Some(false));
-        }
-    }
-
-    #[test]
-    fn repo_wide_baseline_cleans_up_snapshot_dir_when_archive_fails_to_spawn() {
-        let pid = std::process::id();
-        let prefix = format!("kibitzer-head-snapshot-{pid}-");
-        let list_matching = || -> std::collections::HashSet<PathBuf> {
-            std::fs::read_dir(std::env::temp_dir())
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with(&prefix))
-                        .unwrap_or(false)
-                })
-                .collect()
-        };
-
-        let before = list_matching();
-        // A nonexistent repo_root makes `Command::current_dir` fail at the OS level before
-        // `git` even execs, exercising the same "archive command fails to spawn" path a
-        // missing `git` binary would hit.
-        let missing_repo_root = std::env::temp_dir().join(format!("kibitzer-does-not-exist-{pid}"));
-        let result = check_against_git_head_repo(&repo_wide_bad_marker_check(), &missing_repo_root);
-        assert_eq!(result, None);
-
-        let after = list_matching();
-        assert!(
-            after.is_subset(&before),
-            "check_against_git_head_repo leaked a snapshot dir on spawn failure: {:?}",
-            after.difference(&before).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn run_check_downgrades_severity_for_repo_wide_check_when_violation_predates_edit() {
-        let repo = TempRepo::new("run-check-repo-wide-downgrade");
-        repo.write_and_commit("foo.txt", "line1\nBAD\nline3\n", "init");
-        repo.write_uncommitted("foo.txt", "line1\nBAD\nline3-changed\n");
-
-        let result = run_check(
-            &repo_wide_bad_marker_check(),
-            &repo.dir,
-            &repo.dir,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(!result.passed);
-        assert_eq!(result.severity, Severity::Advisory);
-        assert!(result.message.unwrap().contains("predates your edits"));
-    }
-
-    // --- Story 2.2.3: git-HEAD-baseline downgrade for Declaration-kind checkers
-    // (BLOCKER fix) ---
-
-    fn content_rules_check() -> Check {
-        Check {
-            name: "content-rules".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("content-rules".to_string()),
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("content rule violation".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    fn domain_content_rules_arch_config() -> crate::config::ArchitectureConfig {
-        crate::config::ArchitectureConfig {
-            components: vec![crate::config::Component {
-                name: "domain".to_string(),
-                paths: vec!["**/domain".to_string(), "**/domain/**".to_string()],
-            }],
-            content_rules: vec![crate::config::ContentRule {
-                component: "domain".to_string(),
-                allowed_kinds: vec!["struct".to_string()],
-            }],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn content_rules_blocking_violation_downgrades_when_it_predates_head() {
-        let repo = TempRepo::new("content-rules-predates-head");
-        repo.write_and_commit(
-            "domain/domain.go",
-            "package domain\n\ntype Order struct {\n\tID string\n}\n\n\
-             func Validate(o Order) error { return nil }\n",
-            "init",
-        );
-        // Unrelated uncommitted edit — the content-rules violation itself is
-        // untouched by it, i.e. it predates this "current edit."
-        repo.write_uncommitted("README.md", "unrelated edit\n");
-
-        let arch_config = domain_content_rules_arch_config();
-        let files = walk_and_collect_files(&repo.dir).unwrap();
-
-        let result =
-            run_architecture_check(&content_rules_check(), &repo.dir, &files, &arch_config)
-                .unwrap();
-
-        assert!(!result.passed);
-        assert_eq!(result.severity, Severity::Advisory);
-        assert!(result.message.unwrap().contains("predates your edits"));
-    }
-
-    #[test]
-    fn content_rules_blocking_violation_stays_blocking_when_new_since_head() {
-        let repo = TempRepo::new("content-rules-new-since-head");
-        repo.write_and_commit(
-            "domain/domain.go",
-            "package domain\n\ntype Order struct {\n\tID string\n}\n",
-            "init",
-        );
-        // Uncommitted edit introduces the violating function — absent at HEAD.
-        repo.write_uncommitted(
-            "domain/domain.go",
-            "package domain\n\ntype Order struct {\n\tID string\n}\n\n\
-             func Validate(o Order) error { return nil }\n",
-        );
-
-        let arch_config = domain_content_rules_arch_config();
-        let files = walk_and_collect_files(&repo.dir).unwrap();
-
-        let result =
-            run_architecture_check(&content_rules_check(), &repo.dir, &files, &arch_config)
-                .unwrap();
-
-        assert!(!result.passed);
-        assert_eq!(result.severity, Severity::Blocking);
-        assert!(!result.message.unwrap().contains("predates your edits"));
-    }
-
-    fn naming_rules_check() -> Check {
-        Check {
-            name: "naming-rules".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("naming-rules".to_string()),
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("naming rule violation".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    #[test]
-    fn naming_rules_blocking_violation_downgrades_when_it_predates_head() {
-        let repo = TempRepo::new("naming-rules-predates-head");
-        repo.write_and_commit(
-            "infra/infra.go",
-            "package infra\n\ntype OrderStore struct {\n\tID string\n}\n",
-            "init",
-        );
-        repo.write_uncommitted("README.md", "unrelated edit\n");
-
-        let arch_config = crate::config::ArchitectureConfig {
-            components: vec![crate::config::Component {
-                name: "infra".to_string(),
-                paths: vec!["**/infra".to_string(), "**/infra/**".to_string()],
-            }],
-            naming_rules: vec![crate::config::NamingRule {
-                component: "infra".to_string(),
-                kind: "struct".to_string(),
-                pattern: ".*Repository$|.*Client$".to_string(),
-            }],
-            ..Default::default()
-        };
-        let files = walk_and_collect_files(&repo.dir).unwrap();
-
-        let result =
-            run_architecture_check(&naming_rules_check(), &repo.dir, &files, &arch_config).unwrap();
-
-        assert!(!result.passed);
-        assert_eq!(result.severity, Severity::Advisory);
-        assert!(result.message.unwrap().contains("predates your edits"));
-    }
-
-    fn instability_check() -> Check {
-        Check {
-            name: "instability".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("instability".to_string()),
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("instability violation".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    /// Regression guard for the `AnyArchitectureChecker::Model` dispatch arm added
-    /// alongside `InstabilityChecker`/`DipConcreteCouplingChecker`: proves
-    /// `run_architecture_check` actually builds an `ArchModel` and reaches the checker
-    /// (not just that the checker's own unit tests pass against a hand-built model), and
-    /// — via the blocking-severity downgrade path — that `check_native_against_git_head_repo`
-    /// resolves the `Model` arm too, matching the coverage the `Import`/`Declaration` arms
-    /// already have (`naming_rules_blocking_violation_downgrades_when_it_predates_head`
-    /// above).
-    #[test]
-    fn instability_model_checker_blocking_violation_downgrades_when_it_predates_head() {
-        let repo = TempRepo::new("instability-predates-head");
-        repo.write_and_commit(
-            "go.mod",
-            "module kibitzer.example/instabilitytest\n\ngo 1.21\n",
-            "init",
-        );
-        repo.write_and_commit(
-            "stable/stable.go",
-            "package stable\n\ntype Widget struct{}\n",
-            "init",
-        );
-        repo.write_and_commit(
-            "consumer/consumer.go",
-            "package consumer\n\nimport \"kibitzer.example/instabilitytest/stable\"\n\n\
-             var _ = stable.Widget{}\n",
-            "init",
-        );
-        repo.write_uncommitted("README.md", "unrelated edit\n");
-
-        let files = walk_and_collect_files(&repo.dir).unwrap();
-        let result = run_architecture_check(
-            &instability_check(),
-            &repo.dir,
-            &files,
-            &crate::config::ArchitectureConfig::default(),
-        )
-        .unwrap();
-
-        assert!(!result.passed);
-        assert!(result.output.contains("[instability]"));
-        assert_eq!(result.severity, Severity::Advisory);
-        assert!(result.message.unwrap().contains("predates your edits"));
-    }
-
-    fn unreferenced_private_symbol_check() -> Check {
-        Check {
-            name: "unreferenced-private-symbol".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("unreferenced-private-symbol".to_string()),
-            severity: Severity::Advisory,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("unreferenced private symbol".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    /// Regression guard for `ArchModelChecker::needs_private_symbols()`: this checker's
-    /// whole subject is unexported symbols, so it only works at all if
-    /// `run_architecture_check` actually builds its `ArchModel` with
-    /// `PruneConfig { include_private: true }` rather than the default `false` every other
-    /// `ArchModelChecker` gets. Every unit test in `unreferenced_symbols.rs` calls the
-    /// module-private finder function directly against a hand-built model with
-    /// `include_private: true` hardcoded — none of them would catch a regression where
-    /// `checker.needs_private_symbols()` stopped being threaded through to
-    /// `build_arch_model_for_check` here, which would silently prune every private symbol
-    /// before the checker ever saw one and leave it permanently finding nothing in real use.
-    #[test]
-    fn unreferenced_private_symbol_checker_sees_private_symbols_through_run_architecture_check() {
-        let repo = TempRepo::new("unreferenced-private-symbol-wiring");
-        repo.write_and_commit(
-            "pkg/a.go",
-            "package pkg\n\nfunc dead() {}\n\nfunc Live() {}\n",
-            "init",
-        );
-
-        let files = walk_and_collect_files(&repo.dir).unwrap();
-        let result = run_architecture_check(
-            &unreferenced_private_symbol_check(),
-            &repo.dir,
-            &files,
-            &crate::config::ArchitectureConfig::default(),
-        )
-        .unwrap();
-
-        assert!(!result.passed, "got: {result:?}");
-        assert!(result.output.contains("`dead`"), "got: {result:?}");
-    }
-
-    fn layering_check() -> Check {
-        Check {
-            name: "layering".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("layering".to_string()),
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("layering violation".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    // Regression guard: `check_native_against_git_head_repo` had zero prior test
-    // coverage (verified — no existing test in this module names `layering`,
-    // `import-cycles`, or `coupling`), so Task 2.2.3a/b's rewrite (dispatching through
-    // `lookup_any_architecture_checker` and branching on the enum) needs its own new
-    // test proving the Import-kind path still behaves exactly as before.
-    #[test]
-    fn import_kind_checker_head_baseline_downgrade_still_works_through_dual_registry_dispatch() {
-        let repo = TempRepo::new("import-kind-regression");
-        repo.write_and_commit("go.mod", "module fixture\ngo 1.21\n", "init");
-        repo.write_and_commit(
-            "handlers/handlers.go",
-            "package handlers\n\nfunc Do() {}\n",
-            "add handlers",
-        );
-        repo.write_and_commit(
-            "domain/domain.go",
-            "package domain\n\nimport \"fixture/handlers\"\n\nfunc Do() { handlers.Do() }\n",
-            "add domain violating layering",
-        );
-        repo.write_uncommitted("README.md", "unrelated edit\n");
-
-        let arch_config = crate::config::ArchitectureConfig {
-            layers: vec!["handlers".to_string(), "domain".to_string()],
-            ..Default::default()
-        };
-        let files = walk_and_collect_files(&repo.dir).unwrap();
-
-        let result =
-            run_architecture_check(&layering_check(), &repo.dir, &files, &arch_config).unwrap();
-
-        assert!(!result.passed);
-        assert_eq!(result.severity, Severity::Advisory);
-        assert!(result.message.unwrap().contains("predates your edits"));
-    }
-}
+mod plugin_missing_tests;
 
 #[cfg(test)]
-mod native_check_tests {
-    use super::*;
-    use crate::config::Severity;
+mod head_mapping_tests;
 
-    fn primitive_obsession_check() -> Check {
-        Check {
-            name: "native".to_string(),
-            command: None,
-            checker: Some("primitive-obsession".to_string()),
-            architecture_checker: None,
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("primitive obsession".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    // Predates `test_support::unique_temp_dir` and stays on its own atomic-counter
-    // scheme rather than migrating: it's already collision-resistant even under
-    // parallel test threads, which nanosecond-timestamp uniqueness alone is not.
-    fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-native-check-test-{}-{name}-{}",
-            std::process::id(),
-            TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn missing_file_degrades_to_failed_result_instead_of_erroring() {
-        let dir = tmp_dir("missing-file");
-        let file = dir.join("does-not-exist.go");
-
-        let result = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .expect("a missing file must not abort the whole check run");
-        assert!(!result.passed);
-        assert!(result.output.contains("does-not-exist.go"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_not_matching_checkers_globs_is_skipped_rather_than_misparsed() {
-        let dir = tmp_dir("wrong-glob");
-        let file = dir.join("notes.md");
-        std::fs::write(&file, "func f(a, b string) {}\n").unwrap();
-
-        let result = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(result.passed);
-        assert_eq!(result.output, "");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn blank_imports_check() -> Check {
-        Check {
-            name: "native".to_string(),
-            command: None,
-            checker: Some("go-blank-imports".to_string()),
-            architecture_checker: None,
-            severity: Severity::Blocking,
-            scope: vec![],
-            triggers: vec![],
-            message: Some("blank import".to_string()),
-            output_format: None,
-            options: None,
-        }
-    }
-
-    #[test]
-    fn oversized_file_is_skipped_rather_than_parsed() {
-        let dir = tmp_dir("oversized");
-        let file = dir.join("huge.go");
-        let mut content = String::from("package main\n\nimport (\n\t_ \"unjustified/pkg\"\n)\n");
-        content.push_str(&"// padding\n".repeat(300_000)); // ~3.3MB, over MAX_NATIVE_CHECK_BYTES
-        std::fs::write(&file, &content).unwrap();
-
-        let result = run_check(
-            &blank_imports_check(),
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(
-            result.passed,
-            "oversized file should be skipped rather than flagged"
-        );
-        assert!(result.output.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // A `WholeRepoNative` (`architecture_checker`-set) `Check` has neither `checker`
-    // nor `command`, so it must be short-circuited before the `command`-only branch's
-    // `.expect()` — reached whenever a per-file trigger dispatch doesn't pre-filter by
-    // `is_per_file()` the way `run.rs::run_batch` does.
-    #[test]
-    fn whole_repo_native_check_dispatched_per_file_passes_trivially_instead_of_panicking() {
-        let dir = tmp_dir("whole-repo-native-per-file");
-        let file = dir.join("some-file.go");
-        std::fs::write(&file, "package main\n").unwrap();
-
-        let check = Check {
-            name: "package-size".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("package-size".to_string()),
-            severity: Severity::Advisory,
-            scope: vec![],
-            triggers: vec![],
-            message: None,
-            output_format: None,
-            options: None,
-        };
-
-        let result = run_check(
-            &check,
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(result.passed);
-        assert!(result.output.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Proves criterion 6 concretely for a new native checker (not just
-    // primitive-obsession): two unjustified blank imports, one inside
-    // `changed_lines` and one outside it, and only the in-range one survives
-    // output-filtering and drives the pass/fail result.
-    #[test]
-    fn native_go_blank_imports_check_scopes_output_to_changed_lines() {
-        let dir = tmp_dir("blank-imports-scoping");
-        let file = dir.join("main.go");
-        std::fs::write(
-            &file,
-            "package main\n\nimport (\n\t_ \"unjustified/outside\"\n\t_ \"unjustified/inside\"\n)\n",
-        )
-        .unwrap();
-
-        // Line 4 (outside/pre-existing) is excluded; line 5 (inside) is the
-        // only changed line, matching this file's `{file}:{line}:` findings.
-        let registry = Registry::default();
-        let accepted = AcceptedFindings::default();
-        let result = run_check(
-            &blank_imports_check(),
-            &dir,
-            &file,
-            Some(&[(5, 5)]),
-            &registry,
-            &accepted,
-        )
-        .unwrap();
-        assert!(!result.passed);
-        assert!(result.output.contains("unjustified/inside"));
-        assert!(!result.output.contains("unjustified/outside"));
-
-        // Scoping to a range with no findings at all reports a pass, proving the
-        // filtering — not just the checker itself — determines the outcome.
-        let clean = run_check(
-            &blank_imports_check(),
-            &dir,
-            &file,
-            Some(&[(1, 1)]),
-            &registry,
-            &accepted,
-        )
-        .unwrap();
-        assert!(clean.passed);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Regression for docs/go-primitive-obsession-false-positives.md's "pre-existing
-    // unchanged signatures flagged" entry: `changed_lines` scoping (already generic
-    // across every native checker via `run_native_check`) must exclude a
-    // primitive-obsession finding whose signature sits outside the edited range,
-    // even though `check_file` itself still parses and flags the whole file.
-    #[test]
-    fn native_primitive_obsession_check_scopes_output_to_changed_lines() {
-        let dir = tmp_dir("primitive-obsession-scoping");
-        let file = dir.join("tls.go");
-        std::fs::write(
-            &file,
-            "package main\n\nfunc certCurrent(certFile, hashFile, want string) bool {\n\treturn true\n}\n\nfunc LoadTLSConfig(certFile, keyFile string) (int, error) {\n\treturn 0, nil\n}\n",
-        )
-        .unwrap();
-
-        // Only line 7 (`LoadTLSConfig`) falls inside the edited range; line 3
-        // (`certCurrent`) is pre-existing and untouched.
-        let registry = Registry::default();
-        let accepted = AcceptedFindings::default();
-        let result = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            Some(&[(7, 7)]),
-            &registry,
-            &accepted,
-        )
-        .unwrap();
-        assert!(!result.passed);
-        assert!(result.output.contains("LoadTLSConfig") || result.output.contains(":7:"));
-        assert!(!result.output.contains("certCurrent"));
-
-        // Scoping to a range that touches neither flagged signature reports a pass.
-        let clean = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            Some(&[(4, 4)]),
-            &registry,
-            &accepted,
-        )
-        .unwrap();
-        assert!(clean.passed);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Regression for docs/go-primitive-obsession-false-positives.md's "deletion-only
-    // edit flagged" entry: a pure-deletion edit (`hook::compute_changed_lines` now
-    // returns `Some(vec![])` for one, instead of `None`/unscoped) must not re-surface
-    // an unrelated, pre-existing flaggable signature still left in the file.
-    #[test]
-    fn native_primitive_obsession_check_suppresses_findings_for_deletion_only_edit() {
-        let dir = tmp_dir("primitive-obsession-deletion-only");
-        let file = dir.join("tls.go");
-        // What's left in the file after a hypothetical deletion of dead code —
-        // `certCurrent` was already here, untouched by the edit.
-        std::fs::write(
-            &file,
-            "package main\n\nfunc certCurrent(certFile, hashFile, want string) bool {\n\treturn true\n}\n",
-        )
-        .unwrap();
-
-        let registry = Registry::default();
-        let result = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            Some(&[]),
-            &registry,
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(result.passed, "output: {}", result.output);
-        assert_eq!(result.output, "");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `json` is the old `{"accepted": [...]}` shape purely so call sites can keep
-    /// listing entries inline — split into one file per entry, the real on-disk layout.
-    fn write_accepted_findings(dir: &Path, json: &str) {
-        let accepted_dir = dir.join(crate::accepted_findings::ACCEPTED_FINDINGS_DIR);
-        std::fs::create_dir_all(&accepted_dir).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        for (i, entry) in parsed["accepted"].as_array().unwrap().iter().enumerate() {
-            std::fs::write(accepted_dir.join(format!("{i}.json")), entry.to_string()).unwrap();
-        }
-    }
-
-    #[test]
-    fn accepted_finding_with_unchanged_content_suppresses_the_native_finding() {
-        let dir = tmp_dir("accepted-unchanged");
-        let file = dir.join("user.go");
-        std::fs::write(
-            &file,
-            "package main\n\nfunc newUser(name, email string) {}\n",
-        )
-        .unwrap();
-        write_accepted_findings(
-            &dir,
-            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
-        );
-        let accepted = crate::accepted_findings::find_accepted_findings(&dir).unwrap();
-
-        let result = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &accepted,
-        )
-        .unwrap();
-        assert!(result.passed, "output: {}", result.output);
-        assert_eq!(result.output, "");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn accepted_finding_stops_suppressing_once_the_line_content_drifts() {
-        let dir = tmp_dir("accepted-stale");
-        let file = dir.join("user.go");
-        // The signature grew a third same-typed parameter since the entry below was
-        // written — the recorded `content` no longer matches, so the (now different)
-        // finding must still surface rather than being silently swallowed forever.
-        std::fs::write(
-            &file,
-            "package main\n\nfunc newUser(name, email, nickname string) {}\n",
-        )
-        .unwrap();
-        write_accepted_findings(
-            &dir,
-            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": "not worth a newtype here"}]}"#,
-        );
-        let accepted = crate::accepted_findings::find_accepted_findings(&dir).unwrap();
-
-        let result = run_check(
-            &primitive_obsession_check(),
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &accepted,
-        )
-        .unwrap();
-        assert!(!result.passed);
-        assert!(
-            result.output.contains("3 identifiers"),
-            "output: {}",
-            result.output
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn malformed_accepted_findings_file_surfaces_as_a_real_error() {
-        let dir = tmp_dir("accepted-malformed");
-        std::fs::write(
-            dir.join("user.go"),
-            "package main\n\nfunc newUser(name, email string) {}\n",
-        )
-        .unwrap();
-        write_accepted_findings(
-            &dir,
-            r#"{"accepted": [{"rule": "primitive-obsession", "file": "user.go", "line": 3, "content": "func newUser(name, email string) {}", "reason": ""}]}"#,
-        );
-
-        // `AcceptedFindings` is loaded once per batch by the caller (see
-        // `run_checks_for_trigger`'s doc comment), not inside `run_check`/`run_native_check`
-        // — an entry with an empty reason must fail loudly right there, before any check
-        // in the batch ever runs, rather than nondeterministically aborting mid-batch.
-        let result = crate::accepted_findings::find_accepted_findings(&dir);
-        assert!(
-            result.is_err(),
-            "an entry with an empty reason must not be silently accepted"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn ai_vocabulary_density_check(options: Option<serde_json::Value>) -> Check {
-        Check {
-            name: "native".to_string(),
-            command: None,
-            checker: Some("ai-vocabulary-density".to_string()),
-            architecture_checker: None,
-            severity: Severity::Advisory,
-            scope: vec![],
-            triggers: vec![],
-            message: None,
-            output_format: None,
-            options,
-        }
-    }
-
-    /// Without `options`, `ai-vocabulary-density`'s default 3-word threshold doesn't
-    /// fire on a single buzzword occurrence.
-    #[test]
-    fn unconfigured_checker_uses_its_own_default_threshold() {
-        let dir = tmp_dir("checker-options-default");
-        let file = dir.join("doc.md");
-        std::fs::write(&file, "We should leverage this system.\n").unwrap();
-
-        let result = run_check(
-            &ai_vocabulary_density_check(None),
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(result.passed, "output: {}", result.output);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// End-to-end proof that `Check::options` reaches the native checker: lowering the
-    /// threshold to 1 via `options` makes the same file fail, through the exact
-    /// `run_check` -> `run_native_check` path production uses.
-    #[test]
-    fn check_options_reach_the_configured_native_checker() {
-        let dir = tmp_dir("checker-options-configured");
-        let file = dir.join("doc.md");
-        std::fs::write(&file, "We should leverage this system.\n").unwrap();
-
-        let check = ai_vocabulary_density_check(Some(serde_json::json!({ "threshold": 1 })));
-        let result = run_check(
-            &check,
-            &dir,
-            &file,
-            None,
-            &Registry::default(),
-            &AcceptedFindings::default(),
-        )
-        .unwrap();
-        assert!(!result.passed, "output: {}", result.output);
-        assert!(result.output.contains("leverage"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// Closes the gap this fix is for: `ArchFinding.severity_override` was set correctly by
-/// every checker (verified by architecture_checks.rs/declaration_checks.rs's own unit
-/// tests) but was never threaded past `run_architecture_check` into `CheckResult` — so
-/// `mcp.rs`/`main.rs` had no way to render a finding's own effective severity, only the
-/// one `CheckResult.severity` flattened uniformly across every finding a `Check` produced.
-/// These tests prove `CheckResult.findings` now carries that per-finding data end to end.
 #[cfg(test)]
-mod findings_wiring_tests {
-    use super::*;
-    use crate::config::{ArchitectureConfig, Component, Severity};
+mod git_head_integration_tests;
 
-    fn component_deps_check(severity: Severity) -> Check {
-        Check {
-            name: "component-deps".to_string(),
-            command: None,
-            checker: None,
-            architecture_checker: Some("component-deps".to_string()),
-            severity,
-            scope: vec![],
-            triggers: vec![],
-            message: None,
-            output_format: None,
-            options: None,
-        }
-    }
+#[cfg(test)]
+mod native_check_tests;
 
-    /// A single Go package with no imports at all: `ComponentDependencyChecker` has no
-    /// edges to flag as a real violation, but the declared "ghost" component's glob
-    /// matches zero import-graph nodes, so the checker's own
-    /// `zero_match_advisory`-produced `ArchFinding` (`severity_override:
-    /// Some(Severity::Advisory)`) is the *only* finding produced.
-    fn write_zero_match_only_fixture(dir: &Path) {
-        std::fs::create_dir_all(dir.join("pkg")).unwrap();
-        std::fs::write(dir.join("go.mod"), "module fixture\ngo 1.21\n").unwrap();
-        std::fs::write(dir.join("pkg/pkg.go"), "package pkg\n\nfunc F() {}\n").unwrap();
-    }
+#[cfg(test)]
+mod findings_wiring_tests;
 
-    #[test]
-    fn component_deps_flags_zero_match_component_as_advisory_even_when_check_is_blocking() {
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-findings-wiring-test-{}-{}",
-            std::process::id(),
-            TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        write_zero_match_only_fixture(&dir);
+#[cfg(test)]
+mod inline_seam_tests;
 
-        let arch_config = ArchitectureConfig {
-            components: vec![Component {
-                name: "ghost".to_string(),
-                paths: vec!["**/ghost".to_string(), "**/ghost/**".to_string()],
-            }],
-            ..Default::default()
-        };
-        let files = walk_and_collect_files(&dir).unwrap();
-
-        // Check.severity is Blocking — the exact configuration that, before this fix,
-        // made a harmless zero-match advisory masquerade as a blocking finding once it
-        // reached rendered output (the bug this fix closes).
-        let result = run_architecture_check(
-            &component_deps_check(Severity::Blocking),
-            &dir,
-            &files,
-            &arch_config,
-        )
-        .unwrap();
-
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert!(!result.passed);
-        // The single finding is the zero-match advisory, carrying its own narrowed
-        // severity, independent of `result.severity` (which stays whatever the
-        // uniform/flattened `CheckResult.severity` resolves to).
-        assert_eq!(result.findings.len(), 1, "findings: {:?}", result.findings);
-        assert_eq!(
-            result.findings[0].severity_override,
-            Some(Severity::Advisory)
-        );
-        assert!(result.findings[0].message.contains("[component]"));
-        assert!(result.findings[0].message.contains("matched 0"));
-    }
-
-    /// Same additive-field precedent as `command` (`src/check.rs:26-32` at the time this
-    /// was written): a `cache.json` blob written before `findings` existed must still
-    /// deserialize — as an empty `Vec` — instead of `Cache::load` discarding the whole
-    /// cache on the first run after upgrade.
-    #[test]
-    fn cache_json_without_findings_field_deserializes_with_empty_findings() {
-        let old_shape_json = r#"{
-            "check_name": "component-deps",
-            "severity": "blocking",
-            "passed": false,
-            "output": "some finding",
-            "message": null,
-            "command": "kibitzer check architecture component-deps"
-        }"#;
-        let result: CheckResult = serde_json::from_str(old_shape_json)
-            .expect("a pre-`findings`-field CheckResult must still deserialize");
-        assert!(result.findings.is_empty());
-        assert_eq!(result.check_name, "component-deps");
-    }
-}
+#[cfg(test)]
+mod post_pass_pipeline_tests;

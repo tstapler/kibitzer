@@ -96,4 +96,7 @@ check for anyone, including you, on a future run. If a finding is blocking
 real work right now, that's a separate conversation with whoever owns the
 project's `.kibitzer/inspect.json` (see `docs/suppressing-checks.md`), or —
 for one specific, correctly-flagged finding you want to keep rather than
-fix — `docs/accepting-findings.md`.
+fix — dismiss it inline with a `kibitzer:ignore` comment
+(`docs/suppressing-checks.md`), or use `docs/accepting-findings.md` where a
+comment can't go. An inline ignore is not a report: if the checker misfired,
+still file it through `report_false_positive` so the checker gets fixed.

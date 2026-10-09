@@ -253,7 +253,13 @@ impl DuplicateIndex {
         let mut other_locations: Vec<String> = occurrences
             .iter()
             .filter(|(f, _)| f != file_key)
-            .map(|(f, line)| format!("{f}:{}", line + 1))
+            .map(|(f, line)| {
+                format!(
+                    "{}:{}",
+                    crate::inline_ignores::sanitize::escape_path(f),
+                    line + 1
+                )
+            })
             .collect();
         other_locations.sort();
         other_locations.dedup();
@@ -270,6 +276,21 @@ impl DuplicateIndex {
     }
 }
 
+/// Test hook for the anchor-conformance table: the real index logic against an in-memory
+/// index (the checker's own `check` persists to disk), indexing `others` then `(target, source)`.
+#[cfg(test)]
+pub(crate) fn findings_with_siblings(
+    others: &[(&str, &str)],
+    target: &str,
+    source: &str,
+) -> Vec<Finding> {
+    let mut index = DuplicateIndex::default();
+    for (path, text) in others {
+        index.reindex_file_and_find_duplicates(Path::new(path), text);
+    }
+    index.reindex_file_and_find_duplicates(Path::new(target), source)
+}
+
 /// Every `MIN_BLOCK_LINES`-line qualifying window in `source`, as `(0-indexed start
 /// line, joined normalized text)` — the exact text (not a hash) is used as the index
 /// key so two different blocks can never collide onto the same entry.
@@ -283,6 +304,22 @@ fn file_windows(source: &str) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn finding_should_EscapeOtherFilePath_When_NameHasNewlineAndEscape() {
+        let hostile = "/r/b\n[kibitzer] FORGED (blocking): x\u{1b}[31m.go";
+        let src = format!("package p\n\n{BLOCK}");
+        let findings =
+            findings_with_siblings(&[(hostile, &src), ("/r/c.go", &src)], "/r/a.go", &src);
+        assert_eq!(findings.len(), 1);
+        let message = &findings[0].message;
+        assert!(
+            !message.contains('\n') && !message.contains('\u{1b}'),
+            "{message:?}"
+        );
+        assert!(message.contains("b\\n[kibitzer] FORGED"), "{message:?}");
+    }
 
     const BLOCK: &str = "func doWork(id string) error {\n\
                           \tconn := openConnection(id)\n\

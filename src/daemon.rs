@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{Cache, default_cache_path};
+use crate::cache::{Cache, Stamps, default_cache_path};
 use crate::check::{CheckResult, run_checks_for_trigger};
-use crate::config::{find_effective_config, resolve_config_path};
+use crate::config::{find_effective_config, locate_config_path};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -21,29 +21,53 @@ enum Request {
         trigger: String,
         #[serde(default)]
         changed_lines: Option<Vec<(usize, usize)>>,
+        /// The edit removed text at an unknown position (see `RunContext::unlocated_deletion`).
+        #[serde(default)]
+        unlocated_deletion: bool,
     },
     Ping,
     Shutdown,
 }
 
+/// The kibitzer version a daemon answers with. A daemon started before an upgrade keeps
+/// running the old code, so the client compares this to its own and retires a mismatch.
+const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Response {
     ok: bool,
+    /// Absent from a pre-version daemon's replies, which therefore read as a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     results: Option<Vec<CheckResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
+pub(crate) use crate::daemon_lock::DirRejected;
+
 /// Per-user socket path so multiple users on a shared machine never collide, and so a
 /// leftover socket from a previous login session doesn't get reused across reboots
 /// unexpectedly (XDG_RUNTIME_DIR is normally tmpfs, reset on boot).
-pub fn default_socket_path() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+///
+/// Lives in a directory only this user can write (see `daemon_lock::trusted_runtime_dir`). When
+/// no such directory can be had the error names it: hooks then run checks in-process, and
+/// `daemon start` refuses rather than bind a socket nobody could find again.
+pub fn socket_path() -> Result<PathBuf, DirRejected> {
+    runtime_socket().map(|(socket, _)| socket)
+}
+
+/// The socket path, plus the refusal of `XDG_RUNTIME_DIR` when the private fallback directory
+/// stands in for it.
+fn runtime_socket() -> Result<(PathBuf, Option<DirRejected>), DirRejected> {
     let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
-    base.join(format!("kibitzer-{user}.sock"))
+    crate::daemon_lock::trusted_runtime_dir().map(|dir| {
+        (
+            dir.path.join(format!("kibitzer-{user}.sock")),
+            dir.fallback_for,
+        )
+    })
 }
 
 /// Run the daemon in the foreground on `socket_path` until it receives a `Shutdown`
@@ -52,13 +76,29 @@ pub fn default_socket_path() -> PathBuf {
 /// etc.) — the daemon does not self-detach. `run_checks_smart` is one such caller: its
 /// `maybe_spawn_daemon` backgrounds this automatically when no daemon is reachable.
 pub fn run_daemon(socket_path: &Path) -> Result<()> {
-    if socket_path.exists() {
-        // A stale socket from a crashed prior daemon; a live daemon would have failed
-        // to start in the first place (see `is_alive` check callers should do first).
-        std::fs::remove_file(socket_path).ok();
+    // Held until the process exits: the kernel releases it on any death, so a crashed daemon
+    // never blocks its successor, and two daemons can never both pass this point.
+    let Some(_owner_lock) = acquire_owner_lock(socket_path)? else {
+        eprintln!(
+            "[kibitzer] another daemon already owns {}",
+            socket_path.display()
+        );
+        return Ok(());
+    };
+    if !clear_unlocked_daemon(socket_path) {
+        eprintln!(
+            "[kibitzer] a daemon is still answering on {}",
+            socket_path.display()
+        );
+        return Ok(());
     }
+    // Only a socket nobody answers on is stale; the owner lock above rules out a live peer.
+    std::fs::remove_file(socket_path).ok();
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding daemon socket at {}", socket_path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_file(wedged_marker(socket_path));
     eprintln!("[kibitzer] daemon listening on {}", socket_path.display());
 
     let cache_path = default_cache_path();
@@ -77,6 +117,87 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How long a new daemon waits for a retiring predecessor to release its lock and socket.
+const PREDECESSOR_WAIT: Duration = Duration::from_secs(3);
+
+fn owner_lock_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("lock")
+}
+
+use crate::daemon_lock::open_lock_file;
+
+/// The exclusive daemon lock, or `None` when a live same-version daemon owns it or a previous
+/// owner did not exit within `PREDECESSOR_WAIT`. A holder that keeps the lock yet never answers
+/// a probe (stopped or deadlocked) is displaced once that wait runs out, if its pid checks out.
+fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
+    acquire_owner_lock_with(socket_path, &crate::daemon_lock::displace_wedged_holder)
+}
+
+/// Frees the lock of a wedged holder: `(lock_path, still_wedged) -> freed`. A parameter so tests
+/// can observe what the re-probe reports at the moment of displacement.
+type Displace<'a> = &'a dyn Fn(&Path, &dyn Fn() -> bool) -> bool;
+
+fn acquire_owner_lock_with(
+    socket_path: &Path,
+    displace: Displace,
+) -> Result<Option<std::fs::File>> {
+    let lock_path = owner_lock_path(socket_path);
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let file = open_lock_file(&lock_path)
+        .with_context(|| format!("opening daemon lock {}", lock_path.display()))?;
+    let deadline = std::time::Instant::now() + PREDECESSOR_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                crate::daemon_lock::record_owner_pid(&file);
+                return Ok(Some(file));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let probe = exchange(socket_path, &Request::Ping, PROBE_TIMEOUT);
+        if matches!(&probe, Probe::Answered(r) if r.version.as_deref() == Some(DAEMON_VERSION)) {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            let wedged = matches!(probe, Probe::Wedged);
+            if wedged
+                && displace(&lock_path, &|| {
+                    matches!(
+                        exchange(socket_path, &Request::Ping, PROBE_TIMEOUT),
+                        Probe::Wedged
+                    )
+                })
+                && file.try_lock().is_ok()
+            {
+                crate::daemon_lock::record_owner_pid(&file);
+                return Ok(Some(file));
+            }
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// With the owner lock held, anything still answering on the socket is a daemon that predates
+/// the lock. Asks it to exit and waits; false means it stayed up and must not be displaced.
+fn clear_unlocked_daemon(socket_path: &Path) -> bool {
+    if request(socket_path, &Request::Ping).is_none() {
+        return true;
+    }
+    shutdown_at(socket_path);
+    let deadline = std::time::Instant::now() + PREDECESSOR_WAIT;
+    while std::time::Instant::now() < deadline {
+        if request(socket_path, &Request::Ping).is_none() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -90,12 +211,14 @@ fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path)
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => Response {
                 ok: true,
+                version: Some(DAEMON_VERSION.to_string()),
                 results: None,
                 error: None,
             },
             Ok(Request::Shutdown) => {
                 let ack = Response {
                     ok: true,
+                    version: Some(DAEMON_VERSION.to_string()),
                     results: None,
                     error: None,
                 };
@@ -108,27 +231,32 @@ fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path)
                 file_path,
                 trigger,
                 changed_lines,
+                unlocated_deletion,
             }) => match handle_run_checks(
                 &cwd,
                 &file_path,
                 &trigger,
                 changed_lines.as_deref(),
+                unlocated_deletion,
                 cache,
                 cache_path,
             ) {
                 Ok(results) => Response {
                     ok: true,
+                    version: Some(DAEMON_VERSION.to_string()),
                     results: Some(results),
                     error: None,
                 },
                 Err(e) => Response {
                     ok: false,
+                    version: Some(DAEMON_VERSION.to_string()),
                     results: None,
                     error: Some(e.to_string()),
                 },
             },
             Err(e) => Response {
                 ok: false,
+                version: Some(DAEMON_VERSION.to_string()),
                 results: None,
                 error: Some(format!("bad request: {e}")),
             },
@@ -144,17 +272,24 @@ fn handle_run_checks(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
     cache: &Arc<Mutex<Cache>>,
     cache_path: &Path,
 ) -> Result<Vec<CheckResult>> {
+    // Fingerprinted before the first config or registry read, so an edit racing that read
+    // can only make the stamp older than the data (a miss later), never newer (a stale hit).
+    let config_path = locate_config_path(cwd);
+    let before = Stamps::capture(
+        file_path,
+        &config_path,
+        &crate::plugin::default_registry_path(),
+    );
     let (config, repo_root) = find_effective_config(cwd)?;
-    let config_path = resolve_config_path(&repo_root);
 
     // Cached entries aren't keyed by changed_lines — only bypass the cache lookup when a
     // diff-aware caller actually passed ranges, so the common no-diff path keeps caching.
     if changed_lines.is_none()
-        && let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.get(
+        && let Some(cached) = lock_cache(cache).get(
             file_path,
             &config_path,
             &crate::plugin::default_registry_path(),
@@ -167,7 +302,8 @@ fn handle_run_checks(
     // Loaded once for this request's whole check loop, not once per check — see
     // `run_checks_for_trigger`'s doc comment.
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    run_ctx.unlocated_deletion = unlocated_deletion;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -175,10 +311,11 @@ fn handle_run_checks(
         file_path,
         changed_lines,
         &registry,
-        &accepted,
+        &run_ctx,
     )?;
 
-    if let Ok(mut guard) = cache.lock() {
+    {
+        let mut guard = lock_cache(cache);
         guard.apply_grace(&mut results, file_path, trigger);
         // A scoped result only reflects the diffed ranges, not the whole file — writing it
         // to the cache would let a later unscoped (e.g. batch) request read back a partial
@@ -186,13 +323,7 @@ fn handle_run_checks(
         // concern (it's not part of `entries`, the file-results cache `put` populates), so
         // `save` still needs to run unconditionally below to persist it.
         if changed_lines.is_none() {
-            guard.put(
-                file_path,
-                &config_path,
-                &crate::plugin::default_registry_path(),
-                trigger,
-                results.clone(),
-            );
+            guard.put(before, trigger, results.clone());
         }
         // Persist regardless of `changed_lines`: without this, a diff-scoped (Edit-tool)
         // call under this daemon would still work correctly in-memory for as long as the
@@ -203,32 +334,208 @@ fn handle_run_checks(
     Ok(results)
 }
 
-fn connect() -> Option<UnixStream> {
-    let stream = UnixStream::connect(default_socket_path()).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok()?;
-    Some(stream)
+/// A poisoned lock only means another connection thread panicked mid-request; the cache map
+/// is still usable, and a daemon that stops caching for the rest of its life is worse.
+fn lock_cache(cache: &Mutex<Cache>) -> std::sync::MutexGuard<'_, Cache> {
+    cache.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// True if a kibitzer daemon is listening and responds to a ping.
-pub fn is_alive() -> bool {
-    request(&Request::Ping).is_some()
+/// How long a liveness probe (ping, shutdown) waits for the daemon to connect and answer. A
+/// healthy daemon answers in well under a millisecond; this only bounds a wedged one.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// How long a check run may take before the client gives up and runs it in-process.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long after a failed probe hooks skip the daemon outright instead of probing again.
+const WEDGED_SKIP_WINDOW: Duration = Duration::from_secs(10);
+
+/// What one request/response exchange with the daemon found.
+enum Probe {
+    /// Nothing listening: no socket, or a refused connection.
+    Dead,
+    /// A peer accepted (or the kernel queued) the connection but never replied in time.
+    Wedged,
+    Answered(Response),
 }
 
-pub fn shutdown() -> bool {
-    request(&Request::Shutdown).is_some()
+/// Connects within `timeout`; the connect itself can block on a wedged daemon's full backlog,
+/// so it runs on a helper thread that is abandoned on timeout.
+fn connect_within(socket_path: &Path, timeout: Duration) -> Result<UnixStream, Probe> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = socket_path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(path));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(classify_connect_error(e.kind(), || {
+            lock_is_live(&owner_lock_path(socket_path))
+        })),
+        Err(_) => Err(Probe::Wedged),
+    }
 }
 
-fn request(req: &Request) -> Option<Response> {
-    let mut stream = connect()?;
-    let mut payload = serde_json::to_string(req).ok()?;
+/// A refused connect is normally "nothing listening", but macOS also refuses when a stopped
+/// daemon's backlog is full. A refusal while the owner lock is still held is therefore a wedged
+/// holder, so displacement can run.
+fn classify_connect_error(kind: std::io::ErrorKind, lock_held: impl FnOnce() -> bool) -> Probe {
+    if kind == std::io::ErrorKind::ConnectionRefused && lock_held() {
+        Probe::Wedged
+    } else {
+        Probe::Dead
+    }
+}
+
+/// Whether a lock file exists and is held; never creates one.
+fn lock_is_live(lock_path: &Path) -> bool {
+    lock_path.exists() && crate::daemon_lock::lock_is_held(lock_path)
+}
+
+/// Sends `req` and reads one reply line, giving the daemon `timeout` for each step.
+fn exchange(socket_path: &Path, req: &Request, timeout: Duration) -> Probe {
+    let mut stream = match connect_within(socket_path, timeout) {
+        Ok(stream) => stream,
+        Err(probe) => return probe,
+    };
+    let (Ok(()), Ok(()), Ok(mut payload)) = (
+        stream.set_read_timeout(Some(timeout)),
+        stream.set_write_timeout(Some(timeout)),
+        serde_json::to_string(req),
+    ) else {
+        return Probe::Dead;
+    };
     payload.push('\n');
-    stream.write_all(payload.as_bytes()).ok()?;
-    let mut reader = BufReader::new(stream);
+    if let Err(e) = stream.write_all(payload.as_bytes()) {
+        return classify(&e);
+    }
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    serde_json::from_str(&line).ok()
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(0) => Probe::Dead,
+        Ok(_) => serde_json::from_str(&line).map_or(Probe::Dead, Probe::Answered),
+        Err(e) => classify(&e),
+    }
+}
+
+fn classify(error: &std::io::Error) -> Probe {
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Probe::Wedged,
+        _ => Probe::Dead,
+    }
+}
+
+fn request(socket_path: &Path, req: &Request) -> Option<Response> {
+    match exchange(socket_path, req, PROBE_TIMEOUT) {
+        Probe::Answered(response) => Some(response),
+        Probe::Dead | Probe::Wedged => None,
+    }
+}
+
+/// What `kibitzer daemon status` found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DaemonState {
+    Running,
+    NotRunning,
+    /// Something holds the daemon's lock or socket but did not answer a ping (stopped or hung).
+    NotResponding {
+        pid: Option<u32>,
+    },
+}
+
+/// Whether a kibitzer daemon is listening and responds to a ping; an untrusted runtime
+/// directory is an error, not "no daemon".
+pub fn state() -> Result<DaemonState, DirRejected> {
+    let socket = socket_path()?;
+    Ok(match exchange(&socket, &Request::Ping, PROBE_TIMEOUT) {
+        Probe::Answered(_) => DaemonState::Running,
+        Probe::Dead => DaemonState::NotRunning,
+        Probe::Wedged => DaemonState::NotResponding {
+            pid: crate::daemon_lock::holder_pid(&owner_lock_path(&socket)),
+        },
+    })
+}
+
+/// The refusal as printed by `daemon status` and `daemon stop`: a daemon started before the
+/// directory was loosened (or replaced) may still be running there, so say where its lock is.
+pub fn untrusted_message(rejected: &DirRejected) -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "kibitzer".to_string());
+    let lock = owner_lock_path(&rejected.dir.join(format!("kibitzer-{user}.sock")));
+    let held_by = crate::daemon_lock::holder_pid(&lock).map(|pid| {
+        format!(
+            " (pid {pid} in {})",
+            crate::inline_ignores::sanitize::display_path(&lock)
+        )
+    });
+    format!(
+        "{rejected}; a daemon started earlier may still be running{}",
+        held_by.unwrap_or_default()
+    )
+}
+
+/// What `kibitzer daemon stop` accomplished.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    NotRunning,
+    Stopped,
+    /// The daemon held its lock but never answered, so it was signalled and replaced.
+    Killed,
+    /// The daemon never answered and its pid could not be verified as a kibitzer daemon.
+    Unresponsive {
+        pid: Option<u32>,
+    },
+    /// The runtime directory is not trusted now; a daemon started before that may still run.
+    UntrustedDir(DirRejected),
+}
+
+pub fn shutdown() -> ShutdownOutcome {
+    match socket_path() {
+        Ok(path) => shutdown_with_lock(&path, &crate::daemon_lock::displace_wedged_holder),
+        Err(rejected) => ShutdownOutcome::UntrustedDir(rejected),
+    }
+}
+
+fn shutdown_with_lock(socket_path: &Path, displace: Displace) -> ShutdownOutcome {
+    match exchange(socket_path, &Request::Shutdown, PROBE_TIMEOUT) {
+        Probe::Answered(_) => ShutdownOutcome::Stopped,
+        Probe::Dead => ShutdownOutcome::NotRunning,
+        Probe::Wedged => {
+            let lock = owner_lock_path(socket_path);
+            if crate::daemon_lock::lock_is_held(&lock)
+                && displace(&lock, &|| {
+                    matches!(
+                        exchange(socket_path, &Request::Ping, PROBE_TIMEOUT),
+                        Probe::Wedged
+                    )
+                })
+            {
+                ShutdownOutcome::Killed
+            } else {
+                ShutdownOutcome::Unresponsive {
+                    pid: crate::daemon_lock::holder_pid(&lock),
+                }
+            }
+        }
+    }
+}
+
+fn shutdown_at(socket_path: &Path) -> bool {
+    request(socket_path, &Request::Shutdown).is_some()
+}
+
+fn wedged_marker(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("wedged")
+}
+
+fn recently_wedged(socket_path: &Path) -> bool {
+    std::fs::metadata(wedged_marker(socket_path))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < WEDGED_SKIP_WINDOW)
+}
+
+fn mark_wedged(socket_path: &Path) {
+    let _ = std::fs::write(wedged_marker(socket_path), "");
 }
 
 /// Ask the daemon to run checks for `file_path`/`trigger`, if one is reachable.
@@ -239,14 +546,101 @@ pub fn try_run_checks_via_daemon(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Option<Vec<CheckResult>> {
-    let response = request(&Request::RunChecks {
+    let socket = match runtime_socket() {
+        Ok((socket, fallback)) => {
+            note_runtime_dir(&socket, fallback);
+            socket
+        }
+        Err(rejected) => {
+            crate::hook_log::note(crate::hook_log::NoteKind::Degraded, &rejected.to_string());
+            return None;
+        }
+    };
+    try_run_checks_at(
+        &socket,
+        cwd,
+        file_path,
+        trigger,
+        changed_lines,
+        unlocated_deletion,
+    )
+}
+
+/// Tells the hook log once that a refused `XDG_RUNTIME_DIR` was replaced, and forgets any earlier
+/// "ran without the daemon" note: a usable directory means the daemon is reachable again.
+fn note_runtime_dir(socket: &Path, fallback: Option<DirRejected>) {
+    use crate::hook_log::{NoteKind, clear_notes, note};
+    match fallback {
+        Some(refused) => {
+            let used = socket.parent().unwrap_or(socket);
+            note(
+                NoteKind::Fallback,
+                &format!(
+                    "{refused}; using {}",
+                    crate::inline_ignores::sanitize::display_path(used)
+                ),
+            );
+            clear_notes(&[NoteKind::Degraded]);
+        }
+        None => clear_notes(&[NoteKind::Degraded, NoteKind::Fallback]),
+    }
+}
+
+fn try_run_checks_at(
+    socket_path: &Path,
+    cwd: &Path,
+    file_path: &Path,
+    trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
+) -> Option<Vec<CheckResult>> {
+    if recently_wedged(socket_path) {
+        return None;
+    }
+    // A short ping first: a stopped daemon still accepts connections into the kernel queue, and
+    // would otherwise cost the whole check timeout on every hook.
+    match exchange(socket_path, &Request::Ping, PROBE_TIMEOUT) {
+        Probe::Dead => return None,
+        Probe::Wedged => {
+            mark_wedged(socket_path);
+            return None;
+        }
+        Probe::Answered(pong) if pong.version.as_deref() != Some(DAEMON_VERSION) => {
+            retire_stale_daemon(socket_path);
+            return None;
+        }
+        Probe::Answered(_) => {}
+    }
+    let run = Request::RunChecks {
         cwd: cwd.to_path_buf(),
         file_path: file_path.to_path_buf(),
         trigger: trigger.to_string(),
         changed_lines: changed_lines.map(|r| r.to_vec()),
-    })?;
+        unlocated_deletion,
+    };
+    let response = match exchange(socket_path, &run, CHECK_TIMEOUT) {
+        Probe::Answered(response) => response,
+        Probe::Wedged => {
+            mark_wedged(socket_path);
+            return None;
+        }
+        Probe::Dead => return None,
+    };
+    if response.version.as_deref() != Some(DAEMON_VERSION) {
+        retire_stale_daemon(socket_path);
+        return None;
+    }
     if response.ok { response.results } else { None }
+}
+
+/// A daemon from another kibitzer version (or from before replies carried one) answers with
+/// code that predates this binary, so its results are discarded and it is asked to exit. The
+/// spawn debounce stays in force: clearing it let two kibitzer versions on one machine retire
+/// and respawn each other on every hook.
+fn retire_stale_daemon(socket_path: &Path) {
+    shutdown_at(socket_path);
 }
 
 /// Minimum time between background-spawn attempts, so a daemon that keeps failing to
@@ -272,38 +666,57 @@ fn spawn_is_debounced(marker_modified: Option<SystemTime>, now: SystemTime) -> b
 /// since it exercises the deterministic no-daemon fallback path itself and a real daemon
 /// racing to life mid-test would otherwise answer later calls instead.
 fn maybe_spawn_daemon() {
-    if std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
+    if cfg!(test) || std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
         return;
     }
-    let marker = default_socket_path().with_extension("spawn-attempt");
+    let Ok(socket_path) = socket_path() else {
+        return;
+    };
+    let marker = socket_path.with_extension("spawn-attempt");
+    // Non-blocking exclusive gate: a hook that loses it knows another is spawning right now.
+    // The marker mtime is read and written only under the gate, so concurrent hooks cannot
+    // both pass the debounce (an earlier remove-then-create_new marker let one hook delete
+    // another's fresh claim).
+    let Ok(gate) = open_lock_file(&socket_path.with_extension("spawn-lock")) else {
+        return;
+    };
+    if gate.try_lock().is_err() {
+        return;
+    }
     let marker_modified = std::fs::metadata(&marker)
         .ok()
         .and_then(|m| m.modified().ok());
     if spawn_is_debounced(marker_modified, SystemTime::now()) {
         return;
     }
-    // Claim the marker atomically rather than read-mtime-then-write: two `hook`
-    // processes racing through the staleness check above could otherwise both pass
-    // it and both spawn a daemon. `create_new` makes the loser's claim fail instead,
-    // so at most one spawns per debounce window even under a race.
-    let _ = std::fs::remove_file(&marker);
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-        .is_err()
-    {
+    if std::fs::write(&marker, DAEMON_VERSION).is_err() {
         return;
     }
     spawn_detached_daemon();
 }
 
+/// Whether `exe` is an installed kibitzer binary rather than a cargo test harness (named
+/// `kibitzer-<hash>` under `target/*/deps`), which would answer `daemon start` by running tests.
+fn may_spawn_daemon_from(exe: &Path) -> bool {
+    let named_kibitzer = exe
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("kibitzer"));
+    let is_test_harness = exe.components().any(|c| c.as_os_str() == "deps");
+    named_kibitzer && !is_test_harness
+}
+
 /// The actual `kibitzer daemon start` spawn, split out of `maybe_spawn_daemon` so that
 /// function's debounce/marker logic stays readable on its own.
 fn spawn_detached_daemon() {
+    if cfg!(test) {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    if !may_spawn_daemon_from(&exe) {
+        return;
+    }
     // `process_group(0)` detaches the child into its own session/process group so it
     // outlives this short-lived hook process even if the hook's whole group gets
     // signaled (e.g. on a hook timeout) — otherwise the "background" daemon would die
@@ -327,12 +740,17 @@ pub fn run_checks_smart(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Result<Vec<CheckResult>> {
-    if let Some(results) = try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines) {
+    // Unit tests never reach a user's real daemon: a version mismatch would retire it.
+    if !cfg!(test)
+        && let Some(results) =
+            try_run_checks_via_daemon(cwd, file_path, trigger, changed_lines, unlocated_deletion)
+    {
         return Ok(results);
     }
     maybe_spawn_daemon();
-    run_uncached(cwd, file_path, trigger, changed_lines)
+    run_uncached(cwd, file_path, trigger, changed_lines, unlocated_deletion)
 }
 
 /// The no-daemon-reachable path of `run_checks_smart`: run checks in-process and persist
@@ -343,11 +761,36 @@ fn run_uncached(
     file_path: &Path,
     trigger: &str,
     changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
 ) -> Result<Vec<CheckResult>> {
+    run_uncached_with_cache(
+        cwd,
+        file_path,
+        trigger,
+        changed_lines,
+        unlocated_deletion,
+        &default_cache_path(),
+    )
+}
+
+fn run_uncached_with_cache(
+    cwd: &Path,
+    file_path: &Path,
+    trigger: &str,
+    changed_lines: Option<&[(usize, usize)]>,
+    unlocated_deletion: bool,
+    cache_path: &Path,
+) -> Result<Vec<CheckResult>> {
+    // Stamped before the first config read and before the checks run; see `Stamps`.
+    let before = Stamps::capture(
+        file_path,
+        &locate_config_path(cwd),
+        &crate::plugin::default_registry_path(),
+    );
     let (config, repo_root) = find_effective_config(cwd)?;
-    let config_path = resolve_config_path(&repo_root);
     let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
-    let accepted = crate::accepted_findings::find_accepted_findings(&repo_root)?;
+    let mut run_ctx = crate::run_context::RunContext::load(&repo_root)?;
+    run_ctx.unlocated_deletion = unlocated_deletion;
     let mut results = run_checks_for_trigger(
         &config.checks,
         trigger,
@@ -355,23 +798,16 @@ fn run_uncached(
         file_path,
         changed_lines,
         &registry,
-        &accepted,
+        &run_ctx,
     )?;
 
-    let cache_path = default_cache_path();
-    let mut cache = Cache::load(&cache_path);
+    let mut cache = Cache::load(cache_path);
     cache.apply_grace(&mut results, file_path, trigger);
     // See handle_run_checks: don't let a diff-scoped partial result overwrite the
     // full-file cache entry. `grace_pending` isn't part of that cache entry, so it still
     // needs `save` to run unconditionally below.
     if changed_lines.is_none() {
-        cache.put(
-            file_path,
-            &config_path,
-            &crate::plugin::default_registry_path(),
-            trigger,
-            results.clone(),
-        );
+        cache.put(before, trigger, results.clone());
     }
     // Persist regardless of `changed_lines`: this is a fresh `Cache::load` per process
     // (no daemon running), so without an unconditional save here, `apply_grace`'s
@@ -379,7 +815,7 @@ fn run_uncached(
     // subsequent `kibitzer hook` invocation would see an empty `grace_pending` and treat a
     // still-failing check as a fresh "first occurrence" forever, so a Blocking check could
     // never actually escalate back to blocking without a daemon.
-    let _ = cache.save(&cache_path);
+    let _ = cache.save(cache_path);
 
     Ok(results)
 }
@@ -404,5 +840,571 @@ mod spawn_debounce_tests {
     #[test]
     fn allows_the_first_attempt() {
         assert!(!spawn_is_debounced(None, SystemTime::now()));
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod inline_cache_tests {
+    use super::*;
+
+    #[test]
+    fn handle_run_checks_should_ReturnFirstAnchor_When_ResultServedFromCache() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), r#"{"checks": []}"#).unwrap();
+        let file = dir.join("main.go");
+        std::fs::write(
+            &file,
+            "package main\n\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n",
+        )
+        .unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache_path = dir.join("cache.json");
+
+        let anchor = |results: &[CheckResult]| {
+            results
+                .iter()
+                .find(|r| r.check_name == "syntax-rules-go")
+                .and_then(|r| {
+                    r.inline
+                        .first_anchor()
+                        .map(|(rule, line)| (rule.as_str().to_string(), line.get()))
+                })
+        };
+        let first =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
+        assert_eq!(anchor(&first), Some(("flag-argument".to_string(), 3)));
+        // Unchanged file and config: the second call must be a cache hit that still carries the anchor.
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .get(
+                    &file,
+                    &crate::config::resolve_config_path(&dir),
+                    &crate::plugin::default_registry_path(),
+                    "batch"
+                )
+                .is_some(),
+            "second request would not be a cache hit"
+        );
+        let second =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
+        assert_eq!(anchor(&second), anchor(&first));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod stale_daemon_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn client_should_GiveUpWithinProbeBound_And_SkipDaemonBriefly_When_DaemonNeverReplies() {
+        let dir = temp_dir("silent");
+        let socket = dir.join("k.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
+        assert!(out.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            recently_wedged(&socket),
+            "a failed probe must be remembered"
+        );
+        let again = std::time::Instant::now();
+        assert!(
+            try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false).is_none()
+        );
+        assert!(
+            again.elapsed() < Duration::from_millis(200),
+            "the skip window must avoid a second probe"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn may_spawn_daemon_from_should_RefuseTestHarnessAndForeignBinaries() {
+        assert!(may_spawn_daemon_from(Path::new(
+            "/opt/homebrew/bin/kibitzer"
+        )));
+        assert!(may_spawn_daemon_from(Path::new(
+            "/tmp/ks/kibitzer-under-test"
+        )));
+        assert!(!may_spawn_daemon_from(Path::new(
+            "/repo/target/debug/deps/kibitzer-4536938b3797b58f"
+        )));
+        assert!(!may_spawn_daemon_from(Path::new("/usr/bin/python3")));
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fake daemon that answers up to two connections with `reply_for(line)`, and gives up
+    /// after `FAKE_DAEMON_DEADLINE` so a client that never connects fails the test instead of
+    /// hanging `join`.
+    fn fake_daemon(
+        socket: &Path,
+        reply_for: fn(&str) -> String,
+    ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+        const FAKE_DAEMON_DEADLINE: Duration = Duration::from_secs(5);
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let saw_shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_shutdown);
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + FAKE_DAEMON_DEADLINE;
+            let mut served = 0;
+            while served < 2 && std::time::Instant::now() < deadline {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                // Accepted sockets inherit non-blocking mode on some platforms.
+                // Best effort: a peer that already hung up makes these fail with EINVAL.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut line = String::new();
+                if let Ok(clone) = stream.try_clone() {
+                    let _ = BufReader::new(clone).read_line(&mut line);
+                }
+                if line.contains("\"shutdown\"") {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                let mut writer = stream;
+                let _ = writeln!(writer, "{}", reply_for(&line));
+                served += 1;
+            }
+        });
+        (handle, saw_shutdown)
+    }
+
+    fn old_style_reply(_line: &str) -> String {
+        r#"{"ok":true,"results":[]}"#.to_string()
+    }
+
+    fn current_reply(_line: &str) -> String {
+        format!(r#"{{"ok":true,"version":"{DAEMON_VERSION}","results":[]}}"#)
+    }
+
+    #[test]
+    fn client_should_TreatDaemonAsDeadAndShutItDown_When_ReplyHasNoVersion() {
+        let dir = temp_dir("old-style");
+        let socket = dir.join("k.sock");
+        std::fs::write(socket.with_extension("spawn-attempt"), "").unwrap();
+        let (handle, saw_shutdown) = fake_daemon(&socket, old_style_reply);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
+        handle.join().unwrap();
+        assert!(out.is_none(), "an old daemon's results must be discarded");
+        assert!(
+            saw_shutdown.load(Ordering::SeqCst),
+            "old daemon must be asked to exit"
+        );
+        assert!(
+            socket.with_extension("spawn-attempt").exists(),
+            "debounce must survive a retire so versions cannot respawn each other per hook"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_should_TreatDaemonAsDead_When_VersionDiffers() {
+        let dir = temp_dir("other-version");
+        let socket = dir.join("k.sock");
+        let (handle, saw_shutdown) = fake_daemon(&socket, |_| {
+            r#"{"ok":true,"version":"0.0.0-old","results":[]}"#.to_string()
+        });
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
+        handle.join().unwrap();
+        assert!(out.is_none());
+        assert!(saw_shutdown.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_should_UseResults_When_VersionMatches() {
+        let dir = temp_dir("same-version");
+        let socket = dir.join("k.sock");
+        let (handle, saw_shutdown) = fake_daemon(&socket, current_reply);
+        let out = try_run_checks_at(&socket, &dir, &dir.join("f.go"), "batch", None, false);
+        // The fake accepts two connections; a matching daemon gets only one.
+        let _ = UnixStream::connect(&socket);
+        handle.join().unwrap();
+        assert_eq!(out.map(|r| r.len()), Some(0));
+        assert!(!saw_shutdown.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ping_reply_should_CarryVersion_When_DaemonAnswers() {
+        let dir = temp_dir("ping");
+        let socket = dir.join("k.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache_path = dir.join("cache.json");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, &cache, &cache_path).unwrap();
+        });
+        let response = request(&socket, &Request::Ping).unwrap();
+        assert_eq!(response.version.as_deref(), Some(DAEMON_VERSION));
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod stale_result_tests {
+    use super::*;
+
+    /// Config whose check touches `started` before sleeping, so a test waits on that marker
+    /// instead of guessing how long the slow run needs to begin.
+    fn write_slow_on_bad_config(dir: &Path) {
+        let started = dir.join("started");
+        std::fs::write(
+            dir.join(".kibitzer/inspect.json"),
+            format!(
+                r#"{{"checks": [{{"name": "no-bad", "command": "if grep -q BAD {{file}}; then touch {}; sleep 2; exit 1; fi", "severity": "advisory", "message": "bad"}}]}}"#,
+                started.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn wait_for_slow_check_to_start(dir: &Path) {
+        let started = dir.join("started");
+        for _ in 0..500 {
+            if started.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("slow check never started");
+    }
+
+    /// A shell check that sleeps only on BAD content: the slow request on old content is the
+    /// one that finishes last, after a fast request already cached the new content's result.
+    #[test]
+    fn handle_run_checks_should_NotCacheStaleResult_When_SlowRunFinishesAfterFileChanged() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        write_slow_on_bad_config(&dir);
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "BAD\n").unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let cache_path = dir.join("cache.json");
+
+        let slow = {
+            let (dir, file, cache, cache_path) = (
+                dir.clone(),
+                file.clone(),
+                Arc::clone(&cache),
+                cache_path.clone(),
+            );
+            std::thread::spawn(move || {
+                handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap()
+            })
+        };
+        wait_for_slow_check_to_start(&dir);
+        std::fs::write(&file, "GOOD content\n").unwrap();
+        let fast =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
+        assert!(fast.iter().all(|r| r.passed), "{fast:?}");
+        let stale = slow.join().unwrap();
+        assert!(
+            stale.iter().any(|r| !r.passed),
+            "slow run saw the BAD content"
+        );
+
+        let again =
+            handle_run_checks(&dir, &file, "batch", None, false, &cache, &cache_path).unwrap();
+        assert!(
+            again.iter().all(|r| r.passed),
+            "stale BAD result was served for the new content: {again:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The no-daemon fallback has the same stale-result hazard as the daemon path.
+    #[test]
+    fn run_uncached_should_NotCacheStaleResult_When_SlowRunFinishesAfterFileChanged() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-uncached-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        write_slow_on_bad_config(&dir);
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "BAD\n").unwrap();
+        let cache_path = dir.join("cache").join("cache.json");
+
+        let slow = {
+            let (dir, file, cache_path) = (dir.clone(), file.clone(), cache_path.clone());
+            std::thread::spawn(move || {
+                run_uncached_with_cache(&dir, &file, "batch", None, false, &cache_path).unwrap()
+            })
+        };
+        wait_for_slow_check_to_start(&dir);
+        std::fs::write(&file, "GOOD content\n").unwrap();
+        let fast = run_uncached_with_cache(&dir, &file, "batch", None, false, &cache_path).unwrap();
+        assert!(fast.iter().all(|r| r.passed), "{fast:?}");
+        let stale = slow.join().unwrap();
+        assert!(stale.iter().any(|r| !r.passed), "slow run saw BAD content");
+
+        let cached = Cache::load(&cache_path)
+            .get(
+                &file,
+                &crate::config::resolve_config_path(&dir),
+                &crate::plugin::default_registry_path(),
+                "batch",
+            )
+            .expect("fast result should be cached");
+        assert!(
+            cached.iter().all(|r| r.passed),
+            "stale BAD cached: {cached:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_run_checks_should_KeepServing_When_CacheMutexIsPoisoned() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-daemon-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), r#"{"checks": []}"#).unwrap();
+        let file = dir.join("main.go");
+        std::fs::write(&file, "package main\n").unwrap();
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let poisoner = Arc::clone(&cache);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("poison the cache lock");
+        })
+        .join();
+        assert!(cache.lock().is_err(), "setup: mutex must be poisoned");
+        let out = handle_run_checks(
+            &dir,
+            &file,
+            "batch",
+            None,
+            false,
+            &cache,
+            &dir.join("cache.json"),
+        );
+        assert!(out.is_ok(), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_connect_error_should_ReportWedged_When_RefusedWhileLockHeld() {
+        use std::io::ErrorKind::{ConnectionRefused, NotFound};
+        assert!(matches!(
+            classify_connect_error(ConnectionRefused, || true),
+            Probe::Wedged
+        ));
+        assert!(matches!(
+            classify_connect_error(ConnectionRefused, || false),
+            Probe::Dead
+        ));
+        // No socket at all is "nothing listening" even if a daemon is mid-startup.
+        assert!(matches!(
+            classify_connect_error(NotFound, || panic!("lock must not be probed")),
+            Probe::Dead
+        ));
+    }
+
+    #[test]
+    fn exchange_should_ReportWedged_When_StoppedDaemonBacklogIsSaturatedAndLockHeld() {
+        let dir = std::env::temp_dir().join(format!("kibitzer-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("k.sock");
+        // Bound and listening but never accepting, like a SIGSTOPped daemon.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let lock = open_lock_file(&owner_lock_path(&socket)).unwrap();
+        lock.try_lock().unwrap();
+        // macOS refuses once the backlog fills; Linux blocks the connect. Both must read as wedged.
+        let _clients: Vec<UnixStream> = (0..1024)
+            .map_while(|_| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let path = socket.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(UnixStream::connect(path));
+                });
+                rx.recv_timeout(Duration::from_millis(200)).ok()?.ok()
+            })
+            .collect();
+        let probe = exchange(&socket, &Request::Ping, Duration::from_millis(300));
+        assert!(
+            matches!(probe, Probe::Wedged),
+            "saturated backlog + held lock"
+        );
+        drop(lock);
+        let probe = exchange(&socket, &Request::Ping, Duration::from_millis(300));
+        assert!(matches!(probe, Probe::Wedged | Probe::Dead));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod displacement_wiring_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A daemon that swallows every request (wedged) until `healthy` is set, then answers like a
+    /// current daemon. Stopped by dropping it.
+    struct Holder {
+        healthy: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Holder {
+        fn spawn(socket: &Path) -> Self {
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let healthy = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (h, s) = (Arc::clone(&healthy), Arc::clone(&stop));
+            let handle = std::thread::spawn(move || {
+                let mut parked = Vec::new();
+                while !s.load(Ordering::SeqCst) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    if h.load(Ordering::SeqCst) {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut line = String::new();
+                        if let Ok(clone) = stream.try_clone() {
+                            let _ = BufReader::new(clone).read_line(&mut line);
+                        }
+                        let mut writer = stream;
+                        let _ = writeln!(
+                            writer,
+                            r#"{{"ok":true,"version":"{DAEMON_VERSION}","results":[]}}"#
+                        );
+                    } else {
+                        parked.push(stream);
+                    }
+                }
+            });
+            Self {
+                healthy,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kz-dw-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What `still_wedged` reports before and after a healthy daemon takes over the socket.
+    fn reprobe_answers(holder: &Holder, still_wedged: &dyn Fn() -> bool) -> Vec<bool> {
+        let before = still_wedged();
+        holder.healthy.store(true, Ordering::SeqCst);
+        vec![before, still_wedged()]
+    }
+
+    #[test]
+    fn acquire_owner_lock_should_PassHealthyReprobe_When_HolderRecoversBeforeDisplacement() {
+        let dir = scratch("acquire");
+        let socket = dir.join("k.sock");
+        let lock = owner_lock_path(&socket);
+        let held = crate::daemon_lock::open_lock_file(&lock).unwrap();
+        held.try_lock().unwrap();
+        let holder = Holder::spawn(&socket);
+        let seen = RefCell::new(Vec::new());
+        let out = acquire_owner_lock_with(&socket, &|_, still_wedged| {
+            seen.borrow_mut()
+                .extend(reprobe_answers(&holder, still_wedged));
+            false
+        })
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(
+            *seen.borrow(),
+            vec![true, false],
+            "re-probe must see a holder that answers after takeover as healthy"
+        );
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_with_lock_should_PassHealthyReprobe_When_HolderRecoversBeforeDisplacement() {
+        let dir = scratch("shutdown");
+        let socket = dir.join("k.sock");
+        let lock = owner_lock_path(&socket);
+        let held = crate::daemon_lock::open_lock_file(&lock).unwrap();
+        held.try_lock().unwrap();
+        let holder = Holder::spawn(&socket);
+        let seen = RefCell::new(Vec::new());
+        let outcome = shutdown_with_lock(&socket, &|_, still_wedged| {
+            seen.borrow_mut()
+                .extend(reprobe_answers(&holder, still_wedged));
+            false
+        });
+        assert_eq!(outcome, ShutdownOutcome::Unresponsive { pid: None });
+        assert_eq!(*seen.borrow(), vec![true, false]);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_is_live_should_NotCreateLockFile_When_NothingIsRunning() {
+        let dir = scratch("live");
+        let lock = dir.join("k.lock");
+        assert!(!lock_is_live(&lock));
+        assert!(!lock.exists(), "lock_is_live created {}", lock.display());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

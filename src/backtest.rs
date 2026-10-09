@@ -859,6 +859,37 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn backtest_should_ReturnRawFindings_When_FixtureHasCoveringIgnore() {
+        let content = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+        let lines = vec![tool_use(
+            "w1",
+            "Write",
+            serde_json::json!({"file_path": "/repo/foo.go", "content": content}),
+        )];
+        let file = write_transcript(&lines);
+        let report = run_backtest(
+            &[file.path().to_path_buf()],
+            &["syntax-rules".to_string()],
+            false,
+            &mut BacktestCache::default(),
+        )
+        .unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.message.contains("[flag-argument]")),
+            "backtest must measure raw checker output, ignores included: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|f| &f.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn unrelated_checker_globs_skip_the_file() {
         let lines = vec![tool_use(
             "w1",
