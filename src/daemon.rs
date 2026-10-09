@@ -59,11 +59,24 @@ pub fn default_socket_path() -> PathBuf {
 /// etc.) — the daemon does not self-detach. `run_checks_smart` is one such caller: its
 /// `maybe_spawn_daemon` backgrounds this automatically when no daemon is reachable.
 pub fn run_daemon(socket_path: &Path) -> Result<()> {
-    if socket_path.exists() {
-        // A stale socket from a crashed prior daemon; a live daemon would have failed
-        // to start in the first place (see `is_alive` check callers should do first).
-        std::fs::remove_file(socket_path).ok();
+    // Held until the process exits: the kernel releases it on any death, so a crashed daemon
+    // never blocks its successor, and two daemons can never both pass this point.
+    let Some(_owner_lock) = acquire_owner_lock(socket_path)? else {
+        eprintln!(
+            "[kibitzer] another daemon already owns {}",
+            socket_path.display()
+        );
+        return Ok(());
+    };
+    if !clear_unlocked_daemon(socket_path) {
+        eprintln!(
+            "[kibitzer] a daemon is still answering on {}",
+            socket_path.display()
+        );
+        return Ok(());
     }
+    // Only a socket nobody answers on is stale; the owner lock above rules out a live peer.
+    std::fs::remove_file(socket_path).ok();
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding daemon socket at {}", socket_path.display()))?;
     eprintln!("[kibitzer] daemon listening on {}", socket_path.display());
@@ -82,6 +95,64 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// How long a new daemon waits for a retiring predecessor to release its lock and socket.
+const PREDECESSOR_WAIT: Duration = Duration::from_secs(3);
+
+fn owner_lock_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("lock")
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// The exclusive daemon lock, or `None` when a live same-version daemon owns it or a previous
+/// owner did not exit within `PREDECESSOR_WAIT`.
+fn acquire_owner_lock(socket_path: &Path) -> Result<Option<std::fs::File>> {
+    let lock_path = owner_lock_path(socket_path);
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let file = open_lock_file(&lock_path)
+        .with_context(|| format!("opening daemon lock {}", lock_path.display()))?;
+    let deadline = std::time::Instant::now() + PREDECESSOR_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let owner_is_current = request(socket_path, &Request::Ping)
+            .is_some_and(|r| r.version.as_deref() == Some(DAEMON_VERSION));
+        if owner_is_current || std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// With the owner lock held, anything still answering on the socket is a daemon that predates
+/// the lock. Asks it to exit and waits; false means it stayed up and must not be displaced.
+fn clear_unlocked_daemon(socket_path: &Path) -> bool {
+    if request(socket_path, &Request::Ping).is_none() {
+        return true;
+    }
+    shutdown_at(socket_path);
+    let deadline = std::time::Instant::now() + PREDECESSOR_WAIT;
+    while std::time::Instant::now() < deadline {
+        if request(socket_path, &Request::Ping).is_none() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 fn handle_conn(stream: UnixStream, cache: &Arc<Mutex<Cache>>, cache_path: &Path) -> Result<()> {
@@ -296,11 +367,11 @@ fn try_run_checks_at(
 }
 
 /// A daemon from another kibitzer version (or from before replies carried one) answers with
-/// code that predates this binary, so its results are discarded: it is asked to exit and the
-/// spawn debounce is cleared so the caller's fallback can start a fresh one.
+/// code that predates this binary, so its results are discarded and it is asked to exit. The
+/// spawn debounce stays in force: clearing it let two kibitzer versions on one machine retire
+/// and respawn each other on every hook.
 fn retire_stale_daemon(socket_path: &Path) {
     shutdown_at(socket_path);
-    let _ = std::fs::remove_file(socket_path.with_extension("spawn-attempt"));
 }
 
 /// Minimum time between background-spawn attempts, so a daemon that keeps failing to
@@ -329,24 +400,25 @@ fn maybe_spawn_daemon() {
     if std::env::var_os("KIBITZER_NO_AUTO_DAEMON").is_some() {
         return;
     }
-    let marker = default_socket_path().with_extension("spawn-attempt");
+    let socket_path = default_socket_path();
+    let marker = socket_path.with_extension("spawn-attempt");
+    // Non-blocking exclusive gate: a hook that loses it knows another is spawning right now.
+    // The marker mtime is read and written only under the gate, so concurrent hooks cannot
+    // both pass the debounce (an earlier remove-then-create_new marker let one hook delete
+    // another's fresh claim).
+    let Ok(gate) = open_lock_file(&socket_path.with_extension("spawn-lock")) else {
+        return;
+    };
+    if gate.try_lock().is_err() {
+        return;
+    }
     let marker_modified = std::fs::metadata(&marker)
         .ok()
         .and_then(|m| m.modified().ok());
     if spawn_is_debounced(marker_modified, SystemTime::now()) {
         return;
     }
-    // Claim the marker atomically rather than read-mtime-then-write: two `hook`
-    // processes racing through the staleness check above could otherwise both pass
-    // it and both spawn a daemon. `create_new` makes the loser's claim fail instead,
-    // so at most one spawns per debounce window even under a race.
-    let _ = std::fs::remove_file(&marker);
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-        .is_err()
-    {
+    if std::fs::write(&marker, DAEMON_VERSION).is_err() {
         return;
     }
     spawn_detached_daemon();
@@ -545,24 +617,40 @@ mod stale_daemon_tests {
         dir
     }
 
-    /// A one-connection fake daemon that answers every line with `reply_for(line)`.
+    /// A fake daemon that answers up to two connections with `reply_for(line)`, and gives up
+    /// after `FAKE_DAEMON_DEADLINE` so a client that never connects fails the test instead of
+    /// hanging `join`.
     fn fake_daemon(
         socket: &Path,
         reply_for: fn(&str) -> String,
     ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+        const FAKE_DAEMON_DEADLINE: Duration = Duration::from_secs(5);
         let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let saw_shutdown = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&saw_shutdown);
         let handle = std::thread::spawn(move || {
-            for stream in listener.incoming().take(2) {
-                let stream = stream.unwrap();
+            let deadline = std::time::Instant::now() + FAKE_DAEMON_DEADLINE;
+            let mut served = 0;
+            while served < 2 && std::time::Instant::now() < deadline {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                // Accepted sockets inherit non-blocking mode on some platforms.
+                // Best effort: a peer that already hung up makes these fail with EINVAL.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut line = String::new();
-                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                if let Ok(clone) = stream.try_clone() {
+                    let _ = BufReader::new(clone).read_line(&mut line);
+                }
                 if line.contains("\"shutdown\"") {
                     flag.store(true, Ordering::SeqCst);
                 }
                 let mut writer = stream;
                 let _ = writeln!(writer, "{}", reply_for(&line));
+                served += 1;
             }
         });
         (handle, saw_shutdown)
@@ -590,8 +678,8 @@ mod stale_daemon_tests {
             "old daemon must be asked to exit"
         );
         assert!(
-            !socket.with_extension("spawn-attempt").exists(),
-            "debounce must be cleared"
+            socket.with_extension("spawn-attempt").exists(),
+            "debounce must survive a retire so versions cannot respawn each other per hook"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

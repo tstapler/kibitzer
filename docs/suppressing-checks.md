@@ -187,7 +187,11 @@ Most checkers anchor on the flagged statement: the comment goes on the line abov
   `cache.json` (under `$XDG_CACHE_HOME/kibitzer/` or `~/.cache/kibitzer/`) or
   restart the daemon. A daemon left running across an upgrade is retired
   automatically: every reply carries its version, and a client that sees a different
-  one (or none) stops using that daemon and asks it to exit.
+  one (or none) stops using that daemon and asks it to exit. A replacement is spawned
+  at most once per 10 seconds, so two kibitzer versions on one machine cannot restart
+  each other on every hook. Only one daemon runs per socket: it holds an exclusive
+  lock (`kibitzer-<user>.lock` beside the socket) and a second `daemon start` exits
+  instead of taking the socket over.
 
 ## Accept one specific, correctly-flagged finding
 
