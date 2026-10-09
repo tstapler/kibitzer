@@ -2,6 +2,7 @@
 //! Kept out of `check.rs` so advisories about directives (blocking suppressions, and later
 //! wrong-row unused ignores) do not grow that file.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::check_result::CheckResult;
@@ -9,10 +10,13 @@ use crate::checker::{NativeSource, read_native_source};
 use crate::config::{Check, Severity};
 use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo_path, quote_reason};
 use crate::inline_ignores::{
-    Directive, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind, owned_by,
-    rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
+    Directive, DroppedFinding, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind,
+    is_file_scope, owned_by, rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
 };
 use crate::run_context::RunContext;
+
+mod advised;
+use advised::{Advised, fingerprint};
 
 /// Reruns one native check against `source` with inline ignores disabled; injected so this
 /// module does not depend on the check pipeline.
@@ -43,7 +47,23 @@ pub(crate) fn run(input: PostPassInput) -> Vec<CheckResult> {
         None if input.run_ctx.skip_whole_file_advisories => return Vec::new(),
         None => (WHOLE_FILE, false),
     };
-    let blocking = blocking_advisories(input.results, changed_lines, input.file_path);
+    let source = read_markered_source(input.file_path);
+    let advised = input
+        .run_ctx
+        .advised_dir
+        .as_deref()
+        .map(|dir| Advised::load(dir, input.file_path));
+    let ctx = BlockingContext {
+        changed_lines,
+        scoped,
+        slide_possible: changed_lines.is_empty() || input.run_ctx.unlocated_deletion,
+        source: source.as_deref(),
+        advised: advised.as_ref(),
+    };
+    let blocking = blocking_advisories(input.results, &ctx, input.file_path);
+    if let (Some(advised), Some(_)) = (&advised, &source) {
+        advised.save(blocking_fingerprints(input.results, ctx.source));
+    }
     let unused = if scoped {
         unused_advisories(&input, changed_lines)
     } else {
@@ -56,14 +76,25 @@ pub(crate) fn run(input: PostPassInput) -> Vec<CheckResult> {
         .collect()
 }
 
+/// What `blocking_suppressions` needs to decide which drops are worth telling the agent about.
+struct BlockingContext<'a> {
+    changed_lines: &'a [(usize, usize)],
+    /// The run is diff-scoped (an `Edit`/`MultiEdit`), not a whole-file `Write`.
+    scoped: bool,
+    /// The edit removed text, so a finding may have slid under a directive.
+    slide_possible: bool,
+    source: Option<&'a str>,
+    advised: Option<&'a Advised>,
+}
+
 /// One advisory line per blocking suppression, the overflow past `MAX_BLOCKING_ADVISORIES`
 /// folded into a single count line so a rewrite with many ignores stays bounded.
 fn blocking_advisories(
     results: &[CheckResult],
-    changed_lines: &[(usize, usize)],
+    ctx: &BlockingContext,
     file_path: &Path,
 ) -> Vec<String> {
-    let all = blocking_suppressions(results, changed_lines);
+    let all = blocking_suppressions(results, ctx);
     let overflow = all.len().saturating_sub(MAX_BLOCKING_ADVISORIES);
     let mut lines: Vec<String> = all
         .iter()
@@ -210,11 +241,55 @@ impl BlockingSuppression {
     }
 }
 
-/// Directives touching `changed_lines` (or whose silenced finding sits in them) that dropped a blocking finding, grouped per directive
-/// so one comment naming two rules or silencing two findings yields one advisory.
+fn drop_fingerprint(drop: &DroppedFinding, source: Option<&str>) -> String {
+    let line_text = if is_file_scope(drop.rule.as_str()) {
+        None
+    } else {
+        source.and_then(|s| s.lines().nth(drop.finding_line.get().saturating_sub(1)))
+    };
+    fingerprint(drop.rule.as_str(), drop.reason.as_str(), line_text)
+}
+
+fn blocking_fingerprints(results: &[CheckResult], source: Option<&str>) -> BTreeSet<String> {
+    results
+        .iter()
+        .flat_map(|r| &r.inline.dropped)
+        .filter(|d| d.severity == Severity::Blocking)
+        .map(|d| drop_fingerprint(d, source))
+        .collect()
+}
+
+/// Whether the agent should hear about `drop`. An edit that touched the directive or the silenced
+/// row always reports. Otherwise a finding that was not already suppressed before this edit (it
+/// appeared, or code slid under a directive) reports; one the store has seen stays quiet. With no
+/// stored baseline, a whole-file write, a deletion, and a file-scope finding (a directive in the
+/// file head covers it wherever it lands) report, as the safe default.
+fn worth_reporting(drop: &DroppedFinding, ctx: &BlockingContext) -> bool {
+    let rows = drop.directive_span();
+    let finding_row = LineSpan {
+        start: drop.finding_line,
+        end: drop.finding_line,
+    };
+    let edited = ctx.scoped
+        && !ctx.changed_lines.is_empty()
+        && (rows.intersects(ctx.changed_lines) || finding_row.intersects(ctx.changed_lines));
+    if edited {
+        return true;
+    }
+    match ctx.advised {
+        Some(advised) if advised.is_known() => {
+            !advised.has_seen(&drop_fingerprint(drop, ctx.source))
+        }
+        _ if !ctx.scoped => true,
+        _ => ctx.slide_possible || is_file_scope(drop.rule.as_str()),
+    }
+}
+
+/// Directives that dropped a blocking finding and are worth reporting (see `worth_reporting`),
+/// grouped per directive so one comment naming two rules or silencing two findings yields one advisory.
 fn blocking_suppressions(
     results: &[CheckResult],
-    changed_lines: &[(usize, usize)],
+    ctx: &BlockingContext,
 ) -> Vec<BlockingSuppression> {
     let mut found: Vec<(LineSpan, BlockingSuppression)> = Vec::new();
     let blocking_drops = results
@@ -222,20 +297,10 @@ fn blocking_suppressions(
         .flat_map(|r| &r.inline.dropped)
         .filter(|d| d.severity == Severity::Blocking);
     for drop in blocking_drops {
-        let rows = drop.directive_span();
-        // A pre-planted directive can silence a finding the edit just introduced, so the
-        // finding's own row counts too. A pure deletion (no changed rows) can slide code under
-        // an existing directive, so every blocking drop in the file is reported then.
-        let finding_row = LineSpan {
-            start: drop.finding_line,
-            end: drop.finding_line,
-        };
-        if !(rows.intersects(changed_lines)
-            || finding_row.intersects(changed_lines)
-            || changed_lines.is_empty())
-        {
+        if !worth_reporting(drop, ctx) {
             continue;
         }
+        let rows = drop.directive_span();
         match found.iter_mut().find(|(key, _)| *key == rows) {
             Some((_, existing)) if !existing.rules.contains(&drop.rule) => {
                 existing.rules.push(drop.rule.clone());

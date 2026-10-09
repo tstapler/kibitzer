@@ -16,6 +16,11 @@ pub struct RunContext {
     /// Skip the post-pass advisories for an unscoped (whole-file) run: `kibitzer run` and the
     /// LSP report suppressions through their own footer or not at all, and have no agent to tell.
     pub skip_whole_file_advisories: bool,
+    /// Where the hook remembers which blocking suppressions it has already reported per file;
+    /// `None` (the default) keeps every run stateless.
+    pub advised_dir: Option<std::path::PathBuf>,
+    /// The edit removed text whose position is unknown, so a finding may have slid under a directive.
+    pub unlocated_deletion: bool,
 }
 
 impl RunContext {
@@ -24,12 +29,18 @@ impl RunContext {
             accepted,
             inline: InlineIgnoreContext::default(),
             skip_whole_file_advisories: false,
+            advised_dir: None,
+            unlocated_deletion: false,
         }
     }
 
     /// Loads the `accepted/` entries above `start`; inline ignores start in their default mode.
     pub fn load(start: &Path) -> Result<Self> {
-        find_accepted_findings(start).map(Self::new)
+        let mut ctx = find_accepted_findings(start).map(Self::new)?;
+        ctx.advised_dir = crate::cache::default_cache_path()
+            .parent()
+            .map(|dir| dir.join("advised"));
+        Ok(ctx)
     }
 
     /// For one `kibitzer run` batch: a fresh suppression counter (never global, so parallel
@@ -42,6 +53,7 @@ impl RunContext {
             ..InlineIgnoreContext::default()
         };
         ctx.skip_whole_file_advisories = true;
+        ctx.advised_dir = None;
         Ok(ctx)
     }
 }

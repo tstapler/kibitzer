@@ -538,3 +538,132 @@ fn read_markered_source_should_ReturnNone_When_FileOverSizeCapOrNotRegular() {
     assert_eq!(got.expect("read_markered_source hung on a FIFO"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A scratch file carrying the marker plus an advised-state dir, for tests of the
+/// baseline-aware blocking advisory.
+struct Baselined {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+impl Baselined {
+    fn new(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-pp-adv-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.md");
+        let mut rows: Vec<String> = (0..30).map(|i| format!("body {i}")).collect();
+        rows[0] =
+            "<!-- kibitzer:ignore go-file-size, markdown-link-integrity -- planted for later -->"
+                .to_string();
+        std::fs::write(&file, rows.join("\n")).unwrap();
+        Self { dir, file }
+    }
+
+    fn run(
+        &self,
+        changed: Option<&[(usize, usize)]>,
+        deletion: bool,
+        results: &[CheckResult],
+    ) -> Vec<CheckResult> {
+        let ctx = RunContext {
+            advised_dir: Some(self.dir.join("advised")),
+            unlocated_deletion: deletion,
+            ..RunContext::default()
+        };
+        run(PostPassInput {
+            checks: &[],
+            file_path: &self.file,
+            changed_lines: changed,
+            results,
+            run_ctx: &ctx,
+            raw_rerun: &no_rerun,
+        })
+    }
+}
+
+impl Drop for Baselined {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn blocking_drop_result(rule: &str, finding_line: usize) -> Vec<CheckResult> {
+    let mut d = dropped(rule, "planted for later", (1, 1), Severity::Blocking);
+    d.finding_line = Line::new(finding_line);
+    vec![result_with_dropped(rule, vec![d])]
+}
+
+#[test]
+fn run_should_EmitAdvisory_When_FileScopeFindingAppearsOutsideEditWithoutBaseline() {
+    let b = Baselined::new("filescope");
+    let out = b.run(
+        Some(&[(15, 15)]),
+        false,
+        &blocking_drop_result("go-file-size", 30),
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        out[0].output.contains("[blocking-suppressed]"),
+        "{}",
+        out[0].output
+    );
+}
+
+#[test]
+fn run_should_StaySilent_When_RowFindingOutsideEditWithoutBaselineAndNoDeletion() {
+    let b = Baselined::new("rowquiet");
+    let out = b.run(
+        Some(&[(15, 15)]),
+        false,
+        &blocking_drop_result("markdown-link-integrity", 30),
+    );
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn run_should_EmitAdvisory_When_MixedEditRemovesLinesWithoutBaseline() {
+    let b = Baselined::new("mixed");
+    let out = b.run(
+        Some(&[(15, 15)]),
+        true,
+        &blocking_drop_result("markdown-link-integrity", 30),
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+}
+
+#[test]
+fn run_should_ReportOnlyNewSuppression_When_BaselineKnown() {
+    let b = Baselined::new("baseline");
+    let old = blocking_drop_result("markdown-link-integrity", 30);
+    // First sight stores the baseline (a Write reports everything it has no memory of).
+    assert_eq!(b.run(None, false, &old).len(), 1);
+    // A deletion elsewhere must not re-list the suppression the agent already heard about.
+    assert!(b.run(Some(&[]), false, &old).is_empty());
+    // Nor a second Write of the same file, nor an Edit with no located rows.
+    assert!(b.run(None, false, &old).is_empty());
+    // A different finding sliding under the directive is new.
+    let slid = blocking_drop_result("markdown-link-integrity", 29);
+    assert_eq!(b.run(Some(&[]), false, &slid).len(), 1);
+}
+
+#[test]
+fn run_should_EmitAdvisory_When_FileGrowsPastLimitUnderPlantedDirectiveWithBaseline() {
+    let b = Baselined::new("grow");
+    assert!(b.run(Some(&[(15, 15)]), false, &[]).is_empty());
+    let out = b.run(
+        Some(&[(15, 15)]),
+        false,
+        &blocking_drop_result("go-file-size", 30),
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        b.run(
+            Some(&[(16, 16)]),
+            false,
+            &blocking_drop_result("go-file-size", 31)
+        )
+        .is_empty()
+    );
+}

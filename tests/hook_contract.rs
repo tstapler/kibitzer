@@ -586,3 +586,68 @@ fn hook_should_EmitBlockingSuppressedAdvisory_When_EditAddsFindingUnderPlantedDi
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("[blocking-suppressed]"), "stdout: {stdout}");
 }
+
+fn numbered_go(count: usize) -> String {
+    let mut text =
+        String::from("// kibitzer:ignore go-file-size -- will grow later\npackage main\n\n");
+    for i in 0..count {
+        text.push_str(&format!("var b{i} = {i}\n"));
+    }
+    text
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_EmitBlockingSuppressedAdvisory_When_MidFileEditGrowsFileUnderHeadDirective() {
+    let repo = TempRepo::new(
+        "grow-under-head-directive",
+        json!({
+            "name": "go-file-size",
+            "checker": "go-file-size",
+            "severity": "blocking",
+            "scope": ["**/*.go"],
+        }),
+    );
+    let small = numbered_go(400);
+    std::fs::write(repo.path("a.go"), &small).unwrap();
+    let grown = small.replacen(
+        "var b200 = 200\n",
+        &format!("var b200 = 200\n{}", "var extra = 1\n".repeat(200)),
+        1,
+    );
+    let inserted = format!("var b200 = 200\n{}", "var extra = 1\n".repeat(200));
+    let (code, stdout, stderr) = repo.run_hook_edit("a.go", &grown, "var b200 = 200\n", &inserted);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("[blocking-suppressed]"), "stdout: {stdout}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_EmitBlockingSuppressedAdvisory_When_MultiEditMixesDeletionWithOtherEdit() {
+    let repo = TempRepo::new(
+        "multiedit-mixed-deletion",
+        json!({
+            "name": "go-ignored-error",
+            "checker": "go-ignored-error",
+            "severity": "blocking",
+            "scope": ["**/*.go"],
+        }),
+    );
+    // The removed comment lines used to separate the directive's covered row from the call.
+    let after = "package main\n\nfunc main() {\n\t// kibitzer:ignore go-ignored-error -- fine here ok\n\tv, _ := f()\n\tw := 1\n}\n";
+    let payload = json!({
+        "cwd": repo.dir,
+        "hook_event_name": "PostToolUse",
+        "tool_input": {
+            "file_path": repo.path("a.go"),
+            "edits": [
+                {"old_string": "\t// note\n\t// note two\n", "new_string": ""},
+                {"old_string": "\tw := 2\n", "new_string": "\tw := 1\n"},
+            ],
+        }
+    });
+    std::fs::write(repo.path("a.go"), after).unwrap();
+    let (code, stdout, stderr) = repo.spawn_hook(&payload);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("[blocking-suppressed]"), "stdout: {stdout}");
+}
