@@ -214,9 +214,15 @@ pub fn run_hook() -> Result<ExitCode> {
                 strip_unsafe(&result.describe())
             );
         }
+        // Directives only suppress native per-file findings; a shell check or an
+        // `[ignore-syntax]` repair has nothing a directive could dismiss.
+        let dismiss = if failures.iter().any(|r| r.inline.first_anchor().is_some()) {
+            "to dismiss a judged finding, add `kibitzer:ignore <rule> -- <why>`; "
+        } else {
+            ""
+        };
         eprintln!(
-            "[kibitzer] to dismiss a judged finding, add `kibitzer:ignore <rule> -- <why>`; to \
-             disable a check or exclude a file, see \
+            "[kibitzer] {dismiss}to disable a check or exclude a file, see \
              https://github.com/tstapler/kibitzer/blob/master/docs/suppressing-checks.md"
         );
         return Ok(ExitCode::from(2));

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::rules::is_meta_rule;
 use super::sanitize::{MAX_REASON_CHARS, MAX_RULE_ID_CHARS};
 use super::scan::ScanMemo;
 use crate::config::Severity;
@@ -313,14 +314,20 @@ impl DroppedFinding {
 }
 
 impl InlineOutcome {
+    /// The first shown finding a directive could suppress; meta rules (`ignore-syntax`, ...)
+    /// are never suppressible, so a footer must not suggest ignoring them.
     pub fn first_anchor(&self) -> Option<(&RuleId, Line)> {
-        self.shown.first().map(|a| (&a.rule, a.line))
+        self.suppressible().next().map(|a| (&a.rule, a.line))
     }
 
-    /// Distinct rule ids of the shown findings, in finding order.
+    fn suppressible(&self) -> impl Iterator<Item = &Anchor> {
+        self.shown.iter().filter(|a| !is_meta_rule(a.rule.as_str()))
+    }
+
+    /// Distinct suppressible rule ids of the shown findings, in finding order.
     pub fn rule_ids(&self) -> Vec<&RuleId> {
         let mut ids: Vec<&RuleId> = Vec::new();
-        for anchor in &self.shown {
+        for anchor in self.suppressible() {
             if !ids.contains(&&anchor.rule) {
                 ids.push(&anchor.rule);
             }

@@ -153,10 +153,8 @@ fn advisory_check_exits_zero_and_reports_via_stdout_context() {
     assert!(stdout.contains("no-bad-marker"));
     assert!(stdout.contains("found a BAD marker"));
     assert!(stdout.contains("hookSpecificOutput"));
-    assert!(
-        stdout.contains("# kibitzer:ignore <rule> -- <why>"),
-        "stdout: {stdout}"
-    );
+    // A shell check's finding cannot be dismissed by a directive, so no hint is shown.
+    assert!(!stdout.contains("kibitzer:ignore"), "stdout: {stdout}");
 }
 
 #[test]
@@ -232,10 +230,52 @@ fn blocking_check_gets_one_edit_of_grace_then_blocks_with_exit_code_2() {
     assert!(stdout.is_empty());
     assert!(stderr.contains("no-bad-marker"));
     assert!(stderr.contains("blocking"));
+    // A shell check's finding cannot be dismissed by a directive: no ignore hint, only the docs link.
+    assert!(!stderr.contains("kibitzer:ignore"), "{stderr}");
+    assert!(stderr.contains("suppressing-checks.md"), "{stderr}");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_TeachIgnoreSyntaxOnExit2_When_NativeBlockingFindingIsAnchored() {
+    let repo = TempRepo::new(
+        "native-blocking-hint",
+        json!({
+            "name": "syntax-rules-go",
+            "checker": "syntax-rules",
+            "severity": "blocking",
+        }),
+    );
+    let source = format!("package main\n\n{FLAG_FUNC}");
+    repo.run_hook("a.go", &source);
+    let (code, _stdout, stderr) = repo.run_hook("a.go", &source);
+    assert_eq!(code, 2, "{stderr}");
     assert!(
         stderr.contains("kibitzer:ignore <rule> -- <why>"),
-        "plain exit-2 stderr must teach the ignore syntax: {stderr}"
+        "native anchored exit-2 stderr must teach the ignore syntax: {stderr}"
     );
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn hook_should_NotSuggestIgnoringMetaRule_When_OnlyIgnoreSyntaxFinding() {
+    let repo = TempRepo::new(
+        "meta-only",
+        json!({
+            "name": "inline-ignore",
+            "checker": "inline-ignore",
+            "severity": "advisory",
+        }),
+    );
+    let source = "package main\n\n// kibitzer:ignore flag-argument\nfunc f() {}\n";
+    let (code, stdout, _stderr) = repo.run_hook("a.go", source);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("[ignore-syntax]"), "{stdout}");
+    assert!(
+        !stdout.contains("kibitzer:ignore ignore-syntax"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Dismiss a judged finding"), "{stdout}");
 }
 
 /// Regression test for docs/markdown-link-integrity-false-positives.md's `dcb5a7eb`

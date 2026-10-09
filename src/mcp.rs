@@ -298,12 +298,14 @@ fn render_run_checks_report(results: &[CheckResult], path: &Path) -> String {
         .iter()
         .map(|r| r.summary_line(crate::check_result::SummaryTag::Severity))
         .collect();
-    let anchor = failed.iter().find_map(|r| r.inline.first_anchor());
-    lines.push(crate::inline_ignores::syntax_hint(
-        path,
-        anchor,
-        &crate::inline_ignores::InlineOutcome::union_rule_ids(failed.iter().map(|r| &r.inline)),
-    ));
+    // Only a native, anchored finding can be dismissed by a directive; omit the hint otherwise.
+    if let Some(anchor) = failed.iter().find_map(|r| r.inline.first_anchor()) {
+        lines.push(crate::inline_ignores::syntax_hint(
+            path,
+            Some(anchor),
+            &crate::inline_ignores::InlineOutcome::union_rule_ids(failed.iter().map(|r| &r.inline)),
+        ));
+    }
     crate::inline_ignores::sanitize::strip_unsafe(&lines.join("\n"))
 }
 
@@ -3121,14 +3123,33 @@ mod tests {
     }
 
     #[test]
-    fn run_checks_report_should_UseGenericHint_When_NoStructuredAnchor() {
+    fn run_checks_report_should_OmitHint_When_NoNativeAnchoredFinding() {
         let report = render_run_checks_report(&[failing("shell", None)], Path::new("notes.md"));
+        assert!(!report.contains("kibitzer:ignore"), "got: {report}");
+    }
+
+    #[test]
+    fn run_checks_report_should_OmitHint_When_OnlyMetaRuleAnchor() {
+        let report = render_run_checks_report(
+            &[failing("inline-ignore", Some(("ignore-syntax", 4)))],
+            Path::new("x.go"),
+        );
+        assert!(!report.contains("kibitzer:ignore"), "got: {report}");
+    }
+
+    #[test]
+    fn run_checks_report_should_SuggestNonMetaRule_When_MetaAnchorComesFirst() {
+        let report = render_run_checks_report(
+            &[
+                failing("inline-ignore", Some(("ignore-syntax", 2))),
+                failing("go-flag-argument", Some(("flag-argument", 4))),
+            ],
+            Path::new("x.go"),
+        );
+        let last = report.lines().last().unwrap();
         assert!(
-            report
-                .lines()
-                .last()
-                .unwrap()
-                .contains("<!-- kibitzer:ignore <rule> -- <why> -->"),
+            last.contains("kibitzer:ignore flag-argument -- <why>")
+                && !last.contains("ignore-syntax"),
             "got: {report}"
         );
     }

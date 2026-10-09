@@ -424,3 +424,22 @@ fn kibitzer_run_should_ExitZero_When_DenyBlockingSuppressionAndOnlyAdvisorySuppr
     assert_eq!(code, Some(0), "{stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn kibitzer_run_should_SuppressFileSize_When_DirectiveNamesCheckerNameInHead() {
+    let dir = temp_dir("file-scope-checker-name");
+    let body: String = (0..600).map(|i| format!("X{i} = {i}\n")).collect();
+    std::fs::write(
+        dir.join("big.py"),
+        format!("# kibitzer:ignore python-file-size -- generated lookup tables\n{body}"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("big2.py"), &body).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(stdout.contains("big2.py"), "control must report: {stdout}");
+    assert!(
+        !stdout.contains("./big.py") && !stdout.contains("/big.py"),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

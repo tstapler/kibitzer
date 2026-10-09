@@ -42,11 +42,14 @@ fn render_footer(trim: Trim, hint: &str) -> String {
         Trim::TurnOffProse => parts.push(TURN_OFF_SHORT_SENTENCE),
         Trim::SuppressingChecksLink => {}
     }
-    parts.push(hint);
+    if !hint.is_empty() {
+        parts.push(hint);
+    }
     parts.join(" ")
 }
 
-/// Advisory footer: links plus the syntax hint for `path`, within `max_chars`. Sheds prose in
+/// Advisory footer: links plus the syntax hint for `path`, within `max_chars`. Without an
+/// `anchor` (no shown finding a directive could suppress) the hint is left out entirely. Sheds prose in
 /// `TRIM_ORDER`, then truncates the `Rules:` list down to one id (never to zero). Only if
 /// `max_chars` is below that irreducible floor does it return over budget (never a panic: a
 /// hook must not die over footer length).
@@ -56,7 +59,9 @@ fn advisory_footer_within(
     rule_ids: &[&RuleId],
     max_chars: usize,
 ) -> String {
-    let full_hint = syntax_hint(path, anchor, rule_ids);
+    let full_hint = anchor
+        .map(|_| syntax_hint(path, anchor, rule_ids))
+        .unwrap_or_default();
     for trim in TRIM_ORDER {
         let footer = render_footer(trim, &full_hint);
         if footer.chars().count() <= max_chars {
@@ -65,6 +70,9 @@ fn advisory_footer_within(
     }
     let last = TRIM_ORDER[TRIM_ORDER.len() - 1];
     let mut footer = render_footer(last, &full_hint);
+    if anchor.is_none() {
+        return footer;
+    }
     for limit in (1..rule_ids.len().min(HINT_RULE_LIMIT)).rev() {
         footer = render_footer(last, &syntax_hint_limited(path, anchor, rule_ids, limit));
         if footer.chars().count() <= max_chars {
@@ -134,13 +142,11 @@ mod footer_tests {
     }
 
     #[test]
-    fn hook_footer_should_UseGenericForm_When_NoStructuredData() {
+    fn hook_footer_should_OmitDirectiveHint_When_NoSuppressibleAnchor() {
         let footer = advisory_footer(Path::new("x.py"), None, &[]);
-        assert!(
-            footer.contains("# kibitzer:ignore <rule> -- <why>"),
-            "{footer}"
-        );
+        assert!(!footer.contains("kibitzer:ignore"), "{footer}");
         assert!(!footer.contains("Rules:"), "{footer}");
+        assert!(footer.contains(SUPPRESS_LINK), "{footer}");
     }
 
     fn longest_case() -> (Vec<RuleId>, String) {
@@ -279,18 +285,15 @@ mod footer_tests {
             ("a.rs", "//"),
         ] {
             let rule = rid("flag-argument");
-            let anchored = advisory_footer(Path::new(path), Some((&rule, Line::new(9))), &[&rule]);
-            let generic = advisory_footer(Path::new(path), None, &[]);
-            for footer in [anchored, generic] {
-                let example = example_line(&footer, &format!("{open} kibitzer:ignore"))
-                    .replace("<rule>", "flag-argument")
-                    .replace("<why>", "legacy callers");
-                match parse_comment_line(&example) {
-                    DirectiveParse::Valid(d) => {
-                        assert_eq!(d.rules(), &[rid("flag-argument")], "{example}");
-                    }
-                    other => panic!("example {example:?} parsed as {other:?}"),
+            let footer = advisory_footer(Path::new(path), Some((&rule, Line::new(9))), &[&rule]);
+            let example = example_line(&footer, &format!("{open} kibitzer:ignore"))
+                .replace("<rule>", "flag-argument")
+                .replace("<why>", "legacy callers");
+            match parse_comment_line(&example) {
+                DirectiveParse::Valid(d) => {
+                    assert_eq!(d.rules(), &[rid("flag-argument")], "{example}");
                 }
+                other => panic!("example {example:?} parsed as {other:?}"),
             }
         }
     }
