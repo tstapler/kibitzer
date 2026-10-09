@@ -1434,3 +1434,38 @@ fn syntax_hint_should_SayFileHead_When_AnchorIsFileScopeCheckerName() {
     let hint = syntax_hint(Path::new("a.go"), Some((&rule, Line::new(80))), &[&rule]);
     assert!(hint.contains("in the first 10 lines"), "{hint}");
 }
+
+fn md_whole_line(source: &str) -> bool {
+    match &scan_markdown(source)[0].parse {
+        DirectiveParse::Valid(d) => d.whole_line,
+        other => panic!("expected Valid for {source:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn scan_markdown_should_BeWholeLine_When_DirectiveFollowsListOrQuoteMarkers() {
+    let directive = "<!-- kibitzer:ignore markdown-link-integrity -- placeholder for later -->";
+    for prefix in [
+        "- ", "* ", "+ ", "1. ", "12) ", "> ", ">> ", "  - ", "> - ", "- > ",
+    ] {
+        assert!(
+            md_whole_line(&format!("{prefix}{directive}\n")),
+            "{prefix:?}"
+        );
+    }
+}
+
+#[test]
+fn scan_markdown_should_NotBeWholeLine_When_ProseOrCodePrecedesDirective() {
+    let directive = "<!-- kibitzer:ignore markdown-link-integrity -- placeholder for later -->";
+    for prefix in ["text ", "- item ", "> quoted ", "1.x "] {
+        let scanned = scan_markdown(&format!("{prefix}{directive}\n"));
+        if let Some(Scanned {
+            parse: DirectiveParse::Valid(d),
+            ..
+        }) = scanned.first()
+        {
+            assert!(!d.whole_line, "{prefix:?}");
+        }
+    }
+}

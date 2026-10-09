@@ -22,6 +22,39 @@ fn only_whitespace_before(source: &str, byte: usize) -> bool {
     source[line_start..byte].trim().is_empty()
 }
 
+/// The rest of `text` after one list marker (`-`, `*`, `+`, `1.`, `1)`) followed by whitespace.
+fn after_list_marker(text: &str) -> Option<&str> {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    let marker_len = if digits > 0 {
+        let punct = text[digits..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '.' | ')'))?;
+        digits + punct.len_utf8()
+    } else {
+        text.chars()
+            .next()
+            .filter(|c| matches!(c, '-' | '*' | '+'))?
+            .len_utf8()
+    };
+    let rest = &text[marker_len..];
+    rest.starts_with(char::is_whitespace).then_some(rest)
+}
+
+/// True when only whitespace, blockquote `>` and list markers precede `byte` on its line: in
+/// Markdown a comment there still starts its own line of content.
+fn only_container_markers_before(source: &str, byte: usize) -> bool {
+    let line_start = source[..byte].rfind('\n').map_or(0, |i| i + 1);
+    let mut rest = source[line_start..byte].trim_start();
+    while !rest.is_empty() {
+        rest = match rest.strip_prefix('>').or_else(|| after_list_marker(rest)) {
+            Some(after) => after.trim_start(),
+            None => return false,
+        };
+    }
+    true
+}
+
 /// Parses each line of `text` (starting on 1-based `first_row`), placing directives with
 /// `end_row` and `whole_line`.
 fn scan_text_lines(text: &str, first_row: usize, end_row: usize, whole_line: bool) -> Vec<Scanned> {
@@ -70,7 +103,7 @@ pub(super) fn scan_markdown(source: &str) -> Vec<Scanned> {
         if let Event::Html(html) | Event::InlineHtml(html) = event {
             let first_row = line_for_offset(&line_starts, range.start);
             let end_row = first_row + html.trim_end().matches('\n').count();
-            let whole_line = only_whitespace_before(source, range.start);
+            let whole_line = only_container_markers_before(source, range.start);
             out.extend(scan_text_lines(&html, first_row, end_row, whole_line));
         }
     }
