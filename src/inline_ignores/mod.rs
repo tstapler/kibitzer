@@ -8,6 +8,7 @@ mod rules;
 pub(crate) mod sanitize;
 mod scan;
 mod types;
+mod unicode_tables;
 mod unused;
 
 #[cfg(test)]

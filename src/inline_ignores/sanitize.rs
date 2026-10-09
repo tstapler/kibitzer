@@ -22,15 +22,42 @@ pub(crate) const ECHO_REASON_CHARS: usize = 160;
 pub(crate) const ECHO_RULE_TEXT_CHARS: usize = 80;
 pub(crate) const ECHO_PATH_CHARS: usize = 200;
 
+use super::unicode_tables::{DEFAULT_IGNORABLE, GRAPHIC, MARK, STANDARDIZED_VARIANTS};
+
+/// Whether `u` lies in one of the sorted, disjoint inclusive `ranges`.
+fn in_ranges(ranges: &[(u32, u32)], u: u32) -> bool {
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if hi < u {
+                std::cmp::Ordering::Less
+            } else if lo > u {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// An assigned letter, number, punctuation mark or symbol (Unicode general category L*, N*, P*,
+/// S*) that is neither Default_Ignorable nor blank, per the generated tables. A code point newer
+/// than the tables' Unicode version is unassigned there and so never matches.
+fn is_assigned_graphic(c: char) -> bool {
+    in_ranges(GRAPHIC, c as u32)
+}
+
 /// Tier 1 allow-list: keeps printable graphic characters only, so a new invisible code point
-/// is dropped by default instead of needing a block-list entry. Letters and digits come from
-/// `char::is_alphanumeric` minus the invisible-but-alphabetic fillers; the symbol ranges are
-/// explicit because `std` exposes no general-category query.
+/// is dropped by default instead of needing a block-list entry. The blocks below narrow the
+/// assigned graphic set to the scripts and symbol blocks real directive text uses; the generated
+/// tables remove each block's unassigned holes, which would otherwise carry a payload.
 fn is_echo_safe(c: char) -> bool {
+    if matches!(c, ' '..='~') {
+        return true;
+    }
+    if !(is_assigned_graphic(c) || in_ranges(MARK, c as u32)) {
+        return false;
+    }
     match c {
-        ' '..='~' => true,
-        '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{3164}' | '\u{FFA0}'
-        | '\u{034F}' => false,
         '\u{00A1}'..='\u{00AC}'
         | '\u{00AE}'..='\u{036F}'
         | '\u{1AB0}'..='\u{1AFF}'
@@ -53,52 +80,16 @@ fn is_echo_safe(c: char) -> bool {
     }
 }
 
-/// Unicode Default_Ignorable_Code_Point, spelled out: none of these render, so each is dropped
-/// unless a context-checked rule in `invisible_fits` keeps it.
+/// Unicode Default_Ignorable_Code_Point (assigned and reserved): none of these render, so each
+/// is dropped unless a context-checked rule in `invisible_fits` keeps it.
 fn is_default_ignorable(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'..='\u{1160}'
-            | '\u{17B4}'..='\u{17B5}'
-            | '\u{180B}'..='\u{180F}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{3164}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-            | '\u{FFA0}'
-            | '\u{FFF0}'..='\u{FFF8}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E0FFF}'
-    )
+    in_ranges(DEFAULT_IGNORABLE, c as u32)
 }
 
-/// Non-ASCII combining marks (Mn, Mc and Me): `XID_Continue` characters that are not letters,
-/// digits, connector punctuation or the format characters above. This is what Zalgo text stacks.
+/// Non-ASCII combining marks (Mn, Mc and Me, so enclosing marks count against the cap too) that
+/// are not Default_Ignorable. This is what Zalgo text stacks.
 fn is_mark(c: char) -> bool {
-    !c.is_ascii()
-        && unicode_ident::is_xid_continue(c)
-        && !unicode_ident::is_xid_start(c)
-        && !c.is_numeric()
-        && !is_default_ignorable(c)
-        && !matches!(
-            c,
-            '\u{00B7}'
-                | '\u{0387}'
-                | '\u{19DA}'
-                | '\u{203F}'
-                | '\u{2040}'
-                | '\u{2054}'
-                | '\u{30FB}'
-                | '\u{FE33}'
-                | '\u{FE34}'
-                | '\u{FE4D}'..='\u{FE4F}' | '\u{FF3F}' | '\u{FF65}'
-        )
+    !c.is_ascii() && in_ranges(MARK, c as u32)
 }
 
 /// Diacritics that sit on any base (accents, enclosing marks); every other mark must match the
@@ -109,9 +100,19 @@ fn is_generic_mark(c: char) -> bool {
 }
 
 /// Most consecutive combining marks one echoed character may carry: Tier 1 (reasons, paths),
-/// and Tier 2 (another checker's finding text), where Vietnamese, Thai and Tibetan stacks fit.
+/// and Tier 2 (another checker's finding text), where Vietnamese and Thai stacks fit. Tier 2 gives
+/// the Tibetan, Myanmar, Khmer and Indic scripts, which stack up to four signs on one consonant,
+/// a larger cap.
 const MAX_MARKS_TIER1: usize = 2;
 const MAX_MARKS_TIER2: usize = 3;
+const MAX_MARKS_TIER2_STACKING_SCRIPTS: usize = 5;
+
+/// Scripts whose real syllables stack more than `MAX_MARKS_TIER2` marks on one base.
+fn is_stacking_group(g: u32) -> bool {
+    matches!(g, GROUP_TIBETAN | GROUP_KHMER | GROUP_MYANMAR)
+        || (GROUP_INDIC_FIRST..=GROUP_INDIC_LAST).contains(&g)
+        || g >= GROUP_BRAHMIC_SUPPLEMENT
+}
 
 /// A coarse script id for the mark-matching and joiner rules; 0 is "none of the scripts we know".
 const GROUP_ARABIC: u32 = 3;
@@ -119,6 +120,7 @@ const GROUP_THAI: u32 = 0x20;
 const GROUP_LAO: u32 = 0x21;
 const GROUP_KHMER: u32 = 0x22;
 const GROUP_MYANMAR: u32 = 0x23;
+const GROUP_TIBETAN: u32 = 0x24;
 const GROUP_INDIC_FIRST: u32 = 0x112;
 const GROUP_INDIC_LAST: u32 = 0x11B;
 const GROUP_BRAHMIC_SUPPLEMENT: u32 = 0x2000;
@@ -139,7 +141,7 @@ fn script_group(c: char) -> u32 {
         '\u{0900}'..='\u{0DFF}' => 0x100 + (u >> 7),
         '\u{0E00}'..='\u{0E7F}' => GROUP_THAI,
         '\u{0E80}'..='\u{0EFF}' => GROUP_LAO,
-        '\u{0F00}'..='\u{0FFF}' => 0x24,
+        '\u{0F00}'..='\u{0FFF}' => GROUP_TIBETAN,
         '\u{1000}'..='\u{109F}' | '\u{A9E0}'..='\u{A9FF}' | '\u{AA60}'..='\u{AA7F}' => {
             GROUP_MYANMAR
         }
@@ -170,17 +172,8 @@ fn is_wordbreak_group(g: u32) -> bool {
 }
 
 fn is_emoji_like(c: char) -> bool {
-    matches!(c, '\u{1F300}'..='\u{1FAFF}' | '\u{2300}'..='\u{23FF}' | '\u{2600}'..='\u{27BF}'
+    matches!(c, '\u{1F300}'..='\u{1FAFF}' | '\u{2190}'..='\u{21FF}' | '\u{2300}'..='\u{23FF}' | '\u{2600}'..='\u{27BF}'
         | '\u{2B00}'..='\u{2BFF}')
-}
-
-fn is_variation_selector(c: char) -> bool {
-    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
-}
-
-/// LRM, RLM and the Arabic letter mark: meaningful only beside right-to-left letters.
-fn is_bidi_mark(c: char) -> bool {
-    matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}')
 }
 
 fn is_rtl_letter(c: char) -> bool {
@@ -195,63 +188,17 @@ fn is_rtl_letter(c: char) -> bool {
         )
 }
 
-/// Printable characters beyond Tier 1's list that real finding text carries: other scripts'
-/// punctuation, braille (minus the blank cell), math operators, small and vertical forms.
-fn is_extra_graphic(c: char) -> bool {
+/// Tier 2 allow-list for a standalone character: every assigned graphic character (letters,
+/// numbers, punctuation, symbols; see `is_assigned_graphic`) and the few non-ASCII spaces with a
+/// real use (NBSP, thin space, narrow NBSP, ideographic space). Everything else (controls,
+/// unassigned, private use, noncharacters, every Default_Ignorable_Code_Point, every other format
+/// and space character, a handful of blank symbols) is dropped here; context-checked exceptions
+/// are handled by `tier2_keeps`.
+fn is_graphic_base(c: char) -> bool {
     matches!(
         c,
-        '\u{0589}'..='\u{058A}'
-            | '\u{055A}'..='\u{055F}'
-            | '\u{05BE}'
-            | '\u{05C0}'
-            | '\u{05C3}'
-            | '\u{05C6}'
-            | '\u{05F3}'..='\u{05F4}'
-            | '\u{060C}'..='\u{060D}'
-            | '\u{061B}'
-            | '\u{061D}'..='\u{061F}'
-            | '\u{066A}'..='\u{066D}'
-            | '\u{06D4}'
-            | '\u{0964}'..='\u{0965}'
-            | '\u{0970}'
-            | '\u{0E4F}'
-            | '\u{0E5A}'..='\u{0E5B}'
-            | '\u{0F04}'..='\u{0F12}'
-            | '\u{104A}'..='\u{104F}'
-            | '\u{1360}'..='\u{1368}'
-            | '\u{166D}'..='\u{166E}'
-            | '\u{169B}'..='\u{169C}'
-            | '\u{16EB}'..='\u{16ED}'
-            | '\u{17D4}'..='\u{17DB}'
-            | '\u{1800}'..='\u{180A}'
-            | '\u{2801}'..='\u{28FF}'
-            | '\u{2900}'..='\u{2AFF}'
-            | '\u{2E00}'..='\u{2E5D}'
-            | '\u{4DC0}'..='\u{4DFF}'
-            | '\u{A700}'..='\u{A71F}'
-            | '\u{FE10}'..='\u{FE19}'
-            | '\u{FE30}'..='\u{FE6B}'
-            | '\u{FF5F}'..='\u{FF64}'
-            | '\u{FFE8}'..='\u{FFEE}'
-            | '\u{FFFD}'
-            | '\u{1D300}'..='\u{1D35F}'
-            | '\u{1FB00}'..='\u{1FBFF}'
-            | '\u{00A0}'
-            | '\u{2009}'
-            | '\u{202F}'
-            | '\u{3000}'
-    )
-}
-
-/// Tier 2 allow-list for a standalone character: printable graphic characters and the few
-/// non-ASCII spaces with a real use (NBSP, thin space, narrow NBSP, ideographic space). Everything
-/// else (controls, unassigned, private use, noncharacters, every Default_Ignorable_Code_Point,
-/// every other format and space character) is dropped here; context-checked exceptions are
-/// handled by `tier2_keeps`.
-fn is_graphic_base(c: char) -> bool {
-    !is_default_ignorable(c)
-        && !is_mark(c)
-        && (is_echo_safe(c) || is_extra_graphic(c) || c.is_alphanumeric())
+        ' '..='~' | '\u{00A0}' | '\u{2009}' | '\u{202F}' | '\u{3000}'
+    ) || is_assigned_graphic(c)
 }
 
 const WAVING_BLACK_FLAG: char = '\u{1F3F4}';
@@ -314,18 +261,27 @@ fn invisible_fits(chars: &[char], i: usize) -> bool {
             prev.is_some_and(|base| selector_fits(base, c))
         }
         '\u{200C}' | '\u{200D}' => {
-            let (Some(base), Some(next)) = (base_before(chars, i), next) else {
+            let Some(base) = base_before(chars, i) else {
                 return false;
             };
-            if c == '\u{200D}' && is_emoji_like(base) && is_emoji_like(next) {
+            if c == '\u{200D}' && is_emoji_like(base) && next.is_some_and(is_emoji_like) {
                 return true;
             }
             let group = script_group(base);
-            is_joining_group(group)
-                && base.is_alphabetic()
-                && next.is_alphabetic()
-                && !is_mark(next)
-                && script_group(next) == group
+            if !is_joining_group(group) || !base.is_alphanumeric() {
+                return false;
+            }
+            match next {
+                Some(next) if next.is_alphanumeric() && !is_mark(next) => {
+                    script_group(next) == group
+                }
+                // A joiner ending a word after a virama (the Malayalam chillu, `ന്‍`).
+                _ => {
+                    let after_script_mark =
+                        i > 0 && is_mark(chars[i - 1]) && script_group(chars[i - 1]) == group;
+                    after_script_mark && !next.is_some_and(is_default_ignorable)
+                }
+            }
         }
         '\u{200B}' | '\u{2060}' => {
             let (Some(base), Some(next)) = (base_before(chars, i), next) else {
@@ -339,11 +295,9 @@ fn invisible_fits(chars: &[char], i: usize) -> bool {
                 && script_group(next) == group
         }
         '\u{200E}' | '\u{200F}' | '\u{061C}' => {
-            let alone = !prev.is_some_and(|p| {
-                is_bidi_mark(p)
-                    || is_variation_selector(p)
-                    || matches!(p, '\u{200B}'..='\u{200D}' | '\u{2060}')
-            });
+            // Any invisible just before, kept or not, ends the gap's one allowance: judging only
+            // kept neighbors would let a dropped character between two marks reset the count.
+            let alone = !prev.is_some_and(is_default_ignorable);
             let beside_rtl =
                 base_before(chars, i).is_some_and(is_rtl_letter) || next.is_some_and(is_rtl_letter);
             alone && beside_rtl
@@ -352,17 +306,20 @@ fn invisible_fits(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// Whether the combining mark at `chars[i]` sits on a base it belongs to: at most `cap` marks in
-/// a row, a visible base (past one fitting variation selector, as in a keycap), and either a
-/// generic diacritic or a mark of the base's own script.
-fn mark_fits(chars: &[char], i: usize, cap: usize) -> bool {
+/// Whether the combining mark at `chars[i]` sits on a base it belongs to: a bounded run of marks
+/// (`MAX_MARKS_TIER2`, or `MAX_MARKS_TIER2_STACKING_SCRIPTS` on a base of a stacking script), a
+/// visible base (past one fitting variation selector, as in a keycap), and either a generic
+/// diacritic or a mark of the base's own script.
+fn mark_fits(chars: &[char], i: usize) -> bool {
     let c = chars[i];
     let mut j = i;
     let mut run = 0;
+    let mut generic_in_run = 0;
     while j > 0 && is_mark(chars[j - 1]) {
         j -= 1;
         run += 1;
-        if run >= cap {
+        generic_in_run += usize::from(is_generic_mark(chars[j]));
+        if run >= MAX_MARKS_TIER2_STACKING_SCRIPTS {
             return false;
         }
     }
@@ -382,10 +339,21 @@ fn mark_fits(chars: &[char], i: usize, cap: usize) -> bool {
     if base.is_whitespace() || !is_graphic_base(base) {
         return false;
     }
-    is_generic_mark(c) || {
-        let group = script_group(c);
-        group != 0 && group == script_group(base)
+    let base_group = script_group(base);
+    let cap = if is_stacking_group(base_group) {
+        MAX_MARKS_TIER2_STACKING_SCRIPTS
+    } else {
+        MAX_MARKS_TIER2
+    };
+    if run >= cap {
+        return false;
     }
+    // The larger cap is for the script's own signs: generic accents stay at the lower cap.
+    if is_generic_mark(c) {
+        return generic_in_run < MAX_MARKS_TIER2;
+    }
+    let group = script_group(c);
+    group != 0 && group == base_group
 }
 
 /// Whether Tier 2 keeps `chars[i]` (a character other than a tab or newline, which the callers
@@ -395,7 +363,7 @@ fn tier2_keeps(chars: &[char], i: usize) -> bool {
     if is_default_ignorable(c) {
         invisible_fits(chars, i)
     } else if is_mark(c) {
-        mark_fits(chars, i, MAX_MARKS_TIER2)
+        mark_fits(chars, i)
     } else {
         is_graphic_base(c)
     }
@@ -540,12 +508,14 @@ pub(crate) fn strip_unsafe(text: &str) -> String {
     tier2_filter(text, RejectedChar::Drop)
 }
 
-/// Whether `base` can carry `selector` as a real variation sequence: CJK ideographs (standardized
-/// and ideographic selectors), emoji and symbol bases from Unicode's emoji and standardized-variant
-/// lists (arrows, math operators, geometric shapes, dingbats), and the keycap characters
-/// `#*0-9`. Letters of other scripts take none, so a selector after them is only a payload.
+/// Whether `base` can carry `selector` as a real variation sequence. `base` must itself survive
+/// (an unassigned base is dropped, and its selector with it). CJK ideographs take the
+/// standardized and ideographic selectors; emoji and symbol bases from Unicode's emoji list take
+/// only the text and emoji presentation selectors (FE0E, FE0F), keeping a selector to under two
+/// bits; any other FE00-FE0D pair must be in Unicode's standardized variants (math operators);
+/// the keycap characters `#*0-9` take FE0E/FE0F. Letters of other scripts take none.
 fn selector_fits(base: char, selector: char) -> bool {
-    if base.is_whitespace() || base.is_control() || matches!(base, '\u{200C}' | '\u{200D}') {
+    if base.is_whitespace() || !is_graphic_base(base) {
         return false;
     }
     let is_cjk = matches!(
@@ -556,14 +526,22 @@ fn selector_fits(base: char, selector: char) -> bool {
             | '\u{F900}'..='\u{FAFF}'
             | '\u{20000}'..='\u{3FFFF}'
     );
+    let text_or_emoji = matches!(selector, '\u{FE0E}' | '\u{FE0F}');
     if matches!(selector, '\u{E0100}'..='\u{E01EF}') {
         return is_cjk;
     }
     if base.is_ascii() {
-        return matches!(selector, '\u{FE0E}' | '\u{FE0F}')
-            && matches!(base, '#' | '*' | '0'..='9');
+        return text_or_emoji && matches!(base, '#' | '*' | '0'..='9');
     }
-    is_cjk || is_symbol_with_variants(base)
+    if is_cjk {
+        return true;
+    }
+    if text_or_emoji {
+        return is_symbol_with_variants(base);
+    }
+    STANDARDIZED_VARIANTS
+        .binary_search(&(base as u32, selector as u32))
+        .is_ok()
 }
 
 fn is_symbol_with_variants(base: char) -> bool {
@@ -911,7 +889,7 @@ mod tests {
         }
         for kept in [
             "\u{2764}\u{FE0F}",
-            "\u{2228}\u{FE00}",
+            "\u{2229}\u{FE00}",
             "\u{1F600}\u{FE0F}",
             "\u{00A9}\u{FE0E}",
         ] {
@@ -1015,29 +993,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_unsafe_should_KeepNoDefaultIgnorableOrUnassigned_When_AnyCodePointOverCarrier() {
-        let mut survivors = Vec::new();
-        for u in 0..=0x10FFFFu32 {
-            let Some(c) = char::from_u32(u) else { continue };
-            if c == '\n' || c == '\t' {
-                continue;
-            }
-            let out = strip_unsafe(&format!("a{c}{c}b"));
-            let inner = &out[1..out.len() - 1];
-            // Whatever survives is visible (a graphic char), never an invisible or a run of two.
-            if !inner.is_empty() {
-                survivors.push(c);
-                assert!(
-                    (is_graphic_base(c) || is_mark(c)) && !is_default_ignorable(c),
-                    "U+{u:04X} survived as an invisible: {out:?}"
-                );
-            }
-        }
-        // Hand-checked sanity: ordinary text is not over-stripped.
-        assert!(survivors.contains(&'é') && survivors.contains(&'\u{1F600}'));
-    }
-
-    #[test]
     fn escape_and_echo_path_should_ShowEveryInvisible_When_OverAsciiCarrier() {
         for c in reviewer_survivors() {
             let text = format!("a{}b", c.to_string().repeat(200));
@@ -1091,7 +1046,10 @@ mod tests {
             family, heart_fire, flag_us, england, keycap, skin, persian, hebrew, arabic, thai, lao,
             khmer, myanmar, ivs, devanagari, bengali, vietnamese, thai_stack, tibetan, code,
             spaces,
-        ] {
+        ]
+        .into_iter()
+        .chain(round_7_legit_text())
+        {
             assert_eq!(strip_unsafe(text), text, "{text:?}");
             assert_eq!(
                 escape_path(&text.replace(['\n', '\t'], "")),
@@ -1102,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_unsafe_should_CapMarksAtThreePerBase_And_MatchScript_When_Stacked() {
+    fn strip_unsafe_should_CapMarksPerBase_And_MatchScript_When_Stacked() {
         let zalgo = format!("a{}b", "\u{0301}".repeat(200));
         assert_eq!(strip_unsafe(&zalgo), "a\u{0301}\u{0301}\u{0301}b");
         // A script-specific mark needs a base of its own script: coeng and Thai tone marks over ASCII.
@@ -1110,9 +1068,16 @@ mod tests {
         assert_eq!(strip_unsafe("a\u{0E48}b\u{094D}c"), "abc");
         // Marks with no base, or on a space or newline, go too.
         assert_eq!(strip_unsafe("\u{0301}x \u{0301}\n\u{0301}"), "x \n");
-        // Devanagari vowel signs (alphabetic marks) are capped as well.
+        // Devanagari vowel signs (alphabetic marks) are capped as well, higher for stacking scripts.
         let signs = format!("\u{0915}{}", "\u{093E}".repeat(100));
-        assert_eq!(strip_unsafe(&signs), "\u{0915}\u{093E}\u{093E}\u{093E}");
+        assert_eq!(
+            strip_unsafe(&signs),
+            format!("\u{0915}{}", "\u{093E}".repeat(5))
+        );
+        // Enclosing marks (Me) count against the cap like any other mark.
+        let rings = format!("a{}b", "\u{20DD}".repeat(50));
+        assert_eq!(strip_unsafe(&rings), "a\u{20DD}\u{20DD}\u{20DD}b");
+        assert_eq!(echo(&rings, 200), "a\u{20DD}\u{20DD}b");
     }
 
     #[test]
@@ -1130,5 +1095,323 @@ mod tests {
         assert_eq!(escape_path("a\u{E000}b"), "a\\u{e000}b");
         assert_eq!(escape_path("a\u{200D}b"), "a\\u{200d}b");
         assert_eq!(escape_path("a\r\n\tb"), "a\\r\\n\\tb");
+    }
+
+    /// Legitimate text the round-7 review found Tier 2 mangling, one entry per loss.
+    fn round_7_legit_text() -> Vec<&'static str> {
+        vec![
+            "ジョン・スミス",
+            "\u{30A0}\u{FF65}",
+            "\u{27E8}x\u{27E9} \u{27E6}y\u{27E7} \u{27F6} \u{27F9}",
+            "\u{1D11E} \u{1D400}\u{1D7D8} \u{2A00} \u{2980}",
+            "\u{0E3F}5 \u{09F3}5 \u{060B} \u{FDFC}",
+            "\u{0387} \u{037E} \u{10FB} \u{0F3A}x\u{0F3B}",
+            "\u{1F642}\u{200D}\u{2194}\u{FE0F} \u{1F642}\u{200D}\u{2195}\u{FE0F}",
+            "\u{1000}\u{103C}\u{103D}\u{1031}\u{1038}",
+            "\u{0F67}\u{0F71}\u{0F74}\u{0F83}",
+            "\u{0D28}\u{0D4D}\u{200D} x",
+            "\u{06F1}\u{06F2}\u{200C}\u{0627}\u{0645}",
+        ]
+    }
+
+    /// Every scalar value worth scanning: all of planes 0-3 and 14-16, plus a stride through the
+    /// unassigned planes 4-13 and their boundaries.
+    fn scan_scalars() -> Vec<char> {
+        (0..0x40000u32)
+            .chain(0xE0000..=0x10FFFF)
+            .chain((0x40000..0xE0000).step_by(0x101))
+            .chain([0x3FFFF, 0x40000, 0xDFFFF])
+            .filter_map(char::from_u32)
+            .collect()
+    }
+
+    /// Runs `check` over `scan_scalars()` on all cores.
+    fn for_each_scalar(check: impl Fn(char) + Sync) {
+        let scalars = scan_scalars();
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let chunk = scalars.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for part in scalars.chunks(chunk) {
+                let check = &check;
+                scope.spawn(move || part.iter().copied().for_each(check));
+            }
+        });
+    }
+
+    /// The only default-ignorable characters context rules may keep.
+    fn is_context_kept_invisible(c: char) -> bool {
+        matches!(c, '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{061C}' | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}')
+    }
+
+    /// Panics unless everything in `out` is something a reader sees or a justified invisible: an
+    /// assigned graphic character, a bounded run of marks, or a context-kept invisible that
+    /// directly follows a visible character (VS16 then ZWJ is the one allowed pair).
+    fn assert_only_visible_or_justified(out: &str, what: &str) {
+        let chars: Vec<char> = out.chars().collect();
+        let mut marks = 0;
+        for (k, &c) in chars.iter().enumerate() {
+            let visible = |p: char| is_assigned_graphic(p) || is_mark(p);
+            if matches!(c, '\n' | '\t') {
+                marks = 0;
+            } else if is_default_ignorable(c) {
+                marks = 0;
+                assert!(
+                    is_context_kept_invisible(c),
+                    "{what}: invisible U+{:04X} in {out:?}",
+                    c as u32
+                );
+                let prev = k.checked_sub(1).map(|p| chars[p]);
+                let after_visible = prev.is_some_and(visible);
+                let vs16_then_zwj =
+                    c == '\u{200D}' && prev == Some('\u{FE0F}') && k >= 2 && visible(chars[k - 2]);
+                assert!(
+                    after_visible || vs16_then_zwj,
+                    "{what}: U+{:04X} kept without a visible character before it in {out:?}",
+                    c as u32
+                );
+            } else if is_mark(c) {
+                marks += 1;
+                assert!(
+                    marks <= MAX_MARKS_TIER2_STACKING_SCRIPTS,
+                    "{what}: mark run in {out:?}"
+                );
+            } else {
+                marks = 0;
+                assert!(
+                    is_graphic_base(c),
+                    "{what}: unassigned or non-graphic U+{:04X} survived in {out:?}",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_unsafe_should_KeepNothingInvisibleOrUnassigned_When_AnyScalarInAnyContext() {
+        let contexts = [
+            ("a", "b"),
+            ("é", "ü"),
+            ("\u{05E9}", "\u{05E9}"),
+            ("\u{1F642}", "\u{1F642}"),
+            ("\u{0E01}", "\u{0E01}"),
+            ("\u{65E5}", "\u{672C}"),
+            (" ", " "),
+            ("\n", "\n"),
+        ];
+        for_each_scalar(|c| {
+            for (before, after) in contexts {
+                for run in 1..=3usize {
+                    let text = format!("{before}{}{after}", c.to_string().repeat(run));
+                    let out = strip_unsafe(&text);
+                    assert_only_visible_or_justified(&out, &format!("U+{:04X} x{run}", c as u32));
+                    let droppable = !is_graphic_base(c)
+                        && !is_mark(c)
+                        && !is_default_ignorable(c)
+                        && !matches!(c, '\n' | '\t');
+                    assert!(
+                        !droppable || !out.contains(c),
+                        "U+{:04X} x{run}: {out:?}",
+                        c as u32
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn strip_unsafe_should_DropSelectorsAndJoiners_When_BaseIsUnassignedOrDropped() {
+        let followers = [
+            '\u{FE0F}',
+            '\u{FE0E}',
+            '\u{FE00}',
+            '\u{E0100}',
+            '\u{200D}',
+            '\u{200C}',
+            '\u{200F}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{2060}',
+        ];
+        for_each_scalar(|base| {
+            for follower in followers {
+                let out = strip_unsafe(&format!("a{base}{follower}x"));
+                assert_only_visible_or_justified(
+                    &out,
+                    &format!("U+{:04X}+U+{:04X}", base as u32, follower as u32),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn echo_and_paths_should_NeverShowUnassignedOrInvisible_When_AnyScalarOverAsciiCarrier() {
+        for_each_scalar(|c| {
+            let text = format!("a{c}{c}{c}b");
+            let echoed = echo(&text, 500);
+            assert!(
+                echoed.chars().all(|e| e.is_ascii() || is_echo_safe(e)),
+                "U+{:04X} echo: {echoed:?}",
+                c as u32
+            );
+            let hidden = !is_graphic_base(c) && !is_mark(c);
+            if hidden {
+                assert!(
+                    !echoed.contains(c),
+                    "U+{:04X} survived echo: {echoed:?}",
+                    c as u32
+                );
+                for out in [escape_path(&text), echo_path(&text, 500)] {
+                    assert!(
+                        !out.contains(c),
+                        "U+{:04X} raw in a path: {out:?}",
+                        c as u32
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn tables_should_AgreeWithStd_When_ClassifyingLettersAndDigits() {
+        assert_eq!(super::super::unicode_tables::UNICODE_VERSION, "18.0.0");
+        for_each_scalar(|c| {
+            // Assigned letters that render blank are dropped on purpose (see the generator).
+            let blank = matches!(c, '\u{13441}' | '\u{13442}');
+            if c.is_alphanumeric() && !blank {
+                assert!(
+                    is_assigned_graphic(c) || is_mark(c) || is_default_ignorable(c),
+                    "std says U+{:04X} is alphanumeric but the tables drop it: regenerate them",
+                    c as u32
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn strip_unsafe_should_DropEveryReviewerReportedUnassignedRange_When_OverAsciiCarrier() {
+        let ranges: &[(u32, u32)] = &[
+            (0x1AF1, 0x1AFF),
+            (0x20C5, 0x20CF),
+            (0x20F1, 0x20FF),
+            (0x242A, 0x243F),
+            (0x244B, 0x245F),
+            (0x2B74, 0x2B75),
+            (0x321F, 0x321F),
+            (0xFE53, 0xFE53),
+            (0xFE67, 0xFE67),
+            (0x1D357, 0x1D35F),
+            (0x1F02C, 0x1F02F),
+            (0x1F094, 0x1F09F),
+            (0x1F1AF, 0x1F1E5),
+            (0x1F203, 0x1F20F),
+            (0x1F266, 0x1F2FF),
+            (0x1F6DA, 0x1F6DB),
+            (0x1F7DC, 0x1F7DF),
+            (0x1F8D9, 0x1F8FF),
+            (0x1FA58, 0x1FA5F),
+            (0x1FAFB, 0x1FAFF),
+            (0x1FB93, 0x1FB93),
+            (0x1FBFB, 0x1FBFF),
+        ];
+        let mut count = 0;
+        for &(lo, hi) in ranges {
+            for c in (lo..=hi).filter_map(char::from_u32) {
+                count += 1;
+                let run = c.to_string().repeat(100);
+                assert_eq!(
+                    strip_unsafe(&format!("a{run}b")),
+                    "ab",
+                    "U+{:04X}",
+                    c as u32
+                );
+                assert_eq!(echo(&format!("a{run}b"), 500), "ab", "U+{:04X}", c as u32);
+                assert!(
+                    escape_path(&format!("a{run}b")).is_ascii(),
+                    "U+{:04X}",
+                    c as u32
+                );
+            }
+        }
+        assert!(count >= 150, "{count}");
+    }
+
+    #[test]
+    fn strip_unsafe_should_DropBlankSymbols_When_AssignedButInvisible() {
+        for c in [
+            '\u{2800}',
+            '\u{303F}',
+            '\u{13441}',
+            '\u{13442}',
+            '\u{1D159}',
+            '\u{FFFC}',
+        ] {
+            assert_eq!(
+                strip_unsafe(&format!("a{c}{c}b")),
+                "ab",
+                "U+{:04X}",
+                c as u32
+            );
+            assert_eq!(echo(&format!("a{c}b"), 50), "ab", "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn strip_unsafe_should_KeepOneBidiMarkPerGap_When_DroppedCharSitsBetween() {
+        let tag = '\u{E0067}';
+        assert_eq!(
+            strip_unsafe(&format!("\u{05E9}\u{200E}{tag}\u{200F}\u{05E9}")),
+            "\u{05E9}\u{200E}\u{05E9}"
+        );
+        assert_eq!(
+            strip_unsafe("\u{05E9}\u{200F}\u{00AD}\u{061C}\u{05E9}"),
+            "\u{05E9}\u{200F}\u{05E9}"
+        );
+    }
+
+    #[test]
+    fn strip_unsafe_should_LimitSelectorsToRealSequences_When_EmojiSymbolOrCjkBase() {
+        // Emoji and symbol bases take only the text/emoji selectors; math bases their listed ones.
+        for dropped in [
+            "\u{2764}\u{FE01}",
+            "\u{1F600}\u{FE00}",
+            "\u{1F600}\u{FE0D}",
+            "\u{2229}\u{FE02}",
+        ] {
+            assert_eq!(
+                strip_unsafe(dropped),
+                dropped.chars().next().unwrap().to_string()
+            );
+        }
+        for kept in [
+            "\u{2764}\u{FE0E}",
+            "\u{2764}\u{FE0F}",
+            "\u{2229}\u{FE00}",
+            "\u{4FAE}\u{FE0F}",
+        ] {
+            assert_eq!(strip_unsafe(kept), kept);
+        }
+        // An unassigned base is dropped, and its selector with it.
+        assert_eq!(strip_unsafe("a\u{1F2FF}\u{FE0F}b"), "ab");
+        assert_eq!(strip_unsafe("a\u{2B74}\u{FE0E}b"), "ab");
+    }
+
+    #[test]
+    fn strip_unsafe_should_KeepTrailingJoiner_When_ChilluOrPersianDigitsOnly() {
+        assert_eq!(
+            strip_unsafe("\u{0D28}\u{0D4D}\u{200D} x"),
+            "\u{0D28}\u{0D4D}\u{200D} x"
+        );
+        assert_eq!(
+            strip_unsafe("\u{0D28}\u{0D4D}\u{200D}"),
+            "\u{0D28}\u{0D4D}\u{200D}"
+        );
+        // A joiner after a plain letter, or a run of them, is still a payload.
+        assert_eq!(strip_unsafe("\u{0D28}\u{200D} x"), "\u{0D28} x");
+        assert_eq!(
+            strip_unsafe("\u{0D28}\u{0D4D}\u{200D}\u{200D}\u{200D} x"),
+            "\u{0D28}\u{0D4D} x"
+        );
+        assert_eq!(strip_unsafe("a\u{200D} x"), "a x");
     }
 }
