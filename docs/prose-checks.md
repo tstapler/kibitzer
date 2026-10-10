@@ -131,26 +131,44 @@ matter — no evidence yet that it does.
 
 ## Backtest: hollow-qualifier-phrasing
 
-Run 2026-10-10 against the prose corpus in `docs/backtest-repos.md`
-(`kubernetes/website`, `gitlabhq/gitlabhq`, `docker/docs`, `mdn/content`,
-`microsoft/vscode-docs`, `rust-lang/book`, `rust-lang/rustc-dev-guide`,
-`stapler-squad`; 36,000+ `.md` files) with `kibitzer check native
-hollow-qualifier-phrasing`, plus `kibitzer check backtest` over local Claude Code
-transcripts (1,645 reconstructable snapshots).
+Run 2026-10-10 against every repo in `docs/backtest-repos.md` (all 15 clones present
+locally, code and prose), over each repo's `.md` files:
 
-| Corpus | Findings | True positives | False positives |
-|---|---|---|---|
-| 8 prose repos, ~36,000 files | 1 | 0 | 1 |
-| Session transcripts | 1 | 0 | 1 |
+```sh
+find ~/code/github.com/<owner>/<repo> -name '*.md' -type f -print0 \
+  | xargs -0 -n1 -P8 kibitzer check native hollow-qualifier-phrasing
+```
 
-- **Corpus FP:** `kubernetes/website`'s `1-18-release-interview.md:95`, a spoken
-  interview line ending `..., essentially`. Conversational hedging, not a hollow
-  heading.
-- **Transcript FP:** a planning doc enumerating the adverb list itself in code spans
-  (`generically`, `fundamentally`, ...) whose last item matched. Checker-describing
-  docs will trip it; suppress with `kibitzer:ignore`.
-- **No second true occurrence turned up**, and zero headings matched anywhere in the
-  corpus, so the "2+ independent occurrences" bar from `docs/check-ideas.md` is still
-  unmet. The check ships opt-in, advisory, for that reason.
-- **Noise rate:** ~1 finding per 18,000 files, all of them false positives. Cheap to
-  keep opt-in; too few true positives to estimate precision for a real hit.
+| Repo | `.md` files | Findings |
+|---|---|---|
+| `kubernetes/kubernetes` | 590 | 0 |
+| `apache/cassandra` | 91 | 0 |
+| `servo/servo` | 388 | 0 |
+| `BurntSushi/ripgrep` | 23 | 0 |
+| `denoland/deno` | 129 | 0 |
+| `microsoft/vscode` | 353 | 0 |
+| `android/nowinandroid` | 43 | 0 |
+| `kubernetes/website` | 8,239 | 1 |
+| `gitlabhq/gitlabhq` | 8,491 | 0 |
+| `docker/docs` | 1,375 | 0 |
+| `mdn/content` | 14,688 | 0 |
+| `microsoft/vscode-docs` | 847 | 0 |
+| `rust-lang/book` | 478 | 0 |
+| `rust-lang/rustc-dev-guide` | 248 | 0 |
+| `tstapler/stapler-squad` | 2,616 | 0 |
+| **Total** | **38,599** | **1** |
+
+A `kibitzer check backtest hollow-qualifier-phrasing` run over local Claude Code
+transcripts (1,645 reconstructable snapshots) produced 1 more finding.
+
+- **Corpus FP (1 of 1):** `kubernetes/website`
+  `content/en/blog/_posts/2020/kubernetes-1-18-release-interview.md:95`, a spoken
+  interview line ending `..., essentially`. Conversational hedging, not a hollow heading.
+- **Transcript FP (1 of 1):** a planning doc enumerating the adverb list itself in code
+  spans (`generically`, `fundamentally`, ...) whose last item matched. Docs that describe
+  the checker will trip it; suppress with `kibitzer:ignore`.
+- **False-positive rate:** 2 findings, 0 true positives. 1 per ~38,600 corpus files.
+  With no true positive, precision cannot be estimated, only that noise is very low.
+- **No second true occurrence turned up**, and no heading matched anywhere, so the
+  "2+ independent occurrences" bar from `docs/check-ideas.md` is still unmet. The check
+  ships opt-in and advisory for that reason.
