@@ -126,3 +126,11 @@ project-specific house-style words — not for this fixed mechanical anti-patter
 The module already has `for_each_paragraph` and `check_paragraphs`. A parallel
 `for_each_heading`/`check_headings` pair is consistent with the module's design. The
 risk is low.
+
+## Implementation deviations
+
+- No `check_headings` wrapper: the one caller needs a per-kind label and the lead-sentence
+  path in the same pass, so the wrapper would have a single caller. Instead
+  `markdown_text::for_each_block` (one walker, `BlockKind::{Paragraph, Heading}`, document
+  order) backs `for_each_paragraph` and the checker; no separate `for_each_heading`.
+- An empty or all-blank `adverbs` list is a config-load error, not a silent no-op.

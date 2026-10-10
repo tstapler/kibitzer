@@ -23,6 +23,9 @@ const DEFAULT_ADVERBS: &[&str] = &[
     "nominally",
 ];
 
+/// Longest stretch of the offending text echoed in a finding (the tail, where the adverb is).
+const MAX_ECHOED_CHARS: usize = 80;
+
 /// Flags a markdown heading, or the first sentence of a flowing-prose paragraph, that
 /// ends with `, <adverb>`. Advisory style judgment; list items and non-lead sentences are
 /// out of scope, matching the other prose checkers. Not wired into
@@ -33,7 +36,7 @@ const DEFAULT_ADVERBS: &[&str] = &[
 /// check's `adverbs` option (see [`Checker::configure`]).
 pub struct HollowQualifierPhrasingChecker {
     adverbs: Vec<String>,
-    /// `None` when `adverbs` is empty (nothing to match).
+    /// Always `Some` after construction; kept optional only for the `?` ergonomics in `finding`.
     ending: Option<Regex>,
 }
 
@@ -94,44 +97,63 @@ impl HollowQualifierPhrasingChecker {
             .filter(|a| !a.is_empty())
             .map(regex::escape)
             .collect();
-        let ending = if usable.is_empty() {
-            None
-        } else {
-            let alternation = usable.join("|");
-            Some(Regex::new(&format!(r"(?i),\s*(?:{alternation})\s*$"))?)
-        };
+        anyhow::ensure!(
+            !usable.is_empty(),
+            "hollow-qualifier-phrasing: `adverbs` must contain at least one non-blank word"
+        );
+        let alternation = usable.join("|");
+        let ending = Some(Regex::new(&format!(r"(?i),\s*(?:{alternation})\s*$"))?);
         Ok(HollowQualifierPhrasingChecker { adverbs, ending })
     }
 
     fn check_source(&self, body: &str) -> Vec<Finding> {
+        use crate::markdown_text::{BlockKind, for_each_block, split_sentences};
+
         let mut findings = Vec::new();
-        crate::markdown_text::for_each_heading(body, |line, text| {
-            findings.extend(self.finding(line, "heading", text));
-        });
-        crate::markdown_text::for_each_paragraph(body, |p| {
-            let lead = crate::markdown_text::split_sentences(&p.text)
-                .into_iter()
-                .next();
-            if let Some(lead) = lead {
-                findings.extend(self.finding(p.line, "lead sentence", lead));
+        for_each_block(body, |kind, line, text| {
+            let candidate = match kind {
+                BlockKind::Heading => Some(("heading", text)),
+                BlockKind::Paragraph => split_sentences(text)
+                    .into_iter()
+                    .next()
+                    .map(|lead| ("lead sentence", lead)),
+            };
+            if let Some((label, text)) = candidate {
+                findings.extend(self.finding(line, label, text));
             }
         });
-        findings.sort_by_key(|f| f.line);
         findings
     }
 
     fn finding(&self, line: usize, kind: &str, text: &str) -> Option<Finding> {
-        let trimmed = text
-            .trim()
-            .trim_end_matches(['.', '!', '?', ':'])
-            .trim_end();
+        // Inline code/emphasis flattening leaves stray spaces ("The  cache , x"); tidy
+        // them so the echoed text reads like the source.
+        let tidy = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" ,", ",");
+        let trimmed = tidy.trim_end_matches(['.', '!', '?', ':']).trim_end();
         if !self.ending.as_ref()?.is_match(trimmed) {
             return None;
         }
+        let shown = if trimmed.chars().count() > MAX_ECHOED_CHARS {
+            let tail: String = trimmed
+                .chars()
+                .rev()
+                .take(MAX_ECHOED_CHARS)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("...{tail}")
+        } else {
+            trimmed.to_string()
+        };
         Some(Finding {
             line,
             message: format!(
-                "{kind} \"{trimmed}\" names the kind of thing, not the thing itself - say what it covers instead of qualifying it"
+                "{kind} \"{shown}\" names the kind of thing, not the thing itself - say what it covers instead of qualifying it"
             ),
         })
     }
@@ -208,21 +230,25 @@ mod tests {
     }
 
     #[test]
-    fn blank_adverb_entry_does_not_match_everything() {
-        let configured = HollowQualifierPhrasingChecker::default()
-            .configure(&serde_json::json!({ "adverbs": ["", "  "] }))
-            .unwrap()
-            .unwrap();
-        let ctx = CheckContext {
-            source: "# Trailing comma,\n",
-            tree: None,
-        };
-        assert!(
-            configured
-                .check(Path::new("doc.md"), &ctx)
-                .unwrap()
-                .is_empty()
-        );
+    fn configure_rejects_blank_only_adverb_list() {
+        let err = HollowQualifierPhrasingChecker::default()
+            .configure(&serde_json::json!({ "adverbs": ["", "  "] }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn ignores_yaml_front_matter() {
+        let body = "---\ntitle: X\ndescription: a thing, essentially\n---\n\n# Real heading\n";
+        assert!(check_source(body).is_empty());
+    }
+
+    #[test]
+    fn truncates_long_lead_sentence_in_message() {
+        let body = format!("{}, essentially. More.\n", "word ".repeat(60));
+        let findings = check_source(&body);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("..."));
+        assert!(findings[0].message.len() < 250);
     }
 
     #[test]

@@ -73,86 +73,79 @@ fn push_if_not_blank<'a>(sentences: &mut Vec<&'a str>, candidate: &'a str) {
     }
 }
 
-/// Walks `body`'s markdown paragraphs outside any list, invoking `on_paragraph` for
-/// each one. List items are excluded because a parallel bulleted enumeration (independent
-/// facts stated in the same grammatical form on purpose) is not the kind of prose defect
-/// these checkers look for — see the originating issue's false-positive guardrail.
+/// Which kind of flowing-prose block [`for_each_block`] reached.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockKind {
+    Paragraph,
+    Heading,
+}
+
+/// Walks `body`'s markdown paragraphs and headings (ATX and setext) outside any list in
+/// document order, invoking `on_block(kind, line, text)` with each one's flattened text.
+/// List items are excluded because a parallel bulleted enumeration (independent facts
+/// stated in the same grammatical form on purpose) is not the kind of prose defect these
+/// checkers look for - see the originating issue's false-positive guardrail.
 ///
 /// Parses with `ENABLE_TABLES`: without it, a GFM table has no blank-line separation
 /// pulldown-cmark recognizes, so the whole table parses as one giant `Tag::Paragraph`
 /// (found backtesting vscode-docs: a troubleshooting table reported as one 30-"sentence"
 /// paragraph). With it, table content arrives as `Tag::Table`/`TableCell` events instead,
-/// which `in_paragraph`'s gate below already excludes.
-pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
+/// which the `current` gate below already excludes. `ENABLE_YAML_STYLE_METADATA_BLOCKS` keeps
+/// a front-matter block's closing `---` from turning its last line into a setext heading.
+pub fn for_each_block(body: &str, mut on_block: impl FnMut(BlockKind, usize, &str)) {
     let line_starts = line_start_offsets(body);
-    let parser = Parser::new_ext(body, Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(
+        body,
+        Options::ENABLE_TABLES | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS,
+    );
 
     let mut list_depth = 0usize;
-    let mut in_paragraph = false;
-    let mut paragraph_line = 0usize;
-    let mut paragraph_text = String::new();
+    let mut current: Option<(BlockKind, usize)> = None;
+    let mut text = String::new();
 
     for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(Tag::List(_)) => list_depth += 1,
             Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
             Event::Start(Tag::Paragraph) if list_depth == 0 => {
-                in_paragraph = true;
-                paragraph_line = line_for_offset(&line_starts, range.start);
-                paragraph_text.clear();
+                current = Some((
+                    BlockKind::Paragraph,
+                    line_for_offset(&line_starts, range.start),
+                ));
+                text.clear();
             }
-            Event::End(TagEnd::Paragraph) if in_paragraph => {
-                in_paragraph = false;
-                on_paragraph(Paragraph {
-                    line: paragraph_line,
-                    text: std::mem::take(&mut paragraph_text),
-                });
+            Event::Start(Tag::Heading { .. }) if list_depth == 0 => {
+                current = Some((
+                    BlockKind::Heading,
+                    line_for_offset(&line_starts, range.start),
+                ));
+                text.clear();
             }
-            Event::Text(ref text) | Event::Code(ref text) if in_paragraph => {
-                paragraph_text.push_str(text);
-                paragraph_text.push(' ');
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_)) => {
+                if let Some((kind, line)) = current.take() {
+                    on_block(kind, line, &text);
+                }
             }
-            Event::SoftBreak | Event::HardBreak if in_paragraph => {
-                paragraph_text.push(' ');
+            Event::Text(ref t) | Event::Code(ref t) if current.is_some() => {
+                text.push_str(t);
+                text.push(' ');
             }
+            Event::SoftBreak | Event::HardBreak if current.is_some() => text.push(' '),
             _ => {}
         }
     }
 }
 
-/// Walks `body`'s markdown headings (ATX and setext) outside any list, invoking
-/// `on_heading(line, text)` with the heading's flattened plain text. Mirrors
-/// [`for_each_paragraph`]'s flattening and list exclusion so heading-scoped prose checks
-/// treat text the same way paragraph-scoped ones do.
-pub fn for_each_heading(body: &str, mut on_heading: impl FnMut(usize, &str)) {
-    let line_starts = line_start_offsets(body);
-    let parser = Parser::new_ext(body, Options::ENABLE_TABLES);
-
-    let mut list_depth = 0usize;
-    let mut in_heading = false;
-    let mut heading_line = 0usize;
-    let mut heading_text = String::new();
-
-    for (event, range) in parser.into_offset_iter() {
-        match event {
-            Event::Start(Tag::List(_)) => list_depth += 1,
-            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
-            Event::Start(Tag::Heading { .. }) if list_depth == 0 => {
-                in_heading = true;
-                heading_line = line_for_offset(&line_starts, range.start);
-                heading_text.clear();
-            }
-            Event::End(TagEnd::Heading(_)) if in_heading => {
-                in_heading = false;
-                on_heading(heading_line, heading_text.trim());
-            }
-            Event::Text(ref text) | Event::Code(ref text) if in_heading => {
-                heading_text.push_str(text);
-            }
-            Event::SoftBreak | Event::HardBreak if in_heading => heading_text.push(' '),
-            _ => {}
+/// Walks `body`'s flowing-prose paragraphs outside any list; see [`for_each_block`].
+pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
+    for_each_block(body, |kind, line, text| {
+        if kind == BlockKind::Paragraph {
+            on_paragraph(Paragraph {
+                line,
+                text: text.to_string(),
+            });
         }
-    }
+    });
 }
 
 /// Runs `check_paragraph` over every flowing-prose paragraph in `body` (via
@@ -207,6 +200,48 @@ mod tests {
         assert!(
             paragraphs.is_empty(),
             "table cells should never surface as paragraphs, got: {paragraphs:?}"
+        );
+    }
+
+    fn headings(body: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for_each_block(body, |kind, line, text| {
+            if kind == BlockKind::Heading {
+                let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                out.push((line, collapsed));
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn for_each_block_should_ReportSetextHeadingAtItsFirstLine_When_Underlined() {
+        assert_eq!(
+            headings("intro\n\nThe primitive\n=====\n"),
+            vec![(3, "The primitive".to_string())]
+        );
+    }
+
+    #[test]
+    fn for_each_block_should_SkipHeading_When_InsideListItem() {
+        assert!(headings("- # inside a list\n").is_empty());
+    }
+
+    #[test]
+    fn for_each_block_should_FlattenInlineMarkup_When_HeadingHasEmphasisAndCode() {
+        assert_eq!(
+            headings("## The *primitive*, `x`, generically\n"),
+            vec![(1, "The primitive , x , generically".to_string())]
+        );
+    }
+
+    #[test]
+    fn for_each_block_should_YieldDocumentOrder_When_HeadingsAndParagraphsInterleave() {
+        let mut kinds = Vec::new();
+        for_each_block("# H\n\npara\n\n## H2\n", |kind, _, _| kinds.push(kind));
+        assert_eq!(
+            kinds,
+            vec![BlockKind::Heading, BlockKind::Paragraph, BlockKind::Heading]
         );
     }
 
