@@ -115,6 +115,13 @@ In Markdown the comment is an HTML comment:
   (`[ignore-syntax]`) only when a bare `TODO`/`FIXME`/`NOTE`-style label precedes it;
   prose that merely describes the syntax is left alone. An upper-case marker such as
   `KIBITZER:IGNORE` is reported as a near miss.
+- **Unused ignores.** `kibitzer run` reports a directive that suppresses nothing as
+  `[unused-ignore]`: "remove it" when no finding of that rule exists, or the row of
+  the nearest finding when the comment sits on the wrong row. A rule that is not a
+  known rule or checker name is reported as a probable typo instead. It judges
+  against findings before any `accepted/` entry, so an ignore an `accepted/` entry also
+  covers is not unused. A directive is not judged when its checker is disabled or
+  did not run on that file (too large, excluded by trigger), nor with `--no-inline-ignores`.
 - **Never suppressible:** the directive diagnostics themselves (`inline-ignore`,
   `ignore-syntax`, `unused-ignore`, `ignore-volume`, `blocking-suppressed`).
 - A malformed directive never suppresses; its `[ignore-syntax]` message says the

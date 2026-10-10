@@ -185,6 +185,118 @@ fn kibitzer_run_should_PrintNoUnusedIgnore_When_IgnoreSuppressesFinding() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const NO_FINDING_GO: &str =
+    "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nfunc f() {}\n";
+
+#[test]
+fn kibitzer_run_should_ReportUnusedIgnore_When_NoFindingUnderIt() {
+    let dir = temp_dir("unused-ignore");
+    std::fs::write(dir.join("main.go"), NO_FINDING_GO).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(
+        stdout.contains(
+            "main.go:3: [unused-ignore] kibitzer:ignore flag-argument suppresses nothing - remove it"
+        ),
+        "{stdout}"
+    );
+    assert!(!run_with_args(&dir, &["--no-inline-ignores"]).contains("[unused-ignore]"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NameRealRow_When_IgnoreSitsOnWrongRow() {
+    let dir = temp_dir("wrong-row");
+    let source = "package main\n\n// kibitzer:ignore flag-argument -- legacy api pinned\nvar x = 1\n\nfunc f(b bool) {\n\tif b {\n\t\tprintln(\"x\")\n\t}\n}\n";
+    std::fs::write(dir.join("main.go"), source).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(
+        stdout.contains(
+            "main.go:3: [unused-ignore] kibitzer:ignore flag-argument matches no finding"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("the finding is at line 6"), "{stdout}");
+    assert!(stdout.contains("main.go:6: [flag-argument]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotJudgeIgnore_When_OwningCheckDisabled() {
+    let dir = temp_dir("owner-disabled");
+    std::fs::write(dir.join("main.go"), NO_FINDING_GO).unwrap();
+    std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+    std::fs::write(
+        dir.join(".kibitzer/inspect.json"),
+        r#"{"disabled": ["syntax-rules-go"]}"#,
+    )
+    .unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotCallIgnoreUnused_When_AcceptedEntryAlsoCoversFinding() {
+    let dir = temp_dir("shadowed-by-accepted");
+    std::fs::write(dir.join("main.go"), COVERED_GO).unwrap();
+    std::fs::create_dir_all(dir.join(".kibitzer/accepted")).unwrap();
+    std::fs::write(
+        dir.join(".kibitzer/accepted/f.json"),
+        r#"{"rule": "flag-argument", "file": "main.go", "line": 4, "content": "func f(b bool) {", "reason": "kept on purpose"}"#,
+    )
+    .unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotJudgeCrossFileDuplicateIgnore_When_IndexStillFilling() {
+    let dir = temp_dir("cross-file-order");
+    let body = "\tx := 1\n\ty := 2\n\tz := x + y\n\tprintln(z)\n\tprintln(x)\n\tprintln(y)\n\tw := z * 2\n\tprintln(w)\n\tprintln(w + x)\n\tprintln(w + y)\n";
+    for f in ["a.go", "b.go", "c.go"] {
+        let source = format!(
+            "package main\n\n// kibitzer:ignore duplicate-code-cross-file -- shared snippet is intentional here\nfunc F() {{\n{body}}}\n"
+        );
+        std::fs::write(dir.join(f), source).unwrap();
+    }
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotJudgeIgnore_When_FileOverNativeSizeLimit() {
+    let dir = temp_dir("too-large");
+    let mut source = String::from(NO_FINDING_GO);
+    source.push_str("// ");
+    source.push_str(&"x".repeat(2 * 1024 * 1024));
+    source.push('\n');
+    std::fs::write(dir.join("main.go"), source).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotCallMarkdownIgnoreUnused_When_ItSuppressesBrokenLink() {
+    let dir = temp_dir("md-link");
+    std::fs::write(
+        dir.join("doc.md"),
+        "# T\n\n<!-- kibitzer:ignore markdown-link-integrity -- link target is generated at build time -->\n[gone][nodef]\n",
+    )
+    .unwrap();
+    let raw = run_with_args(&dir, &["--no-inline-ignores"]);
+    assert!(
+        raw.contains("nodef"),
+        "fixture must produce a finding: {raw}"
+    );
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    assert!(!stdout.contains("nodef"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn kibitzer_check_native_should_BypassInlineIgnores_When_RunDirectly() {
     let dir = temp_dir("check-native");

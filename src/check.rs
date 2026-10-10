@@ -552,7 +552,7 @@ impl SourceCheck {
 /// Findings of `check`'s native checker as it reported them: inline ignores disabled, and
 /// none of diff-scoping, `accepted/` or the HEAD baseline applied (those live in
 /// `run_native_check`, which this deliberately bypasses). Empty for a non-native check.
-fn raw_findings_for_check(
+pub(crate) fn raw_findings_for_check(
     check: &Check,
     file_path: &Path,
     source: &str,

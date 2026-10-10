@@ -27,7 +27,9 @@ pub use types::{
     MalformedReason, Reason, RuleId, SuppressionCounts, WeakReason,
 };
 pub(crate) use types::{LineSpan, RawFinding, has_marker, rows_intersect, valid_directives};
-pub(crate) use unused::{FirstPass, UnusedKind, unowned_verdicts, unused_ignores};
+#[cfg(test)]
+pub(crate) use unused::UnusedKind;
+pub(crate) use unused::{FirstPass, unowned_verdicts, unused_ignores};
 
 // Reached through this module only by tests; production code names the submodule item itself.
 #[cfg(test)]

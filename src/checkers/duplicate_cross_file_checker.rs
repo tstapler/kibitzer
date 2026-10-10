@@ -35,6 +35,10 @@ impl Checker for CrossFileDuplicateChecker {
         DuplicateCodeChecker.file_globs()
     }
 
+    fn reads_cross_run_state(&self) -> bool {
+        true
+    }
+
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
         let index_path = index_path_for_repo(&discover_repo_root(file));
         let mut index = DuplicateIndex::load(&index_path);

@@ -190,7 +190,13 @@ fn run_batch_collect(
         let audit = if mode == InlineIgnoreMode::Disabled {
             Vec::new()
         } else {
-            crate::inline_post_pass::unknown_rule_advisories(file, &results, &run_ctx)
+            crate::inline_post_pass::run_audit(
+                &file_checks,
+                file,
+                &results,
+                &run_ctx,
+                &crate::check::raw_findings_for_check,
+            )
         };
         for result in results.iter().chain(&audit) {
             if !result.passed && has_blocking_finding(result) {

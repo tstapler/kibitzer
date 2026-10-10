@@ -9,7 +9,7 @@ use crate::checker::{NativeSource, read_native_source};
 use crate::config::{Check, Severity};
 use crate::inline_ignores::sanitize::{ECHO_PATH_CHARS, echo_path, quote_reason};
 use crate::inline_ignores::{
-    Directive, DroppedFinding, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId, UnusedKind,
+    Directive, DroppedFinding, FirstPass, Line, LineSpan, RawFinding, Reason, RuleId,
     is_file_scope, owned_by, rows_intersect, unowned_verdicts, unused_ignores, valid_directives,
 };
 use crate::run_context::RunContext;
@@ -111,7 +111,7 @@ fn unused_advisories(input: &PostPassInput, changed_lines: &[(usize, usize)]) ->
         return Vec::new();
     }
     let first = first_pass(input.results);
-    let raw = rerun_owning_checks(input, &first.ran, &touched, &source);
+    let raw = rerun_owning_checks(&RerunCtx::of(input), &first.ran, &touched, &source);
     unused_ignores(touched.iter().copied(), &raw, &first.ran, None)
         .into_iter()
         .chain(unowned_verdicts(
@@ -137,24 +137,51 @@ fn located(file_path: &Path, row: Line, message: &str) -> String {
     format!("{path}:{}: {message}", row.get())
 }
 
-/// `kibitzer run` audit: reports only unknown-rule verdicts, from first-pass data with no
-/// rerun, so a typo'd rule is not silent in the CLI. The rerun-based unused-ignore audit
-/// is hook-only (`run`).
-pub(crate) fn unknown_rule_advisories(
+/// `kibitzer run` audit: every `[unused-ignore]` verdict for the file, judged over the whole
+/// file. Owned rules are judged against a rerun of the owning checks that ran (raw findings,
+/// so an `accepted/` entry never makes an ignore look unused); other rules from first-pass data.
+pub(crate) fn run_audit(
+    checks: &[Check],
     file_path: &Path,
     results: &[CheckResult],
     run_ctx: &RunContext,
+    raw_rerun: RawRerun,
 ) -> Vec<CheckResult> {
     let Some(source) = read_markered_source(file_path) else {
         return Vec::new();
     };
     let scanned = run_ctx.inline.scan_memo.scan(file_path, &source);
-    let verdicts = unowned_verdicts(valid_directives(&scanned), &first_pass(results), None);
-    verdicts
-        .iter()
-        .filter(|v| v.kind == UnusedKind::UnknownRule)
+    let directives: Vec<&Directive> = valid_directives(&scanned);
+    if directives.is_empty() {
+        return Vec::new();
+    }
+    let mut first = first_pass(results);
+    // A check fed by a persistent index sees only the files visited so far, so a directive
+    // for it would look unused on a fresh run; leave those unjudged.
+    first
+        .ran
+        .retain(|name| !reads_cross_run_state(checks, name));
+    let ctx = RerunCtx {
+        checks,
+        file_path,
+        #[cfg(test)]
+        run_ctx,
+        raw_rerun,
+    };
+    let raw = rerun_owning_checks(&ctx, &first.ran, &directives, &source);
+    unused_ignores(directives.iter().copied(), &raw, &first.ran, None)
+        .into_iter()
+        .chain(unowned_verdicts(directives.iter().copied(), &first, None))
         .map(|v| advisory_result(&located(file_path, v.row, &v.message)))
         .collect()
+}
+
+fn reads_cross_run_state(checks: &[Check], check_name: &str) -> bool {
+    checks
+        .iter()
+        .find(|c| c.name == check_name)
+        .and_then(|c| c.checker.as_deref())
+        .is_some_and(crate::checker::reads_cross_run_state)
 }
 
 /// The file text, only when it is small enough for the first pass to have judged it and
@@ -169,10 +196,32 @@ fn read_markered_source(file_path: &Path) -> Option<String> {
     }
 }
 
+/// The slice of `PostPassInput` the unused-ignore rerun needs, so `kibitzer run`, which has no
+/// edit to describe, can share it.
+struct RerunCtx<'a> {
+    checks: &'a [Check],
+    file_path: &'a Path,
+    #[cfg(test)]
+    run_ctx: &'a RunContext,
+    raw_rerun: RawRerun<'a>,
+}
+
+impl<'a> RerunCtx<'a> {
+    fn of(input: &PostPassInput<'a>) -> Self {
+        RerunCtx {
+            checks: input.checks,
+            file_path: input.file_path,
+            #[cfg(test)]
+            run_ctx: input.run_ctx,
+            raw_rerun: input.raw_rerun,
+        }
+    }
+}
+
 /// Raw findings from the checks that ran and own a rule some touched directive names.
 /// Never diff-scoped, so a finding outside `changed_lines` still counts.
 fn rerun_owning_checks(
-    input: &PostPassInput,
+    input: &RerunCtx,
     ran: &[&str],
     touched: &[&Directive],
     source: &str,
