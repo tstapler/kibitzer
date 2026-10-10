@@ -36,7 +36,10 @@ impl Checker for PrimitiveObsessionChecker {
         &["**/*.go"]
     }
 
-    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        if file.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_test.go")) {
+            return Ok(Vec::new());
+        }
         let tree = ctx
             .tree
             .context("primitive-obsession checker requires a parsed tree")?;
@@ -61,6 +64,43 @@ inventory::submit! {
 #[cfg(test)]
 fn check_source(src: &str) -> Result<Vec<Finding>> {
     crate::test_support::check_go_source(&PrimitiveObsessionChecker, src)
+}
+
+/// Stdlib and `slices` package functions whose closure parameters follow a mandated
+/// signature — the caller cannot change these names without breaking the stdlib contract.
+/// Matched against the `field` child of the selector_expression (e.g. `"Slice"` for
+/// `sort.Slice`), so any package with a same-named function is also exempted (accepted
+/// false-negative for user-defined wrappers — see ADR-001).
+const STDLIB_CALLBACK_ALLOWLIST: &[&str] = &[
+    "Slice",
+    "SliceStable",
+    "Search",
+    "SortFunc",
+    "SortStableFunc",
+    "BinarySearchFunc",
+    "IndexFunc",
+    "ContainsFunc",
+    "EqualFunc",
+    "CompareFunc",
+];
+
+/// Returns `true` when `param_list` belongs to a `func_literal` passed directly as an
+/// argument to a call whose selector field is in `STDLIB_CALLBACK_ALLOWLIST`.
+///
+/// Parent chain: parameter_list → func_literal → argument_list → call_expression.
+/// Modeled on `is_run_subtest_closure` in `complexity.rs`.
+fn is_stdlib_callback_param_list(param_list: Node, src: &[u8]) -> bool {
+    let Some(func_lit) = param_list.parent() else { return false; };
+    if GoKind::of(func_lit) != GoKind::FuncLiteral { return false; }
+    let Some(args) = func_lit.parent() else { return false; };
+    if GoKind::of(args) != GoKind::ArgumentList { return false; }
+    let Some(call) = args.parent() else { return false; };
+    if GoKind::of(call) != GoKind::CallExpression { return false; }
+    call.child_by_field_name("function")
+        .filter(|f| GoKind::of(*f) == GoKind::SelectorExpression)
+        .and_then(|f| f.child_by_field_name("field"))
+        .and_then(|f| f.utf8_text(src).ok())
+        .is_some_and(|name| STDLIB_CALLBACK_ALLOWLIST.contains(&name))
 }
 
 fn walk(node: Node, src: &[u8], findings: &mut Vec<Finding>) {
@@ -99,7 +139,11 @@ struct Param<'a> {
     primitive_type: Option<&'a str>,
 }
 
+// kibitzer:ignore long-function -- two distinct detection cases (multi-name declaration and consecutive-run) require the combined body; splitting would hurt locality
 fn check_parameter_list<'a>(list: Node<'a>, src: &'a [u8], findings: &mut Vec<Finding>) {
+    if is_stdlib_callback_param_list(list, src) {
+        return;
+    }
     let mut cursor = list.walk();
     let params: Vec<Param<'a>> = list
         .children(&mut cursor)
@@ -300,5 +344,79 @@ mod tests {
         // function body can confuse `x` for `_`, so this shouldn't fire either.
         let findings = check_source("package main\nfunc f(x, _ string) {}\n").unwrap();
         assert!(findings.is_empty());
+    }
+
+    // --- stdlib callback suppression (AC1, AC2) ---
+
+    #[test]
+    fn suppresses_sort_slice_callback() {
+        // AC1: sort.Slice comparator has mandated (i, j int) signature
+        let src = r#"package main
+import "sort"
+func f(s []int) {
+    sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+}"#;
+        assert!(check_source(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn suppresses_slices_sort_func_callback() {
+        // AC2: slices.SortFunc with primitive element type
+        let src = r#"package main
+import "slices"
+func f(s []int) {
+    slices.SortFunc(s, func(a, b int) int { return a - b })
+}"#;
+        assert!(check_source(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn suppresses_slices_sort_stable_func_callback() {
+        // AC2: slices.SortStableFunc with string element type
+        let src = r#"package main
+import "slices"
+func f(s []string) {
+    slices.SortStableFunc(s, func(a, b string) int {
+        if a < b { return -1 }
+        return 1
+    })
+}"#;
+        assert!(check_source(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn suppresses_sort_search_callback() {
+        // AC2: sort.Search with single-param callback (confirms allowlist match on different shape)
+        let src = r#"package main
+import "sort"
+func f(n int) int {
+    return sort.Search(n, func(i int) bool { return i >= 0 })
+}"#;
+        assert!(check_source(src).unwrap().is_empty());
+    }
+
+    // --- test-file suppression (AC3) and true-positive guard (AC4) ---
+
+    #[test]
+    fn suppresses_func_literal_in_test_file() {
+        // AC3: same-typed multi-param func literal in a _test.go file → zero findings
+        use crate::checker::{CheckContext, Checker};
+        let checker = PrimitiveObsessionChecker;
+        let src = r#"package main_test
+func TestSomething(t *testing.T) {
+    write := func(name, body string) {}
+    write("x", "y")
+}"#;
+        let tree = crate::test_support::parse_go(src).unwrap();
+        let ctx = CheckContext { source: src, tree: Some(&tree) };
+        let findings = checker.check(std::path::Path::new("foo_test.go"), &ctx).unwrap();
+        assert!(findings.is_empty(), "expected no findings in _test.go, got: {findings:?}");
+    }
+
+    #[test]
+    fn still_flags_exported_multi_primitive_in_non_test_file() {
+        // AC4: exported func with same-type primitive pile-up in a non-test file still fires
+        let findings = check_source("package main\nfunc PublicAPI(a, b string) {}\n").unwrap();
+        assert_eq!(findings.len(), 1);
     }
 }
