@@ -155,7 +155,12 @@ pub(crate) fn run_audit(
     if directives.is_empty() {
         return Vec::new();
     }
-    let first = first_pass(results);
+    let mut first = first_pass(results);
+    // A check fed by a persistent index sees only the files visited so far, so a directive
+    // for it would look unused on a fresh run; leave those unjudged.
+    first
+        .ran
+        .retain(|name| !reads_cross_run_state(checks, name));
     let ctx = RerunCtx {
         checks,
         file_path,
@@ -169,6 +174,15 @@ pub(crate) fn run_audit(
         .chain(unowned_verdicts(directives.iter().copied(), &first, None))
         .map(|v| advisory_result(&located(file_path, v.row, &v.message)))
         .collect()
+}
+
+fn reads_cross_run_state(checks: &[Check], check_name: &str) -> bool {
+    checks
+        .iter()
+        .find(|c| c.name == check_name)
+        .and_then(|c| c.checker.as_deref())
+        .and_then(crate::checker::lookup)
+        .is_some_and(|c| c.reads_cross_run_state())
 }
 
 /// The file text, only when it is small enough for the first pass to have judged it and

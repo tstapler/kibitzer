@@ -207,6 +207,12 @@ pub trait Checker {
         Ok(None)
     }
 
+    /// Whether the findings for one file depend on state other runs left behind (a persistent
+    /// index filled as files are visited), so a result is order-dependent within a batch.
+    fn reads_cross_run_state(&self) -> bool {
+        false
+    }
+
     /// Whether a file that cannot be read as UTF-8 text is a pass rather than a failure.
     /// True only for a checker that runs on every walked file, binary ones included.
     fn tolerates_unreadable_files(&self) -> bool {

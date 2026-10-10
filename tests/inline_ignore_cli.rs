@@ -251,6 +251,53 @@ fn kibitzer_run_should_NotCallIgnoreUnused_When_AcceptedEntryAlsoCoversFinding()
 }
 
 #[test]
+fn kibitzer_run_should_NotJudgeCrossFileDuplicateIgnore_When_IndexStillFilling() {
+    let dir = temp_dir("cross-file-order");
+    let body = "\tx := 1\n\ty := 2\n\tz := x + y\n\tprintln(z)\n\tprintln(x)\n\tprintln(y)\n\tw := z * 2\n\tprintln(w)\n\tprintln(w + x)\n\tprintln(w + y)\n";
+    for f in ["a.go", "b.go", "c.go"] {
+        let source = format!(
+            "package main\n\n// kibitzer:ignore duplicate-code-cross-file -- shared snippet is intentional here\nfunc F() {{\n{body}}}\n"
+        );
+        std::fs::write(dir.join(f), source).unwrap();
+    }
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotJudgeIgnore_When_FileOverNativeSizeLimit() {
+    let dir = temp_dir("too-large");
+    let mut source = String::from(NO_FINDING_GO);
+    source.push_str("// ");
+    source.push_str(&"x".repeat(2 * 1024 * 1024));
+    source.push('\n');
+    std::fs::write(dir.join("main.go"), source).unwrap();
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kibitzer_run_should_NotCallMarkdownIgnoreUnused_When_ItSuppressesBrokenLink() {
+    let dir = temp_dir("md-link");
+    std::fs::write(
+        dir.join("doc.md"),
+        "# T\n\n<!-- kibitzer:ignore markdown-link-integrity -- link target is generated at build time -->\n[gone][nodef]\n",
+    )
+    .unwrap();
+    let raw = run_with_args(&dir, &["--no-inline-ignores"]);
+    assert!(
+        raw.contains("nodef"),
+        "fixture must produce a finding: {raw}"
+    );
+    let stdout = run_with_args(&dir, &[]);
+    assert!(!stdout.contains("[unused-ignore]"), "{stdout}");
+    assert!(!stdout.contains("nodef"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn kibitzer_check_native_should_BypassInlineIgnores_When_RunDirectly() {
     let dir = temp_dir("check-native");
     let file = dir.join("main.go");
