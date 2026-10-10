@@ -2,7 +2,9 @@
 
 ## Gate status
 
-**HOLD — below implementation threshold.** Only 1 confirmed occurrence of the
+**PROCEED (owner override) — below the 2+ occurrence threshold.** The owner explicitly directed implementation of the backlog item; the check ships opt-in and advisory, and the backtest (docs/prose-checks.md) found no second true occurrence.
+
+Original assessment: HOLD — below implementation threshold. Only 1 confirmed occurrence of the
 hollow-qualifier pattern has been observed. This repo's methodology requires 2+ independent
 occurrences before implementing a new check. The plan and requirements are complete so
 work can begin immediately when the threshold is met.
@@ -26,7 +28,7 @@ work can begin immediately when the threshold is met.
 
 ## Open questions before implementation
 
-1. **Additive vs. replacing `options.adverbs`?** `ai-vocabulary-density` has `words`
+1. **Additive vs. replacing `options.adverbs`?** (Resolved: replaces, matching `ai-vocabulary-density`.) `ai-vocabulary-density` has `words`
    replace the full list when set. For this check, an "additive" mode (append to
    defaults) might be more useful so projects can add house-style words without
    re-specifying the full list. Decision needed before implementing `configure()`.

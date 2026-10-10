@@ -769,7 +769,8 @@ pub fn default_checks() -> Vec<Check> {
 }
 
 /// Mechanical markdown-prose checks. `ai-vocabulary-density`, `filler-phrase-density`,
-/// `formulaic-ai-openers`, `sentence-length-uniformity`, and `em-dash-overuse` are
+/// `formulaic-ai-openers`, `sentence-length-uniformity`, `em-dash-overuse`, and
+/// `hollow-qualifier-phrasing` are
 /// registered (via `inventory::submit!` in their own modules, so `kibitzer check native
 /// <name>`/an explicit `.claude/inspect.json` entry can still reach them) but deliberately
 /// NOT included here: each carries a real risk of flagging legitimate domain/technical
@@ -1468,6 +1469,25 @@ mod tests {
                 .any(|f| f.message.contains("[replace-magic-literal]")),
             "expected a replace-magic-literal finding, got: {findings:?}"
         );
+    }
+
+    #[test]
+    fn hollow_qualifier_phrasing_is_opt_in_but_reachable_by_name() {
+        assert!(
+            !default_checks()
+                .iter()
+                .any(|c| c.name == "hollow-qualifier-phrasing"
+                    || c.checker.as_deref() == Some("hollow-qualifier-phrasing")),
+            "hollow-qualifier-phrasing must stay opt-in"
+        );
+        let findings = crate::checker::run_checker_configured(
+            "hollow-qualifier-phrasing",
+            Path::new("doc.md"),
+            "# The primitive, generically\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]

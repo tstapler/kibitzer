@@ -25,6 +25,7 @@ unless a repo explicitly adds them:
 | `formulaic-ai-openers` | A paragraph's first sentence starts with a formulaic transition ("in conclusion", "to summarize"...) | A single occurrence is enough to flag (no 3+ run required), and even the trimmed word list can appear in normal writing |
 | `sentence-length-uniformity` | 6+ consecutive sentences with very low length variation | Backtesting found this flagging a deliberately parallel enumeration in real Kubernetes docs ("Signers must not... Signers should... Signers should...") with "vary sentence length" — actively wrong advice, since the parallelism was intentional |
 | `em-dash-overuse` | 3+ em dashes (`—`) in one paragraph | Heavy em-dash use is also a deliberate style choice in well-edited technical writing — this repo's own doc comments trip it (confirmed: 5 hits across `docs/*.md` in this very repo) |
+| `hollow-qualifier-phrasing` | A heading, or a paragraph's first sentence, ending `, <adverb>` ("The primitive, generically"; default adverbs: generically, fundamentally, essentially, basically, broadly, generally, abstractly, conceptually, theoretically, ultimately, nominally) | One user-reported occurrence so far (below the repo's 2+ bar), and a conversational trailing hedge ("...personal information, essentially") matches the same shape; see "Backtest: hollow-qualifier-phrasing" below |
 
 Enable one by adding it to `.kibitzer/inspect.json`'s `checks` array (see
 `docs/suppressing-checks.md` for the general pattern):
@@ -66,10 +67,20 @@ comment (`src/checkers/*.rs`) for its exact `options` shape; for example:
       "severity": "advisory",
       "scope": ["**/*.md"],
       "options": { "min_sentences": 10 }
+    },
+    {
+      "name": "hollow-qualifier-phrasing",
+      "checker": "hollow-qualifier-phrasing",
+      "severity": "advisory",
+      "scope": ["**/*.md"],
+      "options": { "adverbs": ["generically", "fundamentally", "in essence"] }
     }
   ]
 }
 ```
+
+`hollow-qualifier-phrasing`'s `adverbs` replaces the whole default list when set
+(it does not append to it).
 
 `options` is validated at config-load time (`kibitzer run`/`kibitzer check`
 fails immediately with the config path and check name, not a silent
@@ -117,3 +128,29 @@ translates each alert's severity (error/warning/suggestion) into kibitzer's
 own Blocking/Advisory would be a reasonable future addition if per-rule
 severity mapping (rather than one flat command severity) turns out to
 matter — no evidence yet that it does.
+
+## Backtest: hollow-qualifier-phrasing
+
+Run 2026-10-10 against the prose corpus in `docs/backtest-repos.md`
+(`kubernetes/website`, `gitlabhq/gitlabhq`, `docker/docs`, `mdn/content`,
+`microsoft/vscode-docs`, `rust-lang/book`, `rust-lang/rustc-dev-guide`,
+`stapler-squad`; 36,000+ `.md` files) with `kibitzer check native
+hollow-qualifier-phrasing`, plus `kibitzer check backtest` over local Claude Code
+transcripts (1,645 reconstructable snapshots).
+
+| Corpus | Findings | True positives | False positives |
+|---|---|---|---|
+| 8 prose repos, ~36,000 files | 1 | 0 | 1 |
+| Session transcripts | 1 | 0 | 1 |
+
+- **Corpus FP:** `kubernetes/website`'s `1-18-release-interview.md:95`, a spoken
+  interview line ending `..., essentially`. Conversational hedging, not a hollow
+  heading.
+- **Transcript FP:** a planning doc enumerating the adverb list itself in code spans
+  (`generically`, `fundamentally`, ...) whose last item matched. Checker-describing
+  docs will trip it; suppress with `kibitzer:ignore`.
+- **No second true occurrence turned up**, and zero headings matched anywhere in the
+  corpus, so the "2+ independent occurrences" bar from `docs/check-ideas.md` is still
+  unmet. The check ships opt-in, advisory, for that reason.
+- **Noise rate:** ~1 finding per 18,000 files, all of them false positives. Cheap to
+  keep opt-in; too few true positives to estimate precision for a real hit.

@@ -1,7 +1,7 @@
 //! Shared helpers for native checkers that scan raw markdown prose (as opposed to
 //! [`crate::markdown_link_integrity`]'s link/anchor graph): byte-offset-to-line-number
-//! conversion, and walking flowing-prose paragraphs (skipping list items) as flattened
-//! text.
+//! conversion, and walking flowing-prose paragraphs and headings (skipping list items) as
+//! flattened text.
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -115,6 +115,41 @@ pub fn for_each_paragraph(body: &str, mut on_paragraph: impl FnMut(Paragraph)) {
             Event::SoftBreak | Event::HardBreak if in_paragraph => {
                 paragraph_text.push(' ');
             }
+            _ => {}
+        }
+    }
+}
+
+/// Walks `body`'s markdown headings (ATX and setext) outside any list, invoking
+/// `on_heading(line, text)` with the heading's flattened plain text. Mirrors
+/// [`for_each_paragraph`]'s flattening and list exclusion so heading-scoped prose checks
+/// treat text the same way paragraph-scoped ones do.
+pub fn for_each_heading(body: &str, mut on_heading: impl FnMut(usize, &str)) {
+    let line_starts = line_start_offsets(body);
+    let parser = Parser::new_ext(body, Options::ENABLE_TABLES);
+
+    let mut list_depth = 0usize;
+    let mut in_heading = false;
+    let mut heading_line = 0usize;
+    let mut heading_text = String::new();
+
+    for (event, range) in parser.into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            Event::Start(Tag::Heading { .. }) if list_depth == 0 => {
+                in_heading = true;
+                heading_line = line_for_offset(&line_starts, range.start);
+                heading_text.clear();
+            }
+            Event::End(TagEnd::Heading(_)) if in_heading => {
+                in_heading = false;
+                on_heading(heading_line, heading_text.trim());
+            }
+            Event::Text(ref text) | Event::Code(ref text) if in_heading => {
+                heading_text.push_str(text);
+            }
+            Event::SoftBreak | Event::HardBreak if in_heading => heading_text.push(' '),
             _ => {}
         }
     }
