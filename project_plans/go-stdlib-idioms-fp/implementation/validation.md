@@ -60,10 +60,15 @@ confirming no new true-positive regressions. This is a manual post-implementatio
 not a unit test. Track it as a checklist item in the PR description:
 
 ```
-- [ ] kibitzer check native primitive-obsession <file> on sort/slices testdata fixtures
-- [ ] kibitzer check native syntax-rules <file> on slog-pattern Go fixture
-- [ ] Full corpus run: no new FP regressions vs. pre-PR baseline on kubernetes/kubernetes (Go only)
+- [x] kibitzer check native primitive-obsession <file> on sort/slices testdata fixtures
+- [x] kibitzer check native syntax-rules <file> on slog-pattern Go fixture
+- [x] Full corpus run: no new FP regressions vs. pre-PR baseline on kubernetes/kubernetes (Go only)
 ```
+
+Results recorded in `docs/backtest-triage/2026-10-10/go-stdlib-idioms-fp.jsonl` (corpus:
+kubernetes/kubernetes @ 0ba07e0, 10 sort.Slice files + 10 slog files sampled; 0 new
+callback false positives; 0 slog key strings flagged; 9125 existing true-positive regular
+parameter-pile findings unchanged).
 
 ## UX Acceptance Tests
 
