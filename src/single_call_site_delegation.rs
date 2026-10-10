@@ -58,8 +58,7 @@ fn caller_counts(model: &ArchModel) -> HashMap<&str, usize> {
         .collect()
 }
 
-/// Resolved `Implements` edges as `(type id -> interface ids it implements, interface id ->
-/// distinct implementer count)`. Duplicate edges (same type/interface pair) count once.
+/// Resolved `Implements` edges, deduplicated by (type, interface) pair.
 struct ImplementsIndex<'a> {
     interfaces_of: HashMap<&'a str, Vec<&'a str>>,
     implementer_counts: HashMap<&'a str, usize>,
@@ -87,7 +86,8 @@ fn implements_index(model: &ArchModel) -> ImplementsIndex<'_> {
 /// True when `symbol`'s owning type implements an interface that has another
 /// implementer. A type that is the sole implementer of everything it implements is not
 /// suppressed — the interface is effectively private to it.
-fn implements_shared_interface(symbol: &SymbolNode, index: &ImplementsIndex) -> bool {
+fn implements_shared_interface(symbol: &SymbolNode, index: &ImplementsIndex<'_>) -> bool {
+    // Method ids are `{pkg}::{type}.{name}`, the same shape `type_edges.from` uses for the type.
     let Some(type_id) = symbol
         .id
         .strip_suffix(symbol.name.as_str())
@@ -98,7 +98,7 @@ fn implements_shared_interface(symbol: &SymbolNode, index: &ImplementsIndex) -> 
     index.interfaces_of.get(type_id).is_some_and(|interfaces| {
         interfaces
             .iter()
-            .any(|iface| index.implementer_counts.get(iface).copied().unwrap_or(0) > 1)
+            .any(|iface| index.implementer_counts.get(iface).is_some_and(|&n| n > 1))
     })
 }
 
