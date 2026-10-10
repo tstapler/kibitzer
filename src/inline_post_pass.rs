@@ -181,8 +181,7 @@ fn reads_cross_run_state(checks: &[Check], check_name: &str) -> bool {
         .iter()
         .find(|c| c.name == check_name)
         .and_then(|c| c.checker.as_deref())
-        .and_then(crate::checker::lookup)
-        .is_some_and(|c| c.reads_cross_run_state())
+        .is_some_and(crate::checker::reads_cross_run_state)
 }
 
 /// The file text, only when it is small enough for the first pass to have judged it and

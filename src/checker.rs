@@ -260,6 +260,22 @@ pub fn lookup(name: &str) -> Option<Box<dyn Checker>> {
     registry().into_iter().find(|c| c.name() == name)
 }
 
+/// Whether `name` is a registered checker whose results depend on cross-run state; the
+/// registry is built once rather than per call.
+pub fn reads_cross_run_state(name: &str) -> bool {
+    static STATEFUL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    STATEFUL
+        .get_or_init(|| {
+            registry()
+                .iter()
+                .filter(|c| c.reads_cross_run_state())
+                .map(|c| c.name().to_string())
+                .collect()
+        })
+        .iter()
+        .any(|n| n == name)
+}
+
 /// Parses `source` with `checker_name`'s declared grammar (if any), reconfigures the
 /// checker via [`Checker::configure`] when `options` is set, and runs it — returning raw
 /// [`Finding`]s. The shared entry point for anything that needs a checker's structured
