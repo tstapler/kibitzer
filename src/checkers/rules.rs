@@ -1347,10 +1347,10 @@ fn walk_literals<'tree>(
                 node,
                 kind: node.kind(),
             });
-        if let Some(predicate) = cfg.slog_key_predicate {
-            if predicate(node, src) {
-                collector.slog_key_ids.insert(node.id());
-            }
+        if let Some(predicate) = cfg.slog_key_predicate
+            && predicate(node, src)
+        {
+            collector.slog_key_ids.insert(node.id());
         }
     }
     if let Some(binding) = (cfg.binding_finder)(node, src) {
