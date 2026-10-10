@@ -73,6 +73,31 @@ fn push_if_not_blank<'a>(sentences: &mut Vec<&'a str>, candidate: &'a str) {
     }
 }
 
+/// Returns `body` with a leading `---` ... `---`/`...` YAML front-matter block replaced by
+/// spaces (newlines kept, so byte offsets and line numbers are unchanged). Only a block
+/// that starts on line 1 and is closed counts; anything else is returned as-is.
+fn mask_front_matter(body: &str) -> String {
+    let mut lines = body.split_inclusive('\n');
+    if lines.next().map(str::trim_end) != Some("---") {
+        return body.to_string();
+    }
+    let mut end = body.find('\n').map_or(body.len(), |i| i + 1);
+    for line in lines {
+        end += line.len();
+        if matches!(line.trim_end(), "---" | "...") {
+            let blanked: String = body[..end]
+                .chars()
+                .flat_map(|c| {
+                    let pad = if c == '\n' { '\n' } else { ' ' };
+                    std::iter::repeat_n(pad, c.len_utf8())
+                })
+                .collect();
+            return blanked + &body[end..];
+        }
+    }
+    body.to_string()
+}
+
 /// Which kind of flowing-prose block [`for_each_block`] reached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockKind {
@@ -80,24 +105,18 @@ pub enum BlockKind {
     Heading,
 }
 
-/// Walks `body`'s markdown paragraphs and headings (ATX and setext) outside any list in
-/// document order, invoking `on_block(kind, line, text)` with each one's flattened text.
-/// List items are excluded because a parallel bulleted enumeration (independent facts
-/// stated in the same grammatical form on purpose) is not the kind of prose defect these
-/// checkers look for - see the originating issue's false-positive guardrail.
+/// Walks paragraphs and headings (ATX and setext) outside any list, in document order,
+/// calling `on_block(kind, line, flattened_text)`. List items are skipped: parallel
+/// bullets are deliberate, not a prose defect.
 ///
-/// Parses with `ENABLE_TABLES`: without it, a GFM table has no blank-line separation
-/// pulldown-cmark recognizes, so the whole table parses as one giant `Tag::Paragraph`
-/// (found backtesting vscode-docs: a troubleshooting table reported as one 30-"sentence"
-/// paragraph). With it, table content arrives as `Tag::Table`/`TableCell` events instead,
-/// which the `current` gate below already excludes. `ENABLE_YAML_STYLE_METADATA_BLOCKS` keeps
-/// a front-matter block's closing `---` from turning its last line into a setext heading.
+/// `ENABLE_TABLES` keeps a GFM table from parsing as one giant paragraph. A leading YAML
+/// front-matter block is blanked first (see [`mask_front_matter`]); pulldown-cmark's own
+/// metadata option would also swallow text between mid-document `---` rules.
 pub fn for_each_block(body: &str, mut on_block: impl FnMut(BlockKind, usize, &str)) {
+    let masked = mask_front_matter(body);
+    let body = masked.as_str();
     let line_starts = line_start_offsets(body);
-    let parser = Parser::new_ext(
-        body,
-        Options::ENABLE_TABLES | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS,
-    );
+    let parser = Parser::new_ext(body, Options::ENABLE_TABLES);
 
     let mut list_depth = 0usize;
     let mut current: Option<(BlockKind, usize)> = None;
@@ -243,6 +262,33 @@ mod tests {
             kinds,
             vec![BlockKind::Heading, BlockKind::Paragraph, BlockKind::Heading]
         );
+    }
+
+    #[test]
+    fn for_each_paragraph_should_KeepParagraphsBetweenRules_When_DashesAppearMidDocument() {
+        let body =
+            "Intro para.\n\n---\nSlide one text, here.\n\nSecond para.\n\n---\n\nTail para.\n";
+        let mut paragraphs = Vec::new();
+        for_each_paragraph(body, |p| paragraphs.push(p.text.trim().to_string()));
+        assert_eq!(paragraphs.len(), 4, "got: {paragraphs:?}");
+    }
+
+    #[test]
+    fn for_each_paragraph_should_SkipFrontMatter_When_FileStartsWithYaml() {
+        let body = "---\ntitle: a. b.\n\nnote: c. d.\n---\n\nBody.\n";
+        let mut paragraphs = Vec::new();
+        for_each_paragraph(body, |p| {
+            paragraphs.push((p.line, p.text.trim().to_string()))
+        });
+        assert_eq!(paragraphs, vec![(7, "Body.".to_string())]);
+    }
+
+    #[test]
+    fn for_each_paragraph_should_KeepLineNumbers_When_FrontMatterHasNonAscii() {
+        let body = "---\ntitle: caf\u{e9} \u{2014} x\n---\n\nBody here.\n";
+        let mut lines = Vec::new();
+        for_each_paragraph(body, |p| lines.push(p.line));
+        assert_eq!(lines, vec![5]);
     }
 
     fn prose_findings(source: &str) -> Vec<(String, usize, String)> {

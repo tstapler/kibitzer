@@ -769,12 +769,12 @@ pub fn default_checks() -> Vec<Check> {
 }
 
 /// Mechanical markdown-prose checks. `ai-vocabulary-density`, `filler-phrase-density`,
-/// `formulaic-ai-openers`, `sentence-length-uniformity`, `em-dash-overuse`,
-/// and `hollow-qualifier-phrasing` are
-/// registered (via `inventory::submit!` in their own modules, so `kibitzer check native
-/// <name>`/an explicit `.claude/inspect.json` entry can still reach them) but deliberately
-/// NOT included here: each carries a real risk of flagging legitimate domain/technical
-/// writing, so they're opt-in per repo rather than on by default.
+/// `formulaic-ai-openers`, `sentence-length-uniformity`, `em-dash-overuse`, and
+/// `hollow-qualifier-phrasing` are registered (via `inventory::submit!` in their own
+/// modules, so `kibitzer check native <name>`/an explicit `.claude/inspect.json` entry can
+/// still reach them) but deliberately NOT included here: each carries a real risk of
+/// flagging legitimate domain/technical writing, so they're opt-in per repo rather than
+/// on by default.
 ///
 /// `sentence-length-uniformity` was originally wired in here as purely structural (word
 /// counts only, no word lists) — backtesting against kubernetes/website found it flagging
