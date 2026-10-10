@@ -101,3 +101,13 @@ Revisions to plan.md from this review:
 3. All other stories unchanged.
 
 Revised implementation is correct, low-risk, and backtest-complete.
+
+## Verification results (post-implementation)
+
+- AC6 (`kibitzer check backtest single-call-site-delegation`) is not runnable: the backtest only resolves
+  per-file `checker::registry()` checkers; this is a whole-repo `ArchModelChecker`
+  (`src/architecture_checks.rs:529`). Marked fail.
+- Substitute evidence: `kibitzer check architecture single-call-site-delegation <vscode>`, HEAD~1 vs HEAD
+  binary: 4059 -> 3222 findings, 0 added, 837 removed (all methods). 12/12 sampled removals are in
+  classes with an explicit `implements` clause.
+- Full suite: `cargo test --bin kibitzer` 1565 passed, 0 failed.
