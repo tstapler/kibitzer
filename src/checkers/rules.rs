@@ -911,17 +911,27 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
 ///
 /// `*Context` variants and `slog.With` are excluded; see `SLOG_METHOD_NAMES`.
 fn go_is_slog_key_literal(node: Node, src: &[u8]) -> bool {
-    let Some(arg_list) = node.parent() else { return false; };
-    if GoKind::of(arg_list) != GoKind::ArgumentList { return false; }
-    let Some(call) = arg_list.parent() else { return false; };
-    if GoKind::of(call) != GoKind::CallExpression { return false; }
+    let Some(arg_list) = node.parent() else {
+        return false;
+    };
+    if GoKind::of(arg_list) != GoKind::ArgumentList {
+        return false;
+    }
+    let Some(call) = arg_list.parent() else {
+        return false;
+    };
+    if GoKind::of(call) != GoKind::CallExpression {
+        return false;
+    }
     let is_slog_call = call
         .child_by_field_name("function")
         .filter(|f| GoKind::of(*f) == GoKind::SelectorExpression)
         .and_then(|f| f.child_by_field_name("field"))
         .and_then(|f| f.utf8_text(src).ok())
         .is_some_and(|name| SLOG_METHOD_NAMES.contains(&name));
-    if !is_slog_call { return false; }
+    if !is_slog_call {
+        return false;
+    }
     let mut cursor = arg_list.walk();
     let position = arg_list
         .named_children(&mut cursor)
@@ -4016,7 +4026,10 @@ func f(a, b, c string) {
     slog.Warn("msg3", "file", c)
 }"#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
-        assert!(findings.is_empty(), "expected no findings, got: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got: {findings:?}"
+        );
     }
 
     #[test]
@@ -4030,7 +4043,10 @@ func f(a, b, c error) {
     log.Warn("failed to close file", "err", c)
 }"#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
-        assert!(findings.is_empty(), "expected no findings, got: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got: {findings:?}"
+        );
     }
 
     #[test]
@@ -4056,7 +4072,10 @@ func f() {
     slog.Warn("check3", "status", "active")
 }"#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
-        assert!(!findings.is_empty(), "expected finding for 'active' at value position, got: {findings:?}");
+        assert!(
+            !findings.is_empty(),
+            "expected finding for 'active' at value position, got: {findings:?}"
+        );
     }
 
     #[test]
@@ -4075,6 +4094,9 @@ func f(ctx context.Context, a, b, c string) {
     slog.WarnContext(ctx, "msg3", "file", c)
 }"#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
-        assert!(!findings.is_empty(), "WarnContext keys should still fire until *Context suppression is implemented");
+        assert!(
+            !findings.is_empty(),
+            "WarnContext keys should still fire until *Context suppression is implemented"
+        );
     }
 }

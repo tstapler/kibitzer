@@ -37,7 +37,10 @@ impl Checker for PrimitiveObsessionChecker {
     }
 
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        if file.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_test.go")) {
+        if file
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with("_test.go"))
+        {
             return Ok(Vec::new());
         }
         let tree = ctx
@@ -90,12 +93,24 @@ const STDLIB_CALLBACK_ALLOWLIST: &[&str] = &[
 /// Parent chain: parameter_list → func_literal → argument_list → call_expression.
 /// Modeled on `is_run_subtest_closure` in `complexity.rs`.
 fn is_stdlib_callback_param_list(param_list: Node, src: &[u8]) -> bool {
-    let Some(func_lit) = param_list.parent() else { return false; };
-    if GoKind::of(func_lit) != GoKind::FuncLiteral { return false; }
-    let Some(args) = func_lit.parent() else { return false; };
-    if GoKind::of(args) != GoKind::ArgumentList { return false; }
-    let Some(call) = args.parent() else { return false; };
-    if GoKind::of(call) != GoKind::CallExpression { return false; }
+    let Some(func_lit) = param_list.parent() else {
+        return false;
+    };
+    if GoKind::of(func_lit) != GoKind::FuncLiteral {
+        return false;
+    }
+    let Some(args) = func_lit.parent() else {
+        return false;
+    };
+    if GoKind::of(args) != GoKind::ArgumentList {
+        return false;
+    }
+    let Some(call) = args.parent() else {
+        return false;
+    };
+    if GoKind::of(call) != GoKind::CallExpression {
+        return false;
+    }
     call.child_by_field_name("function")
         .filter(|f| GoKind::of(*f) == GoKind::SelectorExpression)
         .and_then(|f| f.child_by_field_name("field"))
@@ -408,9 +423,17 @@ func TestSomething(t *testing.T) {
     write("x", "y")
 }"#;
         let tree = crate::test_support::parse_go(src).unwrap();
-        let ctx = CheckContext { source: src, tree: Some(&tree) };
-        let findings = checker.check(std::path::Path::new("foo_test.go"), &ctx).unwrap();
-        assert!(findings.is_empty(), "expected no findings in _test.go, got: {findings:?}");
+        let ctx = CheckContext {
+            source: src,
+            tree: Some(&tree),
+        };
+        let findings = checker
+            .check(std::path::Path::new("foo_test.go"), &ctx)
+            .unwrap();
+        assert!(
+            findings.is_empty(),
+            "expected no findings in _test.go, got: {findings:?}"
+        );
     }
 
     #[test]
