@@ -86,14 +86,18 @@ inventory::submit! {
 
 impl HollowQualifierPhrasingChecker {
     fn with_adverbs(adverbs: Vec<String>) -> Result<Self> {
-        let ending = if adverbs.is_empty() {
+        // A blank entry would make the alternation match the empty string, flagging
+        // every text that merely ends in a comma.
+        let usable: Vec<String> = adverbs
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(regex::escape)
+            .collect();
+        let ending = if usable.is_empty() {
             None
         } else {
-            let alternation = adverbs
-                .iter()
-                .map(|a| regex::escape(a.trim()))
-                .collect::<Vec<_>>()
-                .join("|");
+            let alternation = usable.join("|");
             Some(Regex::new(&format!(r"(?i),\s*(?:{alternation})\s*$"))?)
         };
         Ok(HollowQualifierPhrasingChecker { adverbs, ending })
@@ -201,6 +205,24 @@ mod tests {
         let findings = configured.check(Path::new("doc.md"), &ctx).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].line, 1);
+    }
+
+    #[test]
+    fn blank_adverb_entry_does_not_match_everything() {
+        let configured = HollowQualifierPhrasingChecker::default()
+            .configure(&serde_json::json!({ "adverbs": ["", "  "] }))
+            .unwrap()
+            .unwrap();
+        let ctx = CheckContext {
+            source: "# Trailing comma,\n",
+            tree: None,
+        };
+        assert!(
+            configured
+                .check(Path::new("doc.md"), &ctx)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
