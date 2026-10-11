@@ -1622,7 +1622,7 @@ fn is_flat_data_literal_body(body: Node, cfg: &LangRuleConfig) -> bool {
     let mut cursor = container.walk();
     let stmts: Vec<Node> = container
         .named_children(&mut cursor)
-        .filter(|c| !c.kind().contains("comment"))
+        .filter(|c| !c.kind().contains("comment") && !is_docstring_statement(*c))
         .collect();
     let [stmt] = stmts.as_slice() else {
         return false;
@@ -1630,18 +1630,42 @@ fn is_flat_data_literal_body(body: Node, cfg: &LangRuleConfig) -> bool {
     if stmt.kind() != cfg.return_kind || stmt.named_child_count() != 1 {
         return false;
     }
-    let mut value = stmt.named_child(0).expect("named_child_count was 1");
+    let Some(mut value) = stmt.named_child(0) else {
+        return false;
+    };
     // Go wraps return values in an `expression_list`.
     if value.kind() == "expression_list" && value.named_child_count() == 1 {
-        value = value.named_child(0).expect("named_child_count was 1");
+        value = value.named_child(0).unwrap_or(value);
     }
     cfg.collection_literal_kinds.contains(&value.kind()) && !has_logic_descendants(value, cfg)
 }
 
+/// Expression kinds that compute rather than describe data but aren't in any language's
+/// `call_kinds`/`nesting_kinds`/`ternary_kind` (Python has no `ternary_kind`; TS `new`/`await`).
+const NON_FLAT_EXPRESSION_KINDS: &[&str] = &[
+    "conditional_expression",
+    "list_comprehension",
+    "dictionary_comprehension",
+    "set_comprehension",
+    "generator_expression",
+    "new_expression",
+    "await_expression",
+];
+
+/// Python docstring: an expression statement whose only child is a string. Other languages
+/// never produce this shape in a function body, so it is a no-op there.
+fn is_docstring_statement(stmt: Node) -> bool {
+    stmt.kind() == "expression_statement"
+        && stmt.named_child_count() == 1
+        && stmt.named_child(0).is_some_and(|c| c.kind() == "string")
+}
+
 fn has_logic_descendants(node: Node, cfg: &LangRuleConfig) -> bool {
     if node.kind() == cfg.if_kind
+        || cfg.ternary_kind == Some(node.kind())
         || cfg.nesting_kinds.contains(&node.kind())
         || cfg.call_kinds.contains(&node.kind())
+        || NON_FLAT_EXPRESSION_KINDS.contains(&node.kind())
     {
         return true;
     }
@@ -2738,6 +2762,60 @@ mod tests {
         assert!(!has_long_function(&flat));
         let with_call = check_py_source(&build("        {\"name\": str(1)},\n")).unwrap();
         assert!(has_long_function(&with_call));
+    }
+
+    fn py_table_fn(docstring: bool, row: &str) -> String {
+        let mut src = String::from("def cases():\n");
+        if docstring {
+            src.push_str("    \"\"\"doc\"\"\"\n");
+        }
+        src.push_str("    return [\n");
+        for _ in 0..45 {
+            src.push_str("        {\"name\": \"a\"},\n");
+        }
+        src.push_str(row);
+        src.push_str("    ]\n");
+        src
+    }
+
+    #[test]
+    fn py_long_function_exempts_flat_list_after_docstring() {
+        let findings = check_py_source(&py_table_fn(true, "")).unwrap();
+        assert!(!has_long_function(&findings));
+    }
+
+    #[test]
+    fn py_long_function_does_not_exempt_ternary_or_comprehension_entries() {
+        for row in [
+            "        {\"k\": 1 if x else 2},\n",
+            "        {\"k\": [i for i in y]},\n",
+        ] {
+            let findings = check_py_source(&py_table_fn(false, row)).unwrap();
+            assert!(has_long_function(&findings), "row: {row}");
+        }
+    }
+
+    #[test]
+    fn ts_long_function_does_not_exempt_ternary_or_new_entries() {
+        for row in ["    { v: a ? 1 : 2 },\n", "    { v: new Foo() },\n"] {
+            let mut src = String::from("function cases() {\n  return [\n");
+            for _ in 0..45 {
+                src.push_str("    { name: \"a\" },\n");
+            }
+            src.push_str(row);
+            src.push_str("  ];\n}\n");
+            let findings = check_ts_source(&src).unwrap();
+            assert!(has_long_function(&findings), "row: {row}");
+        }
+    }
+
+    #[test]
+    fn long_function_does_not_exempt_go_multi_value_return() {
+        let src = go_table_fn(&vec![r#"{name: "case", input: 1, want: 2}"#; 45])
+            .replacen("return []tc{", "return 1, []tc{", 1)
+            .replacen("[]tc {", "(int, []tc) {", 1);
+        let findings = check_source(&src).unwrap();
+        assert!(has_long_function(&findings));
     }
 
     #[test]
