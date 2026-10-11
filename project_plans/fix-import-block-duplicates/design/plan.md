@@ -75,31 +75,16 @@ fn is_preamble_line(line: &str, ext: &str) -> bool {
 
 **File**: `src/checkers/duplicate_code.rs`
 
-Change signature to `find_duplicate_blocks(source: &str, import_end: usize)`. Inside the
-existing `for start in 0..=` loop, add:
+Change signature to `find_duplicate_blocks(source: &str, ext: &str)` (the extension, not a
+precomputed `import_end`). It normalizes lines itself and iterates
+`non_preamble_windows(&normalized, ext)`, which skips windows whose last line falls within
+the leading import/use preamble. In `DuplicateCodeChecker::check(file, ctx)`:
 
 ```rust
-// Skip windows whose last line falls within the leading import/use preamble.
-if start + MIN_BLOCK_LINES <= import_end {
-    continue;
-}
+Ok(find_duplicate_blocks(ctx.source, lang_ext(file)))
 ```
 
-Place the `continue` before the blank-line and char-count checks (cheapest filter first).
-
-In `DuplicateCodeChecker::check(file, ctx)`, compute `import_end` before calling:
-
-```rust
-let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-let normalized: Vec<String> = ctx.source.lines().map(|l| l.trim().to_string()).collect();
-let import_end = leading_import_end(&normalized, ext);
-Ok(find_duplicate_blocks(ctx.source, import_end))
-```
-
-`find_duplicate_blocks` already normalizes lines internally, so compute `import_end`
-from a separate normalization here, or extract the normalization step into a helper to
-avoid double-allocation. Given the lines are cheap to re-allocate for the size of files
-this runs on, a separate allocation is acceptable; note it in a comment.
+(Implemented: the preamble logic lives in `src/checkers/import_preamble.rs`.)
 
 ### Task 3 — Thread `import_end` into `file_windows` (cross-file checker)
 
@@ -109,11 +94,8 @@ Change `file_windows(source: &str)` to `file_windows(file: &Path, source: &str)`
 
 ```rust
 fn file_windows(file: &Path, source: &str) -> Vec<(usize, String)> {
-    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
-    let import_end = leading_import_end(&normalized, ext);
-    qualifying_windows(&normalized)
-        .filter(|(start, _)| start + MIN_BLOCK_LINES > import_end)
+    non_preamble_windows(&normalized, lang_ext(file))
         .map(|(start, window)| (start, window.join("\n")))
         .collect()
 }
@@ -132,17 +114,11 @@ file paths alongside normalized lines:
 
 ```rust
 fn index_cross_file_windows(
-    normalized: &[Vec<String>],
-    paths: &[&Path],
+    normalized: &[(&Path, Vec<String>)],
 ) -> HashMap<&[String], Vec<(usize, usize)>> {
     let mut occurrences = HashMap::new();
-    for (file_idx, lines) in normalized.iter().enumerate() {
-        let ext = paths[file_idx].extension().and_then(|e| e.to_str()).unwrap_or("");
-        let import_end = leading_import_end(lines, ext);
-        for (start, window) in qualifying_windows(lines) {
-            if start + MIN_BLOCK_LINES <= import_end {
-                continue;
-            }
+    for (file_idx, (path, lines)) in normalized.iter().enumerate() {
+        for (start, window) in non_preamble_windows(lines, lang_ext(path)) {
             occurrences.entry(window).or_default().push((file_idx, start));
         }
     }
@@ -150,17 +126,12 @@ fn index_cross_file_windows(
 }
 ```
 
-In `find_cross_file_duplicates`, extract paths from `files` and pass to
-`index_cross_file_windows`:
-
-```rust
-let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
-let occurrences = index_cross_file_windows(&normalized, &paths);
-```
+In `find_cross_file_duplicates`, build `(path, lines)` pairs from `files` and pass them to
+`index_cross_file_windows`.
 
 ### Task 5 — Unit tests for `leading_import_end`
 
-**File**: `src/checkers/duplicate_code.rs`, `#[cfg(test)] mod tests`
+**File**: `src/checkers/import_preamble.rs`, `#[cfg(test)] mod tests`
 
 Add tests:
 - `leading_import_end_go_grouped_import` — Go file with `package main` + `import (` block, asserts the returned index equals the first `func` line
@@ -234,11 +205,9 @@ risk.
 `find_duplicate_blocks` normalizes again internally. This double-allocates, but since
 `leading_import_end` is `O(n)` and called once per file, the overhead is negligible.
 
-**Concern**: The fix does not cover `duplicate_code_fuzzy.rs`, which has its own window
-logic. Out of scope per requirements, but noted for a follow-up.
-(Re-verified in the validate pass: it calls `qualifying_windows` at
-`duplicate_code_fuzzy.rs:156` and is not in the default catalog, so it is unaffected by
-this change and keeps its current behavior.)
+**Concern**: `duplicate_code_fuzzy.rs` has its own window logic. Now covered: it calls
+`non_preamble_windows` as well, since literal normalization would otherwise collapse a run
+of distinct quoted import paths into one key.
 
 **Resolved in validate pass (2026-10-11)**:
 - `leading_import_end` used `unwrap_or(0)`, so a file that is entirely imports returned

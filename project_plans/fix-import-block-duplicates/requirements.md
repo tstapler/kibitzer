@@ -67,8 +67,9 @@ Root cause: `qualifying_window` / `qualifying_windows` in
   the suppressed block — the issue is specifically about import lines, not the whole
   file-top preamble. Package declarations are a single line and cannot fill a 6-line
   window on their own.
-- Fuzzy duplicate checker (`src/checkers/duplicate_code_fuzzy.rs`) — it has its own
-  window logic; out of scope for this fix.
+- (Originally out of scope, now covered:) the fuzzy duplicate checker
+  (`src/checkers/duplicate_code_fuzzy.rs`) applies the same preamble filter, because its
+  literal normalization collapses distinct quoted import paths into one key.
 
 ## Constraints
 
