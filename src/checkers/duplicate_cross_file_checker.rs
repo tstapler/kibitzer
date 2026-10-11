@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_windows,
+    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, in_preamble, leading_import_end,
+    qualifying_windows,
 };
 
 /// Diff-aware counterpart to `kibitzer check duplicates` (`duplicate_code::find_cross_file_duplicates`)
@@ -180,7 +181,7 @@ impl DuplicateIndex {
     fn reindex_file_and_find_duplicates(&mut self, file: &Path, source: &str) -> Vec<Finding> {
         let file_key = file.to_string_lossy().into_owned();
         self.remove_file(&file_key);
-        let windows = file_windows(source);
+        let windows = file_windows(file, source);
         self.insert_file(&file_key, &windows);
         self.find_duplicates(&file_key, &windows)
     }
@@ -298,9 +299,12 @@ pub(crate) fn findings_with_siblings(
 /// Every `MIN_BLOCK_LINES`-line qualifying window in `source`, as `(0-indexed start
 /// line, joined normalized text)` — the exact text (not a hash) is used as the index
 /// key so two different blocks can never collide onto the same entry.
-fn file_windows(source: &str) -> Vec<(usize, String)> {
+fn file_windows(file: &Path, source: &str) -> Vec<(usize, String)> {
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
+    let import_end = leading_import_end(&normalized, ext);
     qualifying_windows(&normalized)
+        .filter(|(start, _)| !in_preamble(*start, import_end))
         .map(|(start, window)| (start, window.join("\n")))
         .collect()
 }

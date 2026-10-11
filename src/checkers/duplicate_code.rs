@@ -53,14 +53,15 @@ impl Checker for DuplicateCodeChecker {
         ]
     }
 
-    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
         // Generated code (protoc, ORM codegen, etc.) mechanically repeats boilerplate
         // per message/entity type; "extract a shared function" isn't actionable on code
         // nobody hand-edits. See docs/duplicate-code-false-positives.md's 2026-09-12 entry.
         if is_generated(ctx.source) {
             return Ok(Vec::new());
         }
-        Ok(find_duplicate_blocks(ctx.source))
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        Ok(find_duplicate_blocks(ctx.source, ext))
     }
 }
 
@@ -78,14 +79,18 @@ inventory::submit! {
 /// shifted start) that all repeat in lockstep — reported once via `covered_until`,
 /// which skips any candidate group whose first occurrence falls inside a block already
 /// reported, the same way the block's later lines would.
-fn find_duplicate_blocks(source: &str) -> Vec<Finding> {
+fn find_duplicate_blocks(source: &str, ext: &str) -> Vec<Finding> {
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
     if normalized.len() < MIN_BLOCK_LINES {
         return Vec::new();
     }
+    let import_end = leading_import_end(&normalized, ext);
 
     let mut occurrences: HashMap<&[String], Vec<usize>> = HashMap::new();
     for start in 0..=(normalized.len() - MIN_BLOCK_LINES) {
+        if in_preamble(start, import_end) {
+            continue;
+        }
         let window = &normalized[start..start + MIN_BLOCK_LINES];
         if window.iter().any(|l| l.is_empty()) {
             continue;
@@ -125,6 +130,63 @@ fn find_duplicate_blocks(source: &str) -> Vec<Finding> {
     findings
 }
 
+/// Returns the exclusive end index of the file's leading import/use preamble: the first
+/// line (of already-trimmed `lines`) that is not blank, a comment, or an import/package/use
+/// declaration for the language inferred from `ext`. Returns 0 for unrecognised extensions
+/// (nothing is suppressed) and `lines.len()` when the whole file is preamble.
+/// `pub(crate)`: the cross-file checker's incremental index applies the same filter.
+pub(crate) fn leading_import_end(lines: &[String], ext: &str) -> usize {
+    if !matches!(
+        ext,
+        "go" | "kt" | "java" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx"
+    ) {
+        return 0;
+    }
+    lines
+        .iter()
+        .position(|l| !is_preamble_line(l, ext))
+        .unwrap_or(lines.len())
+}
+
+/// Whether the `MIN_BLOCK_LINES` window at `start` lies entirely inside the preamble.
+/// Import lines are dictated by what a file references, so repeating them isn't
+/// something a shared function could remove. `pub(crate)`: see `leading_import_end`.
+pub(crate) fn in_preamble(start: usize, import_end: usize) -> bool {
+    start + MIN_BLOCK_LINES <= import_end
+}
+
+fn is_preamble_line(line: &str, ext: &str) -> bool {
+    if line.is_empty() || line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
+    {
+        return true;
+    }
+    match ext {
+        "go" => {
+            line.starts_with("package ")
+                || line.starts_with("import ")
+                || line.starts_with("import(")
+                || line == ")"
+                // inside a grouped `import (...)`: `"path"`, `alias "path"`, `_ "path"`
+                || line.starts_with('"')
+                || line.starts_with('`')
+                || line.contains(" \"")
+        }
+        "kt" | "java" => {
+            line.starts_with("package ")
+                || line.starts_with("import ")
+                || line.starts_with("@file:")
+        }
+        "rs" => {
+            line.starts_with("use ")
+                || line.starts_with("pub use ")
+                || line.starts_with("extern crate ")
+                || line.starts_with("#![")
+        }
+        "py" => line.starts_with('#') || line.starts_with("import ") || line.starts_with("from "),
+        _ => line.starts_with("import ") || line.starts_with("export * from "),
+    }
+}
+
 /// One location a cross-file duplicate block occurs at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossFileOccurrence {
@@ -147,7 +209,8 @@ pub fn find_cross_file_duplicates(files: &[(PathBuf, String)]) -> Vec<CrossFileD
         .iter()
         .map(|(_, src)| src.lines().map(|l| l.trim().to_string()).collect())
         .collect();
-    let occurrences = index_cross_file_windows(&normalized);
+    let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
+    let occurrences = index_cross_file_windows(&normalized, &paths);
     group_cross_file_duplicates(occurrences, files)
 }
 
@@ -156,10 +219,21 @@ pub fn find_cross_file_duplicates(files: &[(PathBuf, String)]) -> Vec<CrossFileD
 /// the multi-file counterpart to `find_duplicate_blocks`'s single-file occurrence map.
 /// Borrows its window keys from `normalized`, which the caller must keep alive at least
 /// as long as the returned map.
-fn index_cross_file_windows(normalized: &[Vec<String>]) -> HashMap<&[String], Vec<(usize, usize)>> {
+fn index_cross_file_windows<'a>(
+    normalized: &'a [Vec<String>],
+    paths: &[&Path],
+) -> HashMap<&'a [String], Vec<(usize, usize)>> {
     let mut occurrences: HashMap<&[String], Vec<(usize, usize)>> = HashMap::new();
     for (file_idx, lines) in normalized.iter().enumerate() {
+        let ext = paths[file_idx]
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let import_end = leading_import_end(lines, ext);
         for (start, window) in qualifying_windows(lines) {
+            if in_preamble(start, import_end) {
+                continue;
+            }
             occurrences
                 .entry(window)
                 .or_default()
@@ -439,5 +513,148 @@ mod tests {
             .collect();
         let dups = find_cross_file_duplicates(&files);
         assert_eq!(dups.len(), 1);
+    }
+
+    const KOTLIN_IMPORTS: &str = "import arrow.core.Either\n\
+                                   import arrow.core.left\n\
+                                   import arrow.core.right\n\
+                                   import dev.stapler.stelekit.db.GraphLoader\n\
+                                   import dev.stapler.stelekit.db.GraphWriter\n\
+                                   import dev.stapler.stelekit.error.DomainError\n";
+
+    fn lines_of(src: &str) -> Vec<String> {
+        src.lines().map(|l| l.trim().to_string()).collect()
+    }
+
+    fn cross_file(ext: &str, preamble: &str, body: &str) -> Vec<CrossFileDuplicate> {
+        let files: Vec<(PathBuf, String)> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                (
+                    PathBuf::from(format!("{n}.{ext}")),
+                    format!("{preamble}\n{body}"),
+                )
+            })
+            .collect();
+        find_cross_file_duplicates(&files)
+    }
+
+    fn single_file(ext: &str, src: &str) -> Vec<Finding> {
+        let ctx = CheckContext {
+            source: src,
+            tree: None,
+        };
+        DuplicateCodeChecker
+            .check(Path::new(&format!("<source>.{ext}")), &ctx)
+            .unwrap()
+    }
+
+    #[test]
+    fn leading_import_end_kotlin() {
+        let src = format!("package a.b\n\n{KOTLIN_IMPORTS}\nclass Foo\n");
+        let lines = lines_of(&src);
+        assert_eq!(leading_import_end(&lines, "kt"), lines.len() - 1);
+        assert_eq!(lines[lines.len() - 1], "class Foo");
+    }
+
+    #[test]
+    fn leading_import_end_go_grouped_import() {
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\tfoo \"example.com/foo\"\n\t_ \"example.com/bar\"\n)\n\nfunc main() {}\n";
+        let lines = lines_of(src);
+        let end = leading_import_end(&lines, "go");
+        assert_eq!(lines[end], "func main() {}");
+    }
+
+    #[test]
+    fn leading_import_end_rust() {
+        let src = "#![allow(dead_code)]\nuse std::fmt;\nuse std::io;\n\nfn main() {}\n";
+        let lines = lines_of(src);
+        assert_eq!(lines[leading_import_end(&lines, "rs")], "fn main() {}");
+    }
+
+    #[test]
+    fn leading_import_end_python() {
+        let src = "import os\nfrom a import b\n\ndef f():\n    pass\n";
+        let lines = lines_of(src);
+        assert_eq!(lines[leading_import_end(&lines, "py")], "def f():");
+    }
+
+    #[test]
+    fn leading_import_end_unknown_ext_is_zero() {
+        let lines = lines_of("import a\nimport b\n");
+        assert_eq!(leading_import_end(&lines, "txt"), 0);
+    }
+
+    #[test]
+    fn leading_import_end_all_preamble_file_covers_whole_file() {
+        let lines = lines_of(KOTLIN_IMPORTS);
+        assert_eq!(leading_import_end(&lines, "kt"), lines.len());
+    }
+
+    #[test]
+    fn does_not_flag_kotlin_import_block_cross_file() {
+        let pre = format!("package a.b\n\n{KOTLIN_IMPORTS}");
+        let body = "class A { val x = 1 }";
+        assert!(cross_file("kt", &pre, body).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_java_import_block_cross_file() {
+        let pre = "package a;\n\nimport java.util.List;\nimport java.util.Map;\nimport java.util.Set;\nimport java.util.HashMap;\nimport java.util.HashSet;\nimport java.util.ArrayList;\n";
+        assert!(cross_file("java", pre, "class A {}").is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_go_import_block_cross_file() {
+        let pre = "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n)\n";
+        assert!(cross_file("go", pre, "func a() {}").is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_python_and_js_family_import_blocks_cross_file() {
+        let py = "import os\nimport sys\nimport json\nfrom collections import OrderedDict\nfrom typing import Optional\nfrom pathlib import Path\n";
+        assert!(cross_file("py", py, "def f(): pass").is_empty());
+        let js = "import React from 'react';\nimport { useState } from 'react';\nimport axios from 'axios';\nimport lodash from 'lodash';\nimport moment from 'moment';\nimport styles from './styles.css';\n";
+        for ext in ["js", "ts", "tsx", "jsx"] {
+            assert!(
+                cross_file(ext, js, "export const a = 1;").is_empty(),
+                "{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_flag_rust_use_block() {
+        let use_block = "use std::collections::HashMap;\nuse std::collections::HashSet;\nuse std::path::{Path, PathBuf};\nuse anyhow::Result;\nuse serde::Serialize;\nuse serde::Deserialize;\n";
+        // Three copies in a single file: only the leading one is preamble, but the
+        // repeated windows must not reach MIN_OCCURRENCES via the leading block alone.
+        let src = format!("{use_block}\nfn main() {{}}\n");
+        assert!(single_file("rs", &src).is_empty());
+        assert!(cross_file("rs", use_block, "fn a() {}").is_empty());
+    }
+
+    #[test]
+    fn still_flags_duplicate_after_import_block() {
+        let pre = format!("package a.b\n\n{KOTLIN_IMPORTS}\n");
+        let body = "fun doWork(id: String): Result {\n\
+                    \tval conn = openConnection(id)\n\
+                    \tconn.use { c ->\n\
+                    \t\tval result = c.fetch(id)\n\
+                    \t\tlog.info(\"fetched $result\")\n\
+                    \t\treturn c.validate(result)\n\
+                    \t}\n}\n";
+        let dups = cross_file("kt", &pre, body);
+        assert_eq!(dups.len(), 1);
+        assert!(dups[0].occurrences.iter().all(|o| o.line > 8));
+    }
+
+    #[test]
+    fn does_not_suppress_mid_file_duplicate_that_happens_to_use_import_syntax() {
+        // The first non-import line ends the preamble, so an identical import-looking
+        // run after it is ordinary code and still counts.
+        let mid = KOTLIN_IMPORTS;
+        let src = format!("package a.b\n\nclass A\n\n{mid}\n{mid}\n{mid}");
+        let findings = single_file("kt", &src);
+        assert_eq!(findings.len(), 1);
     }
 }
