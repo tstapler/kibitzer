@@ -143,10 +143,13 @@ pub(crate) fn leading_import_end(lines: &[String], ext: &str) -> usize {
         return 0;
     }
     let mut state = PreambleState::default();
-    lines
-        .iter()
-        .position(|l| !state.accepts(l, ext))
-        .unwrap_or(lines.len())
+    for (i, line) in lines.iter().enumerate() {
+        if !state.accepts(line, ext) {
+            return state.abandoned_group_start.unwrap_or(i);
+        }
+    }
+    // A group still open at EOF never closed: treat it as malformed, not as preamble.
+    state.group_start.unwrap_or(lines.len())
 }
 
 /// Whether the `MIN_BLOCK_LINES` window at `start` lies entirely inside the preamble.
@@ -161,6 +164,10 @@ pub(crate) fn lang_ext(path: &Path) -> &str {
     path.extension().and_then(|e| e.to_str()).unwrap_or("")
 }
 
+/// An open bracket group that hasn't closed after this many lines is assumed to be an
+/// unmatched opener we misread, not a real import list; the preamble ends where it began.
+const MAX_GROUP_LINES: usize = 100;
+
 #[derive(Default)]
 struct PreambleState {
     /// Unclosed `(`/`{`/`[` from a multi-line import statement.
@@ -170,10 +177,34 @@ struct PreambleState {
     /// Closing delimiter of a leading Python module docstring we're inside.
     docstring_delim: Option<&'static str>,
     seen_import: bool,
+    line_no: usize,
+    /// Line index where the currently open bracket group began.
+    group_start: Option<usize>,
+    /// Set once `group_start` exceeded `MAX_GROUP_LINES`.
+    abandoned_group_start: Option<usize>,
 }
 
 impl PreambleState {
     fn accepts(&mut self, line: &str, ext: &str) -> bool {
+        let line_no = self.line_no;
+        self.line_no += 1;
+        let accepted = self.accepts_line(line, ext);
+        let open = self.depth > 0 || self.in_go_import_group;
+        match (open, self.group_start) {
+            (true, None) => self.group_start = Some(line_no),
+            (false, Some(_)) => self.group_start = None,
+            _ => {}
+        }
+        if let Some(start) = self.group_start
+            && line_no - start >= MAX_GROUP_LINES
+        {
+            self.abandoned_group_start = Some(start);
+            return false;
+        }
+        accepted
+    }
+
+    fn accepts_line(&mut self, line: &str, ext: &str) -> bool {
         if self.in_block_comment {
             self.in_block_comment = !line.contains("*/");
             return true;
@@ -184,14 +215,15 @@ impl PreambleState {
             }
             return true;
         }
+        let is_py = ext == "py";
         if line.is_empty()
-            || line.starts_with("//")
-            || line.starts_with('*')
-            || (ext == "py" && line.starts_with('#'))
+            || (is_py && line.starts_with('#'))
+            || (!is_py && line.starts_with("//"))
+            || (matches!(ext, "js" | "ts" | "tsx" | "jsx") && line.starts_with("#!"))
         {
             return true;
         }
-        if let Some(rest) = line.strip_prefix("/*") {
+        if !is_py && let Some(rest) = line.strip_prefix("/*") {
             self.in_block_comment = !rest.contains("*/");
             return true;
         }
@@ -200,10 +232,10 @@ impl PreambleState {
             return true;
         }
         if self.depth > 0 {
-            self.depth = adjust_depth(self.depth, line);
+            self.depth = adjust_depth(self.depth, line, ext);
             return true;
         }
-        if ext == "py" && !self.seen_import && self.open_docstring(line) {
+        if is_py && !self.seen_import && self.open_docstring(line) {
             return true;
         }
         if !is_import_statement(line, ext) {
@@ -211,16 +243,15 @@ impl PreambleState {
         }
         self.seen_import = true;
         if ext == "go" {
-            self.in_go_import_group = (line.starts_with("import (") || line.starts_with("import("))
-                && !line.contains(')');
+            let code = strip_noise(line, ext);
+            self.in_go_import_group = (code.starts_with("import (") || code.starts_with("import("))
+                && !code.contains(')');
         } else {
-            self.depth = adjust_depth(0, line);
+            self.depth = adjust_depth(0, line, ext);
         }
         true
     }
-}
 
-impl PreambleState {
     /// True when `line` starts a module docstring; records its delimiter if it doesn't
     /// close on the same line.
     fn open_docstring(&mut self, line: &str) -> bool {
@@ -236,12 +267,69 @@ impl PreambleState {
     }
 }
 
-fn adjust_depth(depth: usize, line: &str) -> usize {
-    line.chars().fold(depth, |d, c| match c {
+fn adjust_depth(depth: usize, line: &str, ext: &str) -> usize {
+    strip_noise(line, ext).chars().fold(depth, |d, c| match c {
         '(' | '{' | '[' => d + 1,
         ')' | '}' | ']' => d.saturating_sub(1),
         _ => d,
     })
+}
+
+/// `line` with string literals and trailing/inline comments removed, so delimiters inside
+/// them (`from "a(b"`, `// (see x`) aren't counted. Not a full lexer: an unterminated
+/// quote drops the rest of the line.
+fn strip_noise(line: &str, ext: &str) -> String {
+    let quotes: &[char] = match ext {
+        "rs" => &['"'],
+        "go" | "js" | "ts" | "tsx" | "jsx" => &['"', '\'', '`'],
+        _ => &['"', '\''],
+    };
+    let hash_comments = ext == "py";
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' && q != '`' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if quotes.contains(&c) {
+            quote = Some(c);
+            continue;
+        }
+        if hash_comments {
+            if c == '#' {
+                break;
+            }
+        } else if c == '/' {
+            match chars.peek() {
+                Some('/') => break,
+                Some('*') => {
+                    chars.next();
+                    let mut prev = ' ';
+                    let mut closed = false;
+                    for d in chars.by_ref() {
+                        if prev == '*' && d == '/' {
+                            closed = true;
+                            break;
+                        }
+                        prev = d;
+                    }
+                    if !closed {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// First line of an import/package/use declaration (comments and blanks are handled by the caller).
@@ -839,5 +927,54 @@ mod tests {
         let src = format!("package a.b\n\nclass A\n\n{mid}\n{mid}\n{mid}");
         let findings = single_file("kt", &src);
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn unmatched_opener_in_string_or_comment_does_not_swallow_the_file() {
+        let js = "import x from \"a(b\"\nimport y from \"y\";\n\nexport const z = 1;\n";
+        assert_eq!(leading_import_end(&lines_of(js), "ts"), 3);
+        let js = "import a from 'b' // (see x\nimport y from 'y';\n\nexport const z = 1;\n";
+        assert_eq!(leading_import_end(&lines_of(js), "js"), 3);
+        let py = "from a import b  # (legacy\nimport os\n\ndef f():\n    pass\n";
+        assert_eq!(leading_import_end(&lines_of(py), "py"), 3);
+        let kt = "@file:JvmName(\"Utils\")\n@file:Suppress(\"a(b\")\npackage a\n\nclass A\n";
+        assert_eq!(leading_import_end(&lines_of(kt), "kt"), 4);
+    }
+
+    #[test]
+    fn group_that_never_closes_is_abandoned_at_its_start() {
+        let mut src = String::from("import a from 'a';\nimport x; const o = {\n");
+        for i in 0..150 {
+            src.push_str(&format!("  key{i}: value{i},\n"));
+        }
+        src.push_str("};\nexport const z = 1;\n");
+        assert_eq!(leading_import_end(&lines_of(&src), "ts"), 1);
+        // Unclosed at end of file is also abandoned.
+        let eof = "import a from 'a';\nimport x; const o = {\n  a: 1,\n";
+        assert_eq!(leading_import_end(&lines_of(eof), "ts"), 1);
+    }
+
+    #[test]
+    fn real_duplicates_survive_an_unmatched_opener_in_the_preamble() {
+        let block = "function doWork(id) {\n\
+                     \tconst conn = openConnection(id);\n\
+                     \tconn.configure(defaultOptions);\n\
+                     \tconst result = conn.fetch(id);\n\
+                     \tlogger.info('fetched', result);\n\
+                     \treturn conn.validate(result);\n}\n";
+        let src = format!("import x from \"a(b\";\n\n{block}\n{block}\n{block}");
+        assert_eq!(single_file("ts", &src).len(), 1);
+    }
+
+    #[test]
+    fn js_shebang_java_import_static_and_kotlin_file_annotations_are_preamble() {
+        let js = "#!/usr/bin/env node\nimport a from 'a';\n\nconst x = 1;\n";
+        for ext in ["js", "ts"] {
+            assert_eq!(leading_import_end(&lines_of(js), ext), 3, "{ext}");
+        }
+        let java = "package a;\nimport static a.B.c;\nimport static a.B.d;\n\nclass A {}\n";
+        assert_eq!(leading_import_end(&lines_of(java), "java"), 4);
+        let kt = "@file:JvmName(\"Utils\")\n@file:Suppress(\"unused\")\npackage a\n\nclass A\n";
+        assert_eq!(leading_import_end(&lines_of(kt), "kt"), 4);
     }
 }
