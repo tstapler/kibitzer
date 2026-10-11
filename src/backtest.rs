@@ -1033,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn backtest_should_ReplayArchModelChecker_When_NamedExplicitly() {
         let content = "function helper(x: number) { return x; }\n\n\
                        function thin(x: number) { return helper(x); }\n\n\
@@ -1058,6 +1059,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn backtest_should_Reject_When_NameIsNeitherFileNorModelChecker() {
         let err = run_backtest(
             &[],
