@@ -123,3 +123,12 @@ Reproduced independently with fresh release builds of 67885ac (baseline) and HEA
   (`src/architecture_checks.rs:529`), and `check backtest` only resolves per-file
   `checker::registry()` entries, so it cannot be named there. The vscode corpus run above is the
   applicable evidence for this checker class.
+
+## AC6 closed in code (third cycle)
+
+`check backtest` now resolves `ArchModelChecker`s as a fallback to per-file checkers
+(`src/backtest.rs`, `replay_model_checker`). `kibitzer check backtest single-call-site-delegation`
+now scans 3523 transcripts / 3136 snapshots and reports findings on real historical Go edits
+instead of erroring. Tests: `backtest_should_ReplayArchModelChecker_When_NamedExplicitly`,
+`backtest_should_Reject_When_NameIsNeitherFileNorModelChecker`; suite 1567 passed. Limitation:
+single-file model, so cross-file callers are invisible (documented in `docs/backtesting.md`).
