@@ -1617,6 +1617,7 @@ fn terminal_label(kind: &str) -> &'static str {
 
 /// True when `body` is exactly one `return` of a [`LangRuleConfig::collection_literal_kinds`]
 /// literal whose subtree has no control flow or calls: nothing for Extract Function to take.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn is_flat_data_literal_body(body: Node, cfg: &LangRuleConfig) -> bool {
     let container = (cfg.statement_container)(body);
     let mut cursor = container.walk();
@@ -1654,12 +1655,14 @@ const NON_FLAT_EXPRESSION_KINDS: &[&str] = &[
 
 /// Python docstring: an expression statement whose only child is a string. Other languages
 /// never produce this shape in a function body, so it is a no-op there.
+// SEAM(typed-node-kind-migration): Python-only shape probed from a cross-grammar walk, no single <Lang>Kind applies — see ADR-001.
 fn is_docstring_statement(stmt: Node) -> bool {
     stmt.kind() == "expression_statement"
         && stmt.named_child_count() == 1
         && stmt.named_child(0).is_some_and(|c| c.kind() == "string")
 }
 
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
 fn has_logic_descendants(node: Node, cfg: &LangRuleConfig) -> bool {
     if node.kind() == cfg.if_kind
         || cfg.ternary_kind == Some(node.kind())
