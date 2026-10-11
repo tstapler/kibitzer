@@ -111,3 +111,15 @@ Revised implementation is correct, low-risk, and backtest-complete.
   binary: 4059 -> 3222 findings, 0 added, 837 removed (all methods). 12/12 sampled removals are in
   classes with an explicit `implements` clause.
 - Full suite: `cargo test --bin kibitzer` 1565 passed, 0 failed.
+
+## Re-verification (second review cycle)
+
+Reproduced independently with fresh release builds of 67885ac (baseline) and HEAD:
+`kibitzer check architecture single-call-site-delegation ~/code/github.com/microsoft/vscode`
+- baseline 4059 findings -> HEAD 3222; 837 removed, 0 added (sorted-line `comm`).
+- 40 randomly sampled removals (fixed seed): 40/40 sit in a class whose header has an explicit
+  `implements` clause (two generic headers containing `{` needed a manual look; both implement).
+- AC6 stays failed as written: `single-call-site-delegation` is an `ArchModelChecker`
+  (`src/architecture_checks.rs:529`), and `check backtest` only resolves per-file
+  `checker::registry()` entries, so it cannot be named there. The vscode corpus run above is the
+  applicable evidence for this checker class.
