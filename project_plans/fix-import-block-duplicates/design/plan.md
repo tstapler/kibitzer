@@ -25,7 +25,11 @@ Add a `pub(crate)` function:
 /// import preamble and is not worth flagging as a duplication candidate.
 /// Returns 0 when `ext` is unrecognised or the file starts with a non-import line.
 pub(crate) fn leading_import_end(lines: &[String], ext: &str) -> usize {
-    lines.iter().position(|l| !is_preamble_line(l, ext)).unwrap_or(0)
+    if !matches!(ext, "go" | "kt" | "java" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx") {
+        return 0;
+    }
+    // A file that is entirely preamble yields `lines.len()`, not 0, so it is fully suppressed.
+    lines.iter().position(|l| !is_preamble_line(l, ext)).unwrap_or(lines.len())
 }
 
 fn is_preamble_line(line: &str, ext: &str) -> bool {
@@ -129,7 +133,7 @@ file paths alongside normalized lines:
 ```rust
 fn index_cross_file_windows(
     normalized: &[Vec<String>],
-    paths: &[PathBuf],
+    paths: &[&Path],
 ) -> HashMap<&[String], Vec<(usize, usize)>> {
     let mut occurrences = HashMap::new();
     for (file_idx, lines) in normalized.iter().enumerate() {
@@ -150,7 +154,7 @@ In `find_cross_file_duplicates`, extract paths from `files` and pass to
 `index_cross_file_windows`:
 
 ```rust
-let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
 let occurrences = index_cross_file_windows(&normalized, &paths);
 ```
 
@@ -232,3 +236,14 @@ risk.
 
 **Concern**: The fix does not cover `duplicate_code_fuzzy.rs`, which has its own window
 logic. Out of scope per requirements, but noted for a follow-up.
+(Re-verified in the validate pass: it calls `qualifying_windows` at
+`duplicate_code_fuzzy.rs:156` and is not in the default catalog, so it is unaffected by
+this change and keeps its current behavior.)
+
+**Resolved in validate pass (2026-10-11)**:
+- `leading_import_end` used `unwrap_or(0)`, so a file that is entirely imports returned
+  "no preamble" and stayed flaggable. Now returns `lines.len()`; unknown extensions
+  return 0 via an explicit early guard so that change cannot suppress them.
+- Task 4 cloned every `PathBuf`; now borrows `&[&Path]`.
+- Existing tests never call `find_duplicate_blocks`/`index_cross_file_windows` directly
+  (grep of `src/`), so the signature changes keep AC6 (tests unmodified) satisfiable.
