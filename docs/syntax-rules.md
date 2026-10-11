@@ -27,7 +27,7 @@ kinds each language's `lang_config()` entry checks against differ:
 
 | Rule ID               | Category   | Default severity | Threshold             | Description |
 |------------------------|------------|-------------------|------------------------|--------------|
-| `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this — Fowler's *Extract Function*. |
+| `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this — Fowler's *Extract Function*. Exempt: a body that is a single `return` of a flat collection literal (Go composite literal, TS/JS array/object, Python list/dict) with no calls, ternaries, comprehensions or control flow — a table-test case list has nothing to extract. |
 | `deep-nesting`         | complexity | advisory          | > 4 levels             | Function/method body nests control-flow constructs deeper than this — Fowler's *Replace Nested Conditional with Guard Clauses*. An `else if` chain is treated as one flat branch, not added nesting, in every language. |
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |

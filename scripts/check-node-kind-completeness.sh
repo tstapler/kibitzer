@@ -99,7 +99,7 @@ EXPLAIN_MARKER='typed-node-kind[- ]migration|SEAM\(|anonymous (token|punctuation
 # its explaining comment. Sized with headroom above that.
 CONTEXT_WINDOW=40
 SEAM_FILES=(src/checkers/rules.rs src/symbol_extract.rs)
-EXPECTED_SEAM_COUNT=16
+EXPECTED_SEAM_COUNT=19
 
 fail=0
 
