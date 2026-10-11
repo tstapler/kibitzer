@@ -37,6 +37,19 @@ const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// in the allow-list anyway as defense-in-depth for any future grammar/version where it
 /// might be.
 const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
+
+/// Method name suffixes whose calls follow the alternating key-value convention:
+///   receiver.Method(message, key1, val1, key2, val2, …)
+/// String literals at odd-indexed positions (1, 3, 5, …) are slog attribute keys —
+/// idiomatic and not actionable by replace-magic-literal.
+///
+/// `*Context` variants (WarnContext, InfoContext, etc.) are NOT included: their
+/// signatures are (ctx, msg, key, val), so keys land at even indices 2, 4, 6 rather
+/// than odd 1, 3, 5. A per-method offset table is needed; add in a follow-up.
+///
+/// `slog.With(key, val, …)` is NOT included: index 0 is already a key (no message
+/// prefix), making the even/odd convention opposite to the calls here.
+const SLOG_METHOD_NAMES: &[&str] = &["Info", "Warn", "Error", "Debug", "Log"];
 /// An `if`/`return`/ternary expression whose nested binary/logical-operator and
 /// function-call count reaches this is flagged by `extract-variable`. Set from a
 /// `kubernetes/kubernetes` backtest (non-vendor Go, generated files excluded): at 4-8 the
@@ -188,6 +201,10 @@ pub(crate) struct LiteralOccurrence<'tree> {
 pub(crate) struct LiteralCollector<'tree> {
     pub(crate) occurrences: HashMap<String, Vec<LiteralOccurrence<'tree>>>,
     pub(crate) bound: Vec<ConstBinding<'tree>>,
+    /// Node IDs of literals in a language-specific exempt position (e.g. slog key
+    /// arguments in Go). Populated by `walk_literals` when `cfg.slog_key_predicate`
+    /// is `Some`; zero-cost for all other languages via `HashSet::default()`.
+    pub(crate) slog_key_ids: HashSet<usize>,
 }
 
 /// Per-language node-kind table the AST walk consults instead of hardcoded literals.
@@ -306,6 +323,10 @@ pub(crate) struct LangRuleConfig {
     /// extract). Empty where the idiom is a call (`listOf(...)`, `vec![...]`) or an
     /// initializer that isn't a standalone literal node (Java), so those stay unexempted.
     collection_literal_kinds: &'static [&'static str],
+    /// Returns `true` if `node` is a string literal in a language-specific idiomatic exempt
+    /// position — e.g. a slog attribute key in Go (odd-indexed argument of Info/Warn/etc.).
+    /// `None` for languages with no such idiom; `None` means "never exempt by this rule."
+    slog_key_predicate: Option<fn(Node, &[u8]) -> bool>,
 }
 
 fn field_body(decl: Node) -> Option<Node> {
@@ -885,6 +906,44 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
     }
 }
 
+/// Returns `true` when `node` is a string literal at a slog attribute-key position:
+/// odd-indexed named argument (1, 3, 5, …) of a call whose selector field is in
+/// `SLOG_METHOD_NAMES`.
+///
+/// Uses `named_children()` — commas are anonymous tokens and must not count toward
+/// the argument index (verified: `to_sexp()` on a 3-argument `argument_list` in
+/// tree-sitter-go shows commas as unnamed `","` tokens, not named children).
+///
+/// `*Context` variants and `slog.With` are excluded; see `SLOG_METHOD_NAMES`.
+fn go_is_slog_key_literal(node: Node, src: &[u8]) -> bool {
+    let Some(arg_list) = node.parent() else {
+        return false;
+    };
+    if GoKind::of(arg_list) != GoKind::ArgumentList {
+        return false;
+    }
+    let Some(call) = arg_list.parent() else {
+        return false;
+    };
+    if GoKind::of(call) != GoKind::CallExpression {
+        return false;
+    }
+    let is_slog_call = call
+        .child_by_field_name("function")
+        .filter(|f| GoKind::of(*f) == GoKind::SelectorExpression)
+        .and_then(|f| f.child_by_field_name("field"))
+        .and_then(|f| f.utf8_text(src).ok())
+        .is_some_and(|name| SLOG_METHOD_NAMES.contains(&name));
+    if !is_slog_call {
+        return false;
+    }
+    let mut cursor = arg_list.walk();
+    let position = arg_list
+        .named_children(&mut cursor)
+        .position(|child| child == node);
+    position.is_some_and(|idx| idx % 2 == 1)
+}
+
 fn go_lang_config() -> LangRuleConfig {
     LangRuleConfig {
         name: "syntax-rules",
@@ -918,6 +977,7 @@ fn go_lang_config() -> LangRuleConfig {
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["func_literal", "composite_literal"],
         collection_literal_kinds: &["composite_literal"],
+        slog_key_predicate: Some(go_is_slog_key_literal),
     }
 }
 
@@ -968,6 +1028,7 @@ fn typescript_lang_config() -> LangRuleConfig {
             "class_body",
         ],
         collection_literal_kinds: &["array", "object"],
+        slog_key_predicate: None,
     }
 }
 
@@ -1034,6 +1095,7 @@ fn python_lang_config() -> LangRuleConfig {
         operator_kinds: &["boolean_operator", "comparison_operator"],
         density_boundary_kinds: &["lambda", "dictionary", "list", "set", "tuple"],
         collection_literal_kinds: &["list", "dictionary"],
+        slog_key_predicate: None,
     }
 }
 
@@ -1074,6 +1136,7 @@ fn java_lang_config() -> LangRuleConfig {
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["lambda_expression", "array_initializer", "class_body"],
         collection_literal_kinds: &[],
+        slog_key_predicate: None,
     }
 }
 
@@ -1125,6 +1188,7 @@ fn kotlin_lang_config() -> LangRuleConfig {
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["lambda_literal", "anonymous_function"],
         collection_literal_kinds: &[],
+        slog_key_predicate: None,
     }
 }
 
@@ -1182,6 +1246,7 @@ fn rust_lang_config() -> LangRuleConfig {
             "array_expression",
         ],
         collection_literal_kinds: &[],
+        slog_key_predicate: None,
     }
 }
 
@@ -1293,6 +1358,11 @@ fn walk_literals<'tree>(
                 node,
                 kind: node.kind(),
             });
+        if let Some(predicate) = cfg.slog_key_predicate
+            && predicate(node, src)
+        {
+            collector.slog_key_ids.insert(node.id());
+        }
     }
     if let Some(binding) = (cfg.binding_finder)(node, src) {
         collector.bound.push(binding);
@@ -1435,7 +1505,9 @@ fn emit_literal_findings(
     let mut new_findings: Vec<Finding> = collector
         .occurrences
         .iter()
-        .filter_map(|(text, occurrences)| build_literal_finding(text, occurrences, cfg, excluded))
+        .filter_map(|(text, occurrences)| {
+            build_literal_finding(text, occurrences, cfg, excluded, &collector.slog_key_ids)
+        })
         .collect();
     new_findings.sort_by_key(|f| f.line);
     findings.extend(new_findings);
@@ -1450,6 +1522,7 @@ fn build_literal_finding(
     occurrences: &[LiteralOccurrence],
     cfg: &LangRuleConfig,
     excluded: &HashSet<usize>,
+    slog_keys: &HashSet<usize>,
 ) -> Option<Finding> {
     let first = occurrences.first()?;
     if is_allowlisted_literal(text, first.kind) {
@@ -1457,7 +1530,7 @@ fn build_literal_finding(
     }
     let mut remaining: Vec<&LiteralOccurrence> = occurrences
         .iter()
-        .filter(|occ| !excluded.contains(&occ.node.id()))
+        .filter(|occ| !excluded.contains(&occ.node.id()) && !slog_keys.contains(&occ.node.id()))
         .collect();
     if remaining.len() < MAGIC_LITERAL_MIN_OCCURRENCES {
         return None;
@@ -4065,5 +4138,92 @@ mod tests {
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
         assert!(findings[0].message.contains("condition"));
+    }
+
+    // --- slog key suppression (AC5, AC6) ---
+
+    #[test]
+    fn suppresses_slog_key_string_repeated_3_times() {
+        // AC5: "file" in slog.Warn key position, repeated 3 times → no finding
+        let src = r#"package main
+import "log/slog"
+func f(a, b, c string) {
+    slog.Warn("msg1", "file", a)
+    slog.Warn("msg2", "file", b)
+    slog.Warn("msg3", "file", c)
+}"#;
+        let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn suppresses_log_warn_key_string_repeated_3_times() {
+        // AC5: log.Warn key position (common logger wrapper pattern)
+        // Use distinct messages so the message literal itself doesn't trigger replace-magic-literal.
+        let src = r#"package main
+func f(a, b, c error) {
+    log.Warn("failed to open file", "err", a)
+    log.Warn("failed to read file", "err", b)
+    log.Warn("failed to close file", "err", c)
+}"#;
+        let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_flags_genuine_repeated_string_outside_slog_key_position() {
+        // AC6: "pending" repeated 3 times as a plain return value → fires
+        let src = r#"package main
+func f() string { return "pending" }
+func g() string { return "pending" }
+func h() string { return "pending" }
+"#;
+        let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
+        assert!(!findings.is_empty(), "expected a finding for 'pending'");
+    }
+
+    #[test]
+    fn still_flags_non_slog_value_string() {
+        // AC6: "active" at even index 2 (value position, not key) in slog.Warn calls → fires
+        let src = r#"package main
+import "log/slog"
+func f() {
+    slog.Warn("check1", "status", "active")
+    slog.Warn("check2", "status", "active")
+    slog.Warn("check3", "status", "active")
+}"#;
+        let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
+        assert!(
+            !findings.is_empty(),
+            "expected finding for 'active' at value position, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_flags_slog_context_variant_key_string() {
+        // True-positive guard: WarnContext is excluded from SLOG_METHOD_NAMES (keys land
+        // at even indices 2, 4, 6 — not odd). Until a per-method offset table is added,
+        // keys in WarnContext calls still fire as magic literals.
+        let src = r#"package main
+import (
+    "context"
+    "log/slog"
+)
+func f(ctx context.Context, a, b, c string) {
+    slog.WarnContext(ctx, "msg1", "file", a)
+    slog.WarnContext(ctx, "msg2", "file", b)
+    slog.WarnContext(ctx, "msg3", "file", c)
+}"#;
+        let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
+        assert!(
+            !findings.is_empty(),
+            "WarnContext keys should still fire until *Context suppression is implemented"
+        );
     }
 }
