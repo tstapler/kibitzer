@@ -318,6 +318,11 @@ pub(crate) struct LangRuleConfig {
     /// statements, not part of the surrounding expression's readability cost (found by a
     /// `kubernetes/kubernetes` backtest where `return func(...) {...}` scored 93).
     density_boundary_kinds: &'static [&'static str],
+    /// Pure data-container literal kinds `long-function` exempts when a body is nothing but
+    /// `return <literal>` with no logic inside (a table-test case list has nothing to
+    /// extract). Empty where the idiom is a call (`listOf(...)`, `vec![...]`) or an
+    /// initializer that isn't a standalone literal node (Java), so those stay unexempted.
+    collection_literal_kinds: &'static [&'static str],
     /// Returns `true` if `node` is a string literal in a language-specific idiomatic exempt
     /// position — e.g. a slog attribute key in Go (odd-indexed argument of Info/Warn/etc.).
     /// `None` for languages with no such idiom; `None` means "never exempt by this rule."
@@ -971,6 +976,7 @@ fn go_lang_config() -> LangRuleConfig {
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["func_literal", "composite_literal"],
+        collection_literal_kinds: &["composite_literal"],
         slog_key_predicate: Some(go_is_slog_key_literal),
     }
 }
@@ -1021,6 +1027,7 @@ fn typescript_lang_config() -> LangRuleConfig {
             "array",
             "class_body",
         ],
+        collection_literal_kinds: &["array", "object"],
         slog_key_predicate: None,
     }
 }
@@ -1087,6 +1094,7 @@ fn python_lang_config() -> LangRuleConfig {
         call_kinds: &["call"],
         operator_kinds: &["boolean_operator", "comparison_operator"],
         density_boundary_kinds: &["lambda", "dictionary", "list", "set", "tuple"],
+        collection_literal_kinds: &["list", "dictionary"],
         slog_key_predicate: None,
     }
 }
@@ -1127,6 +1135,7 @@ fn java_lang_config() -> LangRuleConfig {
         call_kinds: &["method_invocation"],
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["lambda_expression", "array_initializer", "class_body"],
+        collection_literal_kinds: &[],
         slog_key_predicate: None,
     }
 }
@@ -1178,6 +1187,7 @@ fn kotlin_lang_config() -> LangRuleConfig {
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["lambda_literal", "anonymous_function"],
+        collection_literal_kinds: &[],
         slog_key_predicate: None,
     }
 }
@@ -1235,6 +1245,7 @@ fn rust_lang_config() -> LangRuleConfig {
             "struct_expression",
             "array_expression",
         ],
+        collection_literal_kinds: &[],
         slog_key_predicate: None,
     }
 }
@@ -1604,12 +1615,74 @@ fn terminal_label(kind: &str) -> &'static str {
     }
 }
 
+/// True when `body` is exactly one `return` of a [`LangRuleConfig::collection_literal_kinds`]
+/// literal whose subtree has no control flow or calls: nothing for Extract Function to take.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
+fn is_flat_data_literal_body(body: Node, cfg: &LangRuleConfig) -> bool {
+    let container = (cfg.statement_container)(body);
+    let mut cursor = container.walk();
+    let stmts: Vec<Node> = container
+        .named_children(&mut cursor)
+        .filter(|c| !c.kind().contains("comment") && !is_docstring_statement(*c))
+        .collect();
+    let [stmt] = stmts.as_slice() else {
+        return false;
+    };
+    if stmt.kind() != cfg.return_kind || stmt.named_child_count() != 1 {
+        return false;
+    }
+    let Some(mut value) = stmt.named_child(0) else {
+        return false;
+    };
+    // Go wraps return values in an `expression_list`.
+    if value.kind() == "expression_list" && value.named_child_count() == 1 {
+        value = value.named_child(0).unwrap_or(value);
+    }
+    cfg.collection_literal_kinds.contains(&value.kind()) && !has_logic_descendants(value, cfg)
+}
+
+/// Expression kinds that compute rather than describe data but aren't in any language's
+/// `call_kinds`/`nesting_kinds`/`ternary_kind` (Python has no `ternary_kind`; TS `new`/`await`).
+const NON_FLAT_EXPRESSION_KINDS: &[&str] = &[
+    "conditional_expression",
+    "list_comprehension",
+    "dictionary_comprehension",
+    "set_comprehension",
+    "generator_expression",
+    "new_expression",
+    "await_expression",
+];
+
+/// Python docstring: an expression statement whose only child is a string. Other languages
+/// never produce this shape in a function body, so it is a no-op there.
+// SEAM(typed-node-kind-migration): Python-only shape probed from a cross-grammar walk, no single <Lang>Kind applies — see ADR-001.
+fn is_docstring_statement(stmt: Node) -> bool {
+    stmt.kind() == "expression_statement"
+        && stmt.named_child_count() == 1
+        && stmt.named_child(0).is_some_and(|c| c.kind() == "string")
+}
+
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
+fn has_logic_descendants(node: Node, cfg: &LangRuleConfig) -> bool {
+    if node.kind() == cfg.if_kind
+        || cfg.ternary_kind == Some(node.kind())
+        || cfg.nesting_kinds.contains(&node.kind())
+        || cfg.call_kinds.contains(&node.kind())
+        || NON_FLAT_EXPRESSION_KINDS.contains(&node.kind())
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| has_logic_descendants(child, cfg))
+}
+
 fn check_declaration(decl: Node, cfg: &LangRuleConfig, src: &[u8], findings: &mut Vec<Finding>) {
     let line = decl.start_position().row + 1;
 
     if let Some(body) = (cfg.body_finder)(decl) {
         let body_lines = body.end_position().row - body.start_position().row + 1;
-        if body_lines > LONG_FUNCTION_LINES {
+        if body_lines > LONG_FUNCTION_LINES && !is_flat_data_literal_body(body, cfg) {
             findings.push(Finding {
                 line,
                 message: format!(
@@ -2054,6 +2127,7 @@ mod tests {
             kinds.extend(cfg.else_wrapper_kinds);
             kinds.extend(cfg.chain_kinds);
             kinds.extend(cfg.terminal_kinds);
+            kinds.extend(cfg.collection_literal_kinds);
             if let Some(t) = cfg.ternary_kind {
                 kinds.push(t);
             }
@@ -2611,6 +2685,140 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[long-function]"))
         );
+    }
+
+    fn go_table_fn(entries: &[&str]) -> String {
+        let mut src = String::from(
+            "package main\ntype tc struct{ name string; input, want int }\nfunc cases() []tc {\n\treturn []tc{\n",
+        );
+        for e in entries {
+            src.push_str(&format!("\t\t{e},\n"));
+        }
+        src.push_str("\t}\n}\n");
+        src
+    }
+
+    fn has_long_function(findings: &[Finding]) -> bool {
+        findings
+            .iter()
+            .any(|f| f.message.contains("[long-function]"))
+    }
+
+    #[test]
+    fn long_function_exempts_flat_go_composite_literal() {
+        let entries = vec![r#"{name: "case", input: 1, want: 2}"#; 45];
+        let findings = check_source(&go_table_fn(&entries)).unwrap();
+        assert!(!has_long_function(&findings));
+    }
+
+    #[test]
+    fn long_function_does_not_exempt_literal_with_call() {
+        let mut entries = vec![r#"{name: "case", input: 1, want: 2}"#; 45];
+        entries[10] = r#"{name: fmt.Sprintf("case %d", 1), input: 1, want: 2}"#;
+        let findings = check_source(&go_table_fn(&entries)).unwrap();
+        assert!(has_long_function(&findings));
+    }
+
+    #[test]
+    fn long_function_does_not_exempt_literal_with_nested_control_flow() {
+        let mut entries = vec![r#"{name: "case", input: 1, want: 2}"#; 45];
+        entries[10] =
+            "{name: \"x\", input: func() int { if true { return 1 }; return 0 }, want: 2}";
+        let findings = check_source(&go_table_fn(&entries)).unwrap();
+        assert!(has_long_function(&findings));
+    }
+
+    #[test]
+    fn long_function_does_not_exempt_multi_statement_body() {
+        let src = go_table_fn(&vec![r#"{name: "case", input: 1, want: 2}"#; 45]).replacen(
+            "\treturn []tc{",
+            "\tx := 1\n\t_ = x\n\treturn []tc{",
+            1,
+        );
+        let findings = check_source(&src).unwrap();
+        assert!(has_long_function(&findings));
+    }
+
+    #[test]
+    fn ts_long_function_exempts_flat_array_literal() {
+        let mut src = String::from("function cases() {\n  return [\n");
+        for _ in 0..45 {
+            src.push_str("    { name: \"a\", input: 1 },\n");
+        }
+        src.push_str("  ];\n}\n");
+        let findings = check_ts_source(&src).unwrap();
+        assert!(!has_long_function(&findings));
+    }
+
+    #[test]
+    fn py_long_function_exempts_flat_list_literal_but_not_one_with_a_call() {
+        let build = |row: &str| {
+            let mut src = String::from("def cases():\n    return [\n");
+            for _ in 0..45 {
+                src.push_str("        {\"name\": \"a\", \"input\": 1},\n");
+            }
+            src.push_str(row);
+            src.push_str("    ]\n");
+            src
+        };
+        let flat = check_py_source(&build("")).unwrap();
+        assert!(!has_long_function(&flat));
+        let with_call = check_py_source(&build("        {\"name\": str(1)},\n")).unwrap();
+        assert!(has_long_function(&with_call));
+    }
+
+    fn py_table_fn(docstring: bool, row: &str) -> String {
+        let mut src = String::from("def cases():\n");
+        if docstring {
+            src.push_str("    \"\"\"doc\"\"\"\n");
+        }
+        src.push_str("    return [\n");
+        for _ in 0..45 {
+            src.push_str("        {\"name\": \"a\"},\n");
+        }
+        src.push_str(row);
+        src.push_str("    ]\n");
+        src
+    }
+
+    #[test]
+    fn py_long_function_exempts_flat_list_after_docstring() {
+        let findings = check_py_source(&py_table_fn(true, "")).unwrap();
+        assert!(!has_long_function(&findings));
+    }
+
+    #[test]
+    fn py_long_function_does_not_exempt_ternary_or_comprehension_entries() {
+        for row in [
+            "        {\"k\": 1 if x else 2},\n",
+            "        {\"k\": [i for i in y]},\n",
+        ] {
+            let findings = check_py_source(&py_table_fn(false, row)).unwrap();
+            assert!(has_long_function(&findings), "row: {row}");
+        }
+    }
+
+    #[test]
+    fn ts_long_function_does_not_exempt_ternary_or_new_entries() {
+        for row in ["    { v: a ? 1 : 2 },\n", "    { v: new Foo() },\n"] {
+            let mut src = String::from("function cases() {\n  return [\n");
+            for _ in 0..45 {
+                src.push_str("    { name: \"a\" },\n");
+            }
+            src.push_str(row);
+            src.push_str("  ];\n}\n");
+            let findings = check_ts_source(&src).unwrap();
+            assert!(has_long_function(&findings), "row: {row}");
+        }
+    }
+
+    #[test]
+    fn long_function_does_not_exempt_go_multi_value_return() {
+        let src = go_table_fn(&vec![r#"{name: "case", input: 1, want: 2}"#; 45])
+            .replacen("return []tc{", "return 1, []tc{", 1)
+            .replacen("[]tc {", "(int, []tc) {", 1);
+        let findings = check_source(&src).unwrap();
+        assert!(has_long_function(&findings));
     }
 
     #[test]
