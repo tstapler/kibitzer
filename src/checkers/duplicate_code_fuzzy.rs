@@ -7,7 +7,8 @@ use regex::Regex;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_windows,
+    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, in_preamble, lang_ext,
+    leading_import_end, qualifying_windows,
 };
 use crate::checkers::file_size::is_generated;
 
@@ -39,7 +40,7 @@ impl Checker for FuzzyDuplicateCodeChecker {
         if is_generated(ctx.source) || is_test_file(file) {
             return Ok(Vec::new());
         }
-        Ok(find_fuzzy_duplicate_blocks(ctx.source))
+        Ok(find_fuzzy_duplicate_blocks(ctx.source, lang_ext(file)))
     }
 }
 
@@ -149,11 +150,17 @@ fn trimmed_lines_before_rust_test_module(source: &str) -> Vec<String> {
 /// Fuzzy counterpart to `duplicate_code::find_duplicate_blocks` — same windowing and
 /// occurrence-count bar, but grouped by literal-normalized text and reported only when
 /// at least one literal actually differs across occurrences.
-fn find_fuzzy_duplicate_blocks(source: &str) -> Vec<Finding> {
+fn find_fuzzy_duplicate_blocks(source: &str, ext: &str) -> Vec<Finding> {
     let trimmed = trimmed_lines_before_rust_test_module(source);
+
+    // Literal normalization makes a run of distinct quoted Go import paths collapse to one key.
+    let import_end = leading_import_end(&trimmed, ext);
 
     let mut occurrences: HashMap<String, Vec<usize>> = HashMap::new();
     for (start, window) in qualifying_windows(&trimmed) {
+        if in_preamble(start, import_end) {
+            continue;
+        }
         let fuzzy_key = window
             .iter()
             .map(|l| normalize_literals(l))
@@ -429,5 +436,11 @@ mod tests {
             vec!["a".to_string()],
         ];
         assert_eq!(differing_literals(&literal_sets), None);
+    }
+
+    #[test]
+    fn does_not_flag_a_go_import_block_whose_paths_normalize_alike() {
+        let src = "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"net/http/httptest\"\n\t\"path/filepath\"\n\t\"database/sql\"\n\t\"text/template\"\n\t\"sync/atomic\"\n\t\"os/signal\"\n)\n\nfunc main() {}\n";
+        assert!(check_source(src).is_empty());
     }
 }
