@@ -5,10 +5,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, in_preamble, lang_ext,
-    leading_import_end, qualifying_windows,
-};
+use crate::checkers::duplicate_code::{DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES};
+use crate::checkers::import_preamble::{lang_ext, non_preamble_windows};
 
 /// Diff-aware counterpart to `kibitzer check duplicates` (`duplicate_code::find_cross_file_duplicates`)
 /// — see #28 proposal item 2. That command rescans a whole directory from scratch every
@@ -301,9 +299,7 @@ pub(crate) fn findings_with_siblings(
 /// key so two different blocks can never collide onto the same entry.
 fn file_windows(file: &Path, source: &str) -> Vec<(usize, String)> {
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
-    let import_end = leading_import_end(&normalized, lang_ext(file));
-    qualifying_windows(&normalized)
-        .filter(|(start, _)| !in_preamble(*start, import_end))
+    non_preamble_windows(&normalized, lang_ext(file))
         .map(|(start, window)| (start, window.join("\n")))
         .collect()
 }

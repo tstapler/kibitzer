@@ -6,11 +6,9 @@ use anyhow::Result;
 use regex::Regex;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, in_preamble, lang_ext,
-    leading_import_end, qualifying_windows,
-};
+use crate::checkers::duplicate_code::{DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES};
 use crate::checkers::file_size::is_generated;
+use crate::checkers::import_preamble::{lang_ext, non_preamble_windows};
 
 /// Opt-in near-duplicate counterpart to `duplicate-code` (issue #47): same window-hashing,
 /// but the key is computed after replacing literals with a placeholder, so
@@ -153,14 +151,10 @@ fn trimmed_lines_before_rust_test_module(source: &str) -> Vec<String> {
 fn find_fuzzy_duplicate_blocks(source: &str, ext: &str) -> Vec<Finding> {
     let trimmed = trimmed_lines_before_rust_test_module(source);
 
-    // Literal normalization makes a run of distinct quoted Go import paths collapse to one key.
-    let import_end = leading_import_end(&trimmed, ext);
-
     let mut occurrences: HashMap<String, Vec<usize>> = HashMap::new();
-    for (start, window) in qualifying_windows(&trimmed) {
-        if in_preamble(start, import_end) {
-            continue;
-        }
+    // The preamble filter matters here: literal normalization makes a run of distinct
+    // quoted Go import paths collapse to one key.
+    for (start, window) in non_preamble_windows(&trimmed, ext) {
         let fuzzy_key = window
             .iter()
             .map(|l| normalize_literals(l))
