@@ -60,8 +60,7 @@ impl Checker for DuplicateCodeChecker {
         if is_generated(ctx.source) {
             return Ok(Vec::new());
         }
-        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-        Ok(find_duplicate_blocks(ctx.source, ext))
+        Ok(find_duplicate_blocks(ctx.source, lang_ext(file)))
     }
 }
 
@@ -132,9 +131,10 @@ fn find_duplicate_blocks(source: &str, ext: &str) -> Vec<Finding> {
 
 /// Returns the exclusive end index of the file's leading import/use preamble: the first
 /// line (of already-trimmed `lines`) that is not blank, a comment, or an import/package/use
-/// declaration for the language inferred from `ext`. Returns 0 for unrecognised extensions
-/// (nothing is suppressed) and `lines.len()` when the whole file is preamble.
-/// `pub(crate)`: the cross-file checker's incremental index applies the same filter.
+/// declaration for the language inferred from `ext`. Multi-line imports (`from a import (`,
+/// `import {`, `use a::{`, Go `import (`) stay preamble until they close. Returns 0 for
+/// unrecognised extensions (nothing is suppressed) and `lines.len()` when the whole file
+/// is preamble. `pub(crate)`: the cross-file checker's incremental index applies the same filter.
 pub(crate) fn leading_import_end(lines: &[String], ext: &str) -> usize {
     if !matches!(
         ext,
@@ -142,9 +142,10 @@ pub(crate) fn leading_import_end(lines: &[String], ext: &str) -> usize {
     ) {
         return 0;
     }
+    let mut state = PreambleState::default();
     lines
         .iter()
-        .position(|l| !is_preamble_line(l, ext))
+        .position(|l| !state.accepts(l, ext))
         .unwrap_or(lines.len())
 }
 
@@ -155,21 +156,103 @@ pub(crate) fn in_preamble(start: usize, import_end: usize) -> bool {
     start + MIN_BLOCK_LINES <= import_end
 }
 
-fn is_preamble_line(line: &str, ext: &str) -> bool {
-    if line.is_empty() || line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
-    {
-        return true;
+/// File extension of `path`, or `""` when it has none or isn't UTF-8.
+pub(crate) fn lang_ext(path: &Path) -> &str {
+    path.extension().and_then(|e| e.to_str()).unwrap_or("")
+}
+
+#[derive(Default)]
+struct PreambleState {
+    /// Unclosed `(`/`{`/`[` from a multi-line import statement.
+    depth: usize,
+    in_block_comment: bool,
+    in_go_import_group: bool,
+    /// Closing delimiter of a leading Python module docstring we're inside.
+    docstring_delim: Option<&'static str>,
+    seen_import: bool,
+}
+
+impl PreambleState {
+    fn accepts(&mut self, line: &str, ext: &str) -> bool {
+        if self.in_block_comment {
+            self.in_block_comment = !line.contains("*/");
+            return true;
+        }
+        if let Some(delim) = self.docstring_delim {
+            if line.contains(delim) {
+                self.docstring_delim = None;
+            }
+            return true;
+        }
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('*')
+            || (ext == "py" && line.starts_with('#'))
+        {
+            return true;
+        }
+        if let Some(rest) = line.strip_prefix("/*") {
+            self.in_block_comment = !rest.contains("*/");
+            return true;
+        }
+        if self.in_go_import_group {
+            self.in_go_import_group = !line.starts_with(')');
+            return true;
+        }
+        if self.depth > 0 {
+            self.depth = adjust_depth(self.depth, line);
+            return true;
+        }
+        if ext == "py" && !self.seen_import && self.open_docstring(line) {
+            return true;
+        }
+        if !is_import_statement(line, ext) {
+            return false;
+        }
+        self.seen_import = true;
+        if ext == "go" {
+            self.in_go_import_group = (line.starts_with("import (") || line.starts_with("import("))
+                && !line.contains(')');
+        } else {
+            self.depth = adjust_depth(0, line);
+        }
+        true
     }
+}
+
+impl PreambleState {
+    /// True when `line` starts a module docstring; records its delimiter if it doesn't
+    /// close on the same line.
+    fn open_docstring(&mut self, line: &str) -> bool {
+        for delim in ["\"\"\"", "'''"] {
+            if let Some(rest) = line.strip_prefix(delim) {
+                if !rest.contains(delim) {
+                    self.docstring_delim = Some(delim);
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn adjust_depth(depth: usize, line: &str) -> usize {
+    line.chars().fold(depth, |d, c| match c {
+        '(' | '{' | '[' => d + 1,
+        ')' | '}' | ']' => d.saturating_sub(1),
+        _ => d,
+    })
+}
+
+/// First line of an import/package/use declaration (comments and blanks are handled by the caller).
+fn is_import_statement(line: &str, ext: &str) -> bool {
     match ext {
+        // Go grouped-import bodies are tracked by `in_go_import_group`, not matched here,
+        // so `var s = "b"` / `fmt.Println("a", "b")` can't pass as import specs.
         "go" => {
             line.starts_with("package ")
                 || line.starts_with("import ")
                 || line.starts_with("import(")
-                || line == ")"
-                // inside a grouped `import (...)`: `"path"`, `alias "path"`, `_ "path"`
-                || line.starts_with('"')
-                || line.starts_with('`')
-                || line.contains(" \"")
         }
         "kt" | "java" => {
             line.starts_with("package ")
@@ -177,14 +260,26 @@ fn is_preamble_line(line: &str, ext: &str) -> bool {
                 || line.starts_with("@file:")
         }
         "rs" => {
-            line.starts_with("use ")
-                || line.starts_with("pub use ")
-                || line.starts_with("extern crate ")
-                || line.starts_with("#![")
+            let item = strip_rust_visibility(line);
+            item.starts_with("use ")
+                || item.starts_with("extern crate ")
+                || item.starts_with("#![")
+                // `mod x {` opens a body, so only the declaration form is preamble
+                || (item.starts_with("mod ") && item.ends_with(';'))
         }
-        "py" => line.starts_with('#') || line.starts_with("import ") || line.starts_with("from "),
-        _ => line.starts_with("import ") || line.starts_with("export * from "),
+        "py" => line.starts_with("import ") || line.starts_with("from "),
+        "js" | "ts" | "tsx" | "jsx" => {
+            line.starts_with("import ") || line.starts_with("export * from ")
+        }
+        _ => false,
     }
+}
+
+fn strip_rust_visibility(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix("pub(") {
+        return rest.split_once(')').map_or(line, |(_, r)| r.trim_start());
+    }
+    line.strip_prefix("pub ").unwrap_or(line)
 }
 
 /// One location a cross-file duplicate block occurs at.
@@ -224,12 +319,8 @@ fn index_cross_file_windows<'a>(
     paths: &[&Path],
 ) -> HashMap<&'a [String], Vec<(usize, usize)>> {
     let mut occurrences: HashMap<&[String], Vec<(usize, usize)>> = HashMap::new();
-    for (file_idx, lines) in normalized.iter().enumerate() {
-        let ext = paths[file_idx]
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let import_end = leading_import_end(lines, ext);
+    for (file_idx, (lines, path)) in normalized.iter().zip(paths).enumerate() {
+        let import_end = leading_import_end(lines, lang_ext(path));
         for (start, window) in qualifying_windows(lines) {
             if in_preamble(start, import_end) {
                 continue;
@@ -561,22 +652,21 @@ mod tests {
     fn leading_import_end_go_grouped_import() {
         let src = "package main\n\nimport (\n\t\"fmt\"\n\tfoo \"example.com/foo\"\n\t_ \"example.com/bar\"\n)\n\nfunc main() {}\n";
         let lines = lines_of(src);
-        let end = leading_import_end(&lines, "go");
-        assert_eq!(lines[end], "func main() {}");
+        assert_eq!(leading_import_end(&lines, "go"), lines.len() - 1);
     }
 
     #[test]
     fn leading_import_end_rust() {
         let src = "#![allow(dead_code)]\nuse std::fmt;\nuse std::io;\n\nfn main() {}\n";
         let lines = lines_of(src);
-        assert_eq!(lines[leading_import_end(&lines, "rs")], "fn main() {}");
+        assert_eq!(leading_import_end(&lines, "rs"), lines.len() - 1);
     }
 
     #[test]
     fn leading_import_end_python() {
         let src = "import os\nfrom a import b\n\ndef f():\n    pass\n";
         let lines = lines_of(src);
-        assert_eq!(lines[leading_import_end(&lines, "py")], "def f():");
+        assert_eq!(leading_import_end(&lines, "py"), 3);
     }
 
     #[test]
@@ -623,14 +713,107 @@ mod tests {
         }
     }
 
+    const RUST_USE_BLOCK: &str = "use std::collections::HashMap;\nuse std::collections::HashSet;\nuse std::path::{Path, PathBuf};\nuse anyhow::Result;\nuse serde::Serialize;\nuse serde::Deserialize;\n";
+
     #[test]
     fn does_not_flag_rust_use_block() {
-        let use_block = "use std::collections::HashMap;\nuse std::collections::HashSet;\nuse std::path::{Path, PathBuf};\nuse anyhow::Result;\nuse serde::Serialize;\nuse serde::Deserialize;\n";
-        // Three copies in a single file: only the leading one is preamble, but the
-        // repeated windows must not reach MIN_OCCURRENCES via the leading block alone.
-        let src = format!("{use_block}\nfn main() {{}}\n");
-        assert!(single_file("rs", &src).is_empty());
-        assert!(cross_file("rs", use_block, "fn a() {}").is_empty());
+        // Three copies: only the leading one is preamble, so without the filter the
+        // block would reach MIN_OCCURRENCES; with it, two remain and nothing fires.
+        let three =
+            format!("{RUST_USE_BLOCK}fn a() {{}}\n{RUST_USE_BLOCK}fn b() {{}}\n{RUST_USE_BLOCK}");
+        assert!(single_file("rs", &three).is_empty());
+        // A fourth copy leaves three non-preamble occurrences, a real finding.
+        let four = format!("{three}fn c() {{}}\n{RUST_USE_BLOCK}");
+        assert_eq!(single_file("rs", &four).len(), 1);
+    }
+
+    #[test]
+    fn rust_use_block_in_three_files_is_suppressed_by_the_filter() {
+        let files: Vec<(PathBuf, String)> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                (
+                    PathBuf::from(format!("{n}.rs")),
+                    format!("{RUST_USE_BLOCK}fn {n}() {{}}\n"),
+                )
+            })
+            .collect();
+        assert!(find_cross_file_duplicates(&files).is_empty());
+    }
+
+    #[test]
+    fn go_value_declarations_and_calls_are_not_preamble() {
+        let lines = lines_of("package main\n\nvar a = \"x\"\nvar b = \"y\"\n");
+        assert_eq!(leading_import_end(&lines, "go"), 2);
+        let lines = lines_of("package main\nfmt.Println(\"a\", \"b\")\n");
+        assert_eq!(leading_import_end(&lines, "go"), 1);
+    }
+
+    #[test]
+    fn still_flags_repeated_go_var_runs_across_files() {
+        let body = "var a = \"alpha-value\"\nvar b = \"beta-value\"\nvar c = \"gamma-value\"\nvar d = \"delta-value\"\nvar e = \"epsilon-value\"\nvar f = \"zeta-value\"\n";
+        assert_eq!(cross_file("go", "package main\n", body).len(), 1);
+    }
+
+    #[test]
+    fn python_parenthesized_import_is_preamble_until_closed() {
+        let src = "from a import (\n    b,\n    c,\n)\nimport os\n\ndef f():\n    pass\n";
+        let lines = lines_of(src);
+        assert_eq!(leading_import_end(&lines, "py"), 6);
+        let block = "from pkg.module_one import (\n    alpha_function,\n    beta_function,\n    gamma_function,\n    delta_function,\n)\n";
+        assert!(cross_file("py", block, "def f(): pass").is_empty());
+    }
+
+    #[test]
+    fn js_multiline_import_is_preamble_until_closed() {
+        let src = "import {\n  a,\n  b,\n} from 'x';\nimport y from 'y';\n\nexport const z = 1;\n";
+        let lines = lines_of(src);
+        for ext in ["js", "ts", "tsx", "jsx"] {
+            assert_eq!(leading_import_end(&lines, ext), 6, "{ext}");
+        }
+        let block = "import {\n  alphaFunction,\n  betaFunction,\n  gammaFunction,\n  deltaFunction,\n} from './module';\n";
+        assert!(cross_file("ts", block, "export const a = 1;").is_empty());
+    }
+
+    #[test]
+    fn rust_multiline_use_and_mod_declarations_are_preamble() {
+        let src = "use foo::{\n    a,\n    b,\n};\npub(crate) use bar::baz;\nmod m;\npub mod n;\n\nfn main() {}\n";
+        let lines = lines_of(src);
+        assert_eq!(leading_import_end(&lines, "rs"), lines.len() - 1);
+        // An inline module body is code, not preamble.
+        let lines = lines_of("mod m {\n    fn f() {}\n}\n");
+        assert_eq!(leading_import_end(&lines, "rs"), 0);
+    }
+
+    #[test]
+    fn in_preamble_window_boundaries() {
+        let end = 10;
+        assert!(in_preamble(end - MIN_BLOCK_LINES, end));
+        assert!(!in_preamble(end - MIN_BLOCK_LINES + 1, end));
+        assert!(!in_preamble(end, end));
+    }
+
+    #[test]
+    fn java_license_header_and_interleaved_comments_are_preamble() {
+        let src = "/*\n * Copyright 2024\n * Licensed under X\n */\npackage a;\n// group one\nimport java.util.List;\n/* inline */\nimport java.util.Map;\n\nclass A {}\n";
+        let lines = lines_of(src);
+        assert_eq!(leading_import_end(&lines, "java"), lines.len() - 1);
+    }
+
+    #[test]
+    fn block_comment_without_star_prefixed_lines_is_preamble() {
+        let src = "/*\nlicense text\nmore text\n*/\npackage a;\nclass A {}\n";
+        let lines = lines_of(src);
+        assert_eq!(leading_import_end(&lines, "java"), 5);
+    }
+
+    #[test]
+    fn python_comments_and_module_docstring_before_imports_are_preamble() {
+        let src = "#!/usr/bin/env python\n# comment\n\"\"\"Module doc.\n\nMore doc.\n\"\"\"\nimport os\nimport sys\n\ndef f():\n    pass\n";
+        let lines = lines_of(src);
+        assert_eq!(leading_import_end(&lines, "py"), 9);
+        let one_line = lines_of("\"\"\"Doc.\"\"\"\nimport os\n\ndef f(): pass\n");
+        assert_eq!(leading_import_end(&one_line, "py"), 3);
     }
 
     #[test]

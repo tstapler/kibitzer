@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, in_preamble, leading_import_end,
-    qualifying_windows,
+    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, in_preamble, lang_ext,
+    leading_import_end, qualifying_windows,
 };
 
 /// Diff-aware counterpart to `kibitzer check duplicates` (`duplicate_code::find_cross_file_duplicates`)
@@ -300,9 +300,8 @@ pub(crate) fn findings_with_siblings(
 /// line, joined normalized text)` — the exact text (not a hash) is used as the index
 /// key so two different blocks can never collide onto the same entry.
 fn file_windows(file: &Path, source: &str) -> Vec<(usize, String)> {
-    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
-    let import_end = leading_import_end(&normalized, ext);
+    let import_end = leading_import_end(&normalized, lang_ext(file));
     qualifying_windows(&normalized)
         .filter(|(start, _)| !in_preamble(*start, import_end))
         .map(|(start, window)| (start, window.join("\n")))
