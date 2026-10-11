@@ -2599,7 +2599,9 @@ mod tests {
     }
 
     fn has_long_function(findings: &[Finding]) -> bool {
-        findings.iter().any(|f| f.message.contains("[long-function]"))
+        findings
+            .iter()
+            .any(|f| f.message.contains("[long-function]"))
     }
 
     #[test]
@@ -2620,15 +2622,19 @@ mod tests {
     #[test]
     fn long_function_does_not_exempt_literal_with_nested_control_flow() {
         let mut entries = vec![r#"{name: "case", input: 1, want: 2}"#; 45];
-        entries[10] = "{name: \"x\", input: func() int { if true { return 1 }; return 0 }, want: 2}";
+        entries[10] =
+            "{name: \"x\", input: func() int { if true { return 1 }; return 0 }, want: 2}";
         let findings = check_source(&go_table_fn(&entries)).unwrap();
         assert!(has_long_function(&findings));
     }
 
     #[test]
     fn long_function_does_not_exempt_multi_statement_body() {
-        let src = go_table_fn(&vec![r#"{name: "case", input: 1, want: 2}"#; 45])
-            .replacen("\treturn []tc{", "\tx := 1\n\t_ = x\n\treturn []tc{", 1);
+        let src = go_table_fn(&vec![r#"{name: "case", input: 1, want: 2}"#; 45]).replacen(
+            "\treturn []tc{",
+            "\tx := 1\n\t_ = x\n\treturn []tc{",
+            1,
+        );
         let findings = check_source(&src).unwrap();
         assert!(has_long_function(&findings));
     }
@@ -2642,6 +2648,23 @@ mod tests {
         src.push_str("  ];\n}\n");
         let findings = check_ts_source(&src).unwrap();
         assert!(!has_long_function(&findings));
+    }
+
+    #[test]
+    fn py_long_function_exempts_flat_list_literal_but_not_one_with_a_call() {
+        let build = |row: &str| {
+            let mut src = String::from("def cases():\n    return [\n");
+            for _ in 0..45 {
+                src.push_str("        {\"name\": \"a\", \"input\": 1},\n");
+            }
+            src.push_str(row);
+            src.push_str("    ]\n");
+            src
+        };
+        let flat = check_py_source(&build("")).unwrap();
+        assert!(!has_long_function(&flat));
+        let with_call = check_py_source(&build("        {\"name\": str(1)},\n")).unwrap();
+        assert!(has_long_function(&with_call));
     }
 
     #[test]
