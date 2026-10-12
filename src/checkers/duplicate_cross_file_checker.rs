@@ -5,9 +5,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_windows,
-};
+use crate::checkers::duplicate_code::{DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES};
+use crate::checkers::import_preamble::{lang_ext, non_preamble_windows};
 
 /// Diff-aware counterpart to `kibitzer check duplicates` (`duplicate_code::find_cross_file_duplicates`)
 /// — see #28 proposal item 2. That command rescans a whole directory from scratch every
@@ -180,7 +179,7 @@ impl DuplicateIndex {
     fn reindex_file_and_find_duplicates(&mut self, file: &Path, source: &str) -> Vec<Finding> {
         let file_key = file.to_string_lossy().into_owned();
         self.remove_file(&file_key);
-        let windows = file_windows(source);
+        let windows = file_windows(file, source);
         self.insert_file(&file_key, &windows);
         self.find_duplicates(&file_key, &windows)
     }
@@ -298,9 +297,9 @@ pub(crate) fn findings_with_siblings(
 /// Every `MIN_BLOCK_LINES`-line qualifying window in `source`, as `(0-indexed start
 /// line, joined normalized text)` — the exact text (not a hash) is used as the index
 /// key so two different blocks can never collide onto the same entry.
-fn file_windows(source: &str) -> Vec<(usize, String)> {
+fn file_windows(file: &Path, source: &str) -> Vec<(usize, String)> {
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
-    qualifying_windows(&normalized)
+    non_preamble_windows(&normalized, lang_ext(file))
         .map(|(start, window)| (start, window.join("\n")))
         .collect()
 }
@@ -423,6 +422,29 @@ mod tests {
         index.reindex_file_and_find_duplicates(Path::new("b.go"), &src);
         let findings = index.reindex_file_and_find_duplicates(Path::new("c.go"), &src);
         assert_eq!(findings.len(), 1);
+    }
+
+    const GO_IMPORTS: &str = "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"path/filepath\"\n\t\"database/sql\"\n\t\"text/template\"\n)\n\n";
+
+    #[test]
+    fn shared_import_block_alone_is_not_flagged_through_the_incremental_index() {
+        let mut index = DuplicateIndex::default();
+        for (i, name) in ["a.go", "b.go", "c.go"].iter().enumerate() {
+            let src = format!("{GO_IMPORTS}func unique{i}() {{}}\n");
+            let findings = index.reindex_file_and_find_duplicates(Path::new(name), &src);
+            assert!(findings.is_empty(), "{name}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn shared_body_after_imports_is_still_flagged_through_the_incremental_index() {
+        let mut index = DuplicateIndex::default();
+        let src = format!("{GO_IMPORTS}{BLOCK}");
+        index.reindex_file_and_find_duplicates(Path::new("a.go"), &src);
+        index.reindex_file_and_find_duplicates(Path::new("b.go"), &src);
+        let findings = index.reindex_file_and_find_duplicates(Path::new("c.go"), &src);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].line > 10, "{findings:?}");
     }
 
     #[test]
