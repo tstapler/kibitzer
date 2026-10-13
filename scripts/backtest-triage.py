@@ -20,6 +20,7 @@ kibitzer feature; it doesn't need a dependency for what dict + json already do.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -104,8 +105,37 @@ def build_permalink(owner: str, repo: str, sha: str, rec: dict) -> str:
     return f"https://github.com/{owner}/{repo}/blob/{sha}/{rec['file']}#{fragment}"
 
 
+# Keep in sync with `SKIP_DIRS` in src/check.rs, which `kibitzer run` applies.
+SKIP_DIRS = frozenset({
+    ".git", "node_modules", "vendor", "target", "dist", "build", ".next",
+    "__pycache__", ".venv", "venv", ".tox", ".gradle", ".mvn", "out",
+})
+
+
+def corpus_files(repo_dir: Path, glob: str) -> list[str]:
+    """Files matching `glob`, honoring .gitignore and SKIP_DIRS like `kibitzer run`.
+
+    Falls back to a plain walk when `repo_dir` isn't a git checkout.
+    """
+    listed = subprocess.run(
+        ["git", "-C", str(repo_dir), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True,
+    )
+    if listed.returncode == 0:
+        candidates = [p for p in listed.stdout.decode().split("\0") if p]
+    else:
+        candidates = [str(p.relative_to(repo_dir)) for p in repo_dir.rglob("*") if p.is_file()]
+    return sorted(
+        rel
+        for rel in candidates
+        if fnmatch.fnmatch(Path(rel).name, glob)
+        and not SKIP_DIRS.intersection(Path(rel).parts[:-1])
+        and (repo_dir / rel).is_file()
+    )
+
+
 def run_native_outputs(repo_dir: Path, checker: str, glob: str, kibitzer_bin: str) -> list[str]:
-    files = sorted(str(p.relative_to(repo_dir)) for p in repo_dir.rglob(glob) if p.is_file())
+    files = corpus_files(repo_dir, glob)
 
     def check_one(rel_path: str) -> str:
         result = subprocess.run(
