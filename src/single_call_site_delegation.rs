@@ -1,5 +1,5 @@
 //! Fowler's **Inline Function**: a function/method whose entire body is one delegating
-//! statement (a bare call, or `return <call>`) and which has exactly one resolved caller
+//! statement (a bare call, or `return <call>`) and which has exactly one resolved call site
 //! in the whole repo (issue #48). The AST-shape judgment (`is_pure_delegation`) happens
 //! upstream in `symbol_extract.rs`, not here — `ArchModel` drops source/AST after the
 //! initial scan, so a whole-repo checker can't re-derive it at check time.
@@ -37,20 +37,29 @@ impl ArchModelChecker for SingleCallSiteDelegationChecker {
     }
 }
 
-/// Number of distinct resolved callers per callee `SymbolNode::id` — a callee called
-/// twice from the same caller still has exactly one *caller*, so this counts distinct
-/// `from` values, not edge count.
-fn caller_counts(model: &ArchModel) -> HashMap<&str, usize> {
-    let mut callers_by_target: HashMap<&str, std::collections::HashSet<&str>> = HashMap::new();
-    for edge in model.call_edges.iter().filter(|e| e.resolved) {
-        callers_by_target
+/// Number of distinct resolved call sites per callee `SymbolNode::id` (distinct by caller,
+/// file and line). The finding says "inline it at that call site", so a callee called twice
+/// from one caller has two sites, not one: inlining would duplicate its body.
+fn call_site_counts(model: &ArchModel) -> HashMap<&str, usize> {
+    // A self-edge (a wrapper calling a same-named method on another receiver, which the
+    // receiver-blind resolver maps back to itself) is not a call site of the wrapper.
+    let mut sites_by_target: HashMap<
+        &str,
+        std::collections::HashSet<(&str, &std::path::Path, usize)>,
+    > = HashMap::new();
+    for edge in model
+        .call_edges
+        .iter()
+        .filter(|e| e.resolved && e.from != e.to)
+    {
+        sites_by_target
             .entry(edge.to.as_str())
             .or_default()
-            .insert(edge.from.as_str());
+            .insert((edge.from.as_str(), edge.file.as_path(), edge.line));
     }
-    callers_by_target
+    sites_by_target
         .into_iter()
-        .map(|(target, callers)| (target, callers.len()))
+        .map(|(target, sites)| (target, sites.len()))
         .collect()
 }
 
@@ -67,7 +76,7 @@ fn finding_for(symbol: &SymbolNode) -> ArchFinding {
         line: Some(symbol.line),
         message: format!(
             "[single-call-site-delegation] {kind} `{}` does nothing but delegate to \
-             another call and has exactly one caller in the repo — consider inlining it \
+             another call and has exactly one call site in the repo — consider inlining it \
              at that call site (Fowler, Inline Function)",
             symbol.name
         ),
@@ -76,7 +85,7 @@ fn finding_for(symbol: &SymbolNode) -> ArchFinding {
 }
 
 fn single_call_site_delegation_findings(model: &ArchModel) -> Vec<ArchFinding> {
-    let counts = caller_counts(model);
+    let counts = call_site_counts(model);
     let mut findings: Vec<ArchFinding> = model
         .packages
         .values()
@@ -235,6 +244,77 @@ mod tests {
         assert!(
             single_call_site_delegation_findings(&model).is_empty(),
             "Rust has no call-graph coverage — is_pure_delegation must stay false"
+        );
+    }
+
+    #[test]
+    fn does_not_count_a_self_edge_as_the_sole_caller() {
+        // `Stat` forwards to a same-named method on another receiver; the receiver-blind
+        // resolver maps that call back to `Stat` itself, which is not a caller.
+        let model = model_from(vec![(
+            "/repo/pkg/a.ts",
+            "class P {\n  stat(r: string) { return this.inner.stat(r); }\n}\n",
+        )]);
+        assert!(
+            single_call_site_delegation_findings(&model).is_empty(),
+            "a self-edge must not make `stat` its own one caller"
+        );
+    }
+
+    #[test]
+    fn a_module_level_callback_counts_as_a_second_caller() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.ts",
+            "function helper(x: number) { return x; }\n\n\
+             function thin(x: number) { return helper(x); }\n\n\
+             function named() { thin(1); }\n\n\
+             describe('suite', () => { it('works', () => { thin(2); }); });\n",
+        )]);
+        assert!(
+            single_call_site_delegation_findings(&model).is_empty(),
+            "`thin` is called from `named` and from a describe() callback"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_wrapper_around_a_closure() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.go",
+            "package pkg\n\nimport \"net/http\"\n\n\
+             func auth() http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tw.WriteHeader(401)\n\t})\n}\n\n\
+             func Live() {\n\tauth()\n}\n",
+        )]);
+        assert!(
+            single_call_site_delegation_findings(&model).is_empty(),
+            "a body whose one call wraps a closure registers logic, it doesn't forward"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_wrapper_called_only_from_several_module_level_callbacks() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.ts",
+            "function helper(x: number) { return x; }\n\n\
+             function thin(x: number) { return helper(x); }\n\n\
+             describe('a', () => { thin(1); });\n\
+             describe('b', () => { thin(2); });\n",
+        )]);
+        assert!(
+            single_call_site_delegation_findings(&model).is_empty(),
+            "`thin` is called from two separate callbacks"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_a_wrapper_called_twice_from_the_same_function() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.go",
+            "package pkg\n\nfunc thin() {\n\thelper()\n}\n\nfunc helper() {}\n\n\
+             func Live() {\n\tthin()\n\tthin()\n}\n",
+        )]);
+        assert!(
+            single_call_site_delegation_findings(&model).is_empty(),
+            "two call sites in one caller are still two call sites"
         );
     }
 }
