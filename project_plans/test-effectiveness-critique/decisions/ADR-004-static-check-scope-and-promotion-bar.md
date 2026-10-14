@@ -24,3 +24,7 @@ The `test-no-assertion` hook finding cannot be satisfied by deleting a pre-exist
 - Decision 4 mechanism: registration is `inventory::submit!` in each checker module (`src/checker.rs:248`); `test_quality_checks()` returns `Check` entries that nothing chains (precedent `prose_checks()`, `src/config.rs:784`). `src/checkers/mod.rs` gets only `pub mod` lines.
 - The "assertion_helpers" option is resolved once from `.kibitzer/inspect.json` so the three checkers and the report share one vocabulary.
 - The H4 precision floor that gates promotion is fixed at G0 before triage, not derived afterwards.
+
+## Amendment (round-5 engineering repair, 2026-10-13)
+- The per-file hook cap on test-quality findings spans three rules and several language instances, so it is a post-pass over a file's `CheckResult`s in `run_checks_for_trigger_unbudgeted` (`src/check.rs`), not a per-checker setting; its value remains a G1 parameter.
+- Rule ids stay bare (`test-no-assertion`) for findings and `kibitzer:ignore`; the registered checker names are per-language (`test-no-assertion-go`, ...), so G1 verdicts, which are already per language, map one to one onto checker instances.
