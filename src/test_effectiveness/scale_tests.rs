@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::analysis::{greedy_reduction, joint_safe_subset, unique_coverage};
+use super::locate::{Location, RawTestId, TestLocator};
 use super::matrix::test_support::Rng;
 use super::matrix::{
     CoverageAttribution, CoverageDimension, CoverageUnit, Dimension, Posting, Provenance, TestId,
@@ -38,7 +39,7 @@ const SEED: u64 = 0x5eed_cafe_f00d_1234;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn target_entries() -> u64 {
-    std::env::var("KIBITZER_SCALE_ENTRIES")
+    std::env::var(ENTRIES_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(TARGET_ENTRIES)
@@ -187,7 +188,7 @@ fn total_entries<U, M>(d: &Dimension<U, M>) -> u64 {
 }
 
 /// Generates the matrix, runs the three analyses and returns the entry count, measured per analysis.
-fn run_matrix_scale(shape: Shape) -> (u64, u64, Duration) {
+fn run_matrix_scale(shape: Shape) -> Outcome {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (dim, _, _) = measure("matrix generate", || synth_coverage(shape));
     let entries = total_entries(&dim);
@@ -218,16 +219,98 @@ fn run_matrix_scale(shape: Shape) -> (u64, u64, Duration) {
     assert_eq!(unique.len(), shape.tests, "every test has an entry");
     assert!(!picks.is_empty());
     assert_eq!(safe.safe.len() + safe.rejected.len(), shape.tests);
-    (entries, rss, wall)
+    Outcome {
+        entries,
+        input_bytes: 0,
+        rss_kb: rss,
+        wall,
+    }
 }
 
 #[test]
 #[ignore = "scale: run with `cargo test --release scale -- --ignored`"]
 fn scale_should_FinishWithinBounds_When_100kTests1MUnits50MEntries() {
-    let (entries, rss, wall) = run_matrix_scale(Shape::target());
-    assert!(rss <= RSS_BOUND_KB, "peak RSS {rss} kB over bound");
-    assert!(wall <= WALL_BOUND, "wall clock {wall:?} over bound");
-    println!("SCALE matrix verdict: entries={entries} within bound");
+    let out = fresh_process(MATRIX_JOB, target_entries());
+    println!(
+        "SCALE matrix verdict: entries={} rss={} kB wall={:.1} s",
+        out.entries,
+        out.rss_kb,
+        out.wall.as_secs_f64()
+    );
+    assert!(out.rss_kb <= RSS_BOUND_KB, "peak RSS over bound");
+    assert!(out.wall <= WALL_BOUND, "wall clock over bound");
+}
+
+const JOB_ENV: &str = "KIBITZER_SCALE_JOB";
+const ENTRIES_ENV: &str = "KIBITZER_SCALE_ENTRIES";
+const RESULT_PREFIX: &str = "SCALE_RESULT ";
+const MATRIX_JOB: &str = "matrix";
+const LOCATOR_JOB: &str = "locator";
+const CHILD_TEST: &str = "scale_child_process";
+
+/// Runs one measured job in a fresh copy of this test binary, so its peak RSS is not inflated by memory an
+/// earlier job left behind in the allocator. The child's `SCALE` lines are echoed.
+fn fresh_process(job: &str, entries: u64) -> Outcome {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([CHILD_TEST, "--ignored", "--nocapture", "--test-threads=1"])
+        .env(JOB_ENV, job)
+        .env(ENTRIES_ENV, entries.to_string())
+        .output()
+        .expect("spawn child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|l| l.starts_with("SCALE ") && !l.starts_with(RESULT_PREFIX))
+        .for_each(|l| println!("{l}"));
+    assert!(
+        output.status.success(),
+        "child `{job}` failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix(RESULT_PREFIX))
+        .expect("child printed a result line");
+    let field = |key: &str| -> u64 {
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no `{key}` in `{line}`"))
+    };
+    Outcome {
+        entries: field("entries"),
+        input_bytes: field("input_bytes"),
+        rss_kb: field("rss_kb"),
+        wall: Duration::from_millis(field("wall_ms")),
+    }
+}
+
+/// Child half of `fresh_process`: does nothing unless the parent set the job environment.
+#[test]
+#[ignore = "child of the scale tests; needs KIBITZER_SCALE_JOB"]
+fn scale_child_process() {
+    let Ok(job) = std::env::var(JOB_ENV) else {
+        return;
+    };
+    let entries = target_entries();
+    let out = match job.as_str() {
+        MATRIX_JOB => run_matrix_scale(Shape::for_entries(entries)),
+        LOCATOR_JOB => run_locator_scale(entries as usize),
+        name => run_parse_scale(
+            ALL_FORMATS
+                .into_iter()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("unknown job {name}")),
+            entries,
+        ),
+    };
+    println!(
+        "{RESULT_PREFIX}entries={} input_bytes={} rss_kb={} wall_ms={}",
+        out.entries,
+        out.input_bytes,
+        out.rss_kb,
+        out.wall.as_millis()
+    );
 }
 
 #[test]
@@ -237,8 +320,12 @@ fn scale_should_RunAllThreeAnalyses_When_SmallMatrix() {
         units: 2_000,
         entries: 20_000,
     };
-    let (entries, _, _) = run_matrix_scale(shape);
-    assert!((19_000..=21_000).contains(&entries), "entries={entries}");
+    let out = run_matrix_scale(shape);
+    assert!(
+        (19_000..=21_000).contains(&out.entries),
+        "entries={}",
+        out.entries
+    );
 }
 
 // ---- Task 2.1.5b: parse memory for the four experiment-critical formats ----
@@ -432,7 +519,7 @@ fn write_gocover(dir: &Path, shape: Shape) {
 }
 
 /// What one adapter run measured.
-struct ParseOutcome {
+struct Outcome {
     entries: u64,
     input_bytes: u64,
     rss_kb: u64,
@@ -449,7 +536,7 @@ fn dir_bytes(dir: &Path) -> u64 {
 }
 
 /// Generates the input for `format` at `entries`, parses it through the real adapter and measures it.
-fn run_parse_scale(format: Format, entries: u64) -> ParseOutcome {
+fn run_parse_scale(format: Format, entries: u64) -> Outcome {
     use super::adapters::{coveragepy, gocover, mutation_elements, pit_xml};
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let shape = Shape::for_entries(entries);
@@ -474,7 +561,7 @@ fn run_parse_scale(format: Format, entries: u64) -> ParseOutcome {
     );
     let label = format!("parse {}", format.name());
     let (parsed, rss_kb, wall) = measure(&label, || parse_entries(format, tree.path(), &file));
-    ParseOutcome {
+    Outcome {
         entries: parsed,
         input_bytes,
         rss_kb,
@@ -510,7 +597,7 @@ fn parse_entries(format: Format, dir: &Path, file: &Path) -> u64 {
 }
 
 /// Prints the per-adapter verdict line and returns the names of the bounds it broke.
-fn verdict(format: Format, expected: u64, out: &ParseOutcome) -> Vec<String> {
+fn verdict(format: Format, expected: u64, out: &Outcome) -> Vec<String> {
     let mut broken = Vec::new();
     if out.rss_kb > RSS_BOUND_KB {
         broken.push(format!("{} peak RSS {} kB", format.name(), out.rss_kb));
@@ -546,7 +633,7 @@ fn parse_scale_should_StayWithinMemoryBound_When_EachAdapterFormatAtTargetSize()
     let entries = target_entries();
     let mut broken = Vec::new();
     for format in selected_formats() {
-        let out = run_parse_scale(format, entries);
+        let out = fresh_process(format.name(), entries);
         assert_entries_close(format, entries, out.entries);
         broken.extend(verdict(format, entries, &out));
     }
@@ -558,7 +645,7 @@ fn parse_scale_should_StayWithinMemoryBound_When_EachAdapterFormatAtTargetSize()
 fn gocover_parse_scale_should_BoundPeakRssByMatrixNotDirectoryTotal_When_DirectoryOfProfilesAtTargetSize()
  {
     let entries = target_entries();
-    let out = run_parse_scale(Format::GoCover, entries);
+    let out = fresh_process(Format::GoCover.name(), entries);
     assert_entries_close(Format::GoCover, entries, out.entries);
     assert!(verdict(Format::GoCover, entries, &out).is_empty());
     assert!(
@@ -567,6 +654,105 @@ fn gocover_parse_scale_should_BoundPeakRssByMatrixNotDirectoryTotal_When_Directo
         out.rss_kb,
         out.input_bytes
     );
+}
+
+// ---- Task 2.1.5c: TestLocator over a generated tree ----
+
+const FUNCTIONS_PER_FILE: usize = 10;
+const FILES_PER_DIR: usize = 100;
+const LOCATOR_IDS: u64 = 100_000;
+/// Every fourth id is a Stryker id (explicit file list); the rest are coverage.py dotted contexts.
+const STRYKER_EVERY: usize = 4;
+const LINES_PER_FUNCTION: usize = 3;
+
+fn locator_file(f: usize) -> String {
+    format!("tests/pkg{:03}/test_mod{f:05}.py", f / FILES_PER_DIR)
+}
+
+fn locator_function(f: usize, k: usize) -> String {
+    format!("test_f{f:05}_{k}")
+}
+
+/// Writes `files` Python test files of `FUNCTIONS_PER_FILE` functions each (three lines apiece).
+fn write_locator_tree(root: &Path, files: usize) {
+    for f in 0..files {
+        let path = root.join(locator_file(f));
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let body: String = (0..FUNCTIONS_PER_FILE)
+            .map(|k| format!("def {}():\n    assert True\n\n", locator_function(f, k)))
+            .collect();
+        std::fs::write(path, body).expect("write test file");
+    }
+}
+
+fn locator_id(i: usize, files: usize) -> (RawTestId, Location) {
+    let (f, k) = ((i / FUNCTIONS_PER_FILE) % files, i % FUNCTIONS_PER_FILE);
+    let name = locator_function(f, k);
+    let file = locator_file(f);
+    let want = Location::Located {
+        file: file.clone(),
+        line: 1 + k * LINES_PER_FUNCTION,
+    };
+    let id = if i % STRYKER_EVERY == 0 {
+        RawTestId::Stryker {
+            name,
+            test_files: vec![file],
+        }
+    } else {
+        let module = file.trim_end_matches(".py").replace('/', ".");
+        RawTestId::CoveragePy(format!("{module}.{name}"))
+    };
+    (id, want)
+}
+
+/// Resolves `ids` test ids over a tree of `ids / FUNCTIONS_PER_FILE` files and checks each file is read once.
+fn run_locator_scale(ids: usize) -> Outcome {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let files = ids.div_ceil(FUNCTIONS_PER_FILE);
+    let tree = TempTree::new("scale-locator");
+    let started = Instant::now();
+    write_locator_tree(tree.path(), files);
+    println!(
+        "SCALE locator generated: files={files} functions={} in {:.1} s",
+        files * FUNCTIONS_PER_FILE,
+        started.elapsed().as_secs_f64()
+    );
+    let ((located, reads, parses), rss_kb, wall) = measure("locator resolve", || {
+        let mut locator = TestLocator::new(tree.path()).expect("locator");
+        let mut located = 0usize;
+        for i in 0..ids {
+            let (id, want) = locator_id(i, files);
+            let got = locator.locate(&id);
+            assert_eq!(got, want, "id #{i}");
+            located += 1;
+        }
+        (located, locator.read_count(), locator.parse_count())
+    });
+    println!("SCALE locator result: ids={located} files={files} reads={reads} parses={parses}");
+    assert_eq!(located, ids);
+    assert!(reads <= files, "{reads} reads for {files} files");
+    assert!(parses <= files, "{parses} parses for {files} files");
+    Outcome {
+        entries: located as u64,
+        input_bytes: 0,
+        rss_kb,
+        wall,
+    }
+}
+
+#[test]
+#[ignore = "scale: run with `cargo test --release locator_scale -- --ignored`"]
+fn locator_scale_should_ResolveWithinBoundAndReadEachFileOnce_When_100kTestIds() {
+    let out = fresh_process(LOCATOR_JOB, LOCATOR_IDS);
+    assert_eq!(out.entries, LOCATOR_IDS);
+    assert!(out.rss_kb <= RSS_BOUND_KB, "peak RSS over bound");
+    assert!(out.wall <= WALL_BOUND, "wall clock over bound");
+}
+
+#[test]
+fn locator_scale_should_ResolveEveryIdAndReadEachFileOnce_When_SmallTree() {
+    let out = run_locator_scale(500);
+    assert_eq!(out.entries, 500);
 }
 
 const SMALL_ENTRIES: u64 = 20_000;
