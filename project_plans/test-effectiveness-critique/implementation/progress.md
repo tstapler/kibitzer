@@ -17,9 +17,8 @@ Branch: `sdd/test-effectiveness-critique-impl` (from planning tip `3a8c7e6`). No
 | 2.1.5a-d scale tests, ceiling `DEFAULT_MAX_INPUT_BYTES = 649_949_574` | measured, see commit f333fff; Stryker limiting format |
 | 1.1.1a, 1.1.2a, 1.1.2c, 1.1.5a-b `test-no-assertion` Go+Python, registry-only | 25 + 9 tests; not chained into `default_checks()` |
 
-## In progress
 
-2.2.9b, 2.3.1a, 2.3.1e, 2.3.1k, 2.3.1h (hidden `kibitzer tests report` core).
+| 2.2.9b, 2.3.1a, 2.3.1e, 2.3.1k, 2.3.1h hidden `kibitzer tests report` core + `--emit-experiment-input` | `cargo test --no-fail-fast -- --test-threads=1`: all binaries ok (1805 unit, 29 tests_report_cli, 14 daemon_spawn); clippy clean; command absent from `--help` |
 
 ## Blocked on owner decision
 
@@ -34,7 +33,7 @@ Branch: `sdd/test-effectiveness-critique-impl` (from planning tip `3a8c7e6`). No
 
 ## Not started, unblocked (remainder wave)
 
-2.3.1b/c/d/f/i/j renderer and messages, 2.3.2 ignore + RULES.
+2.3.1b/c/d/f/i/j renderer and messages, 2.3.2 ignore + RULES. Known gaps handed over from 2.3.1: summary.joint_check always [] until 2.3.1i; warning ids not yet mapped to registry ids (2.3.1f); --format brief is a stub (2.3.4).
 
 ## Failed
 
