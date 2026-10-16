@@ -11,21 +11,33 @@
 //!   warning.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::Deserialize;
 
-use super::guard::{self, JsonError};
+use super::guard::{self, GuardError, JsonError};
 use super::sidecar::SidecarRead;
 use crate::test_effectiveness::matrix::{
     AttributionChoice, CoverageAttribution, CoverageBuilder, CoverageDimension, CoverageUnit,
-    CoverageUnitKind, MissingProvenance, Provenance, TestId, Warning, WarningClass,
+    CoverageUnitKind, MissingProvenance, Provenance, TestId, Tier, Warning, WarningClass,
 };
 
 pub const TOOL_NAME: &str = "coverage.py";
 pub const WARN_FIXTURE_IMPORT_ATTRIBUTION: &str = "fixture-import-attribution";
+pub const WARN_UNVERIFIED_TOOL_VERSION: &str = "unverified-tool-version";
+pub const WARN_IMPLAUSIBLE_COVERAGE_SHAPE: &str = "implausible-coverage-shape";
+
+/// coverage.py `major.minor` releases this adapter was fixtured against (`testdata/test-effectiveness/coveragepy`).
+const VERIFIED_VERSIONS: &[(u32, u32)] = &[(7, 13)];
+
+/// Recorded with the fixtures: the real 3-test run sits at 2/3 on both measures, so a share above this is suspect.
+const PLAUSIBLE_MAX_FRACTION: f64 = 0.9;
+/// Below this many tests the shares are too coarse to judge.
+const PLAUSIBILITY_MIN_TESTS: usize = 3;
 
 #[derive(Debug)]
 pub enum CoveragePyError {
+    Guard(GuardError),
     Json(JsonError),
     /// `meta.version` absent or empty; names coverage.py so the report can say which input to fix.
     MissingProvenance(MissingProvenance),
@@ -36,6 +48,7 @@ pub enum CoveragePyError {
 impl std::fmt::Display for CoveragePyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Guard(e) => e.fmt(f),
             Self::Json(e) => write!(f, "{TOOL_NAME} report: {e}"),
             Self::MissingProvenance(e) => write!(f, "{TOOL_NAME} report: {e}"),
             Self::MissingContexts => write!(
@@ -159,7 +172,37 @@ pub fn parse_coveragepy(
             vec![("setup_lines".to_owned(), setup_lines.to_string())],
         ));
     }
+    apply_quality_checks(&mut dimension, version, sidecar);
     Ok(dimension)
+}
+
+fn lower_cap(dimension: &mut CoverageDimension, cap: Tier) {
+    dimension.cap = Some(dimension.cap.map_or(cap, |c| c.min(cap)));
+}
+
+/// Version allow-list (pre-mortem #5), plausibility, and the optional sidecar's own warnings and cap.
+fn apply_quality_checks(
+    dimension: &mut CoverageDimension,
+    version: &str,
+    sidecar: Option<&SidecarRead>,
+) {
+    if !is_verified_version(version) {
+        dimension.warnings.push(warning(
+            WARN_UNVERIFIED_TOOL_VERSION,
+            vec![
+                ("tool".to_owned(), TOOL_NAME.to_owned()),
+                ("version".to_owned(), version.to_owned()),
+            ],
+        ));
+        lower_cap(dimension, Tier::Low);
+    }
+    dimension.warnings.extend(plausibility_warnings(dimension));
+    if let Some(read) = sidecar {
+        dimension.warnings.extend(read.warnings.iter().cloned());
+        if let Some(cap) = read.cap {
+            lower_cap(dimension, cap);
+        }
+    }
 }
 
 /// Records every line's credited tests; returns how many lines were module-level or setup-only.
@@ -181,6 +224,65 @@ fn record_lines(
         }
     }
     setup_lines
+}
+
+/// Reads a report through the size guard (Task 2.2.7a) before parsing.
+pub fn read_coveragepy(
+    path: &Path,
+    max_input_bytes: u64,
+    flag: Option<CoverageAttribution>,
+    sidecar: Option<&SidecarRead>,
+) -> Result<CoverageDimension, CoveragePyError> {
+    let bytes = guard::read_bounded(path, max_input_bytes).map_err(CoveragePyError::Guard)?;
+    parse_coveragepy(&bytes, flag, sidecar)
+}
+
+fn is_verified_version(version: &str) -> bool {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>());
+    matches!((parts.next(), parts.next()),
+        (Some(Ok(major)), Some(Ok(minor))) if VERIFIED_VERSIONS.contains(&(major, minor)))
+}
+
+/// Warns when too many tests share identical coverage or have none of their own (a sign of a drifted format).
+fn plausibility_warnings(d: &CoverageDimension) -> Vec<Warning> {
+    let n = d.tests.len();
+    if n < PLAUSIBILITY_MIN_TESTS {
+        return Vec::new();
+    }
+    let mut per_test: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (unit_idx, posting) in d.index.values().enumerate() {
+        for &t in &posting.tests {
+            per_test[t as usize].push(unit_idx);
+        }
+    }
+    let mut shapes: BTreeMap<&Vec<usize>, usize> = BTreeMap::new();
+    for lines in &per_test {
+        *shapes.entry(lines).or_default() += 1;
+    }
+    let identical: usize = shapes.values().filter(|&&c| c > 1).sum();
+    let mut has_unique = vec![false; n];
+    for (_, owner) in d.singleton_units() {
+        has_unique[owner as usize] = true;
+    }
+    let zero_unique = has_unique.iter().filter(|&&u| !u).count();
+    [
+        ("identical-coverage", identical),
+        ("zero-unique-coverage", zero_unique),
+    ]
+    .into_iter()
+    .filter_map(|(metric, count)| {
+        let fraction = count as f64 / n as f64;
+        (fraction > PLAUSIBLE_MAX_FRACTION).then(|| {
+            warning(
+                WARN_IMPLAUSIBLE_COVERAGE_SHAPE,
+                vec![
+                    ("metric".to_owned(), metric.to_owned()),
+                    ("fraction".to_owned(), format!("{fraction:.2}")),
+                ],
+            )
+        })
+    })
+    .collect()
 }
 
 fn collect_tests(report: &Report) -> BTreeSet<TestId> {
@@ -357,5 +459,103 @@ mod tests {
         assert_eq!(d.meta, CoverageAttribution::Isolated);
         assert!(!d.warnings.iter().any(|w| w.id == "attribution-in-order"));
         assert_eq!(d.provenance.commit.as_deref(), Some("298cc15"));
+    }
+
+    fn sidecar_with_commit() -> SidecarRead {
+        super::super::sidecar::parse_sidecar(br#"{"schema_version":1,"tool":"coverage.py","tool_version":"7.13.4","commit":"abc","attribution":"in-order"}"#)
+            .unwrap()
+    }
+
+    #[test]
+    fn parse_should_ReturnMissingProvenanceNamingCoveragePy_When_MetaLacksVersion() {
+        let err =
+            parse_coveragepy(&report(None, &[(2, &["m.test_a|run"])]), None, None).unwrap_err();
+        assert!(matches!(err, CoveragePyError::MissingProvenance(_)));
+        assert!(err.to_string().contains("coverage.py"), "{err}");
+    }
+
+    #[test]
+    fn parse_should_ReturnMissingProvenance_When_VersionBlank() {
+        let bytes = report(Some("  "), &[(2, &["m.test_a|run"])]);
+        let err = parse_coveragepy(&bytes, None, None).unwrap_err();
+        assert!(matches!(err, CoveragePyError::MissingProvenance(_)));
+    }
+
+    #[test]
+    fn parse_should_ReturnMissingContexts_When_NoFileHasContexts() {
+        let bytes = br#"{"meta":{"version":"7.13.4"},"files":{"m.py":{"executed_lines":[1]}}}"#;
+        let err = parse_coveragepy(bytes, None, None).unwrap_err();
+        assert!(matches!(err, CoveragePyError::MissingContexts));
+    }
+
+    #[test]
+    fn parse_should_ReturnJsonError_When_InputNotJson() {
+        let err = parse_coveragepy(b"not json", None, None).unwrap_err();
+        assert!(matches!(err, CoveragePyError::Json(_)));
+    }
+
+    #[test]
+    fn parse_should_WarnAndCapLow_When_VersionNotInAllowList() {
+        let sc = sidecar_with_commit();
+        let bytes = report(
+            Some("9.0.0"),
+            &[(2, &["m.test_a|run"]), (3, &["m.test_b|run"])],
+        );
+        let d = parse_coveragepy(&bytes, None, Some(&sc)).unwrap();
+        let w = d
+            .warnings
+            .iter()
+            .find(|w| w.id == WARN_UNVERIFIED_TOOL_VERSION)
+            .expect("warning");
+        assert_eq!(w.class, WarningClass::W);
+        assert!(
+            w.params
+                .contains(&("version".to_owned(), "9.0.0".to_owned()))
+        );
+        assert_eq!(d.cap, Some(Tier::Low));
+    }
+
+    #[test]
+    fn parse_should_CapMediumWithoutVersionWarning_When_VersionVerifiedAndCommitKnown() {
+        let sc = sidecar_with_commit();
+        let d = parse_coveragepy(THREE_TEST, None, Some(&sc)).unwrap();
+        assert!(
+            !d.warnings
+                .iter()
+                .any(|w| w.id == WARN_UNVERIFIED_TOOL_VERSION)
+        );
+        assert!(
+            !d.warnings
+                .iter()
+                .any(|w| w.id == WARN_IMPLAUSIBLE_COVERAGE_SHAPE)
+        );
+        assert_eq!(d.cap, Some(Tier::Medium));
+    }
+
+    #[test]
+    fn parse_should_WarnImplausibleShape_When_AllTestsHaveIdenticalCoverage() {
+        let lines: Vec<(u32, &[&str])> = (1..=4)
+            .map(|l| (l, &["m.test_a|run", "m.test_b|run", "m.test_c|run"][..]))
+            .collect();
+        let d = parse_coveragepy(&report(Some("7.13.4"), &lines), None, None).unwrap();
+        let metrics: Vec<_> = d
+            .warnings
+            .iter()
+            .filter(|w| w.id == WARN_IMPLAUSIBLE_COVERAGE_SHAPE)
+            .map(|w| w.params[0].1.clone())
+            .collect();
+        assert_eq!(metrics, vec!["identical-coverage", "zero-unique-coverage"]);
+    }
+
+    #[test]
+    fn read_should_ReturnGuardError_When_FileOverCap() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/test-effectiveness/coveragepy/three-test/coverage.json");
+        let err = read_coveragepy(&path, 10, None, None).unwrap_err();
+        assert!(matches!(
+            err,
+            CoveragePyError::Guard(GuardError::TooLarge(_))
+        ));
+        assert!(read_coveragepy(&path, 1 << 20, None, None).is_ok());
     }
 }
