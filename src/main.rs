@@ -344,6 +344,44 @@ enum DaemonAction {
     Status,
 }
 
+/// Native checker names an effective config (defaults overlaid by the repo's inspect.json)
+/// runs; a config that fails to load falls back to the built-in defaults so `check list` still works.
+fn enabled_checker_names() -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let checks = config::find_effective_config(&cwd)
+        .map(|(c, _)| c.checks)
+        .unwrap_or_else(|_| config::default_checks());
+    checks.into_iter().filter_map(|c| c.checker).collect()
+}
+
+/// One summary line per test-quality rule: the languages its instances support and whether any is on.
+fn print_test_quality_rule_summary(enabled: &[String]) {
+    const RULES: &[&str] = &["test-no-assertion", "test-tautology", "test-mock-only"];
+    let registry = checker::registry();
+    for rule in RULES {
+        let instances: Vec<_> = registry
+            .iter()
+            .filter(|c| c.name().starts_with(rule))
+            .collect();
+        if instances.is_empty() {
+            continue;
+        }
+        let languages: Vec<String> = instances
+            .iter()
+            .filter_map(|c| c.language())
+            .map(|l| format!("{l:?}"))
+            .collect();
+        let on = instances
+            .iter()
+            .any(|c| enabled.iter().any(|n| n == c.name()));
+        println!(
+            "{rule} (rule): languages: {} (state: {})",
+            languages.join(", "),
+            if on { "on" } else { "off" }
+        );
+    }
+}
+
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
@@ -428,18 +466,25 @@ fn main() -> Result<ExitCode> {
         },
         Command::Check { check } => match check {
             CheckCommand::List => {
+                let enabled = enabled_checker_names();
                 for checker in checker::registry() {
                     let language = checker
                         .language()
                         .map(|l| format!("{l:?}"))
                         .unwrap_or_else(|| "any".to_string());
+                    let state = if enabled.iter().any(|n| n == checker.name()) {
+                        "on"
+                    } else {
+                        "off"
+                    };
                     println!(
-                        "{}: {} (language: {language}, globs: {})",
+                        "{}: {} (language: {language}, globs: {}, state: {state})",
                         checker.name(),
                         checker.description(),
                         checker.file_globs().join(", ")
                     );
                 }
+                print_test_quality_rule_summary(&enabled);
                 Ok(ExitCode::SUCCESS)
             }
             CheckCommand::Native { name, file } => {
