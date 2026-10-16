@@ -293,7 +293,10 @@ pub struct DimensionBuilder<U, M> {
     unit_kind: Option<CoverageUnitKind>,
     interned: HashMap<TestId, u32>,
     names: Vec<TestId>,
-    entries: Vec<(u32, U, u32)>,
+    /// Units seen so far, numbered in first-seen order; entries carry the number, not an owned unit.
+    unit_ids: BTreeMap<U, u32>,
+    /// `(unit number, test number, hits)`: 12 bytes per entry however long the unit name is.
+    entries: Vec<(u32, u32, u32)>,
 }
 
 impl<U: Ord, M: DimensionMeta> DimensionBuilder<U, M> {
@@ -304,6 +307,7 @@ impl<U: Ord, M: DimensionMeta> DimensionBuilder<U, M> {
             unit_kind: None,
             interned: HashMap::new(),
             names: Vec::new(),
+            unit_ids: BTreeMap::new(),
             entries: Vec::new(),
         }
     }
@@ -329,8 +333,44 @@ impl<U: Ord, M: DimensionMeta> DimensionBuilder<U, M> {
     }
 
     pub fn record(&mut self, test: &TestId, unit: U, hits: u32) {
-        let id = self.intern(test);
-        self.entries.push((id, unit, hits));
+        self.record_all(std::iter::once(test), unit, hits);
+    }
+
+    /// Records `unit` once for each of `tests`, looking the unit up a single time.
+    pub fn record_all<'a>(
+        &mut self,
+        tests: impl IntoIterator<Item = &'a TestId>,
+        unit: U,
+        hits: u32,
+    ) {
+        let mut unit = Some(unit);
+        let mut number = None;
+        for test in tests {
+            let test = self.intern(test);
+            let n = *number
+                .get_or_insert_with(|| self.unit_number(unit.take().expect("unit taken once")));
+            self.entries.push((n, test, hits));
+        }
+    }
+
+    /// Number of `unit`, assigned on first sight; only called once a test is recorded against it.
+    fn unit_number(&mut self, unit: U) -> u32 {
+        if let Some(&number) = self.unit_ids.get(&unit) {
+            return number;
+        }
+        let number = self.unit_ids.len() as u32;
+        self.unit_ids.insert(unit, number);
+        number
+    }
+
+    /// Provenance fields only known once the input has been read (a version that follows the data).
+    pub fn provenance_mut(&mut self) -> &mut Provenance {
+        &mut self.provenance
+    }
+
+    /// Replaces the dimension metadata when it is only known after the input has been read.
+    pub fn set_meta(&mut self, meta: M) {
+        self.meta = meta;
     }
 
     pub fn build(self) -> Result<Dimension<U, M>, MissingProvenance> {
@@ -356,30 +396,7 @@ impl<U: Ord, M: DimensionMeta> DimensionBuilder<U, M> {
             .map(|&t| self.names[t as usize].clone())
             .collect();
 
-        let mut grouped: BTreeMap<U, Vec<(u32, u32)>> = BTreeMap::new();
-        for (temp, unit, hits) in self.entries {
-            grouped
-                .entry(unit)
-                .or_default()
-                .push((ordinal_of[temp as usize], hits));
-        }
-        let index = grouped
-            .into_iter()
-            .map(|(unit, mut pairs)| {
-                pairs.sort_unstable_by_key(|&(t, _)| t);
-                let mut posting = Posting::default();
-                for (t, h) in pairs {
-                    if posting.tests.last() == Some(&t) {
-                        let last = posting.hits.last_mut().expect("parallel lists");
-                        *last = last.saturating_add(h);
-                    } else {
-                        posting.tests.push(t);
-                        posting.hits.push(h);
-                    }
-                }
-                (unit, posting)
-            })
-            .collect();
+        let index = group_postings(self.unit_ids, self.entries, &ordinal_of, RELEASE_EVERY);
 
         let (mut warnings, mut cap) = self.meta.derive(&self.provenance);
         if self.provenance.commit.is_none() {
@@ -397,6 +414,69 @@ impl<U: Ord, M: DimensionMeta> DimensionBuilder<U, M> {
         })
     }
 }
+
+/// Turns `(unit number, temp test number, hits)` entries into the sorted unit index: renumbers units into key
+/// order and tests into ordinal order, sorts in place, then reads each unit's run off as one posting.
+fn group_postings<U: Ord>(
+    unit_ids: BTreeMap<U, u32>,
+    mut entries: Vec<(u32, u32, u32)>,
+    ordinal_of: &[u32],
+    release_every: usize,
+) -> BTreeMap<U, Posting> {
+    let mut units: Vec<U> = Vec::with_capacity(unit_ids.len());
+    let mut rank = vec![0u32; unit_ids.len()];
+    for (position, (unit, number)) in unit_ids.into_iter().enumerate() {
+        rank[number as usize] = position as u32;
+        units.push(unit);
+    }
+    for entry in &mut entries {
+        *entry = (
+            rank[entry.0 as usize],
+            ordinal_of[entry.1 as usize],
+            entry.2,
+        );
+    }
+    entries.sort_unstable_by_key(|&(unit, test, _)| (unit, test));
+    // Consume runs from the back and hand the tail pages back as we go, so the 12-byte entries and the 8-byte
+    // postings are never both fully resident.
+    let mut postings: Vec<Posting> = Vec::with_capacity(units.len());
+    let mut end = entries.len();
+    let mut consumed = 0;
+    while end > 0 {
+        let unit = entries[end - 1].0;
+        let start = entries[..end]
+            .iter()
+            .rposition(|e| e.0 != unit)
+            .map_or(0, |p| p + 1);
+        let run = end - start;
+        let mut posting = Posting {
+            tests: Vec::with_capacity(run),
+            hits: Vec::with_capacity(run),
+        };
+        for &(_, test, hits) in &entries[start..end] {
+            if posting.tests.last() == Some(&test) {
+                let last = posting.hits.last_mut().expect("parallel lists");
+                *last = last.saturating_add(hits);
+            } else {
+                posting.tests.push(test);
+                posting.hits.push(hits);
+            }
+        }
+        postings.push(posting);
+        end = start;
+        consumed += run;
+        if consumed >= release_every {
+            entries.truncate(end);
+            entries.shrink_to_fit();
+            consumed = 0;
+        }
+    }
+    postings.reverse();
+    units.into_iter().zip(postings).collect()
+}
+
+/// Entries consumed between releases of the entry buffer's tail in `group_postings`.
+const RELEASE_EVERY: usize = 1 << 20;
 
 impl CoverageBuilder {
     pub fn coverage(mut provenance: Provenance, choice: AttributionChoice) -> Self {
@@ -654,6 +734,41 @@ mod tests {
         let p = b.build().unwrap().index.into_values().next().unwrap();
         assert_eq!(p.tests, vec![0, 1]);
         assert_eq!(p.hits, vec![1, 7]);
+    }
+
+    #[test]
+    fn group_postings_should_MatchUnreleasedResult_When_EntryBufferReleasedEveryEntry() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let ordinal_of: Vec<u32> = (0..6).rev().collect();
+        let unit_ids: BTreeMap<u32, u32> = (0..9).map(|u| (u, 8 - u)).collect();
+        let entries: Vec<(u32, u32, u32)> = (0..200)
+            .map(|_| (rng.below(9) as u32, rng.below(6) as u32, 1))
+            .collect();
+        let eager = group_postings(unit_ids.clone(), entries.clone(), &ordinal_of, 1);
+        let lazy = group_postings(unit_ids, entries, &ordinal_of, usize::MAX);
+        assert_eq!(eager, lazy);
+        assert!(!eager.is_empty());
+    }
+
+    #[test]
+    fn record_all_should_RegisterNoUnit_When_NoTestsGiven() {
+        let mut b = cov_builder(prov(), isolated());
+        b.record_all(std::iter::empty(), CoverageUnit::new("p.go", 1), 1);
+        b.record_all([&tid("TestA")], CoverageUnit::new("p.go", 2), 3);
+        let d = b.build().unwrap();
+        assert_eq!(d.index.len(), 1);
+        assert_eq!(d.index.keys().next(), Some(&CoverageUnit::new("p.go", 2)));
+    }
+
+    #[test]
+    fn builder_should_UseLateProvenanceAndMeta_When_SetBeforeBuild() {
+        let mut b = KillBuilder::kills(Provenance::new("tool", None), KillCompleteness::Full);
+        b.provenance_mut().version = Some("2".to_owned());
+        b.set_meta(KillCompleteness::Sampled);
+        b.record(&tid("TestA"), MutantId("m".to_owned()), 1);
+        let d = b.build().expect("version supplied late");
+        assert_eq!(d.provenance.version.as_deref(), Some("2"));
+        assert_eq!(d.meta, KillCompleteness::Sampled);
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::io::BufRead;
 use std::path::Path;
 
 use quick_xml::events::{BytesStart, Event};
@@ -96,9 +97,9 @@ impl fmt::Display for PitError {
 
 impl std::error::Error for PitError {}
 
-/// Reads a `mutations.xml` through the size guard, then parses it.
+/// Reads a `mutations.xml` through the size guard, then streams it: the file is never held in memory.
 pub fn parse_file(path: &Path, opts: &PitOptions) -> Result<PitReport, PitError> {
-    let bytes = guard::read_bounded(path, opts.max_input_bytes).map_err(PitError::Guard)?;
+    let file = guard::open_bounded(path, opts.max_input_bytes).map_err(PitError::Guard)?;
     let mut opts = opts.clone();
     if opts.sidecar.is_none() {
         let sidecar_path = sidecar::sidecar_path_for(path);
@@ -109,15 +110,26 @@ pub fn parse_file(path: &Path, opts: &PitOptions) -> Result<PitReport, PitError>
             );
         }
     }
-    parse_bytes(&bytes, &opts)
+    let mut input = std::io::BufReader::new(file);
+    skip_bom(&mut input)?;
+    scan(Reader::from_reader(input), &opts)
 }
 
 /// Parses bytes already admitted by the size guard.
 pub fn parse_bytes(bytes: &[u8], opts: &PitOptions) -> Result<PitReport, PitError> {
     let text = std::str::from_utf8(bytes).map_err(|_| PitError::NotUtf8)?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let parsed = scan(text)?;
-    build(parsed, opts)
+    scan(Reader::from_reader(text.as_bytes()), opts)
+}
+
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+fn skip_bom(input: &mut impl BufRead) -> Result<(), PitError> {
+    let head = input.fill_buf().map_err(xml_err)?;
+    if head.starts_with(&UTF8_BOM) {
+        input.consume(UTF8_BOM.len());
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -147,11 +159,6 @@ fn known_field(name: &str) -> Option<&'static str> {
         .copied()
         .chain([COVERING, INDEX, BLOCK, DESCRIPTION])
         .find(|f| *f == name)
-}
-
-struct Scanned {
-    version: Option<String>,
-    mutations: Vec<RawMutation>,
 }
 
 fn xml_err(e: impl fmt::Display) -> PitError {
@@ -194,17 +201,25 @@ fn push_entity(buf: &mut String, name: &str) -> Result<(), PitError> {
     Ok(())
 }
 
-fn scan(text: &str) -> Result<Scanned, PitError> {
-    let mut reader = Reader::from_str(text);
+/// Maps a reader failure: invalid UTF-8 is its own class, everything else is generic malformed XML.
+fn read_err(e: quick_xml::Error) -> PitError {
+    match e {
+        quick_xml::Error::Encoding(_) => PitError::NotUtf8,
+        other => xml_err(other),
+    }
+}
+
+/// Streams the events, folding each finished `<mutation>` into a [`Collector`] so only one is held at a time.
+fn scan<R: BufRead>(mut reader: Reader<R>, opts: &PitOptions) -> Result<PitReport, PitError> {
     let mut depth = 0usize;
-    let mut version = None;
-    let mut mutations = Vec::new();
+    let mut collector: Option<Collector<'_>> = None;
     let mut current: Option<RawMutation> = None;
     let mut field: Option<&'static str> = None;
     let mut buf = String::new();
-    let mut saw_root = false;
+    let mut xml = Vec::new();
     loop {
-        match reader.read_event().map_err(xml_err)? {
+        xml.clear();
+        match reader.read_event_into(&mut xml).map_err(read_err)? {
             Event::Eof => break,
             Event::DocType(_) => return Err(PitError::DoctypeNotAllowed),
             Event::Start(e) => {
@@ -216,8 +231,7 @@ fn scan(text: &str) -> Result<Scanned, PitError> {
                     if e.name().as_ref() != "mutations" {
                         return Err(PitError::NotPitReport);
                     }
-                    saw_root = true;
-                    version = attr(&e, "version")?;
+                    collector = Some(Collector::start(attr(&e, "version")?, opts));
                 } else if current.is_none() && e.name().as_ref() == "mutation" {
                     current = Some(raw_from(&e)?);
                 } else if current.is_some() {
@@ -226,11 +240,11 @@ fn scan(text: &str) -> Result<Scanned, PitError> {
                 }
             }
             Event::Empty(e) => {
-                if depth == 0 {
+                let Some(collector) = collector.as_mut() else {
                     return Err(PitError::NotPitReport);
-                }
+                };
                 if current.is_none() && e.name().as_ref() == "mutation" {
-                    mutations.push(raw_from(&e)?);
+                    collector.add(&raw_from(&e)?)?;
                 }
             }
             Event::Text(t) if field.is_some() => buf.push_str(&t.into_inner()),
@@ -249,20 +263,20 @@ fn scan(text: &str) -> Result<Scanned, PitError> {
                 depth = depth.saturating_sub(1);
                 if let (Some(name), Some(m)) = (field.take(), current.as_mut()) {
                     m.fields.insert(name, std::mem::take(&mut buf));
-                } else if e.name().as_ref() == "mutation" {
-                    mutations.extend(current.take());
+                } else if e.name().as_ref() == "mutation"
+                    && let (Some(m), Some(collector)) = (current.take(), collector.as_mut())
+                {
+                    collector.add(&m)?;
                 }
             }
             _ => {}
         }
     }
-    if !saw_root {
-        return Err(xml_err("no root element"));
-    }
+    let collector = collector.ok_or_else(|| xml_err("no root element"))?;
     if depth != 0 {
         return Err(xml_err("unexpected end of file"));
     }
-    Ok(Scanned { version, mutations })
+    collector.finish()
 }
 
 fn raw_from(e: &BytesStart<'_>) -> Result<RawMutation, PitError> {
@@ -346,37 +360,119 @@ fn lower(cap: &mut Option<Tier>, to: Tier) {
     *cap = Some(cap.map_or(to, |c| c.min(to)));
 }
 
-fn build(parsed: Scanned, opts: &PitOptions) -> Result<PitReport, PitError> {
-    let version = parsed
-        .version
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| opts.pit_version.clone())
-        .unwrap_or_else(|| UNKNOWN_VERSION.to_owned());
-    let sidecar = opts.sidecar.as_ref();
-    let commit = opts
-        .commit
-        .as_deref()
-        .or_else(|| sidecar.and_then(|s| s.sidecar.commit.as_deref()));
-    let mut provenance = Provenance::new(TOOL, Some(&version)).with_commit(commit);
-    provenance.language = Some("java".to_owned());
+/// Raw test name to a small number, so each distinct PIT test is parsed into a `TestId` once however many
+/// mutations list it.
+#[derive(Default)]
+struct TestTable {
+    index: HashMap<String, u32>,
+    ids: Vec<TestId>,
+}
 
-    let (flagged, mut extra) =
-        resolve_kill_completeness(sidecar.map(|s| &s.sidecar), opts.kill_completeness);
-    let mut assessed: BTreeSet<TestId> = BTreeSet::new();
-    let mut kill_records: Vec<(TestId, MutantId)> = Vec::new();
-    let mut cov_b = CoverageBuilder::coverage(
-        provenance.clone(),
-        AttributionChoice {
-            attribution: CoverageAttribution::Isolated,
-            assumed: false,
-        },
-    )
-    .unit_kind(CoverageUnitKind::MutantSite);
-    let (mut killed, mut killed_with_matrix, mut any_covering) = (0usize, 0usize, false);
+impl TestTable {
+    fn resolve(&mut self, raw: &str) -> u32 {
+        if let Some(&ix) = self.index.get(raw) {
+            return ix;
+        }
+        let ix = self.ids.len() as u32;
+        self.ids.push(test_id(raw));
+        self.index.insert(raw.to_owned(), ix);
+        ix
+    }
+}
 
-    for m in &parsed.mutations {
+/// Folds mutations into the two builders one at a time (so a report is never held as a document) and turns
+/// them into a `PitReport` at the end.
+struct Collector<'o> {
+    opts: &'o PitOptions,
+    version: String,
+    flagged: KillCompleteness,
+    notes: Vec<Warning>,
+    kills: KillBuilder,
+    covering: CoverageBuilder,
+    tests: TestTable,
+    assessed: Vec<bool>,
+    killed: usize,
+    killed_with_matrix: usize,
+    any_covering: bool,
+}
+
+impl<'o> Collector<'o> {
+    fn start(report_version: Option<String>, opts: &'o PitOptions) -> Self {
+        let version = report_version
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| opts.pit_version.clone())
+            .unwrap_or_else(|| UNKNOWN_VERSION.to_owned());
+        let sidecar = opts.sidecar.as_ref();
+        let commit = opts
+            .commit
+            .as_deref()
+            .or_else(|| sidecar.and_then(|s| s.sidecar.commit.as_deref()));
+        let mut provenance = Provenance::new(TOOL, Some(&version)).with_commit(commit);
+        provenance.language = Some("java".to_owned());
+        let (flagged, notes) =
+            resolve_kill_completeness(sidecar.map(|s| &s.sidecar), opts.kill_completeness);
+        let covering = CoverageBuilder::coverage(
+            provenance.clone(),
+            AttributionChoice {
+                attribution: CoverageAttribution::Isolated,
+                assumed: false,
+            },
+        )
+        .unit_kind(CoverageUnitKind::MutantSite);
+        Self {
+            opts,
+            version,
+            flagged,
+            notes,
+            kills: KillBuilder::kills(provenance, flagged),
+            covering,
+            tests: TestTable::default(),
+            assessed: Vec::new(),
+            killed: 0,
+            killed_with_matrix: 0,
+            any_covering: false,
+        }
+    }
+
+    fn assess(&mut self, ix: u32) {
+        let ix = ix as usize;
+        if self.assessed.len() <= ix {
+            self.assessed.resize(ix + 1, false);
+        }
+        self.assessed[ix] = true;
+    }
+
+    fn resolve_all<'t>(&mut self, raw: impl Iterator<Item = &'t str>) -> Vec<u32> {
+        raw.map(|t| self.tests.resolve(t)).collect()
+    }
+
+    fn add(&mut self, m: &RawMutation) -> Result<(), PitError> {
         let get = |k: &str| m.fields.get(k).map_or("", String::as_str);
         let line = parse_line(m.fields.get("lineNumber"))?;
+        for ix in self.resolve_all(split_tests(m.fields.get("succeedingTests"))) {
+            self.assess(ix);
+        }
+        let covering = self.resolve_all(split_tests(m.fields.get(COVERING)));
+        for &ix in &covering {
+            self.assess(ix);
+        }
+        if !covering.is_empty() {
+            self.any_covering = true;
+            let site = CoverageUnit::new(site_file(get("mutatedClass")), line);
+            let ids = &self.tests.ids;
+            self.covering
+                .record_all(covering.iter().map(|&ix| &ids[ix as usize]), site, 1);
+        }
+        if m.status != "KILLED" {
+            return Ok(());
+        }
+        self.killed += 1;
+        let matrix_killers = split_tests(m.fields.get("killingTests")).count();
+        self.killed_with_matrix += usize::from(matrix_killers > 0);
+        let killers: BTreeSet<&str> = split_tests(m.fields.get("killingTests"))
+            .chain(split_tests(m.fields.get("killingTest")))
+            .collect();
+        let killers = self.resolve_all(killers.into_iter());
         let mutant = MutantId(format!(
             "{}.{}{}:{line}:{}:{}:{}",
             get("mutatedClass"),
@@ -386,107 +482,94 @@ fn build(parsed: Scanned, opts: &PitOptions) -> Result<PitReport, PitError> {
             get(INDEX),
             get(BLOCK),
         ));
-        for t in split_tests(m.fields.get("succeedingTests")) {
-            assessed.insert(test_id(t));
-        }
-        let site = CoverageUnit::new(site_file(get("mutatedClass")), line);
-        for t in split_tests(m.fields.get(COVERING)) {
-            let id = test_id(t);
-            cov_b.record(&id, site.clone(), 1);
-            assessed.insert(id);
-            any_covering = true;
-        }
-        if m.status != "KILLED" {
-            continue;
-        }
-        killed += 1;
-        let matrix_killers = split_tests(m.fields.get("killingTests")).count();
-        killed_with_matrix += usize::from(matrix_killers > 0);
-        let killers: BTreeSet<&str> = split_tests(m.fields.get("killingTests"))
-            .chain(split_tests(m.fields.get("killingTest")))
-            .collect();
-        for t in killers {
-            kill_records.push((test_id(t), mutant.clone()));
-        }
+        let ids = &self.tests.ids;
+        self.kills
+            .record_all(killers.iter().map(|&ix| &ids[ix as usize]), mutant, 1);
+        Ok(())
     }
 
-    let mut dim_warnings = Vec::new();
-    let mut completeness = flagged;
-    if killed > 0 && killed_with_matrix == 0 {
-        dim_warnings.push(warning(WARN_FULL_MATRIX_NOT_ENABLED, &[]));
-        if rank(KillCompleteness::FirstKillerOnly) < rank(completeness) {
-            completeness = KillCompleteness::FirstKillerOnly;
+    fn finish(mut self) -> Result<PitReport, PitError> {
+        let version = self.version.clone();
+        let opts = self.opts;
+        let sidecar = opts.sidecar.as_ref();
+        let mut dim_warnings = Vec::new();
+        let mut completeness = self.flagged;
+        if self.killed > 0 && self.killed_with_matrix == 0 {
+            dim_warnings.push(warning(WARN_FULL_MATRIX_NOT_ENABLED, &[]));
+            if rank(KillCompleteness::FirstKillerOnly) < rank(completeness) {
+                completeness = KillCompleteness::FirstKillerOnly;
+            }
         }
-    }
-    if !version_is_verified(&version) {
-        dim_warnings.push(warning(
-            WARN_UNVERIFIED_TOOL_VERSION,
-            &[("tool", TOOL), ("version", &version)],
-        ));
-    }
-    dim_warnings.append(&mut extra);
-    if let Some(s) = sidecar {
-        dim_warnings.extend(s.warnings.iter().cloned());
-    }
-    let unverified = dim_warnings
-        .iter()
-        .any(|w| w.id == WARN_UNVERIFIED_TOOL_VERSION);
-
-    let mut kills_b = KillBuilder::kills(provenance, completeness);
-    for t in &assessed {
-        kills_b.add_test(t);
-    }
-    for (t, m) in kill_records {
-        kills_b.record(&t, m, 1);
-    }
-    let mut kills: KillDimension = kills_b.build().map_err(PitError::Provenance)?;
-    kills.warnings.extend(dim_warnings);
-    if unverified || rank(completeness) < rank(KillCompleteness::Full) {
-        lower(&mut kills.cap, Tier::Low);
-    }
-    if let Some(cap) = sidecar.and_then(|s| s.cap) {
-        lower(&mut kills.cap, cap);
-    }
-
-    let coverage: Option<CoverageDimension> = if any_covering {
-        let mut c = cov_b.build().map_err(PitError::Provenance)?;
-        if unverified {
-            c.warnings.push(warning(
+        if !version_is_verified(&version) {
+            dim_warnings.push(warning(
                 WARN_UNVERIFIED_TOOL_VERSION,
                 &[("tool", TOOL), ("version", &version)],
             ));
-            lower(&mut c.cap, Tier::Low);
         }
-        Some(c)
-    } else {
-        None
-    };
+        dim_warnings.append(&mut self.notes);
+        if let Some(s) = sidecar {
+            dim_warnings.extend(s.warnings.iter().cloned());
+        }
+        let unverified = dim_warnings
+            .iter()
+            .any(|w| w.id == WARN_UNVERIFIED_TOOL_VERSION);
 
-    let mut mutation_run = sidecar.map_or(
-        MutationRun {
-            scope: MutationScope::Unknown,
-            mutants_run: None,
-            mutants_total: None,
-        },
-        |s| s.sidecar.mutation_run(),
-    );
-    if sidecar.is_some() || opts.kill_completeness.is_some() {
-        mutation_run.scope = match flagged {
-            KillCompleteness::Sampled => MutationScope::Sampled,
-            KillCompleteness::BudgetLimited => MutationScope::BudgetLimited,
-            _ if mutation_run.scope == MutationScope::Unknown && sidecar.is_none() => {
-                MutationScope::Full
+        let assessed: Vec<u32> = (0..self.assessed.len() as u32)
+            .filter(|&ix| self.assessed[ix as usize])
+            .collect();
+        for ix in assessed {
+            self.kills.add_test(&self.tests.ids[ix as usize]);
+        }
+        self.kills.set_meta(completeness);
+        let mut kills: KillDimension = self.kills.build().map_err(PitError::Provenance)?;
+        kills.warnings.extend(dim_warnings);
+        if unverified || rank(completeness) < rank(KillCompleteness::Full) {
+            lower(&mut kills.cap, Tier::Low);
+        }
+        if let Some(cap) = sidecar.and_then(|s| s.cap) {
+            lower(&mut kills.cap, cap);
+        }
+
+        let coverage: Option<CoverageDimension> = if self.any_covering {
+            let mut c = self.covering.build().map_err(PitError::Provenance)?;
+            if unverified {
+                c.warnings.push(warning(
+                    WARN_UNVERIFIED_TOOL_VERSION,
+                    &[("tool", TOOL), ("version", &version)],
+                ));
+                lower(&mut c.cap, Tier::Low);
             }
-            _ => mutation_run.scope,
+            Some(c)
+        } else {
+            None
         };
+
+        let mut mutation_run = sidecar.map_or(
+            MutationRun {
+                scope: MutationScope::Unknown,
+                mutants_run: None,
+                mutants_total: None,
+            },
+            |s| s.sidecar.mutation_run(),
+        );
+        if sidecar.is_some() || opts.kill_completeness.is_some() {
+            mutation_run.scope = match self.flagged {
+                KillCompleteness::Sampled => MutationScope::Sampled,
+                KillCompleteness::BudgetLimited => MutationScope::BudgetLimited,
+                _ if mutation_run.scope == MutationScope::Unknown && sidecar.is_none() => {
+                    MutationScope::Full
+                }
+                _ => mutation_run.scope,
+            };
+        }
+        Ok(PitReport {
+            matrix: TestMatrix {
+                coverage,
+                kills: Some(kills),
+            },
+            mutation_run,
+        })
     }
-    Ok(PitReport {
-        matrix: TestMatrix {
-            coverage,
-            kills: Some(kills),
-        },
-        mutation_run,
-    })
 }
 
 #[cfg(test)]

@@ -10,16 +10,14 @@
 //!   first triggers it. Such lines are credited to every test too, and counted in the `fixture-import-attribution`
 //!   warning.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
-
-use serde::Deserialize;
 
 use super::guard::{self, GuardError, JsonError};
 use super::sidecar::SidecarRead;
 use crate::test_effectiveness::matrix::{
-    AttributionChoice, CoverageAttribution, CoverageBuilder, CoverageDimension, CoverageUnit,
-    CoverageUnitKind, MissingProvenance, Provenance, TestId, Tier, Warning, WarningClass,
+    AttributionChoice, CoverageAttribution, CoverageBuilder, CoverageDimension, CoverageUnitKind,
+    MissingProvenance, Provenance, TestId, Tier, Warning, WarningClass,
 };
 
 pub const TOOL_NAME: &str = "coverage.py";
@@ -62,24 +60,7 @@ impl std::fmt::Display for CoveragePyError {
 
 impl std::error::Error for CoveragePyError {}
 
-#[derive(Deserialize)]
-struct Report {
-    #[serde(default)]
-    meta: Meta,
-    #[serde(default)]
-    files: BTreeMap<String, FileEntry>,
-}
-
-#[derive(Deserialize, Default)]
-struct Meta {
-    version: Option<String>,
-    timestamp: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct FileEntry {
-    contexts: Option<BTreeMap<String, Vec<String>>>,
-}
+mod stream;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -134,34 +115,57 @@ pub fn parse_coveragepy(
     flag: Option<CoverageAttribution>,
     sidecar: Option<&SidecarRead>,
 ) -> Result<CoverageDimension, CoveragePyError> {
-    let report: Report = guard::parse_json_bounded(bytes).map_err(CoveragePyError::Json)?;
-    let version = report
+    let mut scan = new_scan(flag, sidecar);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let read = scan
+        .feed(&mut deserializer)
+        .and_then(|()| deserializer.end());
+    finish(scan, read, sidecar)
+}
+
+fn new_scan(flag: Option<CoverageAttribution>, sidecar: Option<&SidecarRead>) -> stream::Scan {
+    let carried = sidecar.and_then(|s| s.sidecar.attribution);
+    let choice = AttributionChoice::resolve(carried, flag, CoverageAttribution::InOrder);
+    // The version and timestamp come from `meta`, which may follow `files`; `finish` fills them in.
+    let mut provenance = Provenance::new(TOOL_NAME, None)
+        .with_commit(sidecar.and_then(|s| s.sidecar.commit.as_deref()));
+    provenance.language = Some("python".to_owned());
+    stream::Scan::new(
+        CoverageBuilder::coverage(provenance, choice).unit_kind(CoverageUnitKind::Line),
+    )
+}
+
+/// Turns a finished scan into the dimension: provenance from `meta`, then the lines credited to every test.
+fn finish(
+    mut scan: stream::Scan,
+    read: Result<(), serde_json::Error>,
+    sidecar: Option<&SidecarRead>,
+) -> Result<CoverageDimension, CoveragePyError> {
+    read.map_err(|e| CoveragePyError::Json(guard::json_error(e)))?;
+    let version = scan
         .meta
         .version
-        .as_deref()
-        .map(str::trim)
+        .take()
+        .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
         .ok_or(CoveragePyError::MissingProvenance(MissingProvenance {
             field: "version",
         }))?;
-    if report.files.values().all(|f| f.contexts.is_none()) {
+    if !scan.any_contexts {
         return Err(CoveragePyError::MissingContexts);
     }
 
-    let carried = sidecar.and_then(|s| s.sidecar.attribution);
-    let choice = AttributionChoice::resolve(carried, flag, CoverageAttribution::InOrder);
-    let mut provenance = Provenance::new(TOOL_NAME, Some(version))
-        .with_commit(sidecar.and_then(|s| s.sidecar.commit.as_deref()));
-    provenance.run_timestamp = report.meta.timestamp.clone();
-    provenance.language = Some("python".to_owned());
-    let mut builder =
-        CoverageBuilder::coverage(provenance, choice).unit_kind(CoverageUnitKind::Line);
-
-    let all_tests = collect_tests(&report);
-    for test in &all_tests {
+    let setup_lines = scan.module_level.len();
+    let (mut builder, tests) = (scan.builder, scan.tests);
+    for test in &tests {
         builder.add_test(test);
     }
-    let setup_lines = record_lines(&mut builder, &report, &all_tests);
+    for unit in scan.module_level {
+        builder.record_all(&tests, unit, 1);
+    }
+    let provenance = builder.provenance_mut();
+    provenance.version = Some(version.clone());
+    provenance.run_timestamp = scan.meta.timestamp.take();
 
     let mut dimension = builder
         .build()
@@ -172,7 +176,7 @@ pub fn parse_coveragepy(
             vec![("setup_lines".to_owned(), setup_lines.to_string())],
         ));
     }
-    apply_quality_checks(&mut dimension, version, sidecar);
+    apply_quality_checks(&mut dimension, &version, sidecar);
     Ok(dimension)
 }
 
@@ -205,36 +209,20 @@ fn apply_quality_checks(
     }
 }
 
-/// Records every line's credited tests; returns how many lines were module-level or setup-only.
-fn record_lines(
-    builder: &mut CoverageBuilder,
-    report: &Report,
-    all_tests: &BTreeSet<TestId>,
-) -> usize {
-    let mut setup_lines = 0usize;
-    for (file, entry) in &report.files {
-        for (line, contexts) in entry.contexts.iter().flatten() {
-            let Ok(line) = line.parse::<u32>() else {
-                continue;
-            };
-            let unit = CoverageUnit::new(file.as_str(), line);
-            for test in credited_tests(contexts, all_tests, &mut setup_lines) {
-                builder.record(test, unit.clone(), 1);
-            }
-        }
-    }
-    setup_lines
-}
-
-/// Reads a report through the size guard (Task 2.2.7a) before parsing.
+/// Reads a report through the size guard (Task 2.2.7a), streaming it so the file is never held in memory.
 pub fn read_coveragepy(
     path: &Path,
     max_input_bytes: u64,
     flag: Option<CoverageAttribution>,
     sidecar: Option<&SidecarRead>,
 ) -> Result<CoverageDimension, CoveragePyError> {
-    let bytes = guard::read_bounded(path, max_input_bytes).map_err(CoveragePyError::Guard)?;
-    parse_coveragepy(&bytes, flag, sidecar)
+    let file = guard::open_bounded(path, max_input_bytes).map_err(CoveragePyError::Guard)?;
+    let mut scan = new_scan(flag, sidecar);
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let read = scan
+        .feed(&mut deserializer)
+        .and_then(|()| deserializer.end());
+    finish(scan, read, sidecar)
 }
 
 fn is_verified_version(version: &str) -> bool {
@@ -249,13 +237,13 @@ fn plausibility_warnings(d: &CoverageDimension) -> Vec<Warning> {
     if n < PLAUSIBILITY_MIN_TESTS {
         return Vec::new();
     }
-    let mut per_test: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut per_test: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (unit_idx, posting) in d.index.values().enumerate() {
         for &t in &posting.tests {
-            per_test[t as usize].push(unit_idx);
+            per_test[t as usize].push(unit_idx as u32);
         }
     }
-    let mut shapes: BTreeMap<&Vec<usize>, usize> = BTreeMap::new();
+    let mut shapes: BTreeMap<&Vec<u32>, usize> = BTreeMap::new();
     for lines in &per_test {
         *shapes.entry(lines).or_default() += 1;
     }
@@ -285,51 +273,11 @@ fn plausibility_warnings(d: &CoverageDimension) -> Vec<Warning> {
     .collect()
 }
 
-fn collect_tests(report: &Report) -> BTreeSet<TestId> {
-    report
-        .files
-        .values()
-        .filter_map(|f| f.contexts.as_ref())
-        .flat_map(|c| c.values().flatten())
-        .filter_map(|raw| parse_context(raw))
-        .map(|(test, _)| test)
-        .collect()
-}
-
-/// Tests that get credit for one line. Module-level and setup-only lines are credited to every test.
-fn credited_tests<'a>(
-    contexts: &[String],
-    all_tests: &'a BTreeSet<TestId>,
-    setup_lines: &mut usize,
-) -> Vec<&'a TestId> {
-    let mut has_module_level = false;
-    let mut ran = BTreeSet::new();
-    let mut setup = BTreeSet::new();
-    for raw in contexts {
-        match parse_context(raw) {
-            None => has_module_level = true,
-            Some((test, Phase::Run)) => {
-                ran.insert(test);
-            }
-            Some((test, Phase::Setup)) => {
-                setup.insert(test);
-            }
-        }
-    }
-    if has_module_level || ran.is_empty() {
-        *setup_lines += 1;
-        return all_tests.iter().collect();
-    }
-    all_tests
-        .iter()
-        .filter(|t| ran.contains(*t) || setup.contains(*t))
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::test_effectiveness::matrix::CoverageUnit;
 
     const THREE_TEST: &[u8] =
         include_bytes!("../../../testdata/test-effectiveness/coveragepy/three-test/coverage.json");
@@ -486,6 +434,36 @@ mod tests {
         let bytes = br#"{"meta":{"version":"7.13.4"},"files":{"m.py":{"executed_lines":[1]}}}"#;
         let err = parse_coveragepy(bytes, None, None).unwrap_err();
         assert!(matches!(err, CoveragePyError::MissingContexts));
+    }
+
+    #[test]
+    fn parse_should_ReadMetaAfterFiles_When_KeysReordered() {
+        let bytes = br#"{"totals":{"x":1},"files":{"m.py":{"summary":{},"contexts":{"2":["m.test_a|run"],"x":["m.test_b|run"]}},"n.py":{"contexts":null}},"meta":{"version":"7.13.4","timestamp":"t"}}"#;
+        let d = parse_coveragepy(bytes, None, None).unwrap();
+        assert_eq!(d.provenance.version.as_deref(), Some("7.13.4"));
+        assert_eq!(d.provenance.run_timestamp.as_deref(), Some("t"));
+        // the non-numeric line key records nothing, but its test is still assessed
+        assert_eq!(d.tests.len(), 2);
+        assert_eq!(d.index.len(), 1);
+    }
+
+    #[test]
+    fn parse_should_ReturnJsonError_When_FilesIsNotAMap() {
+        let err =
+            parse_coveragepy(br#"{"meta":{"version":"7"},"files":[]}"#, None, None).unwrap_err();
+        assert!(matches!(err, CoveragePyError::Json(_)));
+    }
+
+    #[test]
+    fn read_should_StreamTheFile_When_WithinCap() {
+        let dir = crate::test_support::unique_temp_dir("coveragepy-stream");
+        let path = dir.join("coverage.json");
+        std::fs::write(&path, THREE_TEST).unwrap();
+        let streamed = read_coveragepy(&path, 1 << 20, None, None).unwrap();
+        let sliced = parse_coveragepy(THREE_TEST, None, None).unwrap();
+        assert_eq!(streamed.index, sliced.index);
+        assert_eq!(streamed.tests, sliced.tests);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

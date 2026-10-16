@@ -92,14 +92,26 @@ impl fmt::Display for JsonError {
 
 impl std::error::Error for JsonError {}
 
+/// Classifies a serde_json failure: the recursion-limit error is `NestingTooDeep`, anything else `Invalid`.
+pub fn json_error(e: serde_json::Error) -> JsonError {
+    if e.to_string().contains("recursion limit exceeded") {
+        JsonError::NestingTooDeep
+    } else {
+        JsonError::Invalid(e.to_string())
+    }
+}
+
 /// Parses JSON under serde_json's default recursion limit (128); deeper input is `NestingTooDeep`.
 pub fn parse_json_bounded<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, JsonError> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        if e.to_string().contains("recursion limit exceeded") {
-            JsonError::NestingTooDeep
-        } else {
-            JsonError::Invalid(e.to_string())
-        }
+    serde_json::from_slice(bytes).map_err(json_error)
+}
+
+/// Size-checks, then opens the file for a streaming read. The open happens only after the cap check passes.
+pub fn open_bounded(path: &Path, max_input_bytes: u64) -> Result<std::fs::File, GuardError> {
+    check_size(path, max_input_bytes)?;
+    std::fs::File::open(path).map_err(|source| GuardError::Io {
+        file: path.to_path_buf(),
+        source,
     })
 }
 
@@ -150,6 +162,23 @@ mod tests {
         let path = dir.join("a.json");
         std::fs::write(&path, b"{}").unwrap();
         assert_eq!(read_bounded(&path, 2).unwrap(), b"{}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_bounded_should_OpenFile_When_WithinCapAndRefuseWhenOver() {
+        let dir = scratch("open");
+        let path = dir.join("a.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(open_bounded(&path, 2).is_ok());
+        assert!(matches!(
+            open_bounded(&path, 1),
+            Err(GuardError::TooLarge(_))
+        ));
+        assert!(matches!(
+            open_bounded(&dir.join("missing.json"), 10),
+            Err(GuardError::Io { .. })
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

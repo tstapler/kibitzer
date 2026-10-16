@@ -4,10 +4,13 @@
 //! `testFiles.<file>.tests[]` id-to-name table. `coveredBy` is mutant-site coverage, so it is
 //! returned beside the kills and never credited as line coverage.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use super::guard::{self, GuardError, JsonError};
@@ -67,9 +70,69 @@ struct Mutant {
     #[serde(default)]
     status: String,
     #[serde(rename = "killedBy", default)]
-    killed_by: Vec<String>,
+    killed_by: IdList,
     #[serde(rename = "coveredBy", default)]
-    covered_by: Vec<String>,
+    covered_by: IdList,
+}
+
+/// Test-id strings seen while deserializing one report, numbered in first-seen order.
+#[derive(Default)]
+struct Interner {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl Interner {
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = self.names.len() as u32;
+        self.ids.insert(name.to_owned(), id);
+        self.names.push(name.to_owned());
+        id
+    }
+}
+
+thread_local! {
+    /// serde's `Deserialize` has no side channel, so a parse parks its interner here for `IdList` to fill;
+    /// `deserialize_report` clears it before and takes it after, on the one thread that parses.
+    static INTERNER: RefCell<Interner> = RefCell::new(Interner::default());
+}
+
+/// A `killedBy`/`coveredBy` list held as interned ids: 4 bytes per entry instead of a `String`, which is
+/// what keeps a 5e7-entry report inside the memory bound.
+#[derive(Debug, Default)]
+struct IdList(Vec<u32>);
+
+impl<'de> Deserialize<'de> for IdList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Ids;
+        impl<'de> Visitor<'de> for Ids {
+            type Value = IdList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of test ids")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<IdList, A::Error> {
+                let mut ids = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 16));
+                while let Some(name) = seq.next_element::<Cow<'de, str>>()? {
+                    ids.push(INTERNER.with(|i| i.borrow_mut().intern(&name)));
+                }
+                Ok(IdList(ids))
+            }
+        }
+        deserializer.deserialize_seq(Ids)
+    }
+}
+
+/// Deserializes a report and returns it with the test-id strings its `IdList`s refer to.
+fn deserialize_report(bytes: &[u8]) -> Result<(Report, Vec<String>), MutationElementsError> {
+    INTERNER.with(|i| *i.borrow_mut() = Interner::default());
+    let parsed = guard::parse_json_bounded(bytes).map_err(MutationElementsError::Json);
+    let names = INTERNER.with(|i| std::mem::take(&mut i.borrow_mut().names));
+    Ok((parsed?, names))
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,7 +183,9 @@ pub fn parse_report(
     flag: Option<KillCompleteness>,
 ) -> Result<StrykerReport, MutationElementsError> {
     let bytes = guard::read_bounded(path, max_input_bytes).map_err(MutationElementsError::Guard)?;
-    parse_bytes(&bytes, sidecar, flag)
+    let (report, names) = deserialize_report(&bytes)?;
+    drop(bytes);
+    build_report(report, &names, sidecar, flag)
 }
 
 pub fn parse_bytes(
@@ -128,8 +193,16 @@ pub fn parse_bytes(
     sidecar: Option<&Sidecar>,
     flag: Option<KillCompleteness>,
 ) -> Result<StrykerReport, MutationElementsError> {
-    let report: Report = guard::parse_json_bounded(bytes).map_err(MutationElementsError::Json)?;
+    let (report, names) = deserialize_report(bytes)?;
+    build_report(report, &names, sidecar, flag)
+}
 
+fn build_report(
+    report: Report,
+    names: &[String],
+    sidecar: Option<&Sidecar>,
+    flag: Option<KillCompleteness>,
+) -> Result<StrykerReport, MutationElementsError> {
     let framework = report.framework.as_ref();
     let tool = framework
         .and_then(|f| f.name.as_deref())
@@ -149,14 +222,16 @@ pub fn parse_bytes(
     };
     let mut builder = KillBuilder::kills(provenance, completeness);
 
+    let drift = drift_warnings(&report, &stats);
     let test_ids = register_tests(&report, &mut builder);
-    let covered_by = record_mutants(&report, &test_ids, &mut builder);
+    let covered_by = record_mutants(&report, names, &test_ids, &mut builder);
+    drop(report);
 
     let mut kills = builder
         .build()
         .map_err(MutationElementsError::MissingProvenance)?;
     kills.warnings.extend(completeness_warnings);
-    kills.warnings.extend(drift_warnings(&report, &stats));
+    kills.warnings.extend(drift);
     if kills
         .warnings
         .iter()
@@ -189,7 +264,7 @@ impl KillStats {
             .values()
             .flat_map(|f| &f.mutants)
             .filter(|m| m.status == STATUS_KILLED)
-            .map(|m| m.killed_by.iter().collect::<BTreeSet<_>>().len())
+            .map(|m| m.killed_by.0.iter().collect::<BTreeSet<_>>().len())
             .filter(|&n| n > 0);
         for n in killers {
             stats.killed += 1;
@@ -277,15 +352,19 @@ fn register_tests(report: &Report, builder: &mut KillBuilder) -> BTreeMap<String
 /// Credits each killer of every `Killed` mutant; returns `coveredBy` per mutant for the caller.
 fn record_mutants(
     report: &Report,
+    names: &[String],
     test_ids: &BTreeMap<String, TestId>,
     builder: &mut KillBuilder,
 ) -> BTreeMap<MutantId, Vec<TestId>> {
-    let resolve = |id: &String| {
-        test_ids
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| TestId::new(UNKNOWN_TEST_FILE, id.as_str()))
-    };
+    let resolved: Vec<TestId> = names
+        .iter()
+        .map(|id| {
+            test_ids
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| TestId::new(UNKNOWN_TEST_FILE, id.as_str()))
+        })
+        .collect();
     let mut covered_by = BTreeMap::new();
     let mutants = report.files.iter().flat_map(|(path, file)| {
         file.mutants
@@ -301,12 +380,16 @@ fn record_mutants(
         };
         let mutant_id = MutantId(format!("{path}#{local}"));
         if mutant.status == STATUS_KILLED {
-            for killer in &mutant.killed_by {
-                builder.record(&resolve(killer), mutant_id.clone(), 1);
-            }
+            let killers = mutant.killed_by.0.iter().map(|&k| &resolved[k as usize]);
+            builder.record_all(killers, mutant_id.clone(), 1);
         }
-        if !mutant.covered_by.is_empty() {
-            let tests: BTreeSet<TestId> = mutant.covered_by.iter().map(resolve).collect();
+        if !mutant.covered_by.0.is_empty() {
+            let tests: BTreeSet<TestId> = mutant
+                .covered_by
+                .0
+                .iter()
+                .map(|&k| resolved[k as usize].clone())
+                .collect();
             covered_by.insert(mutant_id, tests.into_iter().collect());
         }
     }

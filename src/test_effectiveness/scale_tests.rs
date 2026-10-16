@@ -119,7 +119,7 @@ impl Shape {
     /// Every tenth unit is covered by one test (so unique coverage has work); the rest share `entries` evenly.
     fn units_per_posting(&self, unit: usize) -> usize {
         let singletons = self.units.div_ceil(SINGLETON_EVERY) as u64;
-        if unit % SINGLETON_EVERY == 0 {
+        if unit.is_multiple_of(SINGLETON_EVERY) {
             return 1;
         }
         let multi = (self.units as u64 - singletons).max(1);
@@ -537,7 +537,6 @@ fn dir_bytes(dir: &Path) -> u64 {
 
 /// Generates the input for `format` at `entries`, parses it through the real adapter and measures it.
 fn run_parse_scale(format: Format, entries: u64) -> Outcome {
-    use super::adapters::{coveragepy, gocover, mutation_elements, pit_xml};
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let shape = Shape::for_entries(entries);
     let tree = TempTree::new(&format!("scale-{}", format.name()));
@@ -693,7 +692,7 @@ fn locator_id(i: usize, files: usize) -> (RawTestId, Location) {
         file: file.clone(),
         line: 1 + k * LINES_PER_FUNCTION,
     };
-    let id = if i % STRYKER_EVERY == 0 {
+    let id = if i.is_multiple_of(STRYKER_EVERY) {
         RawTestId::Stryker {
             name,
             test_files: vec![file],
