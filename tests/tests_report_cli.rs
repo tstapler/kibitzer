@@ -658,6 +658,166 @@ fn report_should_AcceptBriefAndWarnItsExtrasAreNotYetBuilt_When_FormatBrief() {
     );
 }
 
+fn lines_of(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn export_should_ListFullUniverseAndFlaggedAndJointSafe_When_EmitFlagPassed() {
+    let p = Proj::new();
+    p.six_tests();
+    let out = p.dir.join("out.jsonl");
+    let o = p.run(&[
+        "--coveragepy",
+        "coverage.json",
+        "--emit-experiment-input",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stdout(&o).contains("[test-zero-unique-coverage]"));
+    let lines = lines_of(&out);
+    let header = &lines[0];
+    assert_eq!(header["kind"], "experiment_input");
+    assert_eq!(header["schema_version"], 1);
+    assert_eq!(header["provenance"][0]["tool"], "coverage.py");
+    assert_eq!(header["provenance"][0]["attribution"], "isolated");
+    assert_eq!(header["provenance"][0]["unit_kind"], "line");
+    assert_eq!(
+        header["input_digests"][0]["sha256"].as_str().unwrap().len(),
+        64
+    );
+    let tests: Vec<&Value> = lines.iter().filter(|l| l["rec"] == "test").collect();
+    assert_eq!(tests.len(), 6);
+    assert!(
+        tests
+            .iter()
+            .all(|t| t.get("package").is_some() && t["kind"] == "unit" && t.get("cost").is_none())
+    );
+    let flagged = lines.iter().find(|l| l["rec"] == "flagged").unwrap();
+    assert_eq!(flagged["rule"], "test-zero-unique-coverage");
+    assert_eq!(flagged["individually_flagged"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        flagged["joint_safe"],
+        serde_json::json!(["test_all.py::test_a", "test_all.py::test_c"])
+    );
+    let units: Vec<&Value> = lines.iter().filter(|l| l["rec"] == "unit").collect();
+    assert_eq!(units.len(), 5);
+    assert_eq!(units[0]["tests"], serde_json::json!([0, 1]));
+    let end = lines.last().unwrap();
+    assert_eq!(end["rec"], "end");
+    assert_eq!(end["counts"]["tests"], 6);
+    assert_eq!(end["counts"]["units"], 5);
+}
+
+#[test]
+fn export_should_EqualReportFindingsPerRule_When_ParityChecked() {
+    let p = Proj::new();
+    p.six_tests();
+    let out = p.dir.join("out.jsonl");
+    let doc = json(&p.run(&[
+        "--coveragepy",
+        "coverage.json",
+        "--format",
+        "json",
+        "--emit-experiment-input",
+        out.to_str().unwrap(),
+    ]));
+    let lines = lines_of(&out);
+    let flagged = lines.iter().find(|l| l["rec"] == "flagged").unwrap();
+    let exported: Vec<String> = flagged["individually_flagged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        exported,
+        ids_of(&doc["findings"], "test-zero-unique-coverage")
+    );
+}
+
+#[test]
+fn export_should_HaveNoIndependentJointLoss_When_JointSafeReadFromPostingLists() {
+    let p = Proj::new();
+    p.six_tests();
+    let out = p.dir.join("out.jsonl");
+    p.run(&[
+        "--coveragepy",
+        "coverage.json",
+        "--emit-experiment-input",
+        out.to_str().unwrap(),
+    ]);
+    let lines = lines_of(&out);
+    let ids: Vec<String> = lines
+        .iter()
+        .filter(|l| l["rec"] == "test")
+        .map(|l| l["id"].as_str().unwrap().to_string())
+        .collect();
+    let safe: Vec<usize> = lines.iter().find(|l| l["rec"] == "flagged").unwrap()["joint_safe"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| ids.iter().position(|i| i == s.as_str().unwrap()).unwrap())
+        .collect();
+    // The harness's I0 check: no unit has all of its covering tests inside the safe set.
+    for unit in lines.iter().filter(|l| l["rec"] == "unit") {
+        let covering: Vec<usize> = unit["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_u64().unwrap() as usize)
+            .collect();
+        assert!(
+            !covering.iter().all(|t| safe.contains(t)),
+            "unit {unit} would lose all coverage"
+        );
+    }
+}
+
+#[test]
+fn export_should_BeAbsentFromHelpAndAllFormats_When_FlagHidden() {
+    let p = Proj::new();
+    p.six_tests();
+    let out = p.dir.join("out.jsonl");
+    for fmt in ["text", "json", "brief"] {
+        let plain = p.run(&["--coveragepy", "coverage.json", "--format", fmt]);
+        let with = p.run(&[
+            "--coveragepy",
+            "coverage.json",
+            "--format",
+            fmt,
+            "--emit-experiment-input",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            plain.stdout, with.stdout,
+            "{fmt}: the flag must not change stdout"
+        );
+        let lower = stdout(&plain).to_lowercase();
+        for banned in [
+            "experiment_input",
+            "experiment-input",
+            "joint_safe",
+            "jointsafe",
+        ] {
+            assert!(!lower.contains(banned), "{fmt} mentions {banned}");
+        }
+    }
+}
+
+#[test]
+fn export_should_WriteNoFileAndExitTwo_When_NoInputFlag() {
+    let p = Proj::new();
+    let out = p.dir.join("out.jsonl");
+    let o = p.run(&["--emit-experiment-input", out.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(!out.exists());
+}
+
 const GOLDEN_DIR: &str = "testdata/test-effectiveness/golden";
 
 /// Compares `actual` with the golden file; `UPDATE_GOLDEN=1` rewrites it. The crate version is normalised so a
