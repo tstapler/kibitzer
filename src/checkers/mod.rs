@@ -26,3 +26,4 @@ pub mod primitive_obsession;
 pub mod repetitive_sentences;
 pub mod rules;
 pub mod sentence_length_uniformity;
+pub mod test_no_assertion;

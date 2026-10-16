@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "tool": "stryker",
+  "tool_version": "9.0.1",
+  "commit": "abc1234",
+  "attribution": "isolated",
+  "mutants_total": 6,
+  "mutants_run": 4,
+  "budget_seconds": 60,
+  "budget_exhausted": true
+}

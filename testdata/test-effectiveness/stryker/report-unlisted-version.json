@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "99",
+  "thresholds": { "high": 80, "low": 60 },
+  "framework": { "name": "StrykerJS", "version": "9.0.1" },
+  "files": {
+    "src/calc.js": {
+      "language": "javascript",
+      "source": "",
+      "mutants": [
+        { "id": "0", "mutatorName": "ArithmeticOperator", "replacement": "a - b", "status": "Killed", "killedBy": ["t1", "t2"], "coveredBy": ["t1", "t2"] },
+        { "id": "1", "mutatorName": "ConditionalExpression", "replacement": "true", "status": "Killed", "killedBy": ["t1"], "coveredBy": ["t1"] }
+      ]
+    }
+  },
+  "testFiles": {
+    "test/calc.test.js": {
+      "tests": [
+        { "id": "t1", "name": "calc adds two numbers" },
+        { "id": "t2", "name": "calc formats the result" }
+      ]
+    }
+  }
+}

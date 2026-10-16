@@ -1,0 +1,1 @@
+{"go_version":"go1.26.4","mode":"isolated","mode":"in_order","failing":[],"failing":[{"package":"p","test":"T"}]}

@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "format": "json",
+  "mode": "experimental",
+  "banner": "experimental: signals not yet validated (see docs/test-effectiveness.md)",
+  "advisory": true,
+  "non_claims": [
+    "Absence of a flag does not mean a test is valuable.",
+    "A flagged test may be a regression pin, a spec, or guard a distinct failure message.",
+    "Per-test values are alone-values; they do not hold once an overlapping flagged test is gone.",
+    "The joint coverage check is computed on the data the set was chosen from and says nothing about fault detection."
+  ],
+  "header": {
+    "kibitzer_version": "VERSION",
+    "head_commit": null,
+    "inputs": [
+      {
+        "flag": "--coveragepy",
+        "tool": "coverage.py",
+        "tool_version": "7.13.4",
+        "commit": "298cc15",
+        "run": "2026-10-15T21:36:37.994302",
+        "attribution": "isolated",
+        "attribution_assumed": false,
+        "kill_completeness": null,
+        "mutation_run": null,
+        "leave_one_out": null
+      }
+    ],
+    "scope": {
+      "tests_in_input": 3,
+      "assessed": 3,
+      "not_assessed": 0,
+      "by_reason": {
+        "stale": 0,
+        "no_source": 0,
+        "inputs_disagree": 0,
+        "failing": 0,
+        "skipped": 0,
+        "generated": 0,
+        "no_data": 0
+      },
+      "repo_tests_not_in_input": null
+    }
+  },
+  "warnings": [],
+  "summary": {
+    "flagged_by_rule": {
+      "test-zero-unique-coverage": 2
+    },
+    "individually_flagged": 2,
+    "redundant_only_with_flagged": 0,
+    "joint_check": [],
+    "suppressed": {
+      "total": 0,
+      "non_specific_reason": 0,
+      "malformed_directives": 0
+    },
+    "stability": "single_run"
+  },
+  "findings": [
+    {
+      "rule": "test-zero-unique-coverage",
+      "section": "main",
+      "signal_mode": "experimental",
+      "input": 0,
+      "test": {
+        "id": "test_app.py::test_noassert",
+        "file": "test_app.py",
+        "line": 12
+      },
+      "value": {
+        "kind": "unique_coverage",
+        "unique_units": 0,
+        "covered_units": 2,
+        "unit_kind": "line"
+      },
+      "baseline": "3 assessed tests; per-test coverage contexts",
+      "attribution": "isolated",
+      "tool": "coverage.py",
+      "tool_version": "7.13.4",
+      "commit": "298cc15",
+      "confidence": "medium",
+      "cost_seconds": null,
+      "overlaps_with": [
+        "test_app.py::test_neg",
+        "test_app.py::test_pos"
+      ],
+      "overlaps_also_flagged": [
+        "test_app.py::test_pos"
+      ],
+      "leave_one_out": null
+    },
+    {
+      "rule": "test-zero-unique-coverage",
+      "section": "main",
+      "signal_mode": "experimental",
+      "input": 0,
+      "test": {
+        "id": "test_app.py::test_pos",
+        "file": "test_app.py",
+        "line": 4
+      },
+      "value": {
+        "kind": "unique_coverage",
+        "unique_units": 0,
+        "covered_units": 2,
+        "unit_kind": "line"
+      },
+      "baseline": "3 assessed tests; per-test coverage contexts",
+      "attribution": "isolated",
+      "tool": "coverage.py",
+      "tool_version": "7.13.4",
+      "commit": "298cc15",
+      "confidence": "medium",
+      "cost_seconds": null,
+      "overlaps_with": [
+        "test_app.py::test_neg",
+        "test_app.py::test_noassert"
+      ],
+      "overlaps_also_flagged": [
+        "test_app.py::test_noassert"
+      ],
+      "leave_one_out": null
+    }
+  ],
+  "not_assessed": [],
+  "suppressed": []
+}

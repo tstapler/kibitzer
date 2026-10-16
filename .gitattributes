@@ -1,0 +1,2 @@
+# Malformed-input fixtures may be invalid UTF-8; keep them out of text diffs (covgate parses git diff as UTF-8).
+testdata/test-effectiveness/malformed/** -diff

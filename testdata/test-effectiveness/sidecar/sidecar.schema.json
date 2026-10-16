@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kibitzer/test-effectiveness/run-sidecar/1",
+  "title": "Producer run sidecar (<output>.run.json, or <output-dir>/run.json for a directory output)",
+  "description": "Written by the Story 2.2.8 recipe wrappers, read by src/test_effectiveness/adapters/sidecar.rs. Unknown keys are ignored. A missing or wrongly typed key listed in `required` is a class W warning and caps the dimension at Low. The key is `attribution`, never `mode`.",
+  "type": "object",
+  "required": ["schema_version", "tool", "tool_version", "commit", "attribution"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "tool": { "type": "string", "minLength": 1 },
+    "tool_version": { "type": "string", "minLength": 1 },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
+    "attribution": { "enum": ["isolated", "in-order", "leave-one-out"] },
+    "tests_total": { "type": ["integer", "null"], "minimum": 0 },
+    "mutants_total": { "type": ["integer", "null"], "minimum": 0 },
+    "mutants_run": { "type": ["integer", "null"], "minimum": 0 },
+    "sampled_fraction": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+    "budget_seconds": { "type": ["number", "null"], "minimum": 0 },
+    "budget_exhausted": { "type": "boolean", "default": false },
+    "partial": { "type": "boolean", "default": false }
+  },
+  "additionalProperties": true
+}

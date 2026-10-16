@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<!DOCTYPE mutations [<!ENTITY xxe SYSTEM "file:///__PATH__">]>
+<mutations version="1.17.4"><mutation detected="true" status="KILLED"><sourceFile>A.java</sourceFile><mutatedClass>p.A</mutatedClass><mutatedMethod>m</mutatedMethod><lineNumber>1</lineNumber><mutator>M</mutator><indexes><index>0</index></indexes><killingTest>&xxe;</killingTest><killingTests>&xxe;</killingTests></mutation></mutations>
