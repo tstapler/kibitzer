@@ -93,7 +93,7 @@ fn s6_check_list_should_ShowDefaultOff_When_BeforeG1() {
         .unwrap_or_else(|| panic!("{stdout}"));
     assert_eq!(
         summary,
-        "test-no-assertion (rule): languages: Go, Python (state: off)"
+        "test-no-assertion (rule): languages: Go, Python, Kotlin (state: off)"
     );
 }
 

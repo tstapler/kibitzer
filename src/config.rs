@@ -802,6 +802,7 @@ pub fn test_quality_checks() -> Vec<Check> {
     vec![
         native_check("test-no-assertion-go", Severity::Advisory, &["**/*.go"]),
         native_check("test-no-assertion-python", Severity::Advisory, &["**/*.py"]),
+        native_check("test-no-assertion-kotlin", Severity::Advisory, &["**/*.kt"]),
     ]
 }
 

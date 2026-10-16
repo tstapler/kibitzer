@@ -95,6 +95,20 @@ const PYTHON_CASES: &[Case] = &[
     ),
 ];
 
+const KOTLIN_CASES: &[Case] = &[
+    ("OraclesTest.kt", &[], &[]),
+    ("SkipExemptTest.kt", &[], &[]),
+    ("WeakOracleTest.kt", &[], &[]),
+    ("EmptyTest.kt", &[7, 12, 17], &[7, 12, 17]),
+    ("ComposeTest.kt", &[31], &[31]),
+    ("HelperTest.kt", &[29, 34], &[34]),
+    (
+        "SixVacuousTest.kt",
+        &[7, 8, 9, 10, 11, 12],
+        &[7, 8, 9, 10, 11, 12],
+    ),
+];
+
 fn assert_cases(checker: &str, dir: &str, cases: &[Case]) {
     let precision = precision_first();
     for (file, strict, precise) in cases {
@@ -113,6 +127,11 @@ fn test_no_assertion_should_MatchLabelsOnEveryGoFixture_When_StrictAndPrecisionF
 #[test]
 fn test_no_assertion_should_MatchLabelsOnEveryPythonFixture_When_StrictAndPrecisionFirst() {
     assert_cases("test-no-assertion-python", "python", PYTHON_CASES);
+}
+
+#[test]
+fn test_no_assertion_should_MatchLabelsOnEveryKotlinFixture_When_StrictAndPrecisionFirst() {
+    assert_cases("test-no-assertion-kotlin", "kotlin", KOTLIN_CASES);
 }
 
 #[test]
@@ -145,6 +164,7 @@ fn test_no_assertion_should_ReportZero_When_KnownFalseNegativeWeakOracle() {
     for (dir, file, checker) in [
         ("go", "weak_oracle_test.go", "test-no-assertion-go"),
         ("python", "weak_oracle_test.py", "test-no-assertion-python"),
+        ("kotlin", "WeakOracleTest.kt", "test-no-assertion-kotlin"),
     ] {
         let path = fixture_path(dir, file);
         let source = std::fs::read_to_string(&path).unwrap();
@@ -170,6 +190,16 @@ fn test_no_assertion_should_ReportZero_When_FileNameIsNotATestFile() {
         )
         .is_empty()
     );
+    let source = std::fs::read_to_string(fixture_path("kotlin", "EmptyTest.kt")).unwrap();
+    assert!(
+        run_source(
+            "test-no-assertion-kotlin",
+            Path::new("src/main/Helpers.kt"),
+            &source,
+            None
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -182,6 +212,34 @@ fn test_no_assertion_should_AcceptConfiguredHelper_When_AssertionHelpersOptionSe
     );
     let opts = json!({"assertion_helpers": ["mustWork"]});
     assert!(run_source("test-no-assertion-go", path, source, Some(&opts)).is_empty());
+}
+
+#[test]
+fn test_no_assertion_should_AcceptConfiguredHelper_When_KotlinAssertionHelpersOptionSet() {
+    let source = "class FooTest {\n    @Test\n    fun a() {\n        mustWork()\n    }\n}\n";
+    let path = Path::new("FooTest.kt");
+    assert_eq!(
+        lines(&run_source("test-no-assertion-kotlin", path, source, None)),
+        [2]
+    );
+    let opts = json!({"assertion_helpers": ["mustWork"]});
+    assert!(run_source("test-no-assertion-kotlin", path, source, Some(&opts)).is_empty());
+}
+
+#[test]
+fn test_no_assertion_should_SuppressKotlinFinding_When_IgnoreDirectiveAboveAnnotation() {
+    let source = "class FooTest {\n    // kibitzer:ignore test-no-assertion -- smoke\n    @Test\n    fun a() {\n        run()\n    }\n}\n";
+    let findings = run_source(
+        "test-no-assertion-kotlin",
+        Path::new("FooTest.kt"),
+        source,
+        None,
+    );
+    assert_eq!(
+        lines(&findings),
+        [3],
+        "the finding line is the annotation line"
+    );
 }
 
 #[test]
@@ -204,7 +262,11 @@ fn test_no_assertion_should_ExtendAssertionIshWords_When_OptionSet() {
 
 #[test]
 fn s6_config_should_FailNamingKeyAndValidKeys_When_UnknownOptionKey() {
-    for name in ["test-no-assertion-go", "test-no-assertion-python"] {
+    for name in [
+        "test-no-assertion-go",
+        "test-no-assertion-python",
+        "test-no-assertion-kotlin",
+    ] {
         let checker = lookup(name).unwrap();
         let err = checker
             .configure(&json!({"assertion_helper": ["x"]}))
@@ -240,13 +302,26 @@ fn registry_should_ListOneInstancePerLanguage_When_FromOneFactory() {
         .map(|c| c.name().to_string())
         .filter(|n| n.starts_with("test-no-assertion"))
         .collect();
-    assert_eq!(names, ["test-no-assertion-go", "test-no-assertion-python"]);
+    assert_eq!(
+        names,
+        [
+            "test-no-assertion-go",
+            "test-no-assertion-python",
+            "test-no-assertion-kotlin"
+        ]
+    );
 }
 
 // ---------- message shape (Task 1.1.2c: UX-H1, H2, H6, H8, H10, A1) ----------
 
 fn go_message() -> String {
     run_fixture("test-no-assertion-go", "go", "a_test.go", None)
+        .remove(0)
+        .message
+}
+
+fn kotlin_message() -> String {
+    run_fixture("test-no-assertion-kotlin", "kotlin", "EmptyTest.kt", None)
         .remove(0)
         .message
 }
@@ -259,7 +334,7 @@ fn python_message() -> String {
 
 #[test]
 fn ux_h1_finding_should_HaveHeadlineFixNonClaimIgnore_When_AgentAddsEmptyTest() {
-    for message in [go_message(), python_message()] {
+    for message in [go_message(), python_message(), kotlin_message()] {
         let rendered = format!("t_test:1: {message}");
         let rows: Vec<&str> = rendered.lines().collect();
         assert_eq!(rows.len(), 4, "{rendered}");
@@ -272,7 +347,7 @@ fn ux_h1_finding_should_HaveHeadlineFixNonClaimIgnore_When_AgentAddsEmptyTest() 
 
 #[test]
 fn ux_h2_message_should_ContainNoBannedWords_When_AllRulesEmit() {
-    for message in [go_message(), python_message()] {
+    for message in [go_message(), python_message(), kotlin_message()] {
         assert_eq!(banned_word_in(&message), None, "{message}");
         let first = message.split_whitespace().next().unwrap();
         assert!(!first.eq_ignore_ascii_case("delete") && !first.eq_ignore_ascii_case("remove"));
@@ -286,7 +361,7 @@ fn ux_h2_message_should_ContainNoBannedWords_When_AllRulesEmit() {
 
 #[test]
 fn ux_a1_message_should_ListStrengthenFirstAndRequireNamingCoveringTest_When_NoAssertion() {
-    for message in [go_message(), python_message()] {
+    for message in [go_message(), python_message(), kotlin_message()] {
         let fix = message.lines().nth(1).unwrap();
         assert!(
             fix.starts_with("  Likely fix: assert on")
@@ -315,8 +390,17 @@ fn ux_h8_finding_should_HaveQuietPathLineInRecordedVariant_When_AnyRuleInHookOrR
 }
 
 #[test]
+fn ux_h8_finding_should_NameFunPlacement_When_Kotlin() {
+    let last = kotlin_message().lines().last().unwrap().to_string();
+    assert_eq!(
+        last,
+        "  Intentional? add `// kibitzer:ignore test-no-assertion -- <why>` above the fun (and its annotations). Finding wrong? report_false_positive."
+    );
+}
+
+#[test]
 fn ux_h10_finding_should_NameBothQuietPaths_When_AnyHookOrRunChecksFinding() {
-    for message in [go_message(), python_message()] {
+    for message in [go_message(), python_message(), kotlin_message()] {
         assert!(message.contains("kibitzer:ignore"));
         assert!(message.contains("report_false_positive"));
         assert!(message.lines().any(|l| l.starts_with("  Not claimed: ")));
@@ -385,11 +469,12 @@ fn ux_h9_hook_should_ListSixFindingsAndNoMoreLine_When_SixVacuousTestsAndNoCapRe
     for (name, src) in [
         ("six_vacuous_test.go", "six_vacuous_test.go"),
         ("test_six_vacuous.py", "test_six_vacuous.py"),
+        ("SixVacuousTest.kt", "SixVacuousTest.kt"),
     ] {
-        let dir = if name.ends_with(".go") {
-            "go"
-        } else {
-            "python"
+        let dir = match name.rsplit('.').next() {
+            Some("go") => "go",
+            Some("kt") => "kotlin",
+            _ => "python",
         };
         let file = root.join(name);
         std::fs::copy(fixture_path(dir, src), &file).unwrap();

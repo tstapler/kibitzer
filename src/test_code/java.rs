@@ -103,7 +103,7 @@ fn collect(language: Language, function_kind: &str, ctx: &CheckContext) -> Vec<T
 
 fn function_name<'a>(node: Node, source: &'a str) -> &'a str {
     if let Some(name) = node.child_by_field_name("name") {
-        return node_text(name, source);
+        return node_text(name, source).trim_matches('`');
     }
     let mut cursor = node.walk();
     let found = node
