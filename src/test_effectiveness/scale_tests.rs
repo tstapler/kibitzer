@@ -8,6 +8,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,8 +25,11 @@ const RSS_BOUND_KB: u64 = 1_500_000;
 const WALL_BOUND: Duration = Duration::from_secs(120);
 
 const TARGET_TESTS: usize = 100_000;
-const TARGET_UNITS: usize = 1_000_000;
 const TARGET_ENTRIES: u64 = 50_000_000;
+const ENTRIES_PER_TEST: u64 = 500;
+const ENTRIES_PER_UNIT: u64 = 50;
+const MIN_TESTS: usize = 200;
+const MIN_UNITS: usize = 1_000;
 /// Every Nth unit is covered by exactly one test.
 const SINGLETON_EVERY: usize = 10;
 const SEED: u64 = 0x5eed_cafe_f00d_1234;
@@ -99,10 +103,15 @@ struct Shape {
 
 impl Shape {
     fn target() -> Self {
+        Self::for_entries(target_entries())
+    }
+
+    /// The NFR shape (100k tests, 1M units) at 5e7 entries; proportionally smaller below it.
+    fn for_entries(entries: u64) -> Self {
         Self {
-            tests: TARGET_TESTS,
-            units: TARGET_UNITS,
-            entries: target_entries(),
+            tests: ((entries / ENTRIES_PER_TEST) as usize).clamp(MIN_TESTS, TARGET_TESTS),
+            units: ((entries / ENTRIES_PER_UNIT) as usize).max(MIN_UNITS),
+            entries,
         }
     }
 
@@ -173,7 +182,7 @@ fn synth_coverage(shape: Shape) -> CoverageDimension {
     }
 }
 
-fn total_entries(d: &CoverageDimension) -> u64 {
+fn total_entries<U, M>(d: &Dimension<U, M>) -> u64 {
     d.index.values().map(|p| p.tests.len() as u64).sum()
 }
 
@@ -230,4 +239,343 @@ fn scale_should_RunAllThreeAnalyses_When_SmallMatrix() {
     };
     let (entries, _, _) = run_matrix_scale(shape);
     assert!((19_000..=21_000).contains(&entries), "entries={entries}");
+}
+
+// ---- Task 2.1.5b: parse memory for the four experiment-critical formats ----
+
+/// Explicit cap passed to every adapter so the built-in ceiling never refuses the scale inputs.
+const SCALE_CAP: u64 = u64::MAX;
+const WRITE_BUFFER: usize = 1 << 20;
+const GO_TESTS_PER_PACKAGE: u32 = 100;
+const LINES_PER_FILE: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    CoveragePy,
+    GoCover,
+    Stryker,
+    Pit,
+}
+
+const ALL_FORMATS: [Format; 4] = [
+    Format::CoveragePy,
+    Format::GoCover,
+    Format::Stryker,
+    Format::Pit,
+];
+
+impl Format {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CoveragePy => "coveragepy",
+            Self::GoCover => "gocover",
+            Self::Stryker => "stryker",
+            Self::Pit => "pit",
+        }
+    }
+}
+
+/// `KIBITZER_SCALE_FORMATS=pit,stryker` narrows the ignored umbrella test to those formats.
+fn selected_formats() -> Vec<Format> {
+    let wanted = std::env::var("KIBITZER_SCALE_FORMATS").unwrap_or_default();
+    ALL_FORMATS
+        .into_iter()
+        .filter(|f| wanted.is_empty() || wanted.split(',').any(|w| w == f.name()))
+        .collect()
+}
+
+fn create(path: &Path) -> BufWriter<std::fs::File> {
+    BufWriter::with_capacity(WRITE_BUFFER, std::fs::File::create(path).expect("create"))
+}
+
+fn join_tests(ts: &[u32], sep: &str, name: impl Fn(u32) -> String) -> String {
+    ts.iter().map(|&t| name(t)).collect::<Vec<_>>().join(sep)
+}
+
+fn py_context(t: u32) -> String {
+    format!("t{:03}.py::test_{t:05}|run", t / GO_TESTS_PER_PACKAGE)
+}
+
+fn pit_test(t: u32) -> String {
+    let class = format!("p.T{:03}", t / GO_TESTS_PER_PACKAGE);
+    format!("{class}.t{t:05}({class})")
+}
+
+/// coverage.py `--show-contexts` JSON: one line per unit, listing the contexts that ran it.
+fn write_coveragepy(path: &Path, shape: Shape) {
+    let mut w = create(path);
+    write!(
+        w,
+        r#"{{"meta":{{"version":"7.4.0","timestamp":"2026-01-01T00:00:00"}},"files":{{"#
+    )
+    .unwrap();
+    let mut open_file: Option<usize> = None;
+    for_each_posting(shape, SEED, |unit, ts| {
+        let file = unit / LINES_PER_FILE;
+        if open_file != Some(file) {
+            let sep = match open_file {
+                Some(_) => "}},",
+                None => "",
+            };
+            write!(w, r#"{sep}"src/f{file:04}.py":{{"contexts":{{"#).unwrap();
+            open_file = Some(file);
+        } else {
+            w.write_all(b",").unwrap();
+        }
+        let line = unit % LINES_PER_FILE;
+        let ctx = join_tests(ts, ",", |t| format!("\"{}\"", py_context(t)));
+        write!(w, r#""{line}":[{ctx}]"#).unwrap();
+    });
+    w.write_all(b"}}}}").unwrap();
+    w.flush().unwrap();
+}
+
+/// Stryker mutation-testing-elements JSON: one `Killed` mutant per unit with its `killedBy` list.
+fn write_stryker(path: &Path, shape: Shape) {
+    let mut w = create(path);
+    write!(
+        w,
+        r#"{{"schemaVersion":"2","framework":{{"name":"stryker","version":"8.0.0"}},"testFiles":{{"#
+    )
+    .unwrap();
+    let per_file = GO_TESTS_PER_PACKAGE as usize;
+    for (n, first) in (0..shape.tests).step_by(per_file).enumerate() {
+        let tests = (first..(first + per_file).min(shape.tests))
+            .map(|t| format!(r#"{{"id":"t{t:05}","name":"test {t}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sep = if n == 0 { "" } else { "," };
+        write!(w, r#"{sep}"tests/s{n:04}.spec.ts":{{"tests":[{tests}]}}"#).unwrap();
+    }
+    w.write_all(br#"},"files":{"#).unwrap();
+    let mut open_file: Option<usize> = None;
+    for_each_posting(shape, SEED, |unit, ts| {
+        let file = unit / LINES_PER_FILE;
+        if open_file != Some(file) {
+            let sep = match open_file {
+                Some(_) => "]},",
+                None => "",
+            };
+            write!(w, r#"{sep}"src/f{file:04}.ts":{{"mutants":["#).unwrap();
+            open_file = Some(file);
+        } else {
+            w.write_all(b",").unwrap();
+        }
+        let killers = join_tests(ts, ",", |t| format!("\"t{t:05}\""));
+        write!(
+            w,
+            r#"{{"id":"{unit}","status":"Killed","killedBy":[{killers}]}}"#
+        )
+        .unwrap();
+    });
+    w.write_all(b"]}}}").unwrap();
+    w.flush().unwrap();
+}
+
+/// PIT `mutations.xml` with the full kill matrix (`killingTests`): one `KILLED` mutation per unit.
+fn write_pit(path: &Path, shape: Shape) {
+    let mut w = create(path);
+    w.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mutations version=\"1.17.4\">\n")
+        .unwrap();
+    for_each_posting(shape, SEED, |unit, ts| {
+        let class = format!("p.C{:04}", unit / LINES_PER_FILE);
+        let line = unit % LINES_PER_FILE;
+        let first = pit_test(ts[0]);
+        let killers = join_tests(ts, "|", pit_test);
+        writeln!(
+            w,
+            "<mutation detected='true' status='KILLED' numberOfTestsRun='{}'><sourceFile>C.java</sourceFile>\
+             <mutatedClass>{class}</mutatedClass><mutatedMethod>m{unit}</mutatedMethod>\
+             <methodDescription>()V</methodDescription><lineNumber>{line}</lineNumber>\
+             <mutator>org.pitest.mutationtest.engine.gregor.mutators.MathMutator</mutator>\
+             <indexes><index>1</index></indexes><blocks><block>0</block></blocks>\
+             <killingTest>{first}</killingTest><killingTests>{killers}</killingTests>\
+             <succeedingTests/></mutation>",
+            ts.len()
+        )
+        .unwrap();
+    });
+    w.write_all(b"</mutations>\n").unwrap();
+    w.flush().unwrap();
+}
+
+/// Go per-test profile directory plus `manifest.json`; each test covers `entries / tests` units.
+fn write_gocover(dir: &Path, shape: Shape) {
+    std::fs::write(
+        dir.join("manifest.json"),
+        r#"{"go_version":"go1.26.4","commit":"abc","mode":"isolated","failing":[]}"#,
+    )
+    .unwrap();
+    let per_test = shape.entries / shape.tests as u64;
+    let extra = shape.entries % shape.tests as u64;
+    let mut units: Vec<u32> = Vec::new();
+    for t in 0..shape.tests {
+        let k = (per_test + u64::from((t as u64) < extra)) as usize;
+        let mut rng = Rng(SEED ^ ((t as u64 + 1) << 20));
+        units.clear();
+        while units.len() < k.min(shape.units) {
+            while units.len() < k.min(shape.units) {
+                units.push(rng.below(shape.units as u64) as u32);
+            }
+            units.sort_unstable();
+            units.dedup();
+        }
+        let pkg = t as u32 / GO_TESTS_PER_PACKAGE;
+        let mut w = create(&dir.join(format!("pkg%2Fp{pkg:03}__Test{t:05}.out")));
+        w.write_all(b"mode: set\n").unwrap();
+        for &u in &units {
+            let (file, line) = (u as usize / LINES_PER_FILE, u as usize % LINES_PER_FILE + 1);
+            writeln!(w, "pkg/f{file:04}.go:{line}.1,{line}.20 1 1").unwrap();
+        }
+        w.flush().unwrap();
+    }
+}
+
+/// What one adapter run measured.
+struct ParseOutcome {
+    entries: u64,
+    input_bytes: u64,
+    rss_kb: u64,
+    wall: Duration,
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("read_dir")
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Generates the input for `format` at `entries`, parses it through the real adapter and measures it.
+fn run_parse_scale(format: Format, entries: u64) -> ParseOutcome {
+    use super::adapters::{coveragepy, gocover, mutation_elements, pit_xml};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = Shape::for_entries(entries);
+    let tree = TempTree::new(&format!("scale-{}", format.name()));
+    let file = tree.path().join("input");
+    let started = Instant::now();
+    match format {
+        Format::CoveragePy => write_coveragepy(&file, shape),
+        Format::Stryker => write_stryker(&file, shape),
+        Format::Pit => write_pit(&file, shape),
+        Format::GoCover => write_gocover(tree.path(), shape),
+    }
+    let input_bytes = match format {
+        Format::GoCover => dir_bytes(tree.path()),
+        _ => std::fs::metadata(&file).expect("input").len(),
+    };
+    println!(
+        "SCALE {} generated: input={:.0} MB in {:.1} s",
+        format.name(),
+        input_bytes as f64 / 1e6,
+        started.elapsed().as_secs_f64()
+    );
+    let label = format!("parse {}", format.name());
+    let (parsed, rss_kb, wall) = measure(&label, || parse_entries(format, tree.path(), &file));
+    ParseOutcome {
+        entries: parsed,
+        input_bytes,
+        rss_kb,
+        wall,
+    }
+}
+
+/// Parses with the real adapter and returns the matrix entry count; the dimension is dropped before returning.
+fn parse_entries(format: Format, dir: &Path, file: &Path) -> u64 {
+    use super::adapters::{coveragepy, gocover, mutation_elements, pit_xml};
+    match format {
+        Format::CoveragePy => {
+            total_entries(&coveragepy::read_coveragepy(file, SCALE_CAP, None, None).expect("parse"))
+        }
+        Format::GoCover => {
+            total_entries(&gocover::parse_dir(dir, SCALE_CAP).expect("parse").dimension)
+        }
+        Format::Stryker => total_entries(
+            &mutation_elements::parse_report(file, SCALE_CAP, None, None)
+                .expect("parse")
+                .kills,
+        ),
+        Format::Pit => {
+            let opts = pit_xml::PitOptions {
+                max_input_bytes: SCALE_CAP,
+                commit: Some("scale".to_owned()),
+                ..Default::default()
+            };
+            let report = pit_xml::parse_file(file, &opts).expect("parse");
+            total_entries(report.matrix.kills.as_ref().expect("kills"))
+        }
+    }
+}
+
+/// Prints the per-adapter verdict line and returns the names of the bounds it broke.
+fn verdict(format: Format, expected: u64, out: &ParseOutcome) -> Vec<String> {
+    let mut broken = Vec::new();
+    if out.rss_kb > RSS_BOUND_KB {
+        broken.push(format!("{} peak RSS {} kB", format.name(), out.rss_kb));
+    }
+    if out.wall > WALL_BOUND {
+        broken.push(format!("{} wall {:?}", format.name(), out.wall));
+    }
+    println!(
+        "SCALE {} verdict: entries={} (target {expected}) input={} bytes rss={} kB wall={:.1} s -> {}",
+        format.name(),
+        out.entries,
+        out.input_bytes,
+        out.rss_kb,
+        out.wall.as_secs_f64(),
+        if broken.is_empty() { "PASS" } else { "FAIL" }
+    );
+    broken
+}
+
+/// Within 2% of the requested entries (random collisions and rounding make it inexact).
+fn assert_entries_close(format: Format, expected: u64, got: u64) {
+    let slack = expected / 50 + 1;
+    assert!(
+        got.abs_diff(expected) <= slack,
+        "{}: parsed {got} entries, expected about {expected}",
+        format.name()
+    );
+}
+
+#[test]
+#[ignore = "scale: run with `cargo test --release parse_scale -- --ignored`"]
+fn parse_scale_should_StayWithinMemoryBound_When_EachAdapterFormatAtTargetSize() {
+    let entries = target_entries();
+    let mut broken = Vec::new();
+    for format in selected_formats() {
+        let out = run_parse_scale(format, entries);
+        assert_entries_close(format, entries, out.entries);
+        broken.extend(verdict(format, entries, &out));
+    }
+    assert!(broken.is_empty(), "over the bound: {broken:?}");
+}
+
+#[test]
+#[ignore = "scale: run with `cargo test --release parse_scale -- --ignored`"]
+fn gocover_parse_scale_should_BoundPeakRssByMatrixNotDirectoryTotal_When_DirectoryOfProfilesAtTargetSize()
+ {
+    let entries = target_entries();
+    let out = run_parse_scale(Format::GoCover, entries);
+    assert_entries_close(Format::GoCover, entries, out.entries);
+    assert!(verdict(Format::GoCover, entries, &out).is_empty());
+    assert!(
+        out.rss_kb * 1024 < out.input_bytes,
+        "peak RSS {} kB is not below the directory total {} bytes",
+        out.rss_kb,
+        out.input_bytes
+    );
+}
+
+const SMALL_ENTRIES: u64 = 20_000;
+
+#[test]
+fn parse_scale_should_ParseEveryFormatToTheRequestedEntryCount_When_SmallInputs() {
+    for format in ALL_FORMATS {
+        let out = run_parse_scale(format, SMALL_ENTRIES);
+        assert_entries_close(format, SMALL_ENTRIES, out.entries);
+        assert!(verdict(format, SMALL_ENTRIES, &out).is_empty());
+    }
 }
