@@ -659,4 +659,66 @@ mod tests {
             test_id("[engine:junit-jupiter]/[class:com.example.CalcTest]/[method:testAdd()]");
         assert_eq!(jupiter, TestId::new("com/example/CalcTest.java", "testAdd"));
     }
+
+    fn malformed(name: &str) -> Result<PitReport, PitError> {
+        parse(&format!("malformed/pit/{name}"))
+    }
+
+    #[test]
+    fn parse_should_ReturnClassE_When_TruncatedOrEmptyOrNotUtf8() {
+        // Given a truncated, an empty and an invalid-UTF-8 report
+        // Then each is a typed error, never a panic
+        assert!(matches!(malformed("truncated.xml"), Err(PitError::Xml(_))));
+        assert!(matches!(malformed("empty.xml"), Err(PitError::Xml(_))));
+        assert!(matches!(
+            malformed("invalid-utf8.xml"),
+            Err(PitError::NotUtf8)
+        ));
+    }
+
+    #[test]
+    fn parse_should_AcceptReport_When_Utf8BomPrefix() {
+        let r = malformed("bom.xml").unwrap();
+        assert_eq!(kills_of(&r).index.len(), 2);
+    }
+
+    #[test]
+    fn parse_should_ReturnClassE_When_LineNumberWrongTypeOrOutOfRange() {
+        for name in ["wrong-type-line.xml", "out-of-range-line.xml"] {
+            let e = malformed(name).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    PitError::InvalidField {
+                        field: "lineNumber",
+                        ..
+                    }
+                ),
+                "{name}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_should_TakeLastValue_When_ChildElementDuplicated() {
+        assert!(malformed("duplicated-child.xml").is_ok());
+    }
+
+    #[test]
+    fn parse_should_ReturnClassE_When_UndefinedEntityOrNestingTooDeep() {
+        assert!(matches!(
+            malformed("undeclared-entity.xml"),
+            Err(PitError::UnknownEntity(n)) if n == "nope"
+        ));
+        assert!(matches!(
+            malformed("deep-nesting.xml"),
+            Err(PitError::NestingTooDeep)
+        ));
+    }
+
+    #[test]
+    fn parse_should_ReturnClassE_When_RootIsNotMutations() {
+        let e = parse_bytes(b"<html/>", &opts()).unwrap_err();
+        assert!(matches!(e, PitError::NotPitReport), "{e}");
+    }
 }
