@@ -1,0 +1,1 @@
+{"schemaVersion":2,"framework":"StrykerJS","files":{"a.js":{"mutants":[{"id":0,"status":["Killed"],"killedBy":"t1","location":"here"}]}}}

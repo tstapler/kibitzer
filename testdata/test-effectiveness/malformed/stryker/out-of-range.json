@@ -1,0 +1,1 @@
+{"schemaVersion":"2","files":{"a.js":{"mutants":[{"id":"0","status":"Killed","killedBy":["t1"],"coveredBy":["t1"],"location":{"start":{"line":99999999999999999999999,"column":-5},"end":{"line":4294967296,"column":1e400}}}]}}}
