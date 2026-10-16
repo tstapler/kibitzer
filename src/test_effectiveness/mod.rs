@@ -6,6 +6,7 @@
 pub mod adapters;
 pub mod analysis;
 pub mod cli;
+pub mod confidence;
 pub mod exclusions;
 pub mod locate;
 pub mod matrix;
