@@ -115,6 +115,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Experimental test-effectiveness analysis; hidden until the G2 decision (Story 4.2.1c).
+    #[command(hide = true)]
+    Tests {
+        #[command(subcommand)]
+        action: test_effectiveness::cli::TestsCommand,
+    },
     /// Query the shared architecture model (packages, symbols, import edges) — export it
     /// as JSON, or render it as a diagram.
     Architecture {
@@ -664,6 +670,7 @@ fn main() -> Result<ExitCode> {
             },
         },
         Command::Schema { out } => schema::run_schema(out),
+        Command::Tests { action } => test_effectiveness::cli::run(action),
     }
 }
 

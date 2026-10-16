@@ -159,7 +159,9 @@ pub fn derive_tier(signal: Signal, c: &CapInputs) -> Tier {
         }
     }
     if signal == Signal::ZeroUniqueKills
-        && (c.kill_completeness.is_some_and(|k| k != KillCompleteness::Full)
+        && (c
+            .kill_completeness
+            .is_some_and(|k| k != KillCompleteness::Full)
             || c.pit_without_full_matrix)
     {
         caps.push(Tier::Low);
@@ -274,8 +276,14 @@ mod tests {
     #[test]
     fn report_mode_should_BeLeastValidatedAmongRows_When_VerdictsMixed() {
         use ReportMode::*;
-        assert_eq!(ReportMode::least_validated([Tiered, Descriptive]), Descriptive);
-        assert_eq!(ReportMode::least_validated([Tiered, ReportOnly]), ReportOnly);
+        assert_eq!(
+            ReportMode::least_validated([Tiered, Descriptive]),
+            Descriptive
+        );
+        assert_eq!(
+            ReportMode::least_validated([Tiered, ReportOnly]),
+            ReportOnly
+        );
         assert_eq!(ReportMode::least_validated([]), Experimental);
         assert!(!ReportOnly.shows_confidence() && !Descriptive.shows_confidence());
         assert!(Tiered.shows_confidence() && Experimental.shows_confidence());

@@ -1,0 +1,19 @@
+experimental: signals not yet validated (see docs/test-effectiveness.md)
+kibitzer tests report
+input --coveragepy: coverage.py 7.13.4, commit 298cc15, attribution: isolated
+scope: assessed 3 of 3 tests in the input (0 not assessed)
+
+Flagged tests (2)
+Listed in order of confidence, then rule id, then test id. Order is not a removal priority.
+
+test_app.py:12: [test-zero-unique-coverage] test_noassert
+    alone: 0 unique lines of 2 covered
+    conf: medium
+    overlaps: test_neg, test_pos*
+test_app.py:4: [test-zero-unique-coverage] test_pos
+    alone: 0 unique lines of 2 covered
+    conf: medium
+    overlaps: test_neg, test_noassert*
+
+Not assessed (0)
+Absence of a flag does not mean a test is valuable.
