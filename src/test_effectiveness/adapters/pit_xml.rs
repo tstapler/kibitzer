@@ -721,4 +721,75 @@ mod tests {
         let e = parse_bytes(b"<html/>", &opts()).unwrap_err();
         assert!(matches!(e, PitError::NotPitReport), "{e}");
     }
+
+    const CANARY: &str = "CANARY-SECRET-0xDEADBEEF";
+
+    fn external_entity_report(target: &Path) -> String {
+        let template =
+            std::fs::read_to_string(fixture("malformed/pit/doctype-external-entity.xml")).unwrap();
+        template.replace(
+            "__PATH__",
+            target.display().to_string().trim_start_matches('/'),
+        )
+    }
+
+    #[test]
+    fn parse_should_NotReadLocalFile_When_DoctypeDeclaresExternalEntity() {
+        // Given a local file that exists (holding a canary) and a path that does not
+        let dir = std::env::temp_dir().join(format!("kibitzer-pit-xxe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("secret.txt");
+        std::fs::write(&existing, CANARY).unwrap();
+        let missing = dir.join("does-not-exist.txt");
+        // When a DOCTYPE-declared SYSTEM entity naming each is parsed
+        let with_file = parse_bytes(external_entity_report(&existing).as_bytes(), &opts());
+        let with_missing = parse_bytes(external_entity_report(&missing).as_bytes(), &opts());
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Then the DOCTYPE is rejected identically for both: the target is never consulted
+        let (a, b) = (with_file.unwrap_err(), with_missing.unwrap_err());
+        assert!(matches!(a, PitError::DoctypeNotAllowed), "{a}");
+        assert!(matches!(b, PitError::DoctypeNotAllowed), "{b}");
+        assert_eq!(a.to_string(), b.to_string());
+        assert!(!a.to_string().contains(CANARY));
+    }
+
+    #[test]
+    fn parse_should_LeaveEntityUnexpanded_When_NoDoctypeButEntityReferenced() {
+        // Given an entity reference with no declaration (the only way to reach one without a DOCTYPE)
+        let report =
+            std::fs::read_to_string(fixture("malformed/pit/undeclared-entity.xml")).unwrap();
+        // Then it is a class E error, not an expansion
+        let e = parse_bytes(report.as_bytes(), &opts()).unwrap_err();
+        assert!(matches!(e, PitError::UnknownEntity(_)), "{e}");
+    }
+
+    #[test]
+    fn parse_should_StayBoundedOrReject_When_BillionLaughsFixture() {
+        // Given ten nested internal entities, each ten references to the previous (10^9 expansion)
+        let bytes = std::fs::read(fixture("malformed/pit/billion-laughs.xml")).unwrap();
+        assert!(bytes.len() < 2048, "the fixture itself is small");
+        // When parsed
+        let started = std::time::Instant::now();
+        let result = parse_bytes(&bytes, &opts());
+        // Then it is rejected at the DOCTYPE, before any expansion, so memory and time stay bounded
+        let e = result.unwrap_err();
+        assert!(matches!(e, PitError::DoctypeNotAllowed), "{e}");
+        assert!(e.to_string().len() < 256);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn adapter_should_NeverUseCustomEntityResolver_When_SourceScanned() {
+        // The resolver hooks are the only way quick-xml would expand a declared entity.
+        let source = include_str!("pit_xml.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "unescape_with",
+            "normalized_value_with",
+            "resolve_entity",
+            "expand_entities",
+        ] {
+            assert!(!production.contains(forbidden), "{forbidden}");
+        }
+    }
 }
