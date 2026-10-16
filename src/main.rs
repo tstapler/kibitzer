@@ -47,6 +47,8 @@ mod single_call_site_delegation;
 mod status;
 mod symbol_extract;
 mod task_stop;
+mod test_code;
+mod test_effectiveness;
 #[cfg(test)]
 mod test_support;
 mod tree_walk;
