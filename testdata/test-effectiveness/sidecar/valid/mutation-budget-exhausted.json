@@ -1,0 +1,1 @@
+{"schema_version":1,"tool":"stryker","tool_version":"8.2.0","commit":"298cc15","attribution":"isolated","tests_total":240,"mutants_total":1930,"mutants_run":412,"sampled_fraction":null,"budget_seconds":600,"budget_exhausted":true,"partial":true}

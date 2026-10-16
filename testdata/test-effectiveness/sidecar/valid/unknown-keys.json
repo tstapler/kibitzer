@@ -1,0 +1,1 @@
+{"schema_version":1,"tool":"pit","tool_version":"1.15.0","commit":"298cc15","attribution":"isolated","tests_total":10,"mutants_total":20,"mutants_run":20,"budget_exhausted":false,"partial":false,"future_field":{"nested":[1,2,3]}}
