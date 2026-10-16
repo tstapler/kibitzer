@@ -14,7 +14,24 @@ use super::guard::{self, GuardError, JsonError};
 use super::sidecar::{self, MutationRun, MutationScope, Sidecar};
 use crate::test_effectiveness::matrix::{
     KillBuilder, KillCompleteness, KillDimension, MissingProvenance, MutantId, Provenance, TestId,
+    Tier, Warning, WarningClass,
 };
+
+pub const WARN_FIRST_KILLER_ONLY: &str = "first-killer-only";
+pub const WARN_UNVERIFIED_TOOL_VERSION: &str = "unverified-tool-version";
+pub const WARN_SINGLE_KILLER_SHARE: &str = "single-killer-share-implausible";
+
+/// A `schemaVersion` this adapter was fixtured against, with the single-killer share range recorded
+/// with that fixture (see `testdata/test-effectiveness/stryker/README.md`).
+struct FixturedVersion {
+    schema_version: &'static str,
+    single_killer_share: (f64, f64),
+}
+
+const FIXTURED_VERSIONS: &[FixturedVersion] = &[FixturedVersion {
+    schema_version: "2",
+    single_killer_share: (0.30, 1.00),
+}];
 
 const TOOL_NAME: &str = "stryker";
 const UNKNOWN_TEST_FILE: &str = "(unknown)";
@@ -125,7 +142,12 @@ pub fn parse_bytes(
         Provenance::new(tool, version).with_commit(sidecar.and_then(|s| s.commit.as_deref()));
 
     let (resolved, completeness_warnings) = sidecar::resolve_kill_completeness(sidecar, flag);
-    let mut builder = KillBuilder::kills(provenance, resolved);
+    let stats = KillStats::of(&report);
+    let completeness = match resolved {
+        KillCompleteness::Full if stats.is_first_killer_only() => KillCompleteness::FirstKillerOnly,
+        other => other,
+    };
+    let mut builder = KillBuilder::kills(provenance, completeness);
 
     let test_ids = register_tests(&report, &mut builder);
     let covered_by = record_mutants(&report, &test_ids, &mut builder);
@@ -134,12 +156,108 @@ pub fn parse_bytes(
         .build()
         .map_err(MutationElementsError::MissingProvenance)?;
     kills.warnings.extend(completeness_warnings);
+    kills.warnings.extend(drift_warnings(&report, &stats));
+    if kills
+        .warnings
+        .iter()
+        .any(|w| w.id == WARN_UNVERIFIED_TOOL_VERSION)
+    {
+        kills.cap = Some(kills.cap.map_or(Tier::Low, |c| c.min(Tier::Low)));
+    }
 
     Ok(StrykerReport {
         kills,
         mutation_run: mutation_run(sidecar, flag, resolved),
         covered_by,
     })
+}
+
+/// Killed mutants, and how many of them list exactly one distinct killer.
+struct KillStats {
+    killed: u64,
+    single_killer: u64,
+}
+
+impl KillStats {
+    fn of(report: &Report) -> Self {
+        let mut stats = Self {
+            killed: 0,
+            single_killer: 0,
+        };
+        let killers = report
+            .files
+            .values()
+            .flat_map(|f| &f.mutants)
+            .filter(|m| m.status == STATUS_KILLED)
+            .map(|m| m.killed_by.iter().collect::<BTreeSet<_>>().len())
+            .filter(|&n| n > 0);
+        for n in killers {
+            stats.killed += 1;
+            stats.single_killer += u64::from(n == 1);
+        }
+        stats
+    }
+
+    /// Bail-on-first signature: at least one kill, and every kill has a single killer.
+    fn is_first_killer_only(&self) -> bool {
+        self.killed > 0 && self.single_killer == self.killed
+    }
+
+    fn share(&self) -> Option<f64> {
+        (self.killed > 0).then(|| self.single_killer as f64 / self.killed as f64)
+    }
+}
+
+fn warning(id: &'static str, params: &[(&str, String)]) -> Warning {
+    Warning {
+        id,
+        class: WarningClass::W,
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+/// Class W warnings for truncated kill sets, an unlisted `schemaVersion`, and an implausible single-killer share.
+fn drift_warnings(report: &Report, stats: &KillStats) -> Vec<Warning> {
+    let truncated = stats.is_first_killer_only();
+    let mut warnings = Vec::new();
+    if truncated {
+        warnings.push(warning(
+            WARN_FIRST_KILLER_ONLY,
+            &[("killed_mutants", stats.killed.to_string())],
+        ));
+    }
+    let version = report.schema_version.as_ref().map(|v| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    let fixtured = version
+        .as_deref()
+        .and_then(|v| FIXTURED_VERSIONS.iter().find(|f| f.schema_version == v));
+    let Some(fixtured) = fixtured else {
+        let shown = version.unwrap_or_else(|| "missing".to_string());
+        warnings.push(warning(
+            WARN_UNVERIFIED_TOOL_VERSION,
+            &[("schema_version", shown)],
+        ));
+        return warnings;
+    };
+    let (lo, hi) = fixtured.single_killer_share;
+    let implausible = stats
+        .share()
+        .filter(|s| !truncated && !(lo..=hi).contains(s));
+    if let Some(share) = implausible {
+        warnings.push(warning(
+            WARN_SINGLE_KILLER_SHARE,
+            &[
+                ("share", format!("{share:.2}")),
+                ("expected", format!("{lo:.2}-{hi:.2}")),
+            ],
+        ));
+    }
+    warnings
 }
 
 /// Interns every test in `testFiles` (so a test that kills nothing still counts as assessed)
@@ -381,6 +499,115 @@ mod tests {
         .unwrap();
         assert_eq!(r.kills.meta, KillCompleteness::Sampled);
         assert_eq!(r.mutation_run.scope, MutationScope::Sampled);
+    }
+
+    fn with_killers(killers: &[usize], version: &str) -> Vec<u8> {
+        let mutants: Vec<String> = killers
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let by: Vec<String> = (0..n).map(|t| format!("\"t{t}\"")).collect();
+                format!(
+                    r#"{{"id":"{i}","status":"Killed","killedBy":[{}]}}"#,
+                    by.join(",")
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"schemaVersion":"{version}","framework":{{"name":"StrykerJS","version":"9.0.1"}},
+            "files":{{"a.js":{{"mutants":[{}]}}}},
+            "testFiles":{{"a.test.js":{{"tests":[{{"id":"t0","name":"A"}},{{"id":"t1","name":"B"}}]}}}}}}"#,
+            mutants.join(",")
+        )
+        .into_bytes()
+    }
+
+    fn ids(r: &StrykerReport) -> Vec<&'static str> {
+        r.kills.warnings.iter().map(|w| w.id).collect()
+    }
+
+    fn parse_inline(bytes: &[u8]) -> StrykerReport {
+        parse_bytes(bytes, Some(&sidecar_with_commit()), None).unwrap()
+    }
+
+    #[test]
+    fn parse_should_TagFirstKillerOnlyAndDowngrade_When_AllKilledBySingle() {
+        let r = parse_inline(&with_killers(&[1; 40], "2"));
+        assert_eq!(r.kills.meta, KillCompleteness::FirstKillerOnly);
+        assert_eq!(r.kills.cap, Some(Tier::Low));
+        assert_eq!(ids(&r), vec![WARN_FIRST_KILLER_ONLY]);
+        let w = &r.kills.warnings[0];
+        assert_eq!(w.class, WarningClass::W);
+        assert_eq!(
+            w.params,
+            vec![("killed_mutants".to_string(), "40".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_should_StayFull_When_SomeKilledMutantHasTwoKillers() {
+        let r = parse("report-v2.json");
+        assert_eq!(r.kills.meta, KillCompleteness::Full);
+        assert_eq!(r.kills.cap, None);
+        assert!(ids(&r).is_empty());
+    }
+
+    #[test]
+    fn parse_should_NotTagFirstKillerOnly_When_NoMutantWasKilled() {
+        let r = parse_inline(&with_killers(&[], "2"));
+        assert_eq!(r.kills.meta, KillCompleteness::Full);
+        assert!(ids(&r).is_empty());
+    }
+
+    #[test]
+    fn parse_should_KeepBudgetLimitedAndStillWarn_When_AllSingleKillersUnderBudgetStop() {
+        let bytes = std::fs::read(fixture("report-budget.run.json")).unwrap();
+        let sc = sidecar::parse_sidecar(&bytes).unwrap().sidecar;
+        let r = parse_bytes(&with_killers(&[1; 5], "2"), Some(&sc), None).unwrap();
+        assert_eq!(r.kills.meta, KillCompleteness::BudgetLimited);
+        assert_eq!(ids(&r), vec![WARN_FIRST_KILLER_ONLY]);
+    }
+
+    #[test]
+    fn parse_should_WarnAndCapLow_When_SchemaVersionNotOnAllowList() {
+        let r = parse("report-unlisted-version.json");
+        assert_eq!(ids(&r), vec![WARN_UNVERIFIED_TOOL_VERSION]);
+        assert_eq!(
+            r.kills.warnings[0].params,
+            vec![("schema_version".to_string(), "99".to_string())]
+        );
+        assert_eq!(r.kills.cap, Some(Tier::Low));
+        assert_eq!(r.kills.meta, KillCompleteness::Full);
+    }
+
+    #[test]
+    fn parse_should_WarnAndCapLow_When_SchemaVersionMissing() {
+        let r = parse_inline(br#"{"framework":{"name":"S","version":"1"},"files":{}}"#);
+        assert_eq!(ids(&r), vec![WARN_UNVERIFIED_TOOL_VERSION]);
+        assert_eq!(r.kills.cap, Some(Tier::Low));
+    }
+
+    #[test]
+    fn parse_should_WarnAboutPlausibility_When_SingleKillerShareBelowFixtureRange() {
+        let r = parse_inline(&with_killers(&[2, 2, 2, 2, 2, 2, 2, 2, 2, 1], "2"));
+        assert_eq!(ids(&r), vec![WARN_SINGLE_KILLER_SHARE]);
+        assert_eq!(r.kills.meta, KillCompleteness::Full);
+        assert_eq!(r.kills.cap, None);
+    }
+
+    #[test]
+    fn parse_should_NotWarnAboutPlausibility_When_ShareInsideFixtureRange() {
+        let r = parse_inline(&with_killers(&[2, 1, 1, 2], "2"));
+        assert!(ids(&r).is_empty());
+    }
+
+    #[test]
+    fn parse_should_CountDistinctKillers_When_KilledByRepeatsATest() {
+        let r = parse_inline(
+            br#"{"schemaVersion":"2","framework":{"name":"S","version":"1"},
+            "files":{"a.js":{"mutants":[{"id":"0","status":"Killed","killedBy":["t0","t0"]}]}}}"#,
+        );
+        assert_eq!(r.kills.meta, KillCompleteness::FirstKillerOnly);
     }
 
     #[test]
