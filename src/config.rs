@@ -792,6 +792,25 @@ fn prose_checks() -> Vec<Check> {
     ]
 }
 
+/// Static test-quality checks, one `Check` per language instance. Registered (via
+/// `inventory::submit!`) and reachable by name, but deliberately NOT chained into
+/// [`default_checks`]: G1 decides default exposure (ADR-004). `test-tautology-<lang>` and
+/// `test-mock-only-<lang>` join here when those checkers land.
+// Nothing chains this by design (ADR-004); tests and a future G1 decision are its callers.
+#[allow(dead_code)]
+pub fn test_quality_checks() -> Vec<Check> {
+    vec![
+        native_check("test-no-assertion-go", Severity::Advisory, &["**/*.go"]),
+        native_check("test-no-assertion-python", Severity::Advisory, &["**/*.py"]),
+    ]
+}
+
+/// Cap on test-quality findings per file in hook mode. Unset until `G1-decision.md` records a
+/// value (UX-H9): no collapsing happens while this is `None`.
+pub fn test_quality_hook_cap() -> Option<usize> {
+    None
+}
+
 fn core_checks() -> Vec<Check> {
     let inline_ignore_scope = crate::checkers::inline_ignore::scope_globs();
     let inline_ignore_scope: Vec<&str> = inline_ignore_scope.iter().map(String::as_str).collect();

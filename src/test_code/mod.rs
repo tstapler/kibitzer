@@ -211,12 +211,12 @@ impl TestCodeProfile {
     }
 }
 
-pub(super) fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
+pub(crate) fn node_text<'a>(node: Node, source: &'a str) -> &'a str {
     source.get(node.byte_range()).unwrap_or("")
 }
 
 /// 1-based line of `node`'s first row.
-pub(super) fn line_of(node: Node) -> usize {
+pub(crate) fn line_of(node: Node) -> usize {
     node.start_position().row + 1
 }
 
@@ -324,6 +324,60 @@ fn starts_finding(line: &str) -> bool {
         && !num.is_empty()
         && num.bytes().all(|b| b.is_ascii_digit())
         && rest.starts_with(' ')
+}
+
+/// Words a hook finding never uses (UX-H2). A message also never opens with `Delete`/`Remove`.
+pub const BANNED_MESSAGE_WORDS: &[&str] = &["must", "critical", "urgent"];
+const BANNED_OPENERS: &[&str] = &["delete", "remove"];
+
+/// The first banned word in `message`, if any: a [`BANNED_MESSAGE_WORDS`] word anywhere, or a
+/// banned opener as the first word of the message or of its text after the `[rule]` tag.
+pub fn banned_word_in(message: &str) -> Option<String> {
+    let words: Vec<String> = message
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if let Some(w) = words
+        .iter()
+        .find(|w| BANNED_MESSAGE_WORDS.contains(&w.as_str()))
+    {
+        return Some(w.clone());
+    }
+    let after_tag = message.split_once("] ").map_or(message, |(_, rest)| rest);
+    [message, after_tag]
+        .iter()
+        .filter_map(|m| m.split_whitespace().next())
+        .map(str::to_ascii_lowercase)
+        .find(|w| BANNED_OPENERS.contains(&w.as_str()))
+}
+
+/// The four-line hook text shared by the static test-quality rules (UX-H1, H2, H8, H10): headline,
+/// likely fix, non-claim, and the V1 quiet-path line (a copyable `kibitzer:ignore` directive plus
+/// `report_false_positive`). V2 would replace only the last line once G1 records a variant.
+pub struct QualityMessage<'a> {
+    pub rule: &'a str,
+    pub headline: &'a str,
+    pub likely_fix: &'a str,
+    pub non_claim: &'a str,
+    /// Line-comment leader of the language: `//` or `#`.
+    pub comment_leader: &'a str,
+    /// Where the directive goes, for example `above the func`.
+    pub placement: &'a str,
+}
+
+impl QualityMessage<'_> {
+    pub fn render(&self) -> String {
+        format!(
+            "[{rule}] {headline}\n  Likely fix: {fix}\n  Not claimed: {non_claim}\n  Intentional? add `{leader} kibitzer:ignore {rule} -- <why>` {placement}. Finding wrong? report_false_positive.",
+            rule = self.rule,
+            headline = self.headline,
+            fix = self.likely_fix,
+            non_claim = self.non_claim,
+            leader = self.comment_leader,
+            placement = self.placement,
+        )
+    }
 }
 
 #[cfg(test)]
