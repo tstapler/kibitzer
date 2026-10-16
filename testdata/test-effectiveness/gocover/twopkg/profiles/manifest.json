@@ -2,7 +2,7 @@
   "schema_version": 1,
   "tool": "go",
   "go_version": "go1.26.4",
-  "commit": "cce7ab3",
+  "commit": "e5118031cd1e01972cf3868df71396b5d9baa4eb",
   "mode": "isolated",
   "tests_total": 2,
   "failing": []
