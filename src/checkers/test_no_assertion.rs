@@ -143,7 +143,7 @@ impl TestNoAssertionChecker {
 
     fn asserts(&self, ctx: &Scan, calls: &[Call], handles: &[String], depth: usize) -> bool {
         calls.iter().any(|call| {
-            if ctx.vocab.contains(&call.callee) || self.supplemental(call) {
+            if ctx.vocab.contains(&call.callee) || self.supplemental(ctx, call) {
                 return true;
             }
             if depth < MAX_HELPER_DEPTH
@@ -164,11 +164,13 @@ impl TestNoAssertionChecker {
     }
 
     /// Assertion shapes the profile vocabulary cannot express with a fixed receiver name.
-    fn supplemental(&self, call: &Call) -> bool {
+    fn supplemental(&self, ctx: &Scan, call: &Call) -> bool {
         let last = call.callee.rsplit('.').next().unwrap_or(&call.callee);
         match self.lang {
             Language::Python => last.starts_with("assert") || last == "AssertionError",
-            Language::Kotlin => is_kotlin_oracle(last),
+            Language::Kotlin => {
+                is_kotlin_oracle(last) || (ctx.screenshot_file && is_screenshot_capture(last))
+            }
             _ => {
                 last.starts_with("Assert")
                     || last.starts_with("Fatal")
@@ -218,6 +220,8 @@ struct Scan {
     fns: Vec<FnInfo>,
     by_name: HashMap<String, usize>,
     seen: std::cell::RefCell<Vec<usize>>,
+    /// Kotlin only: the file mentions screenshots, so `capture*` calls compare against goldens.
+    screenshot_file: bool,
 }
 
 impl Scan {
@@ -317,6 +321,8 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
         fns,
         by_name,
         seen: Default::default(),
+        screenshot_file: lang == Language::Kotlin
+            && ctx.source.to_ascii_lowercase().contains("screenshot"),
     }
 }
 
@@ -389,6 +395,12 @@ fn is_kotlin_oracle(last: &str) -> bool {
     ];
     const EXACT: &[&str] = &["check", "checkNotNull", "require", "requireNotNull"];
     PREFIXES.iter().any(|p| last.starts_with(p)) || EXACT.contains(&last)
+}
+
+/// Golden-image capture calls (Roborazzi `captureRoboImage`, or a project wrapper such as
+/// `captureMultiTheme`) fail the test when the image differs, so they are the oracle.
+fn is_screenshot_capture(last: &str) -> bool {
+    last.starts_with("capture") || last == "verifyRoboImage" || last == "compareRoboImage"
 }
 
 /// Every call in a Kotlin function, a chain contributing one entry per link:

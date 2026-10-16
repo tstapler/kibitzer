@@ -102,6 +102,8 @@ const KOTLIN_CASES: &[Case] = &[
     ("EmptyTest.kt", &[7, 12, 17], &[7, 12, 17]),
     ("ComposeTest.kt", &[31], &[31]),
     ("HelperTest.kt", &[29, 34], &[34]),
+    ("ScreenshotTest.kt", &[], &[]),
+    ("CaptureNonGoldenTest.kt", &[8], &[8]),
     (
         "SixVacuousTest.kt",
         &[7, 8, 9, 10, 11, 12],
