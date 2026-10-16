@@ -8,6 +8,13 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 
+/// Built-in `--max-input-bytes` ceiling (Task 2.1.5b): the smallest of the four per-format largest inputs that
+/// parsed within the 1.5 GB peak-RSS bound (`cargo test --release parse_scale -- --ignored`, Linux VmHWM).
+/// Stryker JSON is the limiting format: 6.5e7 matrix entries, 649,949,574 bytes, peak 1,489,516 kB in 18.4 s;
+/// 7.0e7 entries (699,752,474 bytes) peaked at 1,596,916 kB and failed. coverage.py, PIT and the Go profile
+/// directory passed at 5e7 entries from 1.3 to 1.6 GB of input (peak 0.76 to 0.91 GB). G0 may tighten this.
+pub const DEFAULT_MAX_INPUT_BYTES: u64 = 649_949_574;
+
 /// An input file over `--max-input-bytes`: the facts the R26 class E message names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputTooLarge {
@@ -153,6 +160,24 @@ mod tests {
         // and a file within the cap is accepted from metadata alone
         assert_eq!(check_size(&path, 5_000).unwrap(), 5_000);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_size_should_AdmitCeilingAndRefuseOneByteMore_When_BuiltInCeiling() {
+        let dir = scratch("ceiling");
+        let path = dir.join("sparse.json");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(DEFAULT_MAX_INPUT_BYTES).unwrap();
+        assert_eq!(
+            check_size(&path, DEFAULT_MAX_INPUT_BYTES).unwrap(),
+            DEFAULT_MAX_INPUT_BYTES
+        );
+        f.set_len(DEFAULT_MAX_INPUT_BYTES + 1).unwrap();
+        assert!(matches!(
+            check_size(&path, DEFAULT_MAX_INPUT_BYTES),
+            Err(GuardError::TooLarge(_))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
