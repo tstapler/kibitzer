@@ -85,7 +85,7 @@
           }
         },
         "parameter_object_suppress": {
-          "description": "`(name, type)` parameter pairs `parameter-object` ignores when clustering — idiomatic boilerplate that recurs everywhere without signalling a missing type. Unset means `parameter_object::DEFAULT_SUPPRESSED_PAIRS` (`ctx context.Context`); set it (even to `[]`) to replace that default outright.",
+          "description": "`(name, type)` parameter pairs `parameter-object` ignores when clustering — idiomatic boilerplate that recurs everywhere without signalling a missing type. Unset means `parameter_object::DEFAULT_SUPPRESSED_PAIRS` (`ctx context.Context`, `t *testing.T`, `b *testing.B`); set it (even to `[]`) to replace that default outright.",
           "default": null,
           "type": [
             "array",

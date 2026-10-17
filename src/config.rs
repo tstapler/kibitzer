@@ -208,7 +208,7 @@ pub struct ArchitectureConfig {
     pub naming_rules: Vec<NamingRule>,
     /// `(name, type)` parameter pairs `parameter-object` ignores when clustering — idiomatic
     /// boilerplate that recurs everywhere without signalling a missing type. Unset means
-    /// `parameter_object::DEFAULT_SUPPRESSED_PAIRS` (`ctx context.Context`); set it
+    /// `parameter_object::DEFAULT_SUPPRESSED_PAIRS` (`ctx context.Context`, `t *testing.T`, `b *testing.B`); set it
     /// (even to `[]`) to replace that default outright.
     #[serde(default)]
     pub parameter_object_suppress: Option<Vec<(String, String)>>,

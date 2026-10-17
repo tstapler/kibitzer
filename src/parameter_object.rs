@@ -2,7 +2,8 @@
 //! parameter group of 2+ that recurs, exactly, across 3+ functions/methods.
 //!
 //! Needs `SymbolNode::params`, which only Go and TypeScript/TSX populate — every other
-//! language is silently skipped. Exact-subset matching only (no fuzzy/Jaccard similarity).
+//! language is silently skipped. Functions with more than `MAX_ENUMERATED_PARAMS` usable
+//! params are skipped (`long-parameter-list` already covers them). Exact-subset matching only (no fuzzy/Jaccard similarity).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,8 +21,8 @@ pub const DEFAULT_SUPPRESSED_PAIRS: &[(&str, &str)] = &[
 
 const MIN_CLUSTER_FUNCTIONS: usize = 3;
 const MIN_GROUP_SIZE: usize = 2;
-/// Subset enumeration is 2^n; beyond this, a function only contributes pairs.
-const MAX_FULL_ENUMERATION_PARAMS: usize = 10;
+/// Subset enumeration is 2^n; a function with more usable params than this is skipped.
+const MAX_ENUMERATED_PARAMS: usize = 10;
 
 type Param = (String, String);
 
@@ -30,6 +31,11 @@ pub struct ParameterObjectChecker;
 impl ArchModelChecker for ParameterObjectChecker {
     fn name(&self) -> &str {
         "parameter-object"
+    }
+
+    /// Repeated parameter groups mostly live in unexported helpers.
+    fn needs_private_symbols(&self) -> bool {
+        true
     }
 
     fn check(&self, model: &ArchModel, config: &ArchitectureConfig) -> Vec<ArchFinding> {
@@ -63,10 +69,13 @@ impl ArchModelChecker for ParameterObjectChecker {
             .filter(|(_, fns)| fns.len() >= MIN_CLUSTER_FUNCTIONS)
             .collect();
 
-        // A superset shared by the same functions already reports every subset of itself.
+        // A strict superset with the same member count has identical members (its members are a
+        // subset of ours), so it already reports this group.
         clusters
             .iter()
-            .filter(|(subset, fns)| !is_interface_implementation(&functions, subset, fns))
+            .filter(|(subset, fns)| {
+                !is_interface_implementation(&functions, subset, fns, &suppressed)
+            })
             .filter(|(subset, fns)| {
                 !clusters.iter().any(|(other, other_fns)| {
                     other.len() > subset.len()
@@ -97,12 +106,13 @@ fn is_interface_implementation(
     functions: &[&SymbolNode],
     group: &[Param],
     members: &[usize],
+    suppressed: &BTreeSet<Param>,
 ) -> bool {
     let members: Vec<&SymbolNode> = members.iter().map(|&i| functions[i]).collect();
     let distinct_parents: BTreeSet<_> = members.iter().filter_map(|f| f.parent.as_ref()).collect();
     members
         .iter()
-        .all(|f| f.kind == SymbolKind::Method && f.params.len() == group.len())
+        .all(|f| f.kind == SymbolKind::Method && usable_params(f, suppressed).len() == group.len())
         && distinct_parents.len() >= MIN_CLUSTER_FUNCTIONS
 }
 
@@ -117,7 +127,10 @@ fn in_fixture_dir(file: &std::path::Path) -> bool {
 fn is_injected_service_type(ty: &str) -> bool {
     let mut chars = ty.chars();
     ty == "ServicesAccessor"
-        || (chars.next() == Some('I') && chars.next().is_some_and(|c| c.is_ascii_uppercase()))
+        || matches!(
+            (chars.next(), chars.next(), chars.next()),
+            (Some('I'), Some(u), Some(l)) if u.is_ascii_uppercase() && l.is_ascii_lowercase()
+        )
 }
 
 fn is_test_file(file: &std::path::Path) -> bool {
@@ -141,18 +154,12 @@ fn usable_params(f: &SymbolNode, suppressed: &BTreeSet<Param>) -> Vec<Param> {
         .collect()
 }
 
-/// Every subset of `params` (already sorted) with at least `MIN_GROUP_SIZE` members. Past
-/// `MAX_FULL_ENUMERATION_PARAMS` params, only pairs — up to C(n,2) rather than 2^n.
+/// Every subset of `params` (already sorted) with at least `MIN_GROUP_SIZE` members.
+/// Empty past `MAX_ENUMERATED_PARAMS` params.
 fn subsets(params: &[Param]) -> Vec<Vec<Param>> {
     let n = params.len();
-    if n < MIN_GROUP_SIZE {
+    if !(MIN_GROUP_SIZE..=MAX_ENUMERATED_PARAMS).contains(&n) {
         return Vec::new();
-    }
-    if n > MAX_FULL_ENUMERATION_PARAMS {
-        return (0..n)
-            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
-            .map(|(i, j)| vec![params[i].clone(), params[j].clone()])
-            .collect();
     }
     (1u32..(1 << n))
         .filter(|mask| mask.count_ones() as usize >= MIN_GROUP_SIZE)
@@ -292,13 +299,13 @@ mod tests {
     }
 
     #[test]
-    fn long_parameter_lists_only_contribute_pairs() {
+    fn long_parameter_lists_are_skipped() {
         let many: Vec<(String, String)> = (0..15)
             .map(|i| (format!("p{i}"), "int".to_string()))
             .collect();
         let refs: Vec<(&str, &str)> = many.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
         let subsets = subsets(&usable_params(&func("big", 1, &refs), &BTreeSet::new()));
-        assert_eq!(subsets.len(), 15 * 14 / 2);
+        assert!(subsets.is_empty());
     }
 
     #[test]
@@ -335,6 +342,52 @@ mod tests {
             })
             .collect();
         assert!(run(methods).is_empty());
+    }
+
+    #[test]
+    fn id_typed_params_are_not_mistaken_for_injected_services() {
+        let ids = [("user", "ID"), ("tenant", "ID")];
+        let findings = run(vec![
+            func("a", 10, &ids),
+            func("b", 20, &ids),
+            func("c", 30, &ids),
+        ]);
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn interface_implementations_with_a_suppressed_ctx_param_are_still_recognised() {
+        let methods: Vec<SymbolNode> = ["A", "B", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, owner)| {
+                let mut m = func(
+                    "Do",
+                    10 * (i + 1),
+                    &[("ctx", "context.Context"), USER, TENANT],
+                );
+                m.kind = SymbolKind::Method;
+                m.parent = Some(owner.to_string());
+                m
+            })
+            .collect();
+        assert!(run(methods).is_empty());
+    }
+
+    #[test]
+    fn a_pair_is_not_reported_alongside_the_triple_that_contains_it() {
+        let abc = [USER, TENANT, ("x", "int")];
+        let findings = run(vec![
+            func("a", 10, &abc),
+            func("b", 20, &abc),
+            func("c", 30, &abc),
+        ]);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .message
+                .contains("tenant_id string, user_id string, x int")
+        );
     }
 
     #[test]
