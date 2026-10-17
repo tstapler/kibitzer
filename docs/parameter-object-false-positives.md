@@ -19,10 +19,11 @@ with `scripts/clone-backtest-repos.sh`).
 | denoland/deno | n/a | model build aborts: `stream did not contain valid UTF-8` reading a test-fixture `.js` file (`import_graph::build`, not this check) |
 | servo/servo | n/a | same UTF-8 abort on a WPT fixture `.js` file |
 
-`kibitzer check backtest parameter-object` scanned 3210 transcripts / 2396 snapshots and
-produced no replayable signal: the check needs 3+ functions across the repo, which a
-single reconstructed file rarely supplies. The corpus run above is the meaningful
-evidence for this check.
+`kibitzer check backtest parameter-object` (replayed through `backtest::ModelBacked`)
+scanned 3227 transcripts / 2400 snapshots and produced 5 findings, all the same group
+(`itemID string, sb *strings.Builder`, 3 helpers in one `stapler-squad` file, seen across
+5 edit snapshots). Each snapshot builds its model from one file alone, so only clusters
+inside a single edited file can appear. The corpus run above is the main evidence.
 
 ## Triage
 

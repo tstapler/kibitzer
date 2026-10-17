@@ -39,6 +39,18 @@ pub trait ArchitectureChecker {
         config: &ArchitectureConfig,
         model: Option<&crate::arch_model::ArchModel>,
     ) -> Vec<ArchFinding>;
+
+    /// Whether dispatch should build and pass an `ArchModel`; a checker returning `true`
+    /// must treat `None` as "no evidence" and report nothing.
+    fn needs_model(&self) -> bool {
+        false
+    }
+
+    /// Same meaning as `ArchModelChecker::needs_private_symbols`, consulted only when
+    /// `needs_model` is `true`.
+    fn needs_private_symbols(&self) -> bool {
+        false
+    }
 }
 
 pub fn registry() -> Vec<Box<dyn ArchitectureChecker>> {
@@ -48,6 +60,7 @@ pub fn registry() -> Vec<Box<dyn ArchitectureChecker>> {
         Box::new(CouplingChecker),
         Box::new(ComponentDependencyChecker),
         Box::new(PackageSizeChecker),
+        Box::new(crate::parameter_object::ParameterObjectChecker),
     ]
 }
 
@@ -560,7 +573,6 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::isp_fat_interface::IspFatInterfaceChecker),
         Box::new(crate::unreferenced_symbols::UnreferencedPrivateSymbolChecker),
         Box::new(crate::single_call_site_delegation::SingleCallSiteDelegationChecker),
-        Box::new(crate::parameter_object::ParameterObjectChecker),
     ]
 }
 

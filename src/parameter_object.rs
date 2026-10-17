@@ -8,8 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::arch_model::{ArchModel, SymbolKind, SymbolNode};
-use crate::architecture_checks::{ArchFinding, ArchModelChecker};
+use crate::architecture_checks::{ArchFinding, ArchitectureChecker};
 use crate::config::{ArchitectureConfig, Severity};
+use crate::import_graph::ImportGraph;
 
 /// Go's ubiquitous first parameter; pairing it with any business parameter would flag
 /// nearly every service method.
@@ -28,7 +29,7 @@ type Param = (String, String);
 
 pub struct ParameterObjectChecker;
 
-impl ArchModelChecker for ParameterObjectChecker {
+impl ArchitectureChecker for ParameterObjectChecker {
     fn name(&self) -> &str {
         "parameter-object"
     }
@@ -38,40 +39,54 @@ impl ArchModelChecker for ParameterObjectChecker {
         true
     }
 
-    fn check(&self, model: &ArchModel, config: &ArchitectureConfig) -> Vec<ArchFinding> {
-        let suppressed: BTreeSet<Param> = match &config.parameter_object_suppress {
-            Some(pairs) => pairs.iter().cloned().collect(),
-            None => DEFAULT_SUPPRESSED_PAIRS
-                .iter()
-                .map(|(n, t)| (n.to_string(), t.to_string()))
-                .collect(),
-        };
+    fn check(
+        &self,
+        _graph: &ImportGraph,
+        config: &ArchitectureConfig,
+        model: Option<&ArchModel>,
+    ) -> Vec<ArchFinding> {
+        model.map_or_else(Vec::new, |model| findings_for(model, config))
+    }
 
-        let mut functions: Vec<&SymbolNode> = model
-            .packages
-            .values()
-            .flat_map(|pkg| pkg.symbols.iter())
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .filter(|s| !is_test_file(&s.file) && !in_fixture_dir(&s.file))
-            .collect();
-        functions.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    fn needs_model(&self) -> bool {
+        true
+    }
+}
 
-        let mut index: BTreeMap<Vec<Param>, Vec<usize>> = BTreeMap::new();
-        for (i, f) in functions.iter().enumerate() {
-            let params = usable_params(f, &suppressed);
-            for subset in subsets(&params) {
-                index.entry(subset).or_default().push(i);
-            }
-        }
-
-        let clusters: Vec<(&Vec<Param>, &Vec<usize>)> = index
+fn findings_for(model: &ArchModel, config: &ArchitectureConfig) -> Vec<ArchFinding> {
+    let suppressed: BTreeSet<Param> = match &config.parameter_object_suppress {
+        Some(pairs) => pairs.iter().cloned().collect(),
+        None => DEFAULT_SUPPRESSED_PAIRS
             .iter()
-            .filter(|(_, fns)| fns.len() >= MIN_CLUSTER_FUNCTIONS)
-            .collect();
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect(),
+    };
 
-        // A strict superset with the same member count has identical members (its members are a
-        // subset of ours), so it already reports this group.
-        clusters
+    let mut functions: Vec<&SymbolNode> = model
+        .packages
+        .values()
+        .flat_map(|pkg| pkg.symbols.iter())
+        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .filter(|s| !is_test_file(&s.file) && !in_fixture_dir(&s.file))
+        .collect();
+    functions.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+
+    let mut index: BTreeMap<Vec<Param>, Vec<usize>> = BTreeMap::new();
+    for (i, f) in functions.iter().enumerate() {
+        let params = usable_params(f, &suppressed);
+        for subset in subsets(&params) {
+            index.entry(subset).or_default().push(i);
+        }
+    }
+
+    let clusters: Vec<(&Vec<Param>, &Vec<usize>)> = index
+        .iter()
+        .filter(|(_, fns)| fns.len() >= MIN_CLUSTER_FUNCTIONS)
+        .collect();
+
+    // A strict superset with the same member count has identical members (its members are a
+    // subset of ours), so it already reports this group.
+    clusters
             .iter()
             .filter(|(subset, fns)| {
                 !is_interface_implementation(&functions, subset, fns, &suppressed)
@@ -97,7 +112,6 @@ impl ArchModelChecker for ParameterObjectChecker {
                 }
             })
             .collect()
-    }
 }
 
 /// Methods on 3+ distinct types whose whole parameter list is exactly the group are one
@@ -232,7 +246,7 @@ mod tests {
     }
 
     fn run(symbols: Vec<SymbolNode>) -> Vec<ArchFinding> {
-        ParameterObjectChecker.check(&model_of(symbols), &ArchitectureConfig::default())
+        findings_for(&model_of(symbols), &ArchitectureConfig::default())
     }
 
     const USER: (&str, &str) = ("user_id", "string");
@@ -295,7 +309,7 @@ mod tests {
             parameter_object_suppress: Some(vec![]),
             ..Default::default()
         };
-        assert_eq!(ParameterObjectChecker.check(&model, &config).len(), 1);
+        assert_eq!(findings_for(&model, &config).len(), 1);
     }
 
     #[test]
@@ -372,6 +386,29 @@ mod tests {
             })
             .collect();
         assert!(run(methods).is_empty());
+    }
+
+    #[test]
+    fn check_reports_nothing_without_a_model() {
+        let graph = ImportGraph::default();
+        assert!(
+            ParameterObjectChecker
+                .check(&graph, &ArchitectureConfig::default(), None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn check_uses_the_supplied_model() {
+        let graph = ImportGraph::default();
+        let model = model_of(vec![
+            func("a", 10, &[USER, TENANT]),
+            func("b", 20, &[USER, TENANT]),
+            func("c", 30, &[USER, TENANT]),
+        ]);
+        let findings =
+            ParameterObjectChecker.check(&graph, &ArchitectureConfig::default(), Some(&model));
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
