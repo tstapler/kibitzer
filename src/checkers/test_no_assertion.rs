@@ -48,6 +48,14 @@ const PYTHON_ORACLE_METHODS: &[&str] = &[
 ];
 /// Synthetic callee for a `validate(...)` call whose failure is re-raised by its `except`.
 const RERAISED_VALIDATE: &str = "assert";
+/// Synthetic Go callee for `if err != nil { panic(...) }` inside a `go` statement: `t.Fatal` is
+/// unsafe off the test goroutine, so the guarded panic is how that goroutine fails the test.
+/// Outside a goroutine it is not counted: setup helpers panic on setup errors without asserting
+/// anything about the code under test (nats `TestSystemAccountWithBadRemoteLatencyUpdate`).
+const GUARDED_PANIC: &str = "guarded-panic";
+/// Testing-handle methods that fail the test; passing one as a function value (`apply(t.Errorf)`)
+/// makes the receiving helper an assertion site. `Log*` and `Skip*` do not fail, so are absent.
+const GO_FAILING_METHODS: &[&str] = &["Error", "Errorf", "Fatal", "Fatalf", "Fail", "FailNow"];
 const OPT_HELPERS: &str = "assertion_helpers";
 const OPT_PRECISION: &str = "precision_first";
 const OPT_ISH: &str = "assertion_ish";
@@ -79,6 +87,8 @@ struct FnInfo {
     span: (usize, usize),
     calls: Vec<Call>,
     handles: Vec<String>,
+    /// Go only: parameter names in order (`""` for an unnamed one), for callback-argument following.
+    params: Vec<String>,
     /// Python only: innermost enclosing class, for `self.method` resolution.
     class: Option<String>,
 }
@@ -184,6 +194,9 @@ impl TestNoAssertionChecker {
             if ctx.vocab.contains(&call.callee) || self.supplemental(ctx, call) {
                 return true;
             }
+            if self.lang == Language::Go && callback_asserts(ctx, call, handles) {
+                return true;
+            }
             if depth < MAX_HELPER_DEPTH
                 && let Some(helper) = ctx.resolve(self.lang, &call.callee, handles, owner)
             {
@@ -220,7 +233,8 @@ impl TestNoAssertionChecker {
                 is_kotlin_oracle(last) || (ctx.screenshot_file && is_screenshot_capture(last))
             }
             _ => {
-                last.starts_with("Assert")
+                call.callee == GUARDED_PANIC
+                    || last.starts_with("Assert")
                     || last.starts_with("Fatal")
                     || last.starts_with("Fail")
                     || (last.starts_with("Error")
@@ -256,6 +270,31 @@ fn string_list<'a>(name: &str, key: &str, value: &'a serde_json::Value) -> Resul
                 .with_context(|| format!("{name}: option `{key}` must be an array of strings"))
         })
         .collect()
+}
+
+/// Go: `helper(t.Errorf, ...)` asserts when `helper` is not resolvable (precision-first: assume
+/// it is an oracle) or resolves to a same-file function that invokes that parameter.
+fn callback_asserts(ctx: &Scan, call: &Call, handles: &[String]) -> bool {
+    let positions: Vec<usize> = call
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| is_failing_method_value(a, handles))
+        .map(|(i, _)| i)
+        .collect();
+    if positions.is_empty() {
+        return false;
+    }
+    match ctx.resolve_go(&call.callee, handles) {
+        None => true,
+        Some(helper) => positions.iter().any(|&i| ctx.invokes_param(helper, i, 0)),
+    }
+}
+
+fn is_failing_method_value(arg: &str, handles: &[String]) -> bool {
+    arg.split_once('.').is_some_and(|(recv, method)| {
+        handles.iter().any(|h| h == recv) && GO_FAILING_METHODS.contains(&method)
+    })
 }
 
 /// Passing the framework handle to an unresolved function counts as asserting.
@@ -308,6 +347,27 @@ impl Scan {
     fn helper_source(&self, name: &str, source: &str) -> Option<String> {
         let f = &self.fns[*self.by_name.get(name)?];
         source.get(f.span.0..f.span.1).map(str::to_string)
+    }
+
+    /// Go: does `f` call its `idx`-th parameter, or hand it on to a callee that does? A callee
+    /// that cannot be resolved is assumed to call it. Depth-bounded, so recursion terminates.
+    fn invokes_param(&self, f: &FnInfo, idx: usize, depth: usize) -> bool {
+        let Some(param) = f.params.get(idx).filter(|p| !p.is_empty() && *p != "_") else {
+            return false;
+        };
+        f.calls.iter().any(|c| {
+            c.callee == *param
+                || c.args.iter().enumerate().any(|(j, a)| {
+                    a == param
+                        && match self.resolve_go(&c.callee, &f.handles) {
+                            None => true,
+                            Some(next) => {
+                                depth + 1 < MAX_HELPER_DEPTH
+                                    && self.invokes_param(next, j, depth + 1)
+                            }
+                        }
+                })
+        })
     }
 
     /// Python `self.name`: the method on `class`, else on its same-file bases (nearest first).
@@ -491,6 +551,11 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
                     span: (node.start_byte(), node.end_byte()),
                     calls: calls_in(lang, node, ctx.source),
                     handles: handles_in(lang, node, ctx.source),
+                    params: if lang == Language::Go {
+                        go_params(node, ctx.source)
+                    } else {
+                        Vec::new()
+                    },
                     class: (lang == Language::Python)
                         .then(|| enclosing_class(node, ctx.source))
                         .flatten(),
@@ -668,6 +733,14 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
                     .into_iter()
                     .collect(),
             });
+        } else if lang == Language::Go
+            && node.kind() == "if_statement"
+            && is_guarded_panic(node, source)
+        {
+            calls.push(Call {
+                callee: GUARDED_PANIC.to_string(),
+                args: Vec::new(),
+            });
         } else if lang == Language::Python && node.kind() == "try_statement" {
             if reraises_validate(node, source) {
                 calls.push(Call {
@@ -684,6 +757,60 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
         true
     });
     calls
+}
+
+/// `if <...err...> != nil { ...panic(...)... }` lexically inside a `go` statement.
+fn is_guarded_panic(if_node: Node, source: &str) -> bool {
+    let mut ancestor = if_node.parent();
+    while let Some(n) = ancestor {
+        if n.kind() == "go_statement" {
+            break;
+        }
+        ancestor = n.parent();
+    }
+    if ancestor.is_none() {
+        return false;
+    }
+    let Some(cond) = if_node.child_by_field_name("condition") else {
+        return false;
+    };
+    let cond = node_text(cond, source);
+    if !(cond.contains("err") && cond.contains("!= nil")) {
+        return false;
+    }
+    let Some(body) = if_node.child_by_field_name("consequence") else {
+        return false;
+    };
+    let mut panics = false;
+    walk_preorder(body, &mut |n| {
+        panics |= GoKind::of(n) == GoKind::CallExpression
+            && n.child_by_field_name("function")
+                .is_some_and(|f| node_text(f, source) == "panic");
+        true
+    });
+    panics
+}
+
+/// Parameter names of a Go function or method in order, `""` standing in for an unnamed one.
+fn go_params(func: Node, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(params) = func.child_by_field_name("parameters") else {
+        return out;
+    };
+    let mut cursor = params.walk();
+    for decl in params.named_children(&mut cursor) {
+        let mut inner = decl.walk();
+        let names: Vec<String> = decl
+            .children_by_field_name("name", &mut inner)
+            .map(|n| node_text(n, source).to_string())
+            .collect();
+        if names.is_empty() {
+            out.push(String::new());
+        } else {
+            out.extend(names);
+        }
+    }
+    out
 }
 
 fn is_go_path(text: &str) -> bool {

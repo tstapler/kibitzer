@@ -81,6 +81,11 @@ const GO_CASES: &[Case] = &[
     ("unresolved_helper_test.go", &[7], &[]),
     ("helper_depth_test.go", &[18, 25], &[18, 25]),
     (
+        "callback_assertion_test.go",
+        &[53, 55, 58, 60, 67, 99, 102, 107],
+        &[53, 55, 58, 60, 67, 99, 102, 107],
+    ),
+    (
         "six_vacuous_test.go",
         &[6, 7, 8, 9, 10, 11],
         &[6, 7, 8, 9, 10, 11],
