@@ -274,6 +274,10 @@ pub fn run_backtest(
                 checkers.push(checker);
             } else if let Some(checker) = crate::architecture_checks::lookup_model(name) {
                 model_checkers.push(checker);
+            } else if let Some(checker) =
+                crate::architecture_checks::lookup(name).filter(|c| c.needs_model())
+            {
+                model_checkers.push(Box::new(ModelBacked(checker)));
             } else {
                 anyhow::bail!("no checker named '{name}' registered");
             }
@@ -441,6 +445,33 @@ pub fn run_backtest(
     }
 
     Ok(BacktestReport { findings, stats })
+}
+
+/// Lets an import-graph `ArchitectureChecker` that only needs the model (`needs_model`)
+/// be replayed like an `ArchModelChecker`; it never reads the graph, so an empty one is
+/// passed.
+struct ModelBacked(Box<dyn crate::architecture_checks::ArchitectureChecker>);
+
+impl ArchModelChecker for ModelBacked {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn check(
+        &self,
+        model: &crate::arch_model::ArchModel,
+        config: &crate::config::ArchitectureConfig,
+    ) -> Vec<crate::architecture_checks::ArchFinding> {
+        self.0.check(
+            &crate::import_graph::ImportGraph::default(),
+            config,
+            Some(model),
+        )
+    }
+
+    fn needs_private_symbols(&self) -> bool {
+        self.0.needs_private_symbols()
+    }
 }
 
 /// Runs a whole-repo `ArchModelChecker` against a single reconstructed file: the model

@@ -228,6 +228,7 @@ mod tests {
             parent: parent.map(str::to_string),
             is_pure_delegation: false,
             delegation_field: None,
+            params: vec![],
         }
     }
 

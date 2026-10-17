@@ -39,6 +39,7 @@ mod mcp;
 mod mermaid;
 mod middle_man;
 mod node_kind;
+mod parameter_object;
 mod plugin;
 mod root_cause_clusters;
 mod run;
@@ -692,7 +693,9 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         check::AnyArchitectureChecker::Import(checker) => {
             let graph = import_graph::build(dir, &files)
                 .with_context(|| format!("building import graph for {}", dir.display()))?;
-            checker.check(&graph, &arch_config)
+            let model = check::model_for_import_checker(checker.as_ref(), dir, &files)
+                .with_context(|| format!("building architecture model for {}", dir.display()))?;
+            checker.check(&graph, &arch_config, model.as_ref())
         }
         check::AnyArchitectureChecker::Model(checker) => {
             let model =
