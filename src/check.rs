@@ -1239,7 +1239,7 @@ pub fn run_architecture_check(
                 Ok(graph) => graph,
                 Err(err) => return Ok(error_result(format!("{err:#}"))),
             };
-            checker.check(&graph, arch_config)
+            checker.check(&graph, arch_config, None)
         }
         AnyArchitectureChecker::Model(checker) => {
             let model =
@@ -1349,7 +1349,7 @@ fn check_native_against_git_head_repo(
         AnyArchitectureChecker::Import(checker) => {
             crate::import_graph::build(&snapshot_dir, &files)
                 .ok()
-                .map(|graph| checker.check(&graph, arch_config).is_empty())
+                .map(|graph| checker.check(&graph, arch_config, None).is_empty())
         }
         AnyArchitectureChecker::Model(checker) => {
             build_arch_model_for_check(&snapshot_dir, &files, checker.needs_private_symbols())

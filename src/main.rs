@@ -692,7 +692,7 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         check::AnyArchitectureChecker::Import(checker) => {
             let graph = import_graph::build(dir, &files)
                 .with_context(|| format!("building import graph for {}", dir.display()))?;
-            checker.check(&graph, &arch_config)
+            checker.check(&graph, &arch_config, None)
         }
         check::AnyArchitectureChecker::Model(checker) => {
             let model =

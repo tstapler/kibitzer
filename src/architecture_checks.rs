@@ -30,7 +30,15 @@ pub struct ArchFinding {
 
 pub trait ArchitectureChecker {
     fn name(&self) -> &str;
-    fn check(&self, graph: &ImportGraph, config: &ArchitectureConfig) -> Vec<ArchFinding>;
+    /// `model` is the repo's `ArchModel` when the caller has already built one, `None`
+    /// otherwise; every current import-graph checker ignores it (symbol-level checkers
+    /// implement `ArchModelChecker` instead, which always receives the model).
+    fn check(
+        &self,
+        graph: &ImportGraph,
+        config: &ArchitectureConfig,
+        model: Option<&crate::arch_model::ArchModel>,
+    ) -> Vec<ArchFinding>;
 }
 
 pub fn registry() -> Vec<Box<dyn ArchitectureChecker>> {
@@ -54,7 +62,12 @@ impl ArchitectureChecker for ImportCycleChecker {
         "import-cycles"
     }
 
-    fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+    fn check(
+        &self,
+        graph: &ImportGraph,
+        _config: &ArchitectureConfig,
+        _model: Option<&crate::arch_model::ArchModel>,
+    ) -> Vec<ArchFinding> {
         let cycles = find_cycles(graph);
         cycles
             .into_iter()
@@ -100,7 +113,12 @@ impl ArchitectureChecker for LayeringChecker {
     /// `config.layers == ["handlers", "domain", "infra"]`. Higher layers (earlier in
     /// the list) are expected to depend on lower ones; the reverse means a lower layer
     /// has taken on a dependency it shouldn't know about.
-    fn check(&self, graph: &ImportGraph, config: &ArchitectureConfig) -> Vec<ArchFinding> {
+    fn check(
+        &self,
+        graph: &ImportGraph,
+        config: &ArchitectureConfig,
+        _model: Option<&crate::arch_model::ArchModel>,
+    ) -> Vec<ArchFinding> {
         if config.layers.is_empty() {
             return Vec::new();
         }
@@ -216,7 +234,12 @@ impl ArchitectureChecker for CouplingChecker {
         "coupling"
     }
 
-    fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+    fn check(
+        &self,
+        graph: &ImportGraph,
+        _config: &ArchitectureConfig,
+        _model: Option<&crate::arch_model::ArchModel>,
+    ) -> Vec<ArchFinding> {
         let counts = fan_in_out(&graph.edges);
         let mut findings = fan_out_findings(graph, &counts);
         findings.extend(fan_in_findings(graph, &counts));
@@ -245,7 +268,12 @@ impl ArchitectureChecker for PackageSizeChecker {
     /// [`crate::checkers::file_size::is_generated`]) are excluded from the sum for the same
     /// reason `go-file-size` skips them outright — machine output isn't a candidate for
     /// a human to split.
-    fn check(&self, graph: &ImportGraph, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+    fn check(
+        &self,
+        graph: &ImportGraph,
+        _config: &ArchitectureConfig,
+        _model: Option<&crate::arch_model::ArchModel>,
+    ) -> Vec<ArchFinding> {
         let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
         for (file, pkg) in &graph.file_packages {
             if file.extension().and_then(|e| e.to_str()) != Some("go") {
@@ -371,7 +399,12 @@ impl ArchitectureChecker for ComponentDependencyChecker {
         "component-deps"
     }
 
-    fn check(&self, graph: &ImportGraph, config: &ArchitectureConfig) -> Vec<ArchFinding> {
+    fn check(
+        &self,
+        graph: &ImportGraph,
+        config: &ArchitectureConfig,
+        _model: Option<&crate::arch_model::ArchModel>,
+    ) -> Vec<ArchFinding> {
         let components = config.effective_components();
         let rules = config.effective_dependency_rules();
 
@@ -961,7 +994,7 @@ mod tests {
         graph.edges.push(edge("a", "b"));
         graph.edges.push(edge("b", "a"));
 
-        let findings = ImportCycleChecker.check(&graph, &ArchitectureConfig::default());
+        let findings = ImportCycleChecker.check(&graph, &ArchitectureConfig::default(), None);
 
         assert_eq!(findings.len(), 1);
         // Story 6.1.1: mandatory `[import-cycle]` bracket prefix.
@@ -984,7 +1017,7 @@ mod tests {
 
         assert!(
             ImportCycleChecker
-                .check(&graph, &ArchitectureConfig::default())
+                .check(&graph, &ArchitectureConfig::default(), None)
                 .is_empty()
         );
     }
@@ -999,7 +1032,7 @@ mod tests {
         graph.edges.push(edge("b", "c"));
         graph.edges.push(edge("c", "a"));
 
-        let findings = ImportCycleChecker.check(&graph, &ArchitectureConfig::default());
+        let findings = ImportCycleChecker.check(&graph, &ArchitectureConfig::default(), None);
 
         assert_eq!(findings.len(), 1);
     }
@@ -1021,7 +1054,7 @@ mod tests {
             ..Default::default()
         };
 
-        let findings = LayeringChecker.check(&graph, &config);
+        let findings = LayeringChecker.check(&graph, &config, None);
 
         assert_eq!(findings.len(), 1);
         // Story 6.1.1: mandatory `[layering]` bracket prefix.
@@ -1043,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(LayeringChecker.check(&graph, &config).is_empty());
+        assert!(LayeringChecker.check(&graph, &config, None).is_empty());
     }
 
     #[test]
@@ -1057,7 +1090,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(LayeringChecker.check(&graph, &config).is_empty());
+        assert!(LayeringChecker.check(&graph, &config, None).is_empty());
     }
 
     #[test]
@@ -1069,7 +1102,7 @@ mod tests {
 
         assert!(
             LayeringChecker
-                .check(&graph, &ArchitectureConfig::default())
+                .check(&graph, &ArchitectureConfig::default(), None)
                 .is_empty()
         );
     }
@@ -1084,7 +1117,7 @@ mod tests {
             graph.edges.push(edge("hub", &dep));
         }
 
-        let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default());
+        let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default(), None);
 
         assert!(
             findings
@@ -1103,7 +1136,7 @@ mod tests {
             graph.edges.push(edge(&dep, "core"));
         }
 
-        let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default());
+        let findings = CouplingChecker.check(&graph, &ArchitectureConfig::default(), None);
 
         assert!(
             findings
@@ -1121,7 +1154,7 @@ mod tests {
 
         assert!(
             CouplingChecker
-                .check(&graph, &ArchitectureConfig::default())
+                .check(&graph, &ArchitectureConfig::default(), None)
                 .is_empty()
         );
     }
@@ -1163,7 +1196,7 @@ mod tests {
             ..Default::default()
         };
 
-        let findings = ComponentDependencyChecker.check(&graph, &config);
+        let findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].file, Some(PathBuf::from("domain/domain.go")));
@@ -1206,7 +1239,7 @@ mod tests {
             ..Default::default()
         };
 
-        let findings = ComponentDependencyChecker.check(&graph, &config);
+        let findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         // Deny wins even though "infra" also appears in `may_depend_on`.
         assert_eq!(findings.len(), 1);
@@ -1238,7 +1271,7 @@ mod tests {
             ..Default::default()
         };
 
-        let findings = ComponentDependencyChecker.check(&graph, &config);
+        let findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         assert_eq!(findings.len(), 1);
     }
@@ -1267,7 +1300,11 @@ mod tests {
 
         // Both endpoints resolve to the same "domain" component regardless of any
         // declared rule.
-        assert!(ComponentDependencyChecker.check(&graph, &config).is_empty());
+        assert!(
+            ComponentDependencyChecker
+                .check(&graph, &config, None)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1294,7 +1331,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(ComponentDependencyChecker.check(&graph, &config).is_empty());
+        assert!(
+            ComponentDependencyChecker
+                .check(&graph, &config, None)
+                .is_empty()
+        );
     }
 
     /// pre-mortem.md P1 #3(i): an edge's target must resolve to an actual `graph.nodes`
@@ -1331,7 +1372,11 @@ mod tests {
         // "some-vendor/infra-client" textually matches "**/infra/**" but was never a
         // walked repo-local file (`build_go`/`build_js` would never have produced this
         // edge), so it must never resolve to a component or a violation.
-        assert!(ComponentDependencyChecker.check(&graph, &config).is_empty());
+        assert!(
+            ComponentDependencyChecker
+                .check(&graph, &config, None)
+                .is_empty()
+        );
     }
 
     // --- Story 1.1.2: `layers`-desugar golden regression tests ---
@@ -1367,8 +1412,8 @@ mod tests {
             ..Default::default()
         };
 
-        let layering_findings = LayeringChecker.check(&graph, &config);
-        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config);
+        let layering_findings = LayeringChecker.check(&graph, &config, None);
+        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         assert_eq!(layering_findings.len(), 1);
         assert_same_findings_by_location(&layering_findings, &component_deps_findings);
@@ -1385,8 +1430,8 @@ mod tests {
             ..Default::default()
         };
 
-        let layering_findings = LayeringChecker.check(&graph, &config);
-        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config);
+        let layering_findings = LayeringChecker.check(&graph, &config, None);
+        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         assert!(layering_findings.is_empty());
         assert_same_findings_by_location(&layering_findings, &component_deps_findings);
@@ -1403,8 +1448,8 @@ mod tests {
             ..Default::default()
         };
 
-        let layering_findings = LayeringChecker.check(&graph, &config);
-        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config);
+        let layering_findings = LayeringChecker.check(&graph, &config, None);
+        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         assert!(layering_findings.is_empty());
         assert_same_findings_by_location(&layering_findings, &component_deps_findings);
@@ -1418,8 +1463,8 @@ mod tests {
         graph.edges.push(edge("a", "b"));
         let config = ArchitectureConfig::default();
 
-        let layering_findings = LayeringChecker.check(&graph, &config);
-        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config);
+        let layering_findings = LayeringChecker.check(&graph, &config, None);
+        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         assert!(layering_findings.is_empty());
         assert_same_findings_by_location(&layering_findings, &component_deps_findings);
@@ -1436,8 +1481,8 @@ mod tests {
             ..Default::default()
         };
 
-        let layering_findings = LayeringChecker.check(&graph, &config);
-        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config);
+        let layering_findings = LayeringChecker.check(&graph, &config, None);
+        let component_deps_findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         // "domain2" matches neither `layer_of()`'s exact-segment match nor the desugared
         // `**/domain`/`**/domain/**` globs (glob anchors on the full segment).
@@ -1460,7 +1505,7 @@ mod tests {
             ..Default::default()
         };
 
-        let findings = ComponentDependencyChecker.check(&graph, &config);
+        let findings = ComponentDependencyChecker.check(&graph, &config, None);
 
         let advisory = findings
             .iter()
@@ -1545,7 +1590,7 @@ mod tests {
         graph.nodes.insert("pkg".to_string());
         graph.file_packages.insert(file, "pkg".to_string());
 
-        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default());
+        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default(), None);
 
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("pkg"));
@@ -1563,7 +1608,7 @@ mod tests {
         graph.file_packages.insert(file_a, "pkg".to_string());
         graph.file_packages.insert(file_b, "pkg".to_string());
 
-        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default());
+        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default(), None);
 
         assert_eq!(findings.len(), 1);
     }
@@ -1579,7 +1624,7 @@ mod tests {
 
         assert!(
             PackageSizeChecker
-                .check(&graph, &ArchitectureConfig::default())
+                .check(&graph, &ArchitectureConfig::default(), None)
                 .is_empty()
         );
     }
@@ -1598,7 +1643,7 @@ mod tests {
 
         assert!(
             PackageSizeChecker
-                .check(&graph, &ArchitectureConfig::default())
+                .check(&graph, &ArchitectureConfig::default(), None)
                 .is_empty()
         );
     }
@@ -1614,7 +1659,7 @@ mod tests {
 
         assert!(
             PackageSizeChecker
-                .check(&graph, &ArchitectureConfig::default())
+                .check(&graph, &ArchitectureConfig::default(), None)
                 .is_empty()
         );
     }
