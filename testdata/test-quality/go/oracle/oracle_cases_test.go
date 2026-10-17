@@ -94,3 +94,54 @@ func TestStub_empty(t *testing.T) {
 func TestUntagged_logOnly(t *testing.T) {
 	t.Logf("slice:\n%s", klog.Format(slice))
 }
+
+func TestStub_delegatesToSkipHelper(t *testing.T) {
+	skipOnlyHelper(t, false, true)
+}
+
+func TestStub_delegatesToSkipHelperWithOptions(t *testing.T) {
+	skipOnlyHelper(t, true, true, WithAuth("invalid", "invalid"))
+}
+
+func TestStub_delegatesToEmptyHelper(t *testing.T) {
+	emptyHelper(t)
+}
+
+func TestStub_delegatesToTodoHelper(t *testing.T) {
+	todoHelper(t)
+}
+
+// The helper does real work, so delegation to it is not a stub.
+func TestDelegates_toWorkingHelper(t *testing.T) {
+	workingHelper(t)
+}
+
+// Two levels deep: only one level of delegation is followed.
+func TestDelegates_twoLevels(t *testing.T) {
+	outerHelper(t)
+}
+
+func TestDelegates_skipHelperPlusRealCall(t *testing.T) {
+	skipOnlyHelper(t, false, true)
+	Parse("x")
+}
+
+func skipOnlyHelper(t *testing.T, a, b bool, opts ...Option) {
+	// TODO: finish this once the client exposes the method
+	t.Skip()
+}
+
+func emptyHelper(t *testing.T) {
+}
+
+func todoHelper(t *testing.T) {
+	// TODO: write this
+}
+
+func workingHelper(t *testing.T) {
+	Parse("x")
+}
+
+func outerHelper(t *testing.T) {
+	skipOnlyHelper(t, false, false)
+}

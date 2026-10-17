@@ -122,7 +122,7 @@ struct Scanned {
     comments: String,
 }
 
-pub fn tag_go(f: &TestFn) -> OracleTag {
+pub fn tag_go(f: &TestFn, helper_source: &dyn Fn(&str) -> Option<String>) -> OracleTag {
     let scanned = scan(&f.body);
     let inner = inner_body(&scanned.code);
     let stmts: Vec<Stmt> = split_statements(inner)
@@ -131,6 +131,9 @@ pub fn tag_go(f: &TestFn) -> OracleTag {
         .collect();
 
     if inner.trim().is_empty() {
+        return OracleTag::EmptyStub;
+    }
+    if delegates_only_to_stubs(&stmts, helper_source) {
         return OracleTag::EmptyStub;
     }
     if is_compile_check(&stmts) || is_compile_note(&stmts, &scanned.comments) {
@@ -155,6 +158,26 @@ pub fn tag_go(f: &TestFn) -> OracleTag {
         return OracleTag::NoPanicSmoke { cued: false };
     }
     OracleTag::Untagged
+}
+
+/// The body is only calls to same-file helpers that are themselves stubs (empty, TODO-only, or
+/// only `t.Skip*`). One level: a stub helper's own delegation is not followed.
+fn delegates_only_to_stubs(stmts: &[Stmt], helper_source: &dyn Fn(&str) -> Option<String>) -> bool {
+    !stmts.is_empty()
+        && stmts.iter().all(|s| match s {
+            Stmt::Call(c) if !c.contains(['.', '[', '(']) => {
+                helper_source(c).is_some_and(|src| is_stub_body(&src))
+            }
+            _ => false,
+        })
+}
+
+fn is_stub_body(helper_src: &str) -> bool {
+    let scanned = scan(helper_src);
+    let inner = inner_body(&scanned.code);
+    split_statements(inner).iter().all(|s| {
+        matches!(classify(s), Stmt::Call(c) if c.contains('.') && last_segment(&c).starts_with("Skip"))
+    })
 }
 
 fn is_compile_check(stmts: &[Stmt]) -> bool {
@@ -452,10 +475,17 @@ mod tests {
     const FIXTURE: &str =
         include_str!("../../testdata/test-quality/go/oracle/oracle_cases_test.go");
 
+    /// Same-file helper lookup for the fixture: text from `func name(` to the next column-0 `}`.
+    fn fixture_helper(name: &str) -> Option<String> {
+        let start = FIXTURE.find(&format!("func {name}("))?;
+        let rest = &FIXTURE[start..];
+        Some(rest[..rest.find("\n}\n")? + 3].to_string())
+    }
+
     fn labels() -> BTreeMap<String, &'static str> {
         functions(Language::Go, FIXTURE)
             .iter()
-            .map(|f| (f.name.clone(), tag_go(f).label()))
+            .map(|f| (f.name.clone(), tag_go(f, &fixture_helper).label()))
             .collect()
     }
 
@@ -475,6 +505,16 @@ mod tests {
             ("TestStub_todoOnly", "empty-stub"),
             ("TestStub_empty", "empty-stub"),
             ("TestUntagged_logOnly", "untagged"),
+            ("TestStub_delegatesToSkipHelper", "empty-stub"),
+            ("TestStub_delegatesToSkipHelperWithOptions", "empty-stub"),
+            ("TestStub_delegatesToEmptyHelper", "empty-stub"),
+            ("TestStub_delegatesToTodoHelper", "empty-stub"),
+            ("TestDelegates_toWorkingHelper", "no-panic-smoke:uncued"),
+            ("TestDelegates_twoLevels", "no-panic-smoke:uncued"),
+            (
+                "TestDelegates_skipHelperPlusRealCall",
+                "no-panic-smoke:uncued",
+            ),
         ];
         let got = labels();
         for (name, tag) in expected {
