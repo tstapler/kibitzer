@@ -46,7 +46,7 @@ impl Checker for FuzzyDuplicateCodeChecker {
 /// against `kubernetes/kubernetes` found ~97% of raw findings were `_test.go` table-driven
 /// cases — already the Parameterize-Function shape, so flagging them back is backwards.
 /// See `docs/duplicate-code-fuzzy.md`.
-fn is_test_file(file: &Path) -> bool {
+pub(crate) fn is_test_file(file: &Path) -> bool {
     // Rust integration tests and JS/TS test suites both conventionally live in a `tests/`
     // or `__tests__/` directory rather than following a filename suffix (e.g.
     // `crates/cli/tests/browser_session.rs`, confirmed as a real backtest hit before this

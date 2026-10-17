@@ -405,6 +405,7 @@ fn go_type_declaration_symbols(
             exported,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
     }
 }
@@ -527,6 +528,13 @@ fn classify_node(
             .child_by_field_name("body")
             .is_some_and(is_pure_delegation_body);
 
+    let delegation_field = if is_pure_delegation && symbol_kind == SymbolKind::Method {
+        node.child_by_field_name("body")
+            .and_then(|body| delegation_field_from_body(node, body, language, source))
+    } else {
+        None
+    };
+
     Some(SymbolNode {
         id,
         name,
@@ -536,6 +544,7 @@ fn classify_node(
         exported,
         parent,
         is_pure_delegation,
+        delegation_field,
     })
 }
 
@@ -581,14 +590,18 @@ const CALL_EXPRESSION_KIND: &str = "call_expression";
 /// `expression_list` (so `return a(), b()` correctly doesn't match); TS/JS's
 /// `return_statement` holds the call directly.
 fn is_pure_delegation_body(body: Node) -> bool {
+    delegating_call(body).is_some()
+}
+
+/// The single call node `is_pure_delegation_body` matched, if any.
+fn delegating_call(body: Node) -> Option<Node> {
     let stmts = body_statements(body);
     let [stmt] = stmts.as_slice() else {
-        return false;
+        return None;
     };
+    let is_call = |n: &Node| n.kind() == CALL_EXPRESSION_KIND;
     match stmt.kind() {
-        "expression_statement" => stmt
-            .named_child(0)
-            .is_some_and(|c| c.kind() == CALL_EXPRESSION_KIND),
+        "expression_statement" => stmt.named_child(0).filter(is_call),
         "return_statement" => {
             let mut cursor = stmt.walk();
             let values: Vec<Node> = stmt
@@ -596,18 +609,73 @@ fn is_pure_delegation_body(body: Node) -> bool {
                 .filter(|c| c.is_named())
                 .collect();
             match values.as_slice() {
-                [value] if value.kind() == CALL_EXPRESSION_KIND => true,
+                [value] if is_call(value) => Some(*value),
                 [value] if value.kind() == "expression_list" => {
                     let mut c2 = value.walk();
                     let exprs: Vec<Node> =
                         value.children(&mut c2).filter(|c| c.is_named()).collect();
-                    matches!(exprs.as_slice(), [expr] if expr.kind() == CALL_EXPRESSION_KIND)
+                    match exprs.as_slice() {
+                        [expr] if is_call(expr) => Some(*expr),
+                        _ => None,
+                    }
                 }
-                _ => false,
+                _ => None,
             }
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// The receiver field a pure-delegation method routes through: `s.inner.Foo()` (Go, where
+/// `s` is the method's receiver) or `this.inner.foo()` (TS/JS) gives `Some("inner")`.
+/// `None` for a bare/free call, a call chained off another call (`s.Get().Foo()`), a
+/// deeper chain (`s.a.b.Foo()`), or any language `call_graph_supports` excludes.
+fn delegation_field_from_body<'a>(
+    method: Node<'a>,
+    body: Node<'a>,
+    language: Language,
+    source: &str,
+) -> Option<String> {
+    if !call_graph_supports(language) {
+        return None;
+    }
+    let callee = delegating_call(body)?.child_by_field_name("function")?;
+    let (callee_kind, operand_field, member_field) = match language {
+        Language::Go => ("selector_expression", "operand", "field"),
+        _ => ("member_expression", "object", "property"),
+    };
+    if callee.kind() != callee_kind {
+        return None;
+    }
+    let receiver_access = callee.child_by_field_name(operand_field)?;
+    if receiver_access.kind() != callee_kind {
+        return None;
+    }
+    let base = receiver_access.child_by_field_name(operand_field)?;
+    let base_ok = match language {
+        Language::Go => {
+            base.kind() == "identifier"
+                && go_receiver_name(method, source).as_deref() == Some(node_text(base, source))
+        }
+        _ => base.kind() == "this",
+    };
+    if !base_ok {
+        return None;
+    }
+    let field = receiver_access.child_by_field_name(member_field)?;
+    Some(node_text(field, source).to_string())
+}
+
+/// Name of a Go method's receiver parameter (`s` in `func (s *S) Foo()`); `None` when the
+/// receiver is unnamed or blank (`_`).
+fn go_receiver_name(method: Node, source: &str) -> Option<String> {
+    let receiver = method.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let param = receiver
+        .children(&mut cursor)
+        .find(|c| c.kind() == "parameter_declaration")?;
+    let name = node_text(param.child_by_field_name("name")?, source);
+    (name != "_").then(|| name.to_string())
 }
 
 fn walk(
@@ -2772,5 +2840,88 @@ mod tests {
         // regardless of body shape, since there's no call-graph signal to pair it with.
         let symbols = extract(Language::Rust, "fn thin() {\n\thelper();\n}\n", "pkg");
         assert!(!find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    // --- `delegation_field` (remove-middle-man checker's input) ---
+
+    #[test]
+    fn delegation_field_set_for_a_go_field_delegation() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{ inner T }\ntype T struct{}\n\nfunc (s *S) Foo() int {\n\treturn s.inner.Foo()\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "Foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_go_direct_method_call() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{}\n\nfunc (s *S) Foo() {\n\ts.bar()\n}\n",
+            "pkg",
+        );
+        let foo = find_by_name(&symbols, "Foo");
+        assert!(foo.is_pure_delegation);
+        assert_eq!(foo.delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_go_call_chained_off_a_call() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{}\n\nfunc (s *S) Foo() {\n\ts.Get().Foo()\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "Foo").delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_go_package_level_selector() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{}\n\nfunc (s *S) Foo() {\n\tlog.Default.Println()\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "Foo").delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_typescript_field_delegation() {
+        let symbols = extract(
+            Language::TypeScript,
+            "class S {\n  foo(x: number) { return this.inner.foo(x); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_typescript_call_chained_off_a_call() {
+        let symbols = extract(
+            Language::TypeScript,
+            "class S {\n  foo() { return this.get().foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "foo").delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_javascript_field_delegation() {
+        let symbols = extract(
+            Language::JavaScript,
+            "class S {\n  foo() { this.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "foo").delegation_field.as_deref(),
+            Some("inner")
+        );
     }
 }

@@ -86,6 +86,12 @@ pub struct SymbolNode {
     /// precedent as `ArchFinding::severity_override`).
     #[serde(default)]
     pub is_pure_delegation: bool,
+    /// Receiver field a pure-delegation method routes through (`s.inner.Foo()` →
+    /// `Some("inner")`), for `middle_man::MiddleManChecker`. `None` for non-delegating
+    /// symbols, delegation that isn't a direct receiver-field call (free functions,
+    /// `s.Get().Foo()`, deeper chains), and languages without call-graph coverage.
+    #[serde(default)]
+    pub delegation_field: Option<String>,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -1205,6 +1211,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         }
     }
 
@@ -1346,6 +1353,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2110,6 +2118,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2121,6 +2130,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
 
         let mut packages = BTreeMap::new();
@@ -2156,6 +2166,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2192,6 +2203,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2463,6 +2475,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2479,6 +2492,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2529,6 +2543,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2570,6 +2585,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         });
         packages.insert("app".to_string(), pkg);
 

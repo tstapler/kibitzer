@@ -527,6 +527,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::isp_fat_interface::IspFatInterfaceChecker),
         Box::new(crate::unreferenced_symbols::UnreferencedPrivateSymbolChecker),
         Box::new(crate::single_call_site_delegation::SingleCallSiteDelegationChecker),
+        Box::new(crate::middle_man::MiddleManChecker),
     ]
 }
 
@@ -1642,6 +1643,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
         }
     }
 
@@ -1823,6 +1825,7 @@ mod tests {
             exported: true,
             parent: Some(type_name.to_string()),
             is_pure_delegation: false,
+            delegation_field: None,
         }
     }
 
@@ -1884,6 +1887,7 @@ mod tests {
                     exported: true,
                     parent: Some("T".to_string()),
                     is_pure_delegation: false,
+                    delegation_field: None,
                 },
             ],
         );
@@ -1908,6 +1912,7 @@ mod tests {
                     exported: true,
                     parent: None,
                     is_pure_delegation: false,
+                    delegation_field: None,
                 },
             ],
         );
@@ -1931,6 +1936,7 @@ mod tests {
                     exported: true,
                     parent: Some("T".to_string()),
                     is_pure_delegation: false,
+                    delegation_field: None,
                 },
             ],
         );
