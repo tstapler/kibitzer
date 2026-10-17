@@ -1202,6 +1202,19 @@ pub(crate) fn build_arch_model_for_check(
     )
 }
 
+/// The `ArchModel` an import-graph checker asked for via `needs_model`, `None` when it
+/// didn't — most don't, and building one walks and parses every file again.
+pub(crate) fn model_for_import_checker(
+    checker: &dyn crate::architecture_checks::ArchitectureChecker,
+    repo_root: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<Option<crate::arch_model::ArchModel>> {
+    if !checker.needs_model() {
+        return Ok(None);
+    }
+    build_arch_model_for_check(repo_root, files, checker.needs_private_symbols()).map(Some)
+}
+
 /// Runs a whole-repo, in-process architecture/declaration checker resolved through
 /// [`lookup_any_architecture_checker`] — the native counterpart to `run_check`'s
 /// shell-out path for `WholeRepoNative` checks. `files` is expected to already be
@@ -1239,7 +1252,11 @@ pub fn run_architecture_check(
                 Ok(graph) => graph,
                 Err(err) => return Ok(error_result(format!("{err:#}"))),
             };
-            checker.check(&graph, arch_config)
+            let model = match model_for_import_checker(checker.as_ref(), repo_root, files) {
+                Ok(model) => model,
+                Err(err) => return Ok(error_result(format!("{err:#}"))),
+            };
+            checker.check(&graph, arch_config, model.as_ref())
         }
         AnyArchitectureChecker::Model(checker) => {
             let model =
@@ -1349,7 +1366,15 @@ fn check_native_against_git_head_repo(
         AnyArchitectureChecker::Import(checker) => {
             crate::import_graph::build(&snapshot_dir, &files)
                 .ok()
-                .map(|graph| checker.check(&graph, arch_config).is_empty())
+                .and_then(|graph| {
+                    let model =
+                        model_for_import_checker(checker.as_ref(), &snapshot_dir, &files).ok()?;
+                    Some(
+                        checker
+                            .check(&graph, arch_config, model.as_ref())
+                            .is_empty(),
+                    )
+                })
         }
         AnyArchitectureChecker::Model(checker) => {
             build_arch_model_for_check(&snapshot_dir, &files, checker.needs_private_symbols())

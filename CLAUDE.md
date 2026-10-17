@@ -12,7 +12,7 @@ architecture model, a `command` a project must supply) goes in
 remember. `comment-quality-<lang>` (`docs/comment-quality.md`) is wired in
 this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
-`duplicate-code-cross-file`, `file-complexity`, `inline-ignore` (reports
+`duplicate-code-cross-file`, `parameter-object` (`docs/parameter-object-false-positives.md`), `file-complexity`, `inline-ignore` (reports
 malformed `kibitzer:ignore` directives; the directives themselves are applied to
 every checker's findings, see `docs/suppressing-checks.md`), the Go-specific
 `go-blank-imports`/`go-ignored-error`/`go-error-context`, and the mechanical

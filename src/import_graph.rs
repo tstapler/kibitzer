@@ -41,6 +41,17 @@ impl ImportGraph {
     }
 }
 
+/// Reads a source file, treating non-UTF-8 content (vendored fixtures, encoded test data)
+/// as "not source" and skipping it, like `arch_model`'s own readers; other I/O errors
+/// still abort.
+fn read_source(file: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(file) {
+        Ok(source) => Ok(Some(source)),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::InvalidData) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading {}", file.display())),
+    }
+}
+
 /// Build the import graph over `files` (already filtered to files kibitzer is scoped
 /// to). Go, TypeScript/JavaScript, Java, Kotlin, and Python are all extracted via
 /// per-language dispatch below. Python uses a bespoke resolver (`build_python`)
@@ -204,8 +215,9 @@ fn build_qualified_name_language(
     // (earlier or later in `files`) declares it.
     let mut file_packages: Vec<(&PathBuf, String, tree_sitter::Tree, String)> = Vec::new();
     for file in files {
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let Some(source) = read_source(file)? else {
+            continue;
+        };
         let tree = parser
             .parse(&source, None)
             .with_context(|| format!("parsing {}", file.display()))?;
@@ -533,8 +545,9 @@ fn build_js(files: &[&PathBuf], graph: &mut ImportGraph) -> Result<()> {
     }
 
     for file in files {
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let Some(source) = read_source(file)? else {
+            continue;
+        };
 
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -1091,8 +1104,9 @@ fn build_python(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -
         std::collections::HashMap::new();
 
     for file in files {
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let Some(source) = read_source(file)? else {
+            continue;
+        };
         let tree = parser
             .parse(&source, None)
             .with_context(|| format!("parsing {}", file.display()))?;
@@ -1437,8 +1451,9 @@ fn build_rust(repo_root: &Path, files: &[&PathBuf], graph: &mut ImportGraph) -> 
     let mut file_data: Vec<(&PathBuf, String, tree_sitter::Tree, String)> = Vec::new();
 
     for file in files {
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let Some(source) = read_source(file)? else {
+            continue;
+        };
         let tree = parser
             .parse(&source, None)
             .with_context(|| format!("parsing {} with tree-sitter-rust", file.display()))?;
@@ -1493,6 +1508,16 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn build_skips_a_non_utf8_file_instead_of_failing() {
+        let dir = tmp_dir("non-utf8");
+        let good = write(&dir, "good/good.js", "export const a = 1;\n");
+        let bad = dir.join("bad/bad.js");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, [0xff, 0xfe, 0x00, 0xd8]).unwrap();
+        assert!(build(&dir, &[good, bad]).is_ok());
     }
 
     #[test]
