@@ -7,6 +7,8 @@
 //! dispatcher already parsed. The rule id a finding prints and a `kibitzer:ignore` directive
 //! names is the bare `test-no-assertion`.
 //!
+//! Files under a `NON_TEST_DIRS` component (`testdata`, `vendor`, ...) are skipped for every language.
+//!
 //! Options: `assertion_helpers` (extra assertion callee names, trailing `*` is a prefix),
 //! `precision_first` (an unresolved call whose name looks assertion-ish counts as asserting),
 //! `assertion_ish` (extra words for that look). Any other key is a load-time error.
@@ -29,10 +31,33 @@ const SUPPORTED: &[Language] = &[Language::Go, Language::Python, Language::Kotli
 /// Same-file helper hops followed from a test body: test -> helper -> helper.
 const MAX_HELPER_DEPTH: usize = 2;
 const DEFAULT_ASSERTION_ISH: &[&str] = &["assert", "check", "verify", "expect", "require", "must"];
+/// Python oracles recognised by method name on any receiver: `<x>.raises` / `<x>.warns` cover
+/// aliases such as `py.test.raises`; the rest are pytester `LineMatcher` / `RunResult` checks
+/// (`result.stdout.fnmatch_lines([...])`).
+const PYTHON_ORACLE_METHODS: &[&str] = &[
+    "raises",
+    "warns",
+    "fnmatch_lines",
+    "fnmatch_lines_random",
+    "re_match_lines",
+    "re_match_lines_random",
+    "no_fnmatch_line",
+    "no_re_match_line",
+    "assert_outcomes",
+    "assert_contains",
+];
+/// Synthetic callee for a `validate(...)` call whose failure is re-raised by its `except`.
+const RERAISED_VALIDATE: &str = "assert";
 const OPT_HELPERS: &str = "assertion_helpers";
 const OPT_PRECISION: &str = "precision_first";
 const OPT_ISH: &str = "assertion_ish";
 const VALID_OPTIONS: &[&str] = &[OPT_HELPERS, OPT_ISH, OPT_PRECISION];
+
+/// Directory components whose files are never runnable tests of the project: Go tooling ignores
+/// `testdata`, and `vendor` / `node_modules` / `third_party` hold someone else's code. Deliberately
+/// excludes generic names like `fixtures` or `example_scripts`, which often do hold real tests.
+/// Fixed list: the options plumbing is not worth a knob until a repo needs a different one.
+pub const NON_TEST_DIRS: &[&str] = &["testdata", "vendor", "node_modules", "third_party"];
 
 const LIKELY_FIX: &str = "assert on the return value or the raised error. Remove only if another test already asserts this behaviour (name it in your reply).";
 const NON_CLAIM: &str =
@@ -52,6 +77,8 @@ struct FnInfo {
     line: usize,
     calls: Vec<Call>,
     handles: Vec<String>,
+    /// Python only: innermost enclosing class, for `self.method` resolution.
+    class: Option<String>,
 }
 
 pub struct TestNoAssertionChecker {
@@ -143,19 +170,32 @@ impl TestNoAssertionChecker {
         .render()
     }
 
-    fn asserts(&self, ctx: &Scan, calls: &[Call], handles: &[String], depth: usize) -> bool {
+    fn asserts(
+        &self,
+        ctx: &Scan,
+        calls: &[Call],
+        handles: &[String],
+        owner: Option<&str>,
+        depth: usize,
+    ) -> bool {
         calls.iter().any(|call| {
             if ctx.vocab.contains(&call.callee) || self.supplemental(ctx, call) {
                 return true;
             }
             if depth < MAX_HELPER_DEPTH
-                && let Some(helper) = ctx.resolve(self.lang, &call.callee, handles)
+                && let Some(helper) = ctx.resolve(self.lang, &call.callee, handles, owner)
             {
                 let mut seen = ctx.seen.borrow_mut();
                 if !seen.contains(&helper.line) {
                     seen.push(helper.line);
                     drop(seen);
-                    let found = self.asserts(ctx, &helper.calls, &helper.handles, depth + 1);
+                    let found = self.asserts(
+                        ctx,
+                        &helper.calls,
+                        &helper.handles,
+                        helper.class.as_deref(),
+                        depth + 1,
+                    );
                     ctx.seen.borrow_mut().pop();
                     return found;
                 }
@@ -169,7 +209,11 @@ impl TestNoAssertionChecker {
     fn supplemental(&self, ctx: &Scan, call: &Call) -> bool {
         let last = call.callee.rsplit('.').next().unwrap_or(&call.callee);
         match self.lang {
-            Language::Python => last.starts_with("assert") || last == "AssertionError",
+            Language::Python => {
+                last.starts_with("assert")
+                    || last == "AssertionError"
+                    || PYTHON_ORACLE_METHODS.contains(&last)
+            }
             Language::Kotlin => {
                 is_kotlin_oracle(last) || (ctx.screenshot_file && is_screenshot_capture(last))
             }
@@ -223,19 +267,33 @@ struct Scan {
     by_name: HashMap<String, usize>,
     /// Go only: same-file methods by bare name, whatever their receiver type.
     by_method: HashMap<String, usize>,
+    /// Python only: `(class, method)` -> fn index, and class -> same-file base names.
+    methods: HashMap<(String, String), usize>,
+    bases: HashMap<String, Vec<String>>,
     seen: std::cell::RefCell<Vec<usize>>,
     /// Kotlin only: the file mentions screenshots, so `capture*` calls compare against goldens.
     screenshot_file: bool,
 }
 
 impl Scan {
-    fn resolve(&self, lang: Language, callee: &str, handles: &[String]) -> Option<&FnInfo> {
+    fn resolve(
+        &self,
+        lang: Language,
+        callee: &str,
+        handles: &[String],
+        owner: Option<&str>,
+    ) -> Option<&FnInfo> {
         if lang == Language::Go {
             return self.resolve_go(callee, handles);
         }
         let name = match (lang, callee.split_once('.')) {
             (_, None) => callee,
-            (Language::Python, Some(("self" | "cls", rest))) if !rest.contains('.') => rest,
+            (Language::Python, Some(("self" | "cls", rest))) if !rest.contains('.') => {
+                if let Some(found) = owner.and_then(|c| self.resolve_in_class_chain(c, rest)) {
+                    return Some(found);
+                }
+                rest
+            }
             (Language::Kotlin, Some(("this", rest))) if !rest.contains('.') => rest,
             _ => return None,
         };
@@ -244,6 +302,25 @@ impl Scan {
 }
 
 impl Scan {
+    /// Python `self.name`: the method on `class`, else on its same-file bases (nearest first).
+    /// Cross-file bases are invisible under one-parse-per-file; `assertion_helpers` covers them.
+    fn resolve_in_class_chain(&self, class: &str, name: &str) -> Option<&FnInfo> {
+        let mut queue = vec![class.to_string()];
+        let mut visited = Vec::new();
+        while !queue.is_empty() {
+            let current = queue.remove(0);
+            if visited.contains(&current) {
+                continue;
+            }
+            if let Some(&i) = self.methods.get(&(current.clone(), name.to_string())) {
+                return Some(&self.fns[i]);
+            }
+            queue.extend(self.bases.get(&current).cloned().unwrap_or_default());
+            visited.push(current);
+        }
+        None
+    }
+
     /// Go callees: `helper`, `helper[T]`, `recv.method`, `recv.m(..).n[T]`. A selector resolves by
     /// its last segment to any same-file method; a test-handle receiver (`t.Run`) never does.
     fn resolve_go(&self, callee: &str, handles: &[String]) -> Option<&FnInfo> {
@@ -333,6 +410,9 @@ impl Checker for TestNoAssertionChecker {
     }
 
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        if in_non_test_dir(file) {
+            return Ok(Vec::new());
+        }
         let profile = TestCodeProfile::for_language(self.lang);
         if !profile.is_test_file_source(file, ctx.source) {
             return Ok(Vec::new());
@@ -360,7 +440,7 @@ impl Checker for TestNoAssertionChecker {
                 continue;
             };
             scan.seen.borrow_mut().clear();
-            if self.asserts(&scan, &info.calls, &info.handles, 0) {
+            if self.asserts(&scan, &info.calls, &info.handles, info.class.as_deref(), 0) {
                 continue;
             }
             findings.push(Finding {
@@ -388,6 +468,9 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
                     line: line_of(node),
                     calls: calls_in(lang, node, ctx.source),
                     handles: handles_in(lang, node, ctx.source),
+                    class: (lang == Language::Python)
+                        .then(|| enclosing_class(node, ctx.source))
+                        .flatten(),
                 });
             }
             true
@@ -395,7 +478,11 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
     }
     let mut by_name = HashMap::new();
     let mut by_method = HashMap::new();
+    let mut methods = HashMap::new();
     for (i, f) in fns.iter().enumerate() {
+        if let Some(class) = &f.class {
+            methods.entry((class.clone(), f.name.clone())).or_insert(i);
+        }
         by_name.entry(f.name.clone()).or_insert(i);
         if f.is_method {
             by_method.entry(f.name.clone()).or_insert(i);
@@ -406,10 +493,91 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
         fns,
         by_name,
         by_method,
+        methods,
+        bases: if lang == Language::Python {
+            python_bases(ctx)
+        } else {
+            HashMap::new()
+        },
         seen: Default::default(),
         screenshot_file: lang == Language::Kotlin
             && ctx.source.to_ascii_lowercase().contains("screenshot"),
     }
+}
+
+/// `try: validate(...)` / `except ...: ...; raise e`: the schema validator's failure is the
+/// test failure, but only because the handler re-raises (a swallowing handler asserts nothing).
+fn reraises_validate(try_node: Node, source: &str) -> bool {
+    let mut cursor = try_node.walk();
+    let (mut validates, mut reraises) = (false, false);
+    for child in try_node.named_children(&mut cursor) {
+        match child.kind() {
+            "block" => walk_preorder(child, &mut |n| {
+                if PythonKind::of(n) == PythonKind::Call
+                    && let Some(func) = n.child_by_field_name("function")
+                {
+                    validates |= node_text(func, source).rsplit('.').next() == Some("validate");
+                }
+                true
+            }),
+            "except_clause" | "except_group_clause" => walk_preorder(child, &mut |n| {
+                reraises |= n.kind() == "raise_statement";
+                true
+            }),
+            _ => {}
+        }
+    }
+    validates && reraises
+}
+
+fn in_non_test_dir(file: &Path) -> bool {
+    file.components()
+        .any(|c| NON_TEST_DIRS.iter().any(|d| c.as_os_str() == *d))
+}
+
+fn class_name<'a>(class: Node, source: &'a str) -> Option<&'a str> {
+    class
+        .child_by_field_name("name")
+        .map(|n| node_text(n, source))
+}
+
+fn enclosing_class(node: Node, source: &str) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "class_definition" {
+            return class_name(n, source).map(str::to_string);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// class name -> base names as written (last segment of a dotted base), whole file.
+fn python_bases(ctx: &CheckContext) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    let Some(tree) = ctx.tree else { return out };
+    walk_preorder(tree.root_node(), &mut |node| {
+        if node.kind() == "class_definition"
+            && let Some(name) = class_name(node, ctx.source)
+            && let Some(supers) = node.child_by_field_name("superclasses")
+        {
+            let mut cursor = supers.walk();
+            let bases = supers
+                .named_children(&mut cursor)
+                .filter(|b| matches!(b.kind(), "identifier" | "attribute"))
+                .map(|b| {
+                    node_text(b, ctx.source)
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            out.insert(name.to_string(), bases);
+        }
+        true
+    });
+    out
 }
 
 fn function_name<'a>(lang: Language, node: Node, source: &'a str) -> Option<&'a str> {
@@ -477,6 +645,13 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
                     .into_iter()
                     .collect(),
             });
+        } else if lang == Language::Python && node.kind() == "try_statement" {
+            if reraises_validate(node, source) {
+                calls.push(Call {
+                    callee: RERAISED_VALIDATE.to_string(),
+                    args: Vec::new(),
+                });
+            }
         } else if lang == Language::Python && PythonKind::of(node) == PythonKind::AssertStatement {
             calls.push(Call {
                 callee: "assert".to_string(),
