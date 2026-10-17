@@ -64,6 +64,15 @@ const GO_CASES: &[Case] = &[
     ("generated_test.go", &[], &[]),
     ("weak_oracle_test.go", &[], &[]),
     ("tautology_pending_test.go", &[], &[]),
+    ("receiver_method_helper_test.go", &[44, 54], &[44, 54]),
+    ("generic_helper_test.go", &[25], &[25]),
+    ("method_value_run_test.go", &[34], &[34]),
+    ("cross_file_helper_test.go", &[7], &[]),
+    (
+        "k8s_stubs_test.go",
+        &[7, 11, 14, 18, 22],
+        &[7, 11, 14, 18, 22],
+    ),
     ("empty_test.go", &[6], &[6]),
     ("a_test.go", &[6], &[6]),
     ("unresolved_helper_test.go", &[7], &[]),
@@ -134,6 +143,18 @@ fn test_no_assertion_should_MatchLabelsOnEveryPythonFixture_When_StrictAndPrecis
 #[test]
 fn test_no_assertion_should_MatchLabelsOnEveryKotlinFixture_When_StrictAndPrecisionFirst() {
     assert_cases("test-no-assertion-kotlin", "kotlin", KOTLIN_CASES);
+}
+
+#[test]
+fn test_no_assertion_should_ReportZero_When_CrossFileHelperListedInAssertionHelpers() {
+    let options = json!({"assertion_helpers": ["assertFailures"]});
+    let got = run_fixture(
+        "test-no-assertion-go",
+        "go",
+        "cross_file_helper_test.go",
+        Some(&options),
+    );
+    assert!(got.is_empty(), "{got:?}");
 }
 
 #[test]

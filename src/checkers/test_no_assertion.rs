@@ -47,6 +47,8 @@ struct Call {
 /// framework-handle parameter names visible inside it.
 struct FnInfo {
     name: String,
+    /// Go `func (r T) m()`; resolvable from a selector call regardless of receiver type.
+    is_method: bool,
     line: usize,
     calls: Vec<Call>,
     handles: Vec<String>,
@@ -147,7 +149,7 @@ impl TestNoAssertionChecker {
                 return true;
             }
             if depth < MAX_HELPER_DEPTH
-                && let Some(helper) = ctx.resolve(self.lang, &call.callee)
+                && let Some(helper) = ctx.resolve(self.lang, &call.callee, handles)
             {
                 let mut seen = ctx.seen.borrow_mut();
                 if !seen.contains(&helper.line) {
@@ -219,13 +221,18 @@ struct Scan {
     vocab: AssertionVocabulary,
     fns: Vec<FnInfo>,
     by_name: HashMap<String, usize>,
+    /// Go only: same-file methods by bare name, whatever their receiver type.
+    by_method: HashMap<String, usize>,
     seen: std::cell::RefCell<Vec<usize>>,
     /// Kotlin only: the file mentions screenshots, so `capture*` calls compare against goldens.
     screenshot_file: bool,
 }
 
 impl Scan {
-    fn resolve(&self, lang: Language, callee: &str) -> Option<&FnInfo> {
+    fn resolve(&self, lang: Language, callee: &str, handles: &[String]) -> Option<&FnInfo> {
+        if lang == Language::Go {
+            return self.resolve_go(callee, handles);
+        }
         let name = match (lang, callee.split_once('.')) {
             (_, None) => callee,
             (Language::Python, Some(("self" | "cls", rest))) if !rest.contains('.') => rest,
@@ -234,6 +241,78 @@ impl Scan {
         };
         self.by_name.get(name).map(|&i| &self.fns[i])
     }
+}
+
+impl Scan {
+    /// Go callees: `helper`, `helper[T]`, `recv.method`, `recv.m(..).n[T]`. A selector resolves by
+    /// its last segment to any same-file method; a test-handle receiver (`t.Run`) never does.
+    fn resolve_go(&self, callee: &str, handles: &[String]) -> Option<&FnInfo> {
+        let cleaned = without_comments_and_space(callee);
+        let callee = strip_type_args(&cleaned);
+        let Some(dot) = last_top_level_dot(callee) else {
+            return self.by_name.get(callee).map(|&i| &self.fns[i]);
+        };
+        let root = callee.split(['.', '(', '[']).next().unwrap_or("");
+        if handles.iter().any(|h| h == root) {
+            return None;
+        }
+        let method = strip_type_args(&callee[dot + 1..]);
+        self.by_method.get(method).map(|&i| &self.fns[i])
+    }
+}
+
+/// A multi-line call chain may carry `// ...` comments between links; drop them and whitespace.
+fn without_comments_and_space(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if rest.starts_with("//") {
+            rest = rest.find('\n').map_or("", |i| &rest[i..]);
+        } else if rest.starts_with("/*") {
+            rest = rest.find("*/").map_or("", |i| &rest[i + 2..]);
+        } else {
+            if !c.is_whitespace() {
+                out.push(c);
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// `helper[int]` -> `helper`; leaves anything not ending in a balanced `]` alone.
+fn strip_type_args(callee: &str) -> &str {
+    if !callee.ends_with(']') {
+        return callee;
+    }
+    let mut depth = 0usize;
+    for (i, c) in callee.char_indices().rev() {
+        match c {
+            ']' => depth += 1,
+            '[' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &callee[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    callee
+}
+
+/// Byte index of the last `.` outside any parentheses or brackets.
+fn last_top_level_dot(callee: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in callee.char_indices().rev() {
+        match c {
+            ')' | ']' => depth += 1,
+            '(' | '[' => depth = depth.saturating_sub(1),
+            '.' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 impl Checker for TestNoAssertionChecker {
@@ -304,6 +383,8 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
             if let Some(name) = function_name(lang, node, ctx.source) {
                 fns.push(FnInfo {
                     name: name.to_string(),
+                    is_method: lang == Language::Go
+                        && GoKind::of(node) == GoKind::MethodDeclaration,
                     line: line_of(node),
                     calls: calls_in(lang, node, ctx.source),
                     handles: handles_in(lang, node, ctx.source),
@@ -313,13 +394,18 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
         });
     }
     let mut by_name = HashMap::new();
+    let mut by_method = HashMap::new();
     for (i, f) in fns.iter().enumerate() {
         by_name.entry(f.name.clone()).or_insert(i);
+        if f.is_method {
+            by_method.entry(f.name.clone()).or_insert(i);
+        }
     }
     Scan {
         vocab,
         fns,
         by_name,
+        by_method,
         seen: Default::default(),
         screenshot_file: lang == Language::Kotlin
             && ctx.source.to_ascii_lowercase().contains("screenshot"),
@@ -363,10 +449,33 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
                 .iter()
                 .flat_map(|a| a.named_children(&mut cursor).collect::<Vec<_>>())
                 .map(|a| node_text(a, source).to_string())
-                .collect();
+                .collect::<Vec<String>>();
+            let callee = node_text(func, source).to_string();
+            if lang == Language::Go && callee.ends_with(".Run") {
+                // `t.Run(name, tc.runner)`: a named function or method value is a call target.
+                calls.extend(arg_texts.iter().filter(|a| is_go_path(a)).map(|a| Call {
+                    callee: a.clone(),
+                    args: Vec::new(),
+                }));
+            }
             calls.push(Call {
-                callee: node_text(func, source).to_string(),
+                callee,
                 args: arg_texts,
+            });
+        } else if lang == Language::Go
+            && node.kind() == "type_conversion_expression"
+            && let Some(generic) = node
+                .child_by_field_name("type")
+                .filter(|t| t.kind() == "generic_type")
+        {
+            // tree-sitter-go reads the one-argument call `helper[T](t)` as a conversion.
+            calls.push(Call {
+                callee: node_text(generic, source).to_string(),
+                args: node
+                    .child_by_field_name("operand")
+                    .map(|o| node_text(o, source).to_string())
+                    .into_iter()
+                    .collect(),
             });
         } else if lang == Language::Python && PythonKind::of(node) == PythonKind::AssertStatement {
             calls.push(Call {
@@ -377,6 +486,13 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
         true
     });
     calls
+}
+
+fn is_go_path(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
 }
 
 /// Kotlin oracle names the shared Java/Kotlin vocabulary leaves out: kotlin.test and Compose
