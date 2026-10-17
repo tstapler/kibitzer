@@ -66,3 +66,17 @@ Precision = 26 / 27 = **96.3%** (was 55.3%). Strict "real" TP only: 5 / 27 = 18.
   list the helper under the `assertion_helpers` option (tested by
   `test_no_assertion_should_ReportZero_When_CrossFileHelperListedInAssertionHelpers`).
 - Not attempted: improvements 5 and 6 (separate smoke-only / empty-stub categories); they change classification, not precision.
+
+## After round 2
+
+Round 2 adds the `testdata`/`vendor`/`node_modules`/`third_party` path skip (no Go oracle change). Same commit
+`0ba07e08`; `find` + `xargs -P8` over `kibitzer check native <rule> <file>`, debug builds before/after, compared by `file:line` against the shard with `comm`.
+
+| | After round 1 | After round 2 |
+|---|---|---|
+| Findings | 27 | 27 |
+| true_positive records still reported | 26 of 26 | 26 of 26 |
+| false_positive records still reported | 1 | 1 |
+
+Precision unchanged at 26 / 27 = **96.3%**. The remaining FP is the cross-file `assertFailures` helper
+(`validation_resourceslice_test.go:210`); fix via `assertion_helpers`.

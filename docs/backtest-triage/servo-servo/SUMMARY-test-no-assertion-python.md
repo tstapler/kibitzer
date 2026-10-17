@@ -48,3 +48,33 @@ B's precision is a sample estimate (n=30 of 497), so treat it as roughly +/- 17 
 5. Skip `example_scripts/`, `testdata/`, `fixtures/` directories (files executed by an outer test). Removes 4 of B's FPs.
 6. Report the two real-defect shapes at higher confidence than the rest: an empty or comment-only body (`pass`), and a bare comparison expression statement (`x == y`) with no `assert`. Both were the only real TPs here.
 7. Mark the smoke-only pattern (body whose only statements are construct/pickle/`.result(timeout)`/`check_call`, or a comment containing "doesn't throw"/"don't raise"/"nothing happens") as a lower-severity category so it is not reported as a defect. That is 26 of 28 TPs here.
+
+## After round 2
+
+Changes (`src/checkers/test_no_assertion.rs`): pytester/`LineMatcher` oracles on any receiver; `<x>.raises`/`<x>.warns`
+aliases; `self.<method>` resolved in its own class then same-file bases; `validate(...)` in a `try` whose `except`
+re-raises; files under a `testdata`/`vendor`/`node_modules`/`third_party` component are skipped. Same commit
+`7821ec2d`; `find` + `xargs -P8` over `kibitzer check native <rule> <file>`, debug builds before/after, compared by `file:line` against the shard with `comm`.
+
+| | Before | After |
+|---|---|---|
+| Findings (whole repo) | 527 | 29 |
+| true_positive records still reported | 28 of 28 | 18 of 28 |
+| false_positive records still reported | 32 | 11 |
+| Findings not in the shard | 0 | 0 |
+
+Precision on what is still reported = 18 / 29 = **62.1%** (was 60.0% on stratum A). The 10 "lost" TPs are all
+stratum B under `tests/wpt/tests/tools/third_party/` (vendored pytest/attrs/etc.), skipped by design, not by an oracle
+change; all 18 stratum-A TPs are retained. With the path skip temporarily bypassed (pytest + iniconfig copied to a
+neutral directory), the oracle changes alone cut those two trees from 394 to 51 findings and lost none of their triaged TPs.
+
+Fixed (21 of 32 FPs): pytester `LineMatcher` (15, fixed by the oracle list on its own), `py.test.raises` alias (1),
+`jsonschema.validate` + `raise e` (1, `test_valid.py:88`), and the 4 `example_scripts` fixture-data tests (removed
+only by the `third_party` skip here; a standalone pytest checkout would still report them, and `example_scripts` is
+not in the skip list because that name can hold real tests).
+
+Remaining (11): all cross-file helpers, one-parse-per-file cannot resolve them. 8x `self.run_wrapper_test` inherited
+from `functional/base.py` (`test_handlers.py:436..490`), 3x `wait_and_assert_no_pause` from `devtools_tests/utils.py`
+(`test_debugger_tab.py:864,888,919`). `assertion_helpers: ["self.run_wrapper_test"]` suppresses the first group
+(`test_no_assertion_should_ReportZero_When_CrossFileBaseHelperListedInAssertionHelpers`); listing the helper name
+clears the second.

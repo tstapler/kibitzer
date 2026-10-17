@@ -32,3 +32,16 @@ All 18 are empty stubs (`def test_x(self): pass`, no skip decorator): 9 in `test
 
 1. Cross-file helper lookup, or an `assertion_helpers` entry for `cmd_and_response`, would clear the one FP.
 2. Report the empty-body stub (`pass`, docstring-only, comment-only) as its own higher-confidence finding; here it is 18 of 18 real TPs, so it deserves a separate rule id or severity.
+
+## After round 2
+
+Same commit `c1030321`; `find` + `xargs -P8` over `kibitzer check native <rule> <file>`, debug builds before/after, compared by `file:line` against the shard with `comm`.
+
+| | Before | After |
+|---|---|---|
+| Findings | 19 | 19 |
+| true_positive records still reported | 18 of 18 | 18 of 18 |
+| false_positive records still reported | 1 | 1 |
+
+Precision unchanged at 18 / 19 = **94.7%**. The one FP (`test_help_types`, `pylib/cqlshlib/test/test_cqlsh_output.py:898`)
+is a cross-file helper (`cmd_and_response` in `run_cqlsh.py`); `assertion_helpers` remains its escape hatch.

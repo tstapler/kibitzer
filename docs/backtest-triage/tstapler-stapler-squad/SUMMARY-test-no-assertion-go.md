@@ -81,3 +81,18 @@ would still be missed, since the checker parses one file per run.
 4. Keep the empty-body stub (`func TestX(t) {}`) as its own category, as suggested for kubernetes. Its only
    instance here was the `testdata` fixture, so this corpus is no evidence either way.
 5. `t.Log(...)`-only bodies are correctly flagged; keep `t.Log` from counting as an assertion.
+
+## After round 2
+
+The `testdata` path skip removes the single FP (`tools/scanner/backend/testdata/handler_test.go:5`; regression fixture
+`testdata/test-quality/go/scanner_handler_test.go`, paths tested in `test_no_assertion_should_SkipNonTestDirs_When_PathHasTestdataVendorOrThirdParty`).
+Same repo commit `d320c038`; `find` + `xargs -P8` over `kibitzer check native <rule> <file>`, debug builds before/after, compared by `file:line` against the shard with `comm`.
+
+| | Before | After |
+|---|---|---|
+| Findings | 39 | 38 |
+| true_positive records still reported | 38 of 38 | 38 of 38 |
+| false_positive records still reported | 1 | 0 |
+| Findings not in the shard | 0 | 0 |
+
+Precision = 38 / 38 = **100%** (was 97.4%); strict (real TP only) 5 / 38 = 13.2%.
