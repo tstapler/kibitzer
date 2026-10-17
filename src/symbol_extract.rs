@@ -697,6 +697,9 @@ fn delegating_call(body: Node) -> Option<Node> {
 /// `s` is the method's receiver) or `this.inner.foo()` (TS/JS) gives `Some("inner")`.
 /// `None` for a bare/free call, a call chained off another call (`s.Get().Foo()`), a
 /// deeper chain (`s.a.b.Foo()`), or any language `call_graph_supports` excludes.
+///
+/// Non-goal (typed-node-kind-migration): the `.kind()` string comparisons below span the
+/// Go and TS/JS grammars at once, so no single `<Lang>Kind` enum covers them (ADR-001).
 fn delegation_field_from_call(
     method: Node,
     call: Node,
@@ -735,6 +738,9 @@ fn delegation_field_from_call(
 
 /// Name of a Go method's receiver parameter (`s` in `func (s *S) Foo()`); `None` when the
 /// receiver is unnamed or blank (`_`).
+///
+/// Non-goal (typed-node-kind-migration): same raw-string `.kind()` seam as
+/// `delegation_field_from_call` above (ADR-001).
 fn go_receiver_name<'s>(method: Node, source: &'s str) -> Option<&'s str> {
     let receiver = method.child_by_field_name("receiver")?;
     let mut cursor = receiver.walk();
