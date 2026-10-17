@@ -41,12 +41,6 @@ impl ImportGraph {
     }
 }
 
-/// Build the import graph over `files` (already filtered to files kibitzer is scoped
-/// to). Go, TypeScript/JavaScript, Java, Kotlin, and Python are all extracted via
-/// per-language dispatch below. Python uses a bespoke resolver (`build_python`)
-/// rather than `build_qualified_name_language`'s shared family — it does not fit the
-/// Go/Java/Kotlin "qualified name" family (see that function's doc comment, and
-/// `build_python`'s own doc comment for why).
 /// Reads a source file, treating non-UTF-8 content (vendored fixtures, encoded test data)
 /// as "not source" and skipping it, like `arch_model`'s own readers; other I/O errors
 /// still abort.
@@ -58,6 +52,12 @@ fn read_source(file: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Build the import graph over `files` (already filtered to files kibitzer is scoped
+/// to). Go, TypeScript/JavaScript, Java, Kotlin, and Python are all extracted via
+/// per-language dispatch below. Python uses a bespoke resolver (`build_python`)
+/// rather than `build_qualified_name_language`'s shared family — it does not fit the
+/// Go/Java/Kotlin "qualified name" family (see that function's doc comment, and
+/// `build_python`'s own doc comment for why).
 pub fn build(repo_root: &Path, files: &[PathBuf]) -> Result<ImportGraph> {
     let mut graph = ImportGraph::default();
 
