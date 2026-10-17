@@ -186,11 +186,30 @@ fn run_stop_hook_with_offsets_dir(
     transcript_path: Option<&Path>,
     offsets_dir: &Path,
 ) -> Result<ExitCode> {
+    if let Some(context) = stop_hook_context(cwd, transcript_path, offsets_dir)? {
+        let payload = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "Stop",
+                "additionalContext": context,
+            }
+        });
+        println!("{payload}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `additionalContext` text for this session's `Stop` firing, or `None` when there
+/// is nothing to report. Split out so tests can assert on the report itself.
+fn stop_hook_context(
+    cwd: &Path,
+    transcript_path: Option<&Path>,
+    offsets_dir: &Path,
+) -> Result<Option<String>> {
     let Some(transcript_path) = transcript_path else {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     };
     let Ok(metadata) = std::fs::metadata(transcript_path) else {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     };
 
     let offsets_path = session_offset_path(offsets_dir, transcript_path);
@@ -199,7 +218,7 @@ fn run_stop_hook_with_offsets_dir(
         .min(metadata.len());
 
     let Some((lines, new_offset)) = new_lines_since(transcript_path, from_offset) else {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     };
 
     // Advance and persist the offset *before* running any checks, regardless of what
@@ -210,15 +229,18 @@ fn run_stop_hook_with_offsets_dir(
 
     let files = touched_files(&lines);
     if files.is_empty() {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     }
 
     let lines_out = stop_hook_findings_for_files(cwd, &files)?;
-
     if lines_out.is_empty() {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     }
 
+    Ok(Some(format_report(&files, &lines_out)))
+}
+
+fn format_report(files: &BTreeSet<PathBuf>, lines_out: &[String]) -> String {
     let mut context = format!(
         "kibitzer re-checked {} file(s) touched this task (unscoped — this can surface \
          findings a per-edit check missed if they didn't overlap the specific lines that \
@@ -227,16 +249,7 @@ fn run_stop_hook_with_offsets_dir(
     );
     context.push_str(&lines_out.join("\n"));
     let echoed: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
-    let context = strip_unsafe_with_paths(&context, &echoed);
-
-    let payload = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "Stop",
-            "additionalContext": context,
-        }
-    });
-    println!("{payload}");
-    Ok(ExitCode::SUCCESS)
+    strip_unsafe_with_paths(&context, &echoed)
 }
 
 /// Re-checks every file in `files` (unscoped) and formats each surviving finding as
@@ -498,12 +511,24 @@ mod tests {
     }
 
     #[test]
-    fn one_sessions_report_names_only_files_from_its_own_transcript() {
-        let dir = tmp_path("scoped-cwd");
+    fn stop_hook_report_names_only_files_from_the_invoking_sessions_transcript() {
+        let dir = tmp_path("scoped-report-repo");
         std::fs::create_dir_all(&dir).unwrap();
-        let (mine, theirs) = (dir.join("mine.go"), dir.join("theirs.go"));
-        let transcript_a = tmp_path("scoped-a.jsonl");
-        let transcript_b = tmp_path("scoped-b.jsonl");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+        let (mine, theirs) = (dir.join("mine.md"), dir.join("theirs.md"));
+        for f in [&mine, &theirs] {
+            std::fs::write(f, "Clean prose with varied openers.\n").unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        // Both sessions leave an uncommitted violation behind.
+        for f in [&mine, &theirs] {
+            std::fs::write(f, "This is bad. This is worse. This is worst.\n").unwrap();
+        }
+        let transcript_a = tmp_path("scoped-report-a.jsonl");
+        let transcript_b = tmp_path("scoped-report-b.jsonl");
         std::fs::write(
             &transcript_a,
             tool_use_line("Edit", &mine.to_string_lossy()) + "\n",
@@ -514,11 +539,27 @@ mod tests {
             tool_use_line("Edit", &theirs.to_string_lossy()) + "\n",
         )
         .unwrap();
+        let offsets = tmp_path("scoped-report-offsets");
 
-        let (lines_a, _) = new_lines_since(&transcript_a, 0).unwrap();
-        assert_eq!(touched_files(&lines_a), BTreeSet::from([mine]));
+        // B fires first, so a shared cursor would have drained its edits before A runs.
+        let report_b = stop_hook_context(&dir, Some(&transcript_b), &offsets)
+            .unwrap()
+            .unwrap();
+        let report_a = stop_hook_context(&dir, Some(&transcript_a), &offsets)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            report_a.contains("mine.md") && !report_a.contains("theirs.md"),
+            "{report_a}"
+        );
+        assert!(
+            report_b.contains("theirs.md") && !report_b.contains("mine.md"),
+            "{report_b}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&offsets).ok();
         std::fs::remove_file(&transcript_a).ok();
         std::fs::remove_file(&transcript_b).ok();
     }
