@@ -47,7 +47,7 @@ impl ImportGraph {
 fn read_source(file: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(file) {
         Ok(source) => Ok(Some(source)),
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => Ok(None),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::InvalidData) => Ok(None),
         Err(err) => Err(err).with_context(|| format!("reading {}", file.display())),
     }
 }
