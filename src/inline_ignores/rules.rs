@@ -96,6 +96,7 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("single-call-site-delegation", OwnerMatch::Unowned),
     rule("god-class", OwnerMatch::Unowned),
     rule("isp-fat-interface", OwnerMatch::Unowned),
+    rule("remove-middle-man", OwnerMatch::Unowned),
     rule("unreferenced-private-symbol", OwnerMatch::Unowned),
     rule("go-type-switch-density", OwnerMatch::SameName),
     rule("go-encapsulate-collection", OwnerMatch::SameName),

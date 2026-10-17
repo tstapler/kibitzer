@@ -37,6 +37,7 @@ mod lsp;
 mod markdown_text;
 mod mcp;
 mod mermaid;
+mod middle_man;
 mod node_kind;
 mod parameter_object;
 mod plugin;

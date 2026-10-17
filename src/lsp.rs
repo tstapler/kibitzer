@@ -708,6 +708,7 @@ mod tests {
                 exported: true,
                 parent: None,
                 is_pure_delegation: false,
+                delegation_field: None,
                 params: vec![],
             });
         }

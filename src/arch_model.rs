@@ -86,6 +86,12 @@ pub struct SymbolNode {
     /// precedent as `ArchFinding::severity_override`).
     #[serde(default)]
     pub is_pure_delegation: bool,
+    /// Receiver field a pure-delegation method routes through (`s.inner.Foo()` →
+    /// `Some("inner")`), for `middle_man::MiddleManChecker`. `None` for non-delegating
+    /// symbols, delegation that isn't a direct receiver-field call (free functions,
+    /// `s.Get().Foo()`, deeper chains), and languages without call-graph coverage.
+    #[serde(default)]
+    pub delegation_field: Option<String>,
     /// `(name, type_text)` per declared parameter of a `Function`/`Method`, in
     /// declaration order, receiver excluded. Populated for Go and TypeScript/TSX only
     /// (`symbol_extract::extract_params`); empty for every other language and for
@@ -1212,6 +1218,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         }
     }
@@ -1354,6 +1361,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         };
 
@@ -2119,6 +2127,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         let mut pkg_b = empty_package("b");
@@ -2131,6 +2140,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
 
@@ -2167,6 +2177,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         let api_pkg = empty_package("server/api");
@@ -2204,6 +2215,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         let api_pkg = empty_package("server/api");
@@ -2476,6 +2488,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
@@ -2493,6 +2506,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
@@ -2544,6 +2558,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         packages.insert("elsewhere".to_string(), elsewhere);
@@ -2586,6 +2601,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
             params: vec![],
         });
         packages.insert("app".to_string(), pkg);
