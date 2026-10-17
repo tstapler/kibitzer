@@ -2,6 +2,8 @@
 
 Tip under test: `7baf957` (`sdd/test-effectiveness-critique-impl`). No code was changed.
 
+> **These 17 findings are now tuning data and no longer held out.** Round 3 (below) changed the rule and the tagger in response to them, so any further number measured on this set is in-sample. A new held-out set needs fresh repos.
+
 ## Method
 
 1. Build `target/debug/kibitzer`; list `test-no-assertion-go` findings over every non-vendor `*_test.go` in three shallow clones: prometheus/prometheus `c052a79`, cli/cli `fa92838`, etcd-io/etcd `0155117` (`heldout-findings.tsv`).
@@ -74,3 +76,29 @@ The in-sample figures (92% coverage, 62/64 exact) cannot be re-derived from file
 - **Exact 62/64 (97%): not reproduced.** Held-out exact is 5/17 (29%) strict, 10/17 (59%) lenient, 5/12 (42%) over true positives. Even the best reading is far below 97%.
 - The sole class that generalised cleanly is `race-smoke` (2/2, both with `Race` in the name and goroutines plus channels). `no-panic-smoke` was right whenever a comment cued it (2/2) and absent when it did not (0/2). The `empty-stub` rule failed in the one pattern (delegation to a skip-only helper) that the in-sample set evidently did not contain.
 - Caveat on conclusions: with n = 17, correlated findings, and a single labeller, the intervals are wide (for 5/12 an exact 95% interval is roughly 15% to 72%). The data support "the in-sample numbers were optimistic, and delegation-to-skip and comment-cue variance are real gaps"; they do not support a precise held-out accuracy.
+
+## After round 3 (the 17 findings are tuning data from here on)
+
+Two changes, both made after reading this document:
+
+1. **Rule (`test-no-assertion-go`)**: a Go test whose body (closures included) calls `os.Exit` is skipped. These are subprocess re-exec entry points (`TestHelperProcess`); the parent test asserts. Keyed on the `os.Exit` call only, not on the name, so `TestNamedHelperButNoExit` and an empty `TestEmptyHelperProcess` are still reported (`testdata/test-quality/go/helper_process_test.go`).
+2. **Tagger**: if every top-level statement of the test is a call to a plain same-file function whose body is empty, TODO-only, or only `t.Skip*`, tag `empty-stub`. One level only (fixture `TestDelegates_twoLevels` is not tagged `empty-stub`). Still annotate-only and behind `KIBITZER_ORACLE_TAGS=1`; nothing is suppressed by a tag.
+
+Not tuned: no name-specific cases. Change 1 is justified by the 5 cli/cli findings, change 2 by the 4 `TestMoveLeaderWith*Auth` findings (same helper) alone; each is one idiom seen in one repo, so in-sample evidence for both is thin even though the idioms are common Go.
+
+Counts (scan = `find <repo> -name '*_test.go' -not -path '*/vendor/*' | xargs -P8 -n1 kibitzer check native test-no-assertion-go`):
+
+| repo | findings before | after |
+|---|---|---|
+| prometheus/prometheus | 2 | 2 |
+| cli/cli | 7 | 2 |
+| etcd-io/etcd | 8 | 8 |
+| total | 17 | 12 |
+
+Rule precision on the 12 remaining: 12/12 loose true positives (was 12/17 = 70.6%); strict (discarded-result + empty-stub) still 5/12.
+
+Tagger on the 12 reported findings: exact match 9/12 (was 5 of the 12 TPs). Changed: the 4 MoveLeader tests `no-panic-smoke:uncued` -> `empty-stub` (now correct). Still wrong: `TestNoOpService` (untagged, truth no-panic-smoke), `TestHistoryAppendSuccess` (untagged, truth no-panic-smoke), `goversion.Test` (empty-stub, truth compile-check; the ambiguous label). Per-class, both are in-sample now and say nothing about generalisation.
+
+Guardrails:
+- In-sample rule recall: kubernetes 26/26 and stapler-squad 38/38 triaged `true_positive` findings still reported (`comm -23 <triaged> <current>` empty); finding counts unchanged (27 and 38).
+- Oracle tagger in-sample eval (`eval.sh`): exact-match 62/64 before and after (the two remaining misses are the known liveness-vs-race cases).

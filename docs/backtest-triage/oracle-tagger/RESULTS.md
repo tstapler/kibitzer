@@ -108,3 +108,7 @@ Not special-cased: the two `race-smoke` errors above (no rule distinguishes them
   carry unusually explicit cues (`should_..._When_...`, "Should not panic"), which likely inflates recall there.
 - Next step if pursued: label a fresh shard from a repo not in this set (for example `servo/servo` or
   `apache/cassandra`) by someone other than the tagger's author, freeze the rules, and measure.
+
+## After round 3
+
+Held-out round (see `HELDOUT.md`) led to two changes: `os.Exit` re-exec stubs are no longer reported by the rule, and the tagger follows one level of same-file delegation to a stub helper (empty, TODO-only, `t.Skip*`) and tags `empty-stub`. In-sample result is unchanged: `eval.sh` exact-match 62/64 before and after; the same two `race-smoke` over-predictions remain. The held-out findings are now tuning data, so the 9/12 reported there is not a generalisation estimate. Tag stays annotate-only and env-gated.
