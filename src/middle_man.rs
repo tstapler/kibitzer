@@ -3,15 +3,10 @@
 //! (`SymbolNode::delegation_field`) happens upstream in `symbol_extract.rs`, since
 //! `ArchModel` drops source/AST after the initial scan.
 //!
-//! Go and TS/JS only (`symbol_extract::call_graph_supports`): other languages never get a
-//! `delegation_field`, so they can't reach the ratio. Types under `MIDDLE_MAN_MIN_METHODS`
-//! methods are skipped — a one- or two-method forwarder is usually an intentional
-//! Adapter/Decorator. The carve-outs below are fixed constants, not `ArchitectureConfig`
-//! options. Skipped: types named `*Adapter`/`*Wrapper`/`*Proxy`/`*Decorator`, methods in test
-//! files, and types with an explicit `implements` edge (TS/Java-style; Go's structural
-//! satisfaction is not tracked). Backtesting `kubernetes/kubernetes` and `microsoft/vscode`
-//! showed those were the intentional-delegation majority of raw hits
-//! (see `project_plans/remove-middle-man/decisions/validation.md`).
+//! Go and TS/JS only (`symbol_extract::call_graph_supports`). Skipped on purpose, as likely
+//! intentional delegation: types under `MIDDLE_MAN_MIN_METHODS` methods, `*Adapter`/`*Wrapper`/
+//! `*Proxy`/`*Decorator` types, test files, and types with an `implements` edge (Go's
+//! structural satisfaction is not tracked). Evidence: `project_plans/remove-middle-man/decisions/validation.md`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -65,6 +60,7 @@ fn findings_for_package(
     let mut methods_by_parent: BTreeMap<&str, Vec<&SymbolNode>> = BTreeMap::new();
     for sym in &pkg.symbols {
         if sym.kind == SymbolKind::Method
+            && sym.name != "constructor"
             && !is_test_file(sym.file.strip_prefix(repo_root).unwrap_or(&sym.file))
             && let Some(parent) = &sym.parent
             && !implements_declared_interface(sym, implementers)
@@ -304,6 +300,57 @@ mod tests {
             "/repo/src/a.ts",
             "interface IFoo { a(): void; b(): void; c(): void; }\nclass S implements IFoo {\n  private inner: any;\n  a() { this.inner.a(); }\n  b() { this.inner.b(); }\n  c() { this.inner.c(); }\n}\n",
         )]);
+        assert!(findings(&model).is_empty());
+    }
+
+    const TS_BODY: &str = "  private inner: any;\n  a() { this.inner.a(); }\n  b() { this.inner.b(); }\n  c() { this.inner.c(); }\n}\n";
+
+    fn ts_class(header: &str) -> ArchModel {
+        model_from(vec![("/repo/src/a.ts", &format!("{header} {{\n{TS_BODY}"))])
+    }
+
+    #[test]
+    fn flags_a_typescript_class_without_implements() {
+        assert_eq!(findings(&ts_class("class S")).len(), 1);
+    }
+
+    #[test]
+    fn skips_a_typescript_class_implementing_an_external_interface() {
+        let model = ts_class("class S implements Unknown");
+        assert!(
+            model
+                .type_edges
+                .iter()
+                .any(|e| e.kind == Some(TypeRelationKind::Implements)),
+            "precondition: an Implements edge exists even though the interface is unresolved"
+        );
+        assert!(findings(&model).is_empty());
+    }
+
+    #[test]
+    fn skips_every_intentional_delegation_suffix_but_not_look_alikes() {
+        for suffix in INTENTIONAL_DELEGATION_SUFFIXES {
+            let model = ts_class(&format!("class Stream{suffix}"));
+            assert!(findings(&model).is_empty(), "{suffix} should be skipped");
+        }
+        assert_eq!(
+            findings(&ts_class("class AdapterFactory")).len(),
+            1,
+            "only a suffix match is an intentional-delegation name"
+        );
+    }
+
+    #[test]
+    fn a_typescript_constructor_does_not_count_against_the_ratio() {
+        let src = "class S {\n  private inner: any;\n  constructor(i: any) { this.inner = i; }\n  a() { this.inner.a(); }\n  b() { this.inner.b(); }\n  c() { this.inner.c(); }\n}\n";
+        let model = model_from(vec![("/repo/src/a.ts", src)]);
+        assert_eq!(findings(&model).len(), 1, "3 of 3 non-constructor methods");
+    }
+
+    #[test]
+    fn does_not_flag_java_even_when_every_method_forwards() {
+        let src = "class S {\n  private T inner;\n  void a() { inner.a(); }\n  void b() { inner.b(); }\n  void c() { inner.c(); }\n}\n";
+        let model = model_from(vec![("/repo/src/S.java", src)]);
         assert!(findings(&model).is_empty());
     }
 }

@@ -79,3 +79,16 @@ the 0.8/3 thresholds: they came from the backlog item, and raising them would no
 interface-forwarder hits, which dominate. If this is ever promoted to a default check, the next
 carve-out to evaluate is "type implements an interface" (needs Go `var _ I = (*T)(nil)` or
 structural-satisfaction edges, see `single_call_site_delegation.rs` header).
+
+## Deferred from the PR #133 code review
+
+Not fixed in this PR (no BLOCKER/CRITICAL found; confidence as the reviewers stated, INFERRED):
+- `root_cause_clusters.rs` builds its model with `include_private: false`, so this checker's
+  ratio there counts exported methods only. Same latent issue as `single-call-site-delegation`.
+- Go generic receivers (`func (s *S[T])`) group under `S[T]`, splitting methods declared with
+  different type-parameter names.
+- Methods are grouped by `(package, type name)`, so same-named types in one package (build-tagged
+  Go files, same-named TS classes in one directory) merge.
+- TS `get`/`set` pairs count as two methods; `this.inner!.foo()` and `(this.inner as X).foo()` are
+  not recognized as field delegation.
+- The finding anchors on the first delegating method, so a `kibitzer:ignore` goes above it.

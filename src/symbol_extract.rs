@@ -738,15 +738,12 @@ fn delegation_field_from_call(
 
 /// Name of a Go method's receiver parameter (`s` in `func (s *S) Foo()`); `None` when the
 /// receiver is unnamed or blank (`_`).
-///
-/// Non-goal (typed-node-kind-migration): same raw-string `.kind()` seam as
-/// `delegation_field_from_call` above (ADR-001).
 fn go_receiver_name<'s>(method: Node, source: &'s str) -> Option<&'s str> {
     let receiver = method.child_by_field_name("receiver")?;
     let mut cursor = receiver.walk();
     let param = receiver
         .children(&mut cursor)
-        .find(|c| c.kind() == "parameter_declaration")?;
+        .find(|c| GoKind::of(*c) == GoKind::ParameterDeclaration)?;
     let name = node_text(param.child_by_field_name("name")?, source);
     (name != "_").then_some(name)
 }
@@ -3062,5 +3059,76 @@ func f(int, string) {}
             find_by_name(&symbols, "foo").delegation_field.as_deref(),
             Some("inner")
         );
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_tsx_field_delegation() {
+        let symbols = extract(
+            Language::Tsx,
+            "class S {\n  foo() { return this.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_typescript_non_this_receiver() {
+        let symbols = extract(
+            Language::TypeScript,
+            "class S {\n  foo() { return other.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        let foo = find_by_name(&symbols, "foo");
+        assert!(foo.is_pure_delegation, "precondition");
+        assert_eq!(foo.delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_none_for_go_receivers_that_cannot_own_a_field() {
+        let cases = [
+            ("unnamed receiver", "func (S) Foo() { x.inner.Foo() }"),
+            ("blank receiver", "func (_ S) Foo() { x.inner.Foo() }"),
+            (
+                "base is not the receiver",
+                "func (s S) Foo() { other.inner.Foo() }",
+            ),
+            (
+                "chain deeper than one field",
+                "func (s S) Foo() { s.a.b.Foo() }",
+            ),
+        ];
+        for (label, method) in cases {
+            let src = format!("package pkg\n\ntype S struct{{}}\n\n{method}\n");
+            let symbols = extract(Language::Go, &src, "pkg");
+            let foo = find_by_name(&symbols, "Foo");
+            assert!(foo.is_pure_delegation, "{label}: precondition");
+            assert_eq!(foo.delegation_field, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_go_value_receiver() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{ inner T }\ntype T struct{}\n\nfunc (s S) Foo() { s.inner.Foo() }\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "Foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_rust_even_with_a_field_call() {
+        let symbols = extract(
+            Language::Rust,
+            "struct S { inner: T }\nimpl S {\n    fn foo(&self) { self.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "foo").delegation_field, None);
     }
 }

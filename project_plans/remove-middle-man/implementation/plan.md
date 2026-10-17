@@ -17,7 +17,7 @@ Implement Fowler's **Remove Middle Man** as a new `ArchModelChecker` by:
 | Where to add checker | `src/architecture_checks.rs` or new `src/middle_man.rs` | Prefer new file (precedent: `src/single_call_site_delegation.rs`, `src/god_class.rs`) to keep `architecture_checks.rs` from growing further. Registers in `model_registry()` via `crate::middle_man::MiddleManChecker`. |
 | `delegation_field` placement | `SymbolNode` field with `#[serde(default)]` | Same additive-field pattern as `is_pure_delegation`. Alternative (separate `HashMap` in `ArchModel`) adds indirection for no benefit. |
 | Language scope | Go + TS/JS only | Matches `call_graph_supports` gate that `is_pure_delegation` already enforces; avoids false `None` silently being treated as a signal. |
-| AST extraction approach | New `delegation_field_from_body` function alongside `is_pure_delegation_body` | Called only when `is_pure_delegation` is true; avoids re-parsing the body. |
+| AST extraction approach | New `delegation_field_from_call` function alongside `delegating_call` | Called only when `is_pure_delegation` is true; avoids re-parsing the body. |
 | Threshold | `const MIDDLE_MAN_MIN_METHODS: usize = 3`, `const MIDDLE_MAN_DELEGATION_RATIO: f64 = 0.8` | Matches backlog proposal. Named constants mirroring `LCOM_MIN_METHODS`/`STABLE_MAX`. |
 | Severity | `severity_override: None` | Inherits the enclosing check's severity, matching `god_class`/`single_call_site_delegation`. Backtest results live in `decisions/validation.md`. |
 
@@ -35,7 +35,7 @@ Implement Fowler's **Remove Middle Man** as a new `ArchModelChecker` by:
 pub delegation_field: Option<String>,
 ```
 
-**`src/symbol_extract.rs`**: Add `delegation_field_from_body(body: Node, language: Language) -> Option<String>`:
+**`src/symbol_extract.rs`**: Add `delegation_field_from_call(body: Node, language: Language) -> Option<String>`:
 - Returns `None` immediately for non-Go/non-TS/non-JS languages.
 - For Go: look for `call_expression → function: selector_expression → operand: selector_expression → field: field_identifier`. Return the inner field identifier's text.
 - For TS/JS: same pattern with `member_expression → object: member_expression → property: property_identifier`.
@@ -44,7 +44,7 @@ pub delegation_field: Option<String>,
 Update the `Some(SymbolNode {...})` construction in `classify_node` to include:
 ```rust
 delegation_field: if is_pure_delegation {
-    delegation_field_from_body(node.child_by_field_name("body")?, language)
+    delegation_field_from_call(node.child_by_field_name("body")?, language)
 } else {
     None
 },
@@ -136,7 +136,7 @@ Per `CLAUDE.md`'s "Writing a new check" section:
 
 2. **TS `member_expression` vs. `selector_expression` naming**: Go calls the node
    `selector_expression`; TS/JS calls it `member_expression`. The extraction function
-   must branch correctly. Risk: `delegation_field_from_body` uses Go-specific node kind
+   must branch correctly. Risk: `delegation_field_from_call` uses Go-specific node kind
    for TS code → always returns `None` → no false positives but also no true positives
    for TS. Mitigation: add `flags_typescript_type_with_majority_delegation` test to
    CI — it will fail if the TS branch is broken.
