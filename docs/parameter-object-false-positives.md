@@ -16,8 +16,8 @@ with `scripts/clone-backtest-repos.sh`).
 | microsoft/vscode | 3231 | TypeScript; see triage below |
 | BurntSushi/ripgrep | 0 | Rust, no param extraction |
 | apache/cassandra | 0 | Java, no param extraction |
-| denoland/deno | n/a | model build aborts: `stream did not contain valid UTF-8` reading a test-fixture `.js` file (`import_graph::build`, not this check) |
-| servo/servo | n/a | same UTF-8 abort on a WPT fixture `.js` file |
+| denoland/deno | 155 | TypeScript; scannable since `import_graph` skips non-UTF-8 files instead of aborting |
+| servo/servo | 0 | Rust, no param extraction (also scannable after the same fix) |
 
 `kibitzer check backtest parameter-object` (replayed through `backtest::ModelBacked`)
 scanned 3227 transcripts / 2400 snapshots and produced 5 findings, all the same group
@@ -39,6 +39,10 @@ build and classified each by eye. This is a judgement call, not a ground-truth l
 - About 20 of 40 were noise: (`db, sql`), (`params, signal`), (`..., level`),
   (`ctx, width`), `_`-prefixed names, callback parameters, framework hook shapes.
 - The rest were ambiguous.
+- A 20-finding deno sample: about 6 plausibly real (`address, port`; `dirfd, pathLen,
+  pathPtr`), the rest noise (Node-API shapes such as `cb, data` and `actual, expected`, a
+  121-function `a number, b number` group in a `tests/registry` fixture, untyped
+  parameters grouped by name alone).
 - The noise share is well above the ~20% false-positive target and the volume is high, so
   the check stays Advisory. A repo that finds it too loud can narrow it via
   `.kibitzer/inspect.json` (see `docs/suppressing-checks.md`) or extend
@@ -62,6 +66,11 @@ build and classified each by eye. This is a judgement call, not a ground-truth l
    suppression list with `ctx context.Context`.
 
 ## Remaining known false positives (not mitigated)
+
+- **Untyped TypeScript parameters** (`cb, data`) match on name alone, so unrelated functions
+  that happen to reuse names group together.
+- **Node-API polyfills** mirror Node's own signatures (`actual, expected`, `cb, data`).
+- **Fixture trees outside `fixtures/`/`testdata/`** (e.g. `tests/registry/...`) are scanned.
 
 - **Framework conventions** that repeat by contract: k8s conversion functions
   (`in *X, s conversion.Scope`), `(newObj, oldObj runtime.Object)` strategy hooks,
