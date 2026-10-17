@@ -7,15 +7,16 @@
 //! `delegation_field`, so they can't reach the ratio. Types under `MIDDLE_MAN_MIN_METHODS`
 //! methods are skipped — a one- or two-method forwarder is usually an intentional
 //! Adapter/Decorator. The carve-outs below are fixed constants, not `ArchitectureConfig`
-//! options. Types named `*Adapter`/`*Wrapper`/`*Proxy`/`*Decorator`, and
-//! methods in test files, are skipped: backtesting `kubernetes/kubernetes` and
-//! `microsoft/vscode` showed those were the intentional-delegation majority of raw hits
+//! options. Skipped: types named `*Adapter`/`*Wrapper`/`*Proxy`/`*Decorator`, methods in test
+//! files, and types with an explicit `implements` edge (TS/Java-style; Go's structural
+//! satisfaction is not tracked). Backtesting `kubernetes/kubernetes` and `microsoft/vscode`
+//! showed those were the intentional-delegation majority of raw hits
 //! (see `project_plans/remove-middle-man/decisions/validation.md`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode};
+use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::checkers::is_test_file;
 use crate::config::ArchitectureConfig;
@@ -38,22 +39,35 @@ impl ArchModelChecker for MiddleManChecker {
     }
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+        // Resolved or not: an `implements Foo` whose interface lives outside the repo is
+        // still an explicit adapter declaration.
+        let implementers: HashSet<&str> = model
+            .type_edges
+            .iter()
+            .filter(|e| e.kind == Some(TypeRelationKind::Implements))
+            .map(|e| e.from.as_str())
+            .collect();
         let mut findings: Vec<ArchFinding> = model
             .packages
             .values()
-            .flat_map(|pkg| findings_for_package(pkg, &model.repo_root))
+            .flat_map(|pkg| findings_for_package(pkg, &model.repo_root, &implementers))
             .collect();
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
     }
 }
 
-fn findings_for_package(pkg: &PackageNode, repo_root: &Path) -> Vec<ArchFinding> {
+fn findings_for_package(
+    pkg: &PackageNode,
+    repo_root: &Path,
+    implementers: &HashSet<&str>,
+) -> Vec<ArchFinding> {
     let mut methods_by_parent: BTreeMap<&str, Vec<&SymbolNode>> = BTreeMap::new();
     for sym in &pkg.symbols {
         if sym.kind == SymbolKind::Method
             && !is_test_file(sym.file.strip_prefix(repo_root).unwrap_or(&sym.file))
             && let Some(parent) = &sym.parent
+            && !implements_declared_interface(sym, implementers)
         {
             methods_by_parent.entry(parent).or_default().push(sym);
         }
@@ -63,6 +77,15 @@ fn findings_for_package(pkg: &PackageNode, repo_root: &Path) -> Vec<ArchFinding>
         .into_iter()
         .filter_map(|(type_name, methods)| finding_for_type(&pkg.path, type_name, &methods))
         .collect()
+}
+
+/// Method ids are `{pkg}::{type}.{name}`, the same shape `type_edges.from` uses for the type.
+fn implements_declared_interface(method: &SymbolNode, implementers: &HashSet<&str>) -> bool {
+    method
+        .id
+        .strip_suffix(method.name.as_str())
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|type_id| implementers.contains(type_id))
 }
 
 fn finding_for_type(
@@ -273,5 +296,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(findings(&model).len(), 1);
+    }
+
+    #[test]
+    fn does_not_flag_a_typescript_type_that_declares_implements() {
+        let model = model_from(vec![(
+            "/repo/src/a.ts",
+            "interface IFoo { a(): void; b(): void; c(): void; }\nclass S implements IFoo {\n  private inner: any;\n  a() { this.inner.a(); }\n  b() { this.inner.b(); }\n  c() { this.inner.c(); }\n}\n",
+        )]);
+        assert!(findings(&model).is_empty());
     }
 }
