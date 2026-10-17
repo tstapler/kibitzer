@@ -106,3 +106,26 @@ Round-3 reference points: rule precision 70.6% on the first 17 findings; tagger 
 - Rule precision: only partially. Overall precision here is 91.1%, higher than 70.6%, but 42 of the 46 terraform findings are one trivially true `_impl` idiom and terraform is 58% of the sample. Excluding terraform it is 78.8% (26/33), and hugo alone is 50%. The honest summary is that precision is repo-dependent, the 70.6% figure was neither a ceiling nor a floor, and there is a new FP class (assertion through a `t.Errorf` function-value callback) the rule does not handle. Strict precision (a likely real defect) is 1.3%; the rule finds smoke tests, almost never defects.
 - Tagger accuracy: the 9/12 (75%) in-sample figure is consistent with 19/26 (73.1%) on non-terraform true positives, so it does not obviously overfit, but the 90.3% overall figure is inflated by the terraform compile-check cluster (46/46) and should not be quoted. Coverage on non-terraform true positives is 80.8%; the tagger leaves `wg.Go`/bare-goroutine race tests, double-shutdown lifecycle tests, and the one discarded-result case untagged. The tagger has no channel for "this finding is a rule FP", so FP-callback tests receive a confident `no-panic-smoke:uncued`.
 - Caveats: same-model labeller, n=33 outside terraform with heavy within-file clustering, and a self-reported blindness procedure. These data support "no evidence of overfitting; failure modes are concurrency-idiom coverage and no FP escape hatch", not a precise accuracy estimate.
+
+## After round 4
+
+Changes (commits 80c7890 rule, b317e29 tagger): the rule counts `helper(t.Errorf, ...)` (also `Error`, `Fatal`, `Fatalf`, `Fail`, `FailNow`; not `Log*`/`Skip*`) as an assertion site when the same-file helper invokes that parameter, directly or by passing it on (depth 2, cycle-safe), and, precision-first, when the helper cannot be resolved. A helper that receives the callback and never calls it is still flagged. An `if err != nil { panic(...) }` counts only inside a `go` statement; it is deliberately not counted in setup code, because the first attempt (any guarded panic in the test or its helpers) dropped true positive nats `events_test.go:1645`, whose setup helpers panic on setup errors. Tagger: `wg.Go(...)` and a bare `go` with a race cue in the name or a comment now give `race-smoke`; `lifecycle-smoke` needs every effective statement to be a `Start`/`Stop`/`Shutdown`/`Close`/`Run` call (optionally suffixed, e.g. `StartProfiler`), construction or `Set*`, otherwise `no-panic-smoke`.
+
+**Both held-out sets (this one, 79 rows, and `HELDOUT.md`, 17 rows) are now tuning data. They are no longer held out**: every change above was chosen by reading their failures, so the numbers below measure fit, not generalisation. A new unseen shard is needed for that.
+
+Counts by command (`find <repo> -name '*_test.go' -not -path '*/vendor/*' | xargs -P8 kibitzer check native test-no-assertion-go`, `KIBITZER_ORACLE_TAGS=1`, compared by `file:line`):
+
+| set | measure | before round 4 | after round 4 |
+|---|---|---:|---:|
+| held-out 2 (79 rows) | findings reported | 79 | 72 |
+| | true positives still reported | 72/72 | 72/72 |
+| | false positives still reported | 7 | 0 |
+| | tagger exact match, all rows (FP rows count as miss) | 65/79 | 68/79 |
+| | tagger exact match, true positives | 65/72 | 68/72 |
+| held-out 1 (17 rows) | findings reported | 12 | 12 |
+| | true positives still reported | 12/12 | 12/12 |
+| | tagger exact match, all rows / true positives | 9/17, 9/12 | 9/17, 9/12 |
+
+Held-out 1 was already at 12 reported after round 3 (the five `os.Exit` stubs); round 4 changes nothing there. Held-out 2 per repo: hugo 14 -> 7 (the six `absurlreplacer_test.go` callback tests and the `clone_test.go:204` goroutine-panic test no longer reported), all other repos unchanged. Three tagger disagreements are fixed (caddy `admin_test.go:163` and lazygit `thread_safe_map_test.go:47` now `race-smoke`; nats `test/gosrv_test.go:59` now `lifecycle-smoke`). Four true-positive disagreements remain and are not addressed: nats `events_test.go:1645` (untagged), nats `server_test.go:162` (`Lock`/`Unlock` between lifecycle calls, so `no-panic-smoke`), nats `stree_test.go:963` (the discarded-result case, untagged), cobra `completions_test.go:2896` (`lifecycle-smoke` vs `compile-check`).
+
+Not handled: a callback stored into a struct field and called later (`h.errorf = ef`) is not seen as an invocation, so such a test is still flagged. Guarded panics outside a goroutine are by design not oracles.
