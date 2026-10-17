@@ -443,9 +443,14 @@ impl Checker for TestNoAssertionChecker {
             if self.asserts(&scan, &info.calls, &info.handles, info.class.as_deref(), 0) {
                 continue;
             }
+            let mut message = self.message(test);
+            if self.lang == Language::Go && crate::test_code::oracle_tag::enabled() {
+                message.push_str("\n  ");
+                message.push_str(&crate::test_code::oracle_tag::tag_go(test).annotation());
+            }
             findings.push(Finding {
                 line: test.line,
-                message: self.message(test),
+                message,
             });
         }
         Ok(findings)
