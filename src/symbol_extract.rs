@@ -522,18 +522,17 @@ fn classify_node(
 
     let id = build_id(package_path, parent.as_deref(), &name);
 
-    let is_pure_delegation = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+    let delegating = if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
         && call_graph_supports(language)
-        && node
-            .child_by_field_name("body")
-            .is_some_and(is_pure_delegation_body);
-
-    let delegation_field = if is_pure_delegation && symbol_kind == SymbolKind::Method {
-        node.child_by_field_name("body")
-            .and_then(|body| delegation_field_from_body(node, body, language, source))
+    {
+        node.child_by_field_name("body").and_then(delegating_call)
     } else {
         None
     };
+    let is_pure_delegation = delegating.is_some();
+    let delegation_field = delegating
+        .filter(|_| symbol_kind == SymbolKind::Method)
+        .and_then(|call| delegation_field_from_call(node, call, language, source));
 
     Some(SymbolNode {
         id,
@@ -589,11 +588,6 @@ const CALL_EXPRESSION_KIND: &str = "call_expression";
 /// Fowler's *Inline Function* shape. Go wraps a `return`'s value(s) in an
 /// `expression_list` (so `return a(), b()` correctly doesn't match); TS/JS's
 /// `return_statement` holds the call directly.
-fn is_pure_delegation_body(body: Node) -> bool {
-    delegating_call(body).is_some()
-}
-
-/// The single call node `is_pure_delegation_body` matched, if any.
 fn delegating_call(body: Node) -> Option<Node> {
     let stmts = body_statements(body);
     let [stmt] = stmts.as_slice() else {
@@ -630,52 +624,52 @@ fn delegating_call(body: Node) -> Option<Node> {
 /// `s` is the method's receiver) or `this.inner.foo()` (TS/JS) gives `Some("inner")`.
 /// `None` for a bare/free call, a call chained off another call (`s.Get().Foo()`), a
 /// deeper chain (`s.a.b.Foo()`), or any language `call_graph_supports` excludes.
-fn delegation_field_from_body<'a>(
-    method: Node<'a>,
-    body: Node<'a>,
+fn delegation_field_from_call(
+    method: Node,
+    call: Node,
     language: Language,
     source: &str,
 ) -> Option<String> {
-    if !call_graph_supports(language) {
-        return None;
-    }
-    let callee = delegating_call(body)?.child_by_field_name("function")?;
-    let (callee_kind, operand_field, member_field) = match language {
+    let (access_kind, operand_field, member_field) = match language {
         Language::Go => ("selector_expression", "operand", "field"),
-        _ => ("member_expression", "object", "property"),
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            ("member_expression", "object", "property")
+        }
+        _ => return None,
     };
-    if callee.kind() != callee_kind {
+    let callee = call.child_by_field_name("function")?;
+    if callee.kind() != access_kind {
         return None;
     }
-    let receiver_access = callee.child_by_field_name(operand_field)?;
-    if receiver_access.kind() != callee_kind {
+    let field_access = callee.child_by_field_name(operand_field)?;
+    if field_access.kind() != access_kind {
         return None;
     }
-    let base = receiver_access.child_by_field_name(operand_field)?;
-    let base_ok = match language {
+    let base = field_access.child_by_field_name(operand_field)?;
+    let base_is_receiver = match language {
         Language::Go => {
             base.kind() == "identifier"
-                && go_receiver_name(method, source).as_deref() == Some(node_text(base, source))
+                && go_receiver_name(method, source) == Some(node_text(base, source))
         }
         _ => base.kind() == "this",
     };
-    if !base_ok {
+    if !base_is_receiver {
         return None;
     }
-    let field = receiver_access.child_by_field_name(member_field)?;
+    let field = field_access.child_by_field_name(member_field)?;
     Some(node_text(field, source).to_string())
 }
 
 /// Name of a Go method's receiver parameter (`s` in `func (s *S) Foo()`); `None` when the
 /// receiver is unnamed or blank (`_`).
-fn go_receiver_name(method: Node, source: &str) -> Option<String> {
+fn go_receiver_name<'s>(method: Node, source: &'s str) -> Option<&'s str> {
     let receiver = method.child_by_field_name("receiver")?;
     let mut cursor = receiver.walk();
     let param = receiver
         .children(&mut cursor)
         .find(|c| c.kind() == "parameter_declaration")?;
     let name = node_text(param.child_by_field_name("name")?, source);
-    (name != "_").then(|| name.to_string())
+    (name != "_").then_some(name)
 }
 
 fn walk(

@@ -9,6 +9,7 @@ use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::duplicate_code::{DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES};
 use crate::checkers::file_size::is_generated;
 use crate::checkers::import_preamble::{lang_ext, non_preamble_windows};
+use crate::checkers::is_test_file;
 
 /// Opt-in near-duplicate counterpart to `duplicate-code` (issue #47): same window-hashing,
 /// but the key is computed after replacing literals with a placeholder, so
@@ -40,46 +41,6 @@ impl Checker for FuzzyDuplicateCodeChecker {
         }
         Ok(find_fuzzy_duplicate_blocks(ctx.source, lang_ext(file)))
     }
-}
-
-/// Skips common test-file naming conventions across supported languages. Backtesting
-/// against `kubernetes/kubernetes` found ~97% of raw findings were `_test.go` table-driven
-/// cases — already the Parameterize-Function shape, so flagging them back is backwards.
-/// See `docs/duplicate-code-fuzzy.md`.
-pub(crate) fn is_test_file(file: &Path) -> bool {
-    // Rust integration tests and JS/TS test suites both conventionally live in a `tests/`
-    // or `__tests__/` directory rather than following a filename suffix (e.g.
-    // `crates/cli/tests/browser_session.rs`, confirmed as a real backtest hit before this
-    // check was added — see docs/duplicate-code-fuzzy.md).
-    if file
-        .components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some("tests") | Some("__tests__")))
-    {
-        return true;
-    }
-
-    let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with("_test.go")
-        || lower.ends_with("_test.py")
-        || (lower.starts_with("test_") && lower.ends_with(".py"))
-        || [
-            ".test.ts",
-            ".test.tsx",
-            ".test.js",
-            ".test.jsx",
-            ".spec.ts",
-            ".spec.tsx",
-            ".spec.js",
-            ".spec.jsx",
-        ]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-        || (lower.ends_with(".java")
-            && (name.ends_with("Test.java") || name.ends_with("Tests.java")))
-        || (lower.ends_with(".kt") && (name.ends_with("Test.kt") || name.ends_with("Tests.kt")))
 }
 
 inventory::submit! {

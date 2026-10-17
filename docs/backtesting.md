@@ -19,7 +19,7 @@ kibitzer check backtest duplicate-code --transcripts-dir ~/.claude/projects
 
 - `name` is a checker name from `kibitzer check list`, or `all` to run every
   registered per-file checker. A whole-repo model checker (e.g.
-  `single-call-site-delegation`, see `kibitzer check architecture`) can also be
+  `single-call-site-delegation` or `remove-middle-man`, see `kibitzer check architecture`) can also be
   named explicitly; it is replayed against a model built from each reconstructed
   file alone, so cross-file signals (callers or implementers in other files) are
   not visible. `all` does not include model checkers.

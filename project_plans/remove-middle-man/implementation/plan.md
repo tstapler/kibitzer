@@ -19,7 +19,7 @@ Implement Fowler's **Remove Middle Man** as a new `ArchModelChecker` by:
 | Language scope | Go + TS/JS only | Matches `call_graph_supports` gate that `is_pure_delegation` already enforces; avoids false `None` silently being treated as a signal. |
 | AST extraction approach | New `delegation_field_from_body` function alongside `is_pure_delegation_body` | Called only when `is_pure_delegation` is true; avoids re-parsing the body. |
 | Threshold | `const MIDDLE_MAN_MIN_METHODS: usize = 3`, `const MIDDLE_MAN_DELEGATION_RATIO: f64 = 0.8` | Matches backlog proposal. Named constants mirroring `LCOM_MIN_METHODS`/`STABLE_MAX`. |
-| Severity | `Advisory` | Same as `LcomChecker` — the finding is actionable but requires human judgment (Adapter/Decorator patterns are legitimate). |
+| Severity | `severity_override: None` | Inherits the enclosing check's severity, matching `god_class`/`single_call_site_delegation`. Backtest results live in `decisions/validation.md`. |
 
 ## Implementation steps
 
@@ -123,7 +123,7 @@ Also add `symbol_extract` tests for `delegation_field` population:
 Per `CLAUDE.md`'s "Writing a new check" section:
 1. `kibitzer check backtest remove-middle-man` against session transcripts.
 2. Run against all repos in `docs/backtest-repos.md`.
-3. Record findings in `project_plans/remove-middle-man/validation.md`.
+3. Record findings in `project_plans/remove-middle-man/decisions/validation.md`.
 
 ## Adversarial review
 

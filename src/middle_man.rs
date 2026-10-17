@@ -6,16 +6,18 @@
 //! Go and TS/JS only (`symbol_extract::call_graph_supports`): other languages never get a
 //! `delegation_field`, so they can't reach the ratio. Types under `MIDDLE_MAN_MIN_METHODS`
 //! methods are skipped — a one- or two-method forwarder is usually an intentional
-//! Adapter/Decorator. Types named `*Adapter`/`*Wrapper`/`*Proxy`/`*Decorator`, and
+//! Adapter/Decorator. The carve-outs below are fixed constants, not `ArchitectureConfig`
+//! options. Types named `*Adapter`/`*Wrapper`/`*Proxy`/`*Decorator`, and
 //! methods in test files, are skipped: backtesting `kubernetes/kubernetes` and
 //! `microsoft/vscode` showed those were the intentional-delegation majority of raw hits
 //! (see `project_plans/remove-middle-man/decisions/validation.md`).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
-use crate::checkers::duplicate_code_fuzzy::is_test_file;
+use crate::checkers::is_test_file;
 use crate::config::ArchitectureConfig;
 
 const MIDDLE_MAN_MIN_METHODS: usize = 3;
@@ -39,18 +41,18 @@ impl ArchModelChecker for MiddleManChecker {
         let mut findings: Vec<ArchFinding> = model
             .packages
             .values()
-            .flat_map(middle_man_findings_for_package)
+            .flat_map(|pkg| findings_for_package(pkg, &model.repo_root))
             .collect();
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
     }
 }
 
-fn middle_man_findings_for_package(pkg: &PackageNode) -> Vec<ArchFinding> {
+fn findings_for_package(pkg: &PackageNode, repo_root: &Path) -> Vec<ArchFinding> {
     let mut methods_by_parent: BTreeMap<&str, Vec<&SymbolNode>> = BTreeMap::new();
     for sym in &pkg.symbols {
         if sym.kind == SymbolKind::Method
-            && !is_test_file(&sym.file)
+            && !is_test_file(sym.file.strip_prefix(repo_root).unwrap_or(&sym.file))
             && let Some(parent) = &sym.parent
         {
             methods_by_parent.entry(parent).or_default().push(sym);
@@ -85,12 +87,9 @@ fn finding_for_type(
             by_field.entry(field).or_default().push(method);
         }
     }
-    // Ties resolve to the alphabetically first field: `max_by_key` keeps the last max,
-    // so iterate in reverse.
     let (field, delegating) = by_field
         .into_iter()
-        .rev()
-        .max_by_key(|(_, delegating)| delegating.len())?;
+        .min_by_key(|(field, delegating)| (std::cmp::Reverse(delegating.len()), *field))?;
 
     if (delegating.len() as f64) / (total as f64) < MIDDLE_MAN_DELEGATION_RATIO {
         return None;
@@ -221,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn methods_without_a_delegation_field_do_not_count_toward_the_fraction() {
+    fn methods_without_a_delegation_field_do_not_count_as_delegating() {
         // Two of four delegate through `inner`; the other two are pure delegations that
         // route through a call chain (`delegation_field = None`), not a field.
         let src = go_type(&[
@@ -254,5 +253,25 @@ mod tests {
         ]);
         let model = model_from(vec![("/repo/pkg/a_test.go", &src)]);
         assert!(findings(&model).is_empty());
+    }
+
+    #[test]
+    fn a_checkout_under_a_tests_directory_is_still_checked() {
+        let src = go_type(&[
+            "func (s *S) A() { s.inner.A() }",
+            "func (s *S) B() { s.inner.B() }",
+            "func (s *S) C() { s.inner.C() }",
+        ]);
+        let files = vec![(PathBuf::from("/work/tests/repo/pkg/a.go"), src)];
+        let model = crate::arch_model::build_model(
+            &PathBuf::from("/work/tests/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(findings(&model).len(), 1);
     }
 }
