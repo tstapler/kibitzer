@@ -75,6 +75,8 @@ struct FnInfo {
     /// Go `func (r T) m()`; resolvable from a selector call regardless of receiver type.
     is_method: bool,
     line: usize,
+    /// Byte range of the whole declaration, for the oracle tagger's one-level helper lookup.
+    span: (usize, usize),
     calls: Vec<Call>,
     handles: Vec<String>,
     /// Python only: innermost enclosing class, for `self.method` resolution.
@@ -302,6 +304,12 @@ impl Scan {
 }
 
 impl Scan {
+    /// Source text of the same-file plain function `name` (Go oracle tagger only).
+    fn helper_source(&self, name: &str, source: &str) -> Option<String> {
+        let f = &self.fns[*self.by_name.get(name)?];
+        source.get(f.span.0..f.span.1).map(str::to_string)
+    }
+
     /// Python `self.name`: the method on `class`, else on its same-file bases (nearest first).
     /// Cross-file bases are invisible under one-parse-per-file; `assertion_helpers` covers them.
     fn resolve_in_class_chain(&self, class: &str, name: &str) -> Option<&FnInfo> {
@@ -439,6 +447,10 @@ impl Checker for TestNoAssertionChecker {
             else {
                 continue;
             };
+            if self.lang == Language::Go && info.calls.iter().any(|c| c.callee == "os.Exit") {
+                // A Go subprocess re-exec stub (`TestHelperProcess`): the parent test asserts.
+                continue;
+            }
             scan.seen.borrow_mut().clear();
             if self.asserts(&scan, &info.calls, &info.handles, info.class.as_deref(), 0) {
                 continue;
@@ -446,7 +458,12 @@ impl Checker for TestNoAssertionChecker {
             let mut message = self.message(test);
             if self.lang == Language::Go && crate::test_code::oracle_tag::enabled() {
                 message.push_str("\n  ");
-                message.push_str(&crate::test_code::oracle_tag::tag_go(test).annotation());
+                message.push_str(
+                    &crate::test_code::oracle_tag::tag_go(test, &|name| {
+                        scan.helper_source(name, ctx.source)
+                    })
+                    .annotation(),
+                );
             }
             findings.push(Finding {
                 line: test.line,
@@ -471,6 +488,7 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
                     is_method: lang == Language::Go
                         && GoKind::of(node) == GoKind::MethodDeclaration,
                     line: line_of(node),
+                    span: (node.start_byte(), node.end_byte()),
                     calls: calls_in(lang, node, ctx.source),
                     handles: handles_in(lang, node, ctx.source),
                     class: (lang == Language::Python)

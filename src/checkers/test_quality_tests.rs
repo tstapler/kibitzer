@@ -75,6 +75,7 @@ const GO_CASES: &[Case] = &[
         &[7, 11, 14, 18, 22],
     ),
     ("empty_test.go", &[6], &[6]),
+    ("helper_process_test.go", &[27, 34], &[27, 34]),
     ("scanner_handler_test.go", &[5], &[5]),
     ("a_test.go", &[6], &[6]),
     ("unresolved_helper_test.go", &[7], &[]),
