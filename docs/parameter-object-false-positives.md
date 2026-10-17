@@ -45,19 +45,19 @@ build and classified each by eye. This is a judgement call, not a ground-truth l
 
 ## False-positive classes
 
-1. **Blank params** (`_ *v1.Pod, _ string`) grouped as if named. (m) Params named `_` or
+1. **Blank params** (`_ *v1.Pod, _ string`) grouped as if named. Params named `_` or
    unnamed are dropped.
    Functions with more than 10 usable params are skipped entirely.
 2. **Injected services** (`logService ILogService`, `ServicesAccessor`) in VS Code. (m)
    Types shaped `I` + capital + lowercase (so not Go's `ID`), and `ServicesAccessor`, are
    dropped. Heuristic; it will also drop a real `IFoo` data interface.
 3. **Interface implementations**: the same full signature on methods of 3+ distinct
-   types. (m) Skipped; a `ctx` parameter doesn't defeat the match. Free functions implementing one callback type (e.g. 23 k8s
+   types. Skipped; a `ctx` parameter doesn't defeat the match. Free functions implementing one callback type (e.g. 23 k8s
    `validate.*` functions sharing `fldPath, op`) are still flagged.
 4. **Test and fixture code**: `_test.go`, `*.test.ts`, `*.spec.ts` and `fixtures/`
-   or `testdata/` directories. (m) Skipped. Test helpers under other paths
+   or `testdata/` directories. Skipped. Test helpers under other paths
    (`test/e2e/...`) are still flagged.
-5. **Go `testing` boilerplate** (`t *testing.T`, `b *testing.B`). (m) Added to the default
+5. **Go `testing` boilerplate** (`t *testing.T`, `b *testing.B`). Added to the default
    suppression list with `ctx context.Context`.
 
 ## Remaining known false positives (not mitigated)
