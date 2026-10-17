@@ -405,6 +405,7 @@ fn go_type_declaration_symbols(
             exported,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
     }
 }
@@ -527,6 +528,12 @@ fn classify_node(
             .child_by_field_name("body")
             .is_some_and(is_pure_delegation_body);
 
+    let params = if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method) {
+        extract_params(node, language, source)
+    } else {
+        Vec::new()
+    };
+
     Some(SymbolNode {
         id,
         name,
@@ -536,7 +543,73 @@ fn classify_node(
         exported,
         parent,
         is_pure_delegation,
+        params,
     })
+}
+
+/// `(name, type_text)` pairs for a function/method's parameters, receiver excluded. Go
+/// and TypeScript/TSX only; every other language returns empty. A Go `a, b int` group
+/// yields one pair per name; an unnamed parameter yields `("", type)`.
+// SEAM(typed-node-kind-migration): TS/TSX parameter kinds are matched by raw string
+// since both grammars share the same spellings — see ADR-001.
+fn extract_params(node: Node, language: Language, source: &str) -> Vec<(String, String)> {
+    let Some(list) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = list.walk();
+    match language {
+        Language::Go => {
+            for decl in list.children(&mut cursor) {
+                let Some(ty) = decl.child_by_field_name("type") else {
+                    continue;
+                };
+                let mut ty_text = node_text(ty, source).to_string();
+                match decl.kind() {
+                    "parameter_declaration" => {}
+                    "variadic_parameter_declaration" => ty_text.insert_str(0, "..."),
+                    _ => continue,
+                }
+                let mut nc = decl.walk();
+                let names: Vec<_> = decl.children_by_field_name("name", &mut nc).collect();
+                if names.is_empty() {
+                    out.push((String::new(), ty_text));
+                } else {
+                    out.extend(
+                        names
+                            .into_iter()
+                            .map(|n| (node_text(n, source).to_string(), ty_text.clone())),
+                    );
+                }
+            }
+        }
+        Language::TypeScript | Language::Tsx => {
+            for param in list.children(&mut cursor) {
+                if !matches!(param.kind(), "required_parameter" | "optional_parameter") {
+                    continue;
+                }
+                let Some(pattern) = param.child_by_field_name("pattern") else {
+                    continue;
+                };
+                // `this` is a type-only pseudo-parameter, not a real argument.
+                if node_text(pattern, source) == "this" {
+                    continue;
+                }
+                let ty = param
+                    .child_by_field_name("type")
+                    .map(|t| {
+                        node_text(t, source)
+                            .trim_start_matches(':')
+                            .trim()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                out.push((node_text(pattern, source).to_string(), ty));
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 // SEAM(typed-node-kind-migration): raw `.kind()` comparisons against Go's
@@ -2683,6 +2756,72 @@ mod tests {
     // signal) — exercised directly here rather than only indirectly through the
     // checker's own tests, so an AST-shape regression can be localized without also
     // touching caller-counting/export-filtering.
+
+    fn pairs(symbols: &[SymbolNode], name: &str) -> Vec<(String, String)> {
+        find_by_name(symbols, name).params.clone()
+    }
+
+    fn pair(n: &str, t: &str) -> (String, String) {
+        (n.to_string(), t.to_string())
+    }
+
+    #[test]
+    fn params_go_expands_shared_type_groups_and_excludes_the_receiver() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg
+
+type T struct{}
+
+func (t *T) Do(a, b string, n int, rest ...int) {}
+",
+            "pkg",
+        );
+        assert_eq!(
+            pairs(&symbols, "Do"),
+            vec![
+                pair("a", "string"),
+                pair("b", "string"),
+                pair("n", "int"),
+                pair("rest", "...int")
+            ]
+        );
+    }
+
+    #[test]
+    fn params_go_unnamed_parameter_has_an_empty_name() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg
+
+func f(int, string) {}
+",
+            "pkg",
+        );
+        assert_eq!(
+            pairs(&symbols, "f"),
+            vec![pair("", "int"), pair("", "string")]
+        );
+    }
+
+    #[test]
+    fn params_typescript_strips_the_annotation_colon() {
+        let symbols = extract(
+            Language::TypeScript,
+            "function f(a: string, b?: number, c) {}\n",
+            "pkg",
+        );
+        assert_eq!(
+            pairs(&symbols, "f"),
+            vec![pair("a", "string"), pair("b", "number"), pair("c", "")]
+        );
+    }
+
+    #[test]
+    fn params_empty_for_unsupported_languages() {
+        let symbols = extract(Language::Python, "def f(a, b):\n    pass\n", "pkg");
+        assert!(pairs(&symbols, "f").is_empty());
+    }
 
     #[test]
     fn is_pure_delegation_true_for_a_go_bare_call_body() {

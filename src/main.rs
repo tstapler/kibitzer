@@ -38,6 +38,7 @@ mod markdown_text;
 mod mcp;
 mod mermaid;
 mod node_kind;
+mod parameter_object;
 mod plugin;
 mod root_cause_clusters;
 mod run;

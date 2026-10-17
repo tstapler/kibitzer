@@ -103,6 +103,10 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
         "whole-repo architecture check, reports packages rather than file rows",
     ),
     (
+        "parameter-object",
+        "whole-repo architecture check, reports a cluster of functions at its first member",
+    ),
+    (
         "go-blank-imports",
         "an adjacent comment of any kind counts as the justification, so a directive above the \
          import clears the finding by construction rather than by suppression",

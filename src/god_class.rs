@@ -508,6 +508,7 @@ mod tests {
             exported: true,
             parent: Some(type_name.to_string()),
             is_pure_delegation: false,
+            params: vec![],
         }
     }
 

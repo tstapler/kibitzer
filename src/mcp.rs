@@ -2640,6 +2640,7 @@ mod tests {
                 exported: true,
                 parent: None,
                 is_pure_delegation: false,
+                params: vec![],
             },
             SymbolNode {
                 id: "pkg::Dog".to_string(),
@@ -2650,6 +2651,7 @@ mod tests {
                 exported: true,
                 parent: None,
                 is_pure_delegation: false,
+                params: vec![],
             },
         ];
         let mut packages = BTreeMap::new();

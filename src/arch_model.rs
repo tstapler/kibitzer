@@ -86,6 +86,13 @@ pub struct SymbolNode {
     /// precedent as `ArchFinding::severity_override`).
     #[serde(default)]
     pub is_pure_delegation: bool,
+    /// `(name, type_text)` per declared parameter of a `Function`/`Method`, in
+    /// declaration order, receiver excluded. Populated for Go and TypeScript/TSX only
+    /// (`symbol_extract::extract_params`); empty for every other language and for
+    /// `Type`/`Interface` symbols. `#[serde(default)]` so a `cache.json` written before
+    /// this field existed still deserializes.
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -1205,6 +1212,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         }
     }
 
@@ -1346,6 +1354,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2110,6 +2119,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2121,6 +2131,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
 
         let mut packages = BTreeMap::new();
@@ -2156,6 +2167,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         let api_pkg = empty_package("server/api");
 
@@ -2192,6 +2204,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         let api_pkg = empty_package("server/api");
 
@@ -2463,6 +2476,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2479,6 +2493,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2529,6 +2544,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2570,6 +2586,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            params: vec![],
         });
         packages.insert("app".to_string(), pkg);
 

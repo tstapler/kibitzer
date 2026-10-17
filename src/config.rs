@@ -206,6 +206,12 @@ pub struct ArchitectureConfig {
     /// Per-component, per-kind naming pattern rules.
     #[serde(default)]
     pub naming_rules: Vec<NamingRule>,
+    /// `(name, type)` parameter pairs `parameter-object` ignores when clustering — idiomatic
+    /// boilerplate that recurs everywhere without signalling a missing type. Unset means
+    /// `parameter_object::DEFAULT_SUPPRESSED_PAIRS` (`ctx context.Context`); set it
+    /// (even to `[]`) to replace that default outright.
+    #[serde(default)]
+    pub parameter_object_suppress: Option<Vec<(String, String)>>,
 }
 
 /// Hardcoded, portable Go-ecosystem bail-out globs `affected.rs` always checks, on top
@@ -898,6 +904,7 @@ fn file_size_checks() -> Vec<Check> {
     vec![
         native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
         whole_repo_check("go-package-size", "package-size"),
+        whole_repo_check("parameter-object", "parameter-object"),
         native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
         native_check("tsx-file-size", Severity::Advisory, &["**/*.tsx"]),
         native_check(
