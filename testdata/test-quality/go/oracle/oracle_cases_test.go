@@ -145,3 +145,61 @@ func workingHelper(t *testing.T) {
 func outerHelper(t *testing.T) {
 	skipOnlyHelper(t, false, false)
 }
+
+// sync.WaitGroup.Go is a goroutine launch even though there is no `go` keyword.
+func TestRace_waitGroupGoMethod(t *testing.T) {
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Go(func() {
+			_ = Load(testCfg, true)
+		})
+	}
+	wg.Wait()
+}
+
+// A bare `go func` with no WaitGroup/channel: the name carries the race cue.
+func TestRace_bareGoNamedConcurrent(t *testing.T) {
+	m := NewThreadSafeMap[int, int]()
+	go func() {
+		for range 10000 {
+			m.Set(0, 0)
+		}
+	}()
+	for range 10000 {
+		m.Get(0)
+	}
+}
+
+// A bare `go` with neither a sync primitive nor a race cue is not enough for race-smoke.
+func TestBareGo_noCue(t *testing.T) {
+	go worker()
+	Parse("x")
+}
+
+// A construction-style bind (RunServer) followed only by lifecycle calls.
+func TestLifecycle_runServerMultiShutdown(t *testing.T) {
+	s := RunServer(&opts)
+	s.Shutdown()
+	s.Shutdown()
+}
+
+func TestLifecycle_prefixedVerbs(t *testing.T) {
+	s := New(DefaultOptions())
+	s.StartProfiler()
+	s.CloseAll()
+}
+
+// A non-lifecycle call among the lifecycle calls: no-panic, not lifecycle.
+func TestStartStop_withSleep(t *testing.T) {
+	s := NewServer()
+	s.Start()
+	time.Sleep(time.Second)
+	s.Stop()
+}
+
+func TestStartStop_withSubjectCall(t *testing.T) {
+	s := NewServer()
+	s.Start()
+	s.Process("x")
+	s.Stop()
+}

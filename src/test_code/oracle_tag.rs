@@ -96,10 +96,15 @@ static COMPILE_NOTE: LazyLock<Regex> =
 static COMPOSITE_RHS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^&?[A-Za-z_][\w.\[\]*]*\s*\{").expect("valid regex"));
 
-const LIFECYCLE_CALLS: &[&str] = &[
-    "Start", "Stop", "Close", "Run", "Shutdown", "Init", "Open", "Cancel", "Wait", "Begin", "End",
-];
+/// The only method names that make a body `lifecycle-smoke`. A call matches when its last
+/// segment is a verb exactly or the verb followed by an upper-case letter (`StartProfiler`,
+/// `RunServer`, `CloseAll`). Any other effective call (`Sleep`, `Wait`, `Process`) makes the
+/// body `no-panic-smoke` instead. Construction-style calls ([`SETUP_PREFIXES`], `Set*`) and `t.*`,
+/// `defer` are not effective statements.
+const LIFECYCLE_VERBS: &[&str] = &["Start", "Stop", "Shutdown", "Close", "Run"];
 const SETUP_PREFIXES: &[&str] = &["New", "new", "With", "Make", "make", "Default"];
+/// Configuration setters (`poller.SetSource(src)`) count like construction between lifecycle calls.
+const CONFIG_PREFIX: &str = "Set";
 
 /// What a top-level statement of the test body is, as far as the tagger cares.
 #[derive(Debug, PartialEq)]
@@ -207,11 +212,18 @@ fn is_compile_note(stmts: &[Stmt], comments: &str) -> bool {
 
 fn is_race_smoke(code: &str, inner: &str, name: &str, comments: &str) -> bool {
     let go_count = count_go_statements(inner);
-    if go_count == 0 || !SYNC_PRIMITIVE.is_match(code) {
+    let cue = RACE_CUE.is_match(name) || RACE_CUE.is_match(comments);
+    if go_count == 0 || !(cue || SYNC_PRIMITIVE.is_match(code)) {
         return false;
     }
-    let cue = RACE_CUE.is_match(name) || RACE_CUE.is_match(comments);
     cue || go_count >= 2 || go_in_loop(inner)
+}
+
+fn is_lifecycle_call(last: &str) -> bool {
+    LIFECYCLE_VERBS.iter().any(|v| {
+        last.strip_prefix(v)
+            .is_some_and(|rest| rest.chars().next().is_none_or(char::is_uppercase))
+    })
 }
 
 fn is_lifecycle_only(stmts: &[Stmt], inner: &str) -> bool {
@@ -222,14 +234,9 @@ fn is_lifecycle_only(stmts: &[Stmt], inner: &str) -> bool {
     for s in stmts {
         match s {
             Stmt::Call(c) => {
-                let last = last_segment(c);
-                if LIFECYCLE_CALLS.contains(&last) {
+                if is_lifecycle_call(last_segment(c)) {
                     lifecycle_calls += 1;
-                } else if !(c.starts_with("t.")
-                    || c.starts_with("time.Sleep")
-                    || last.starts_with("Set")
-                    || last == "cancel")
-                {
+                } else if !(c.starts_with("t.") || is_construction(c)) {
                     return false;
                 }
             }
@@ -395,9 +402,13 @@ fn is_setup_rhs(rhs: &str) -> bool {
     callee.starts_with("t.")
         || callee.starts_with("context.")
         || callee.starts_with("time.")
-        || SETUP_PREFIXES
-            .iter()
-            .any(|p| last_segment(callee).starts_with(p))
+        || is_construction(callee)
+        || is_lifecycle_call(last_segment(callee))
+}
+
+fn is_construction(callee: &str) -> bool {
+    let last = last_segment(callee);
+    last.starts_with(CONFIG_PREFIX) || SETUP_PREFIXES.iter().any(|p| last.starts_with(p))
 }
 
 fn classify(s: &str) -> Stmt {
@@ -433,12 +444,18 @@ fn classify(s: &str) -> Stmt {
     Stmt::Other
 }
 
-/// `go` statements at any nesting depth (goroutines are usually launched inside loops).
+/// Goroutine launches at any nesting depth (usually inside loops): `go f()`, `go func() {...}()`
+/// and `<recv>.Go(...)` (`sync.WaitGroup.Go`, `errgroup.Group.Go`).
 fn count_go_statements(inner: &str) -> usize {
     static GO: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)(^|[{;\s])go\s+(func\b|[A-Za-z_][\w.]*\()").expect("valid regex")
+        Regex::new(r"(?m)(^|[{;\s])go\s+(func\b|[A-Za-z_][\w.]*\()|\b[A-Za-z_]\w*\.Go\(")
+            .expect("valid regex")
     });
     GO.find_iter(inner).count()
+}
+
+fn is_go_launch(line: &str) -> bool {
+    line.starts_with("go ") || count_go_statements(line) > 0
 }
 
 /// True when some `go` statement is lexically inside a `for` block.
@@ -447,7 +464,7 @@ fn go_in_loop(inner: &str) -> bool {
     for line in inner.lines() {
         let t = line.trim_start();
         let is_for = t.starts_with("for ") || t.starts_with("for{");
-        if t.starts_with("go ") && stack.iter().any(|&f| f) {
+        if is_go_launch(t) && stack.iter().any(|&f| f) {
             return true;
         }
         for c in line.chars() {
@@ -509,6 +526,13 @@ mod tests {
             ("TestStub_delegatesToSkipHelperWithOptions", "empty-stub"),
             ("TestStub_delegatesToEmptyHelper", "empty-stub"),
             ("TestStub_delegatesToTodoHelper", "empty-stub"),
+            ("TestRace_waitGroupGoMethod", "race-smoke"),
+            ("TestRace_bareGoNamedConcurrent", "race-smoke"),
+            ("TestBareGo_noCue", "untagged"),
+            ("TestLifecycle_runServerMultiShutdown", "lifecycle-smoke"),
+            ("TestLifecycle_prefixedVerbs", "lifecycle-smoke"),
+            ("TestStartStop_withSleep", "no-panic-smoke:uncued"),
+            ("TestStartStop_withSubjectCall", "no-panic-smoke:uncued"),
             ("TestDelegates_toWorkingHelper", "no-panic-smoke:uncued"),
             ("TestDelegates_twoLevels", "no-panic-smoke:uncued"),
             (
