@@ -18,7 +18,7 @@
 //! `last_tool_use`). Best-effort: a parse failure or format change degrades to "found
 //! nothing new" rather than erroring the hook.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -35,17 +35,21 @@ use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
 /// batch-only (unaffected — nothing here changes that constraint).
 pub const TRIGGER: &str = "Stop";
 
-/// Persistent, transcript-path-keyed record of how far into each transcript this hook
-/// has already looked, so a later `Stop` firing only re-checks files touched *since*
-/// the last one instead of the whole session every time. Byte offsets, not line
-/// counts, so a partially-written trailing line can be safely deferred to the next run
-/// (see [`new_lines_since`]).
+/// Persistent record of how far into one session's transcript this hook has already
+/// looked, so a later `Stop` firing only re-checks files touched *since* the last one
+/// instead of the whole session every time. A byte offset, not a line count, so a
+/// partially-written trailing line can be safely deferred to the next run (see
+/// [`new_lines_since`]).
+///
+/// Stored one file per session (see [`session_offset_path`]) rather than in a shared
+/// map: concurrent sessions each read-modify-wrote the same file and clobbered each
+/// other's offsets, so a session re-processed content it had already seen.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct StopOffsets {
-    entries: BTreeMap<String, u64>,
+struct SessionOffset {
+    offset: u64,
 }
 
-impl StopOffsets {
+impl SessionOffset {
     fn load(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
@@ -62,17 +66,41 @@ impl StopOffsets {
     }
 }
 
-fn default_offsets_path() -> PathBuf {
+fn default_offsets_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(dir)
-            .join("kibitzer")
-            .join("stop-offsets.json");
+        return PathBuf::from(dir).join("kibitzer").join("stop-offsets");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
         .join(".cache")
         .join("kibitzer")
-        .join("stop-offsets.json")
+        .join("stop-offsets")
+}
+
+/// `<offsets_dir>/<sanitized transcript basename>.json`. Claude Code names each
+/// session's transcript with a unique session id, so the basename is a per-session key.
+///
+/// GC (not implemented): files accumulate, one per session ever seen. A lazy sweep —
+/// after saving the current session's offset, delete every `*.json` here whose
+/// transcript JSONL no longer exists under `~/.claude/projects` — would bound it.
+fn session_offset_path(offsets_dir: &Path, transcript_path: &Path) -> PathBuf {
+    let base = transcript_path
+        .file_name()
+        .unwrap_or(transcript_path.as_os_str())
+        .to_string_lossy();
+    // ASCII-only so the byte-length cap below can't split a character.
+    let safe: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(200)
+        .collect();
+    offsets_dir.join(format!("{safe}.json"))
 }
 
 /// Returns every complete line appended to `path` after `from_offset`, plus the byte
@@ -146,17 +174,17 @@ fn touched_files(lines: &[String]) -> BTreeSet<PathBuf> {
 /// [`TRIGGER`], and reports failures via `additionalContext`. Never blocks (see the
 /// module doc for why) — always exits success.
 pub fn run_stop_hook(cwd: &Path, transcript_path: Option<&Path>) -> Result<ExitCode> {
-    run_stop_hook_with_offsets_path(cwd, transcript_path, &default_offsets_path())
+    run_stop_hook_with_offsets_dir(cwd, transcript_path, &default_offsets_dir())
 }
 
-/// Same as [`run_stop_hook`], but with the offsets-store path injected — lets tests
-/// exercise this against a scratch file instead of the real
-/// `~/.cache/kibitzer/stop-offsets.json`, which would otherwise both pollute real
+/// Same as [`run_stop_hook`], but with the offsets directory injected — lets tests
+/// exercise this against a scratch directory instead of the real
+/// `~/.cache/kibitzer/stop-offsets/`, which would otherwise both pollute real
 /// state and make repeat test runs see stale offsets from a prior run.
-fn run_stop_hook_with_offsets_path(
+fn run_stop_hook_with_offsets_dir(
     cwd: &Path,
     transcript_path: Option<&Path>,
-    offsets_path: &Path,
+    offsets_dir: &Path,
 ) -> Result<ExitCode> {
     let Some(transcript_path) = transcript_path else {
         return Ok(ExitCode::SUCCESS);
@@ -165,13 +193,9 @@ fn run_stop_hook_with_offsets_path(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let mut offsets = StopOffsets::load(offsets_path);
-    let key = transcript_path.to_string_lossy().into_owned();
-    let from_offset = offsets
-        .entries
-        .get(&key)
-        .copied()
-        .unwrap_or(0)
+    let offsets_path = session_offset_path(offsets_dir, transcript_path);
+    let from_offset = SessionOffset::load(&offsets_path)
+        .offset
         .min(metadata.len());
 
     let Some((lines, new_offset)) = new_lines_since(transcript_path, from_offset) else {
@@ -182,8 +206,7 @@ fn run_stop_hook_with_offsets_path(
     // they find — this is the actual loop-safety mechanism (see module doc): the same
     // transcript content is never re-evaluated on a later `Stop`, so a forced
     // continuation that doesn't touch the file again can never re-trigger on it.
-    offsets.entries.insert(key, new_offset);
-    let _ = offsets.save(offsets_path);
+    let _ = SessionOffset { offset: new_offset }.save(&offsets_path);
 
     let files = touched_files(&lines);
     if files.is_empty() {
@@ -217,7 +240,7 @@ fn run_stop_hook_with_offsets_path(
 }
 
 /// Re-checks every file in `files` (unscoped) and formats each surviving finding as
-/// `{file}: {check_name}: {description}` — split out from [`run_stop_hook_with_offsets_path`]
+/// `{file}: {check_name}: {description}` — split out from [`run_stop_hook_with_offsets_dir`]
 /// so a test can exercise the recheck-and-filter behavior directly against a real repo
 /// fixture without going through the transcript/offset-tracking machinery.
 fn stop_hook_findings_for_files(cwd: &Path, files: &BTreeSet<PathBuf>) -> Result<Vec<String>> {
@@ -373,9 +396,9 @@ mod tests {
     fn run_stop_hook_with_no_transcript_path_is_a_quiet_noop() {
         let dir = tmp_path("no-transcript-cwd");
         std::fs::create_dir_all(&dir).unwrap();
-        let offsets = tmp_path("no-transcript-offsets.json");
+        let offsets = tmp_path("no-transcript-offsets");
 
-        let result = run_stop_hook_with_offsets_path(&dir, None, &offsets).unwrap();
+        let result = run_stop_hook_with_offsets_dir(&dir, None, &offsets).unwrap();
 
         assert_eq!(result, ExitCode::SUCCESS);
         std::fs::remove_dir_all(&dir).ok();
@@ -391,15 +414,15 @@ mod tests {
             tool_use_line("Edit", &dir.join("gone.go").to_string_lossy()) + "\n",
         )
         .unwrap();
-        let offsets = tmp_path("deleted-file-offsets.json");
+        let offsets = tmp_path("deleted-file-offsets");
 
-        let result = run_stop_hook_with_offsets_path(&dir, Some(&transcript), &offsets).unwrap();
+        let result = run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
 
         assert_eq!(result, ExitCode::SUCCESS);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&transcript).ok();
-        std::fs::remove_file(&offsets).ok();
+        std::fs::remove_dir_all(&offsets).ok();
     }
 
     #[test]
@@ -414,23 +437,101 @@ mod tests {
             tool_use_line("Edit", &target.to_string_lossy()) + "\n",
         )
         .unwrap();
-        let offsets = tmp_path("advances-offsets.json");
+        let offsets = tmp_path("advances-offsets");
 
-        run_stop_hook_with_offsets_path(&dir, Some(&transcript), &offsets).unwrap();
-        let stored = StopOffsets::load(&offsets);
-        let key = transcript.to_string_lossy().into_owned();
-        let after_first = *stored.entries.get(&key).expect("offset recorded");
+        run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
+        let offset_file = session_offset_path(&offsets, &transcript);
+        let after_first = SessionOffset::load(&offset_file).offset;
         assert_eq!(after_first, std::fs::metadata(&transcript).unwrap().len());
 
         // Nothing new appended — a second call must not re-derive the same touched
         // files (which would defeat the whole point of tracking an offset).
-        run_stop_hook_with_offsets_path(&dir, Some(&transcript), &offsets).unwrap();
-        let stored_again = StopOffsets::load(&offsets);
-        assert_eq!(*stored_again.entries.get(&key).unwrap(), after_first);
+        run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
+        assert_eq!(SessionOffset::load(&offset_file).offset, after_first);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&transcript).ok();
-        std::fs::remove_file(&offsets).ok();
+        std::fs::remove_dir_all(&offsets).ok();
+    }
+
+    #[test]
+    fn concurrent_sessions_each_persist_their_own_offset() {
+        let dir = tmp_path("concurrent-cwd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let offsets = tmp_path("concurrent-offsets");
+        let mut transcripts = Vec::new();
+        for name in ["session-a.jsonl", "session-b.jsonl"] {
+            let target = dir.join(format!("{name}.go"));
+            std::fs::write(&target, "package main\n").unwrap();
+            let transcript = tmp_path(name);
+            std::fs::write(
+                &transcript,
+                tool_use_line("Edit", &target.to_string_lossy()) + "\n",
+            )
+            .unwrap();
+            transcripts.push(transcript);
+        }
+
+        let handles: Vec<_> = transcripts
+            .iter()
+            .map(|transcript| {
+                let (dir, offsets, transcript) = (dir.clone(), offsets.clone(), transcript.clone());
+                std::thread::spawn(move || {
+                    run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap()
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for transcript in &transcripts {
+            let stored = SessionOffset::load(&session_offset_path(&offsets, transcript));
+            assert_eq!(stored.offset, std::fs::metadata(transcript).unwrap().len());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&offsets).ok();
+        for transcript in &transcripts {
+            std::fs::remove_file(transcript).ok();
+        }
+    }
+
+    #[test]
+    fn one_sessions_report_names_only_files_from_its_own_transcript() {
+        let dir = tmp_path("scoped-cwd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mine, theirs) = (dir.join("mine.go"), dir.join("theirs.go"));
+        let transcript_a = tmp_path("scoped-a.jsonl");
+        let transcript_b = tmp_path("scoped-b.jsonl");
+        std::fs::write(
+            &transcript_a,
+            tool_use_line("Edit", &mine.to_string_lossy()) + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &transcript_b,
+            tool_use_line("Edit", &theirs.to_string_lossy()) + "\n",
+        )
+        .unwrap();
+
+        let (lines_a, _) = new_lines_since(&transcript_a, 0).unwrap();
+        assert_eq!(touched_files(&lines_a), BTreeSet::from([mine]));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&transcript_a).ok();
+        std::fs::remove_file(&transcript_b).ok();
+    }
+
+    #[test]
+    fn session_offset_path_is_per_transcript_and_filesystem_safe() {
+        let dir = Path::new("/offsets");
+        let a = session_offset_path(dir, Path::new("/p/one/abc.jsonl"));
+        let b = session_offset_path(dir, Path::new("/p/two/def.jsonl"));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(dir));
+        let weird = session_offset_path(dir, Path::new(&format!("/p/{}é .jsonl", "x".repeat(300))));
+        assert!(weird.file_name().unwrap().len() <= 255);
     }
 
     fn git(dir: &Path, args: &[&str]) {
