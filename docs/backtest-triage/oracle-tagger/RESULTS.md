@@ -120,3 +120,32 @@ Two tagger changes (commit b317e29): `race-smoke` recognises `<recv>.Go(...)` (`
 Results by command (`docs/backtest-triage/oracle-tagger/eval.sh`): in-sample exact-match 62/64 before and 62/64 after (same two `race-smoke` over-predictions, `wait_test.go:664` and `informerwatcher_test.go:46`; an intermediate version without `Set*` in the construction set dropped `worktree_pr_poller_test.go:48` to `no-panic-smoke:uncued`, 61/64, which is why `Set*` is accepted). Held-out 1 (17 rows): 9/17 before and after. Held-out 2 (79 rows): 65/79 before, 68/79 after (65/72 -> 68/72 on true positives). See `HELDOUT2.md` "After round 4". The rule-side change (callback assertions, goroutine-guarded panic) is described there too; kubernetes (27 findings) and stapler-squad (38) report exactly the same `file:line` set before and after, so all 26 + 38 triaged true positives are still reported.
 
 Both held-out sets are now tuning data and no longer held out: the caddy, lazygit and nats `gosrv` fixes and the `Set*` allowance were chosen from their failures. The gains above (+3 on held-out 2, 0 on held-out 1, 0 in-sample) therefore measure fit to those sets, not generalisation.
+
+## After round 5
+
+Held-out 3 (`HELDOUT3.md`) found two rule gaps and showed that most tags did not generalise. Held-out sets 1, 2 and 3 are now all tuning data; any new accuracy claim needs a fresh batch of repos.
+
+Rule (commit `50a7bb9`): a same-file function or method value passed as a call argument or struct-field value is followed like a helper call (assertions in it count; a passed function with none keeps the test flagged), and an `if <cond> { panic(...) }` counts as an assertion in the body, a goroutine or a same-file helper. `if err != nil { panic(err) }` still counts only inside a goroutine, because counting it everywhere dropped a held-out 2 true positive (nats `TestSystemAccountWithBadRemoteLatencyUpdate`, whose helper panics on setup errors). rclone `TestTests` is not handled: it is a fixture run by another test and nothing mechanical separates it from a real assertion-free test.
+
+Tagger (commit `5a34c8c`): only `empty-stub`, `race-smoke` and `compile-check` are emitted. `lifecycle-smoke`, `no-panic-smoke`, `discarded-result` and `liveness-smoke` emit no tag line, and a body matching none of the three gets no line instead of `untagged`. `eval.sh` now reads a missing tag line as `untagged`. Still annotate-only behind `KIBITZER_ORACLE_TAGS=1`.
+
+Guardrails, whole-repo scans of `test-no-assertion-go`, `file:line` sets compared with `comm`:
+
+| Set | Findings before | After | Ground-truth true positives still reported | False positives left |
+|---|---|---|---|---|
+| In-sample (kubernetes 27, stapler-squad 38) | 65 | 65 | 64/64 | 0 |
+| Held-out 1 (cli, etcd, prometheus) | 12 | 12 | 12/12 | 0 |
+| Held-out 2 (7 repos) | 72 | 72 | 72/72 | 0 |
+| Held-out 3 (8 repos) | 54 | 37 | 36/36 | 1 (rclone `TestTests`) |
+
+Counts are whole-repo scans at today's checkouts; the ground-truth files hold 64, 17, 79 and 54 rows because earlier rounds already removed some false-positive rows from the output.
+
+Per kept tag, over all four ground-truth sets (214 rows; correct / predicted for precision, correct / truth for recall):
+
+| Tag | Precision | Recall |
+|---|---|---|
+| empty-stub | 13/14 | 13/13 |
+| race-smoke | 36/39 | 36/36 |
+| compile-check | 51/51 | 51/54 |
+
+These tags were kept because they matched in all three held-out rounds, so the table is a fit to that data, not a generalisation estimate.

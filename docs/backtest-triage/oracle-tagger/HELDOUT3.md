@@ -203,3 +203,58 @@ Answer to "do post-tuning rules and tagger hold up on genuinely new code":
 
 - `heldout3-findings.tsv`: the 54 findings.
 - `heldout3-ground-truth.jsonl`: labels `{repo,file,line,func,tag,reason}`.
+
+## After round 5
+
+Two changes, both chosen from this set's failures, so **held-out sets 1, 2 and 3 are now all
+tuning data. A fresh batch of unseen repos is needed for any new accuracy claim**; the numbers
+below measure fit to these sets, not generalisation.
+
+Rule (commit `50a7bb9`):
+
+- A same-file function or method value passed as a call argument or struct-field value
+  (`ExecObjectLayerAPITest(Args{objAPITest: testX})`) is followed like a helper call, one
+  helper hop deeper than the passed function. A passed function with no assertion keeps the
+  test flagged, as does a value not defined in the file.
+- An `if <cond> { panic(...) }` counts as an assertion in the test body, a goroutine or a
+  same-file helper. Deviation from the brief: `if err != nil { panic(err) }` still counts only
+  inside a `go` statement. Counting it everywhere dropped nats
+  `TestSystemAccountWithBadRemoteLatencyUpdate` (held-out 2 true positive), whose helper
+  `createAccount` panics on a setup error; that panic propagates a setup failure and asserts
+  nothing about the code under test. The minio and restic panics are value checks, so they count.
+- Not handled: rclone `TestTests` (`fstest/runs`). It is a fixture run by another test, and
+  nothing in its body distinguishes it from a real assertion-free test short of its name or
+  comment.
+
+Tagger (commit `5a34c8c`): only `empty-stub`, `race-smoke` and `compile-check` are emitted
+(the three that matched in all three rounds). `lifecycle-smoke`, `no-panic-smoke` (cued and
+uncued), `discarded-result` and `liveness-smoke` no longer produce a tag line; a body matching
+none of the three gets no line (previously `untagged`). Still annotate-only behind
+`KIBITZER_ORACLE_TAGS=1`.
+
+### Rule on this set
+
+Findings 54 -> 37 (minio 26 -> 10, restic 3 -> 2). Removed: the 13 callback wrappers plus
+minio `TestDynamicTimeoutConcurrent`, dsync `TestRWMutex` and lsync `TestRWMutex` (16), and
+restic `TestNoopCounter` (1). All 36 ground-truth true positives are still reported.
+
+| | Before | After |
+|---|---|---|
+| Findings | 54 | 37 |
+| False positives | 18 | 1 (rclone `TestTests`) |
+| Loose precision | 36/54 = 66.7% | 36/37 = 97.3% |
+| Excluding minio | 26/28 = 92.9% | 26/27 = 96.3% |
+
+The fix targets the causes found on this set, so 97.3% is a fit figure, not an estimate.
+
+### Kept tags on this set (after, annotation run over the 37 findings)
+
+| Tag | Predicted | Truth | Correct | Precision | Recall |
+|---|---|---|---|---|---|
+| empty-stub | 3 | 3 | 3 | 100% | 100% |
+| race-smoke | 4 | 3 | 3 | 75% | 100% |
+| compile-check | 2 | 3 | 2 | 100% | 67% |
+
+Across all four ground-truth sets (in-sample, held-out 1, 2, 3; 214 rows): `empty-stub`
+13/14 precision, 13/13 recall; `race-smoke` 36/39, 36/36; `compile-check` 51/51, 51/54. These
+are the tags that survived three rounds, so selection is itself a fit to the data.
