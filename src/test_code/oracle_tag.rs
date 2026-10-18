@@ -1,9 +1,11 @@
 //! Intentional-oracle tagger (prototype): classifies a Go test that has no assertion call by the
 //! mechanical shape of its body. Annotates only; a tag never suppresses a finding (ADR-004).
 //!
-//! Tags are mutually exclusive and checked in a fixed order (see [`tag_go`]). Signals are text and
-//! statement-shape only: no type information, so "is this call a conversion or a function call"
-//! and "is this goroutine test checking liveness or a race" are not decidable here.
+//! Only the three classes that generalized across three held-out rounds are emitted:
+//! `empty-stub`, `race-smoke` and `compile-check`. Lifecycle, no-panic, discarded-result and
+//! liveness classes did not (see `docs/backtest-triage/oracle-tagger/RESULTS.md`), so a body that
+//! matches none of the three gets no tag at all. Signals are text and statement-shape only: no
+//! type information, so "is this call a conversion or a function call" is not decidable here.
 
 use std::sync::LazyLock;
 
@@ -15,11 +17,7 @@ use super::TestFn;
 pub enum OracleTag {
     CompileCheck,
     RaceSmoke,
-    LifecycleSmoke,
-    NoPanicSmoke { cued: bool },
-    DiscardedResult,
     EmptyStub,
-    Untagged,
 }
 
 impl OracleTag {
@@ -27,12 +25,7 @@ impl OracleTag {
         match self {
             Self::CompileCheck => "compile-check",
             Self::RaceSmoke => "race-smoke",
-            Self::LifecycleSmoke => "lifecycle-smoke",
-            Self::NoPanicSmoke { cued: true } => "no-panic-smoke",
-            Self::NoPanicSmoke { cued: false } => "no-panic-smoke:uncued",
-            Self::DiscardedResult => "discarded-result",
             Self::EmptyStub => "empty-stub",
-            Self::Untagged => "untagged",
         }
     }
 
@@ -43,18 +36,7 @@ impl OracleTag {
             Self::RaceSmoke => {
                 "Smoke-only: race (goroutines and sync primitives, results discarded)"
             }
-            Self::LifecycleSmoke => "Smoke-only: lifecycle (start/stop calls, no result used)",
-            Self::NoPanicSmoke { cued: true } => {
-                "Smoke-only: no-panic (explicit cue in name or comment)"
-            }
-            Self::NoPanicSmoke { cued: false } => {
-                "Smoke-only: no-panic, uncued (calls with no result used; lower confidence)"
-            }
-            Self::DiscardedResult => {
-                "Likely defect: the name promises behaviour but the result is computed and dropped"
-            }
             Self::EmptyStub => "Stub: empty body or TODO only",
-            Self::Untagged => "No mechanical intent signal found",
         };
         format!("{text} [tag={}]", self.label())
     }
@@ -67,55 +49,21 @@ pub fn enabled() -> bool {
     std::env::var(ENV_FLAG).is_ok_and(|v| v == "1")
 }
 
-static NO_PANIC_CUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)(not|n't|no|never)\s+(cause\s+|raise\s+)?(a\s+)?(panic|crash)|(did|does|do|must|should)\s*not\s+(panic|crash)|smoke",
-    )
-    .expect("valid regex")
-});
-static NO_PANIC_NAME_CUE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(no|not)_?(panic|crash)").expect("valid regex"));
 static RACE_CUE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)concurren|race|thread.?safe|atomic").expect("valid regex"));
-static LIFECYCLE_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)start|stop|close|shutdown|lifecycle").expect("valid regex"));
-static PROMISE_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"No[A-Z]|Returns|Empty|Error|[Ss]hould|When|Not[A-Z]").expect("valid regex")
-});
-static PANIC_ONLY_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)no_?panic|not_?panic|no_?crash|no_?(data_?)?race|race_?(free|safe)|panic")
-        .expect("valid regex")
-});
 static SYNC_PRIMITIVE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"WaitGroup|\bchan\b|<-|\bMutex\b|\bRWMutex\b|errgroup").expect("valid regex")
 });
-static BLANK_ASSIGN_ANYWHERE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^\s*_\s*(,\s*_\s*)?:?=[^=]").expect("valid regex"));
 static COMPILE_NOTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)compile.?time|compiles").expect("valid regex"));
 static COMPOSITE_RHS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^&?[A-Za-z_][\w.\[\]*]*\s*\{").expect("valid regex"));
-
-/// The only method names that make a body `lifecycle-smoke`. A call matches when its last
-/// segment is a verb exactly or the verb followed by an upper-case letter (`StartProfiler`,
-/// `RunServer`, `CloseAll`). Any other effective call (`Sleep`, `Wait`, `Process`) makes the
-/// body `no-panic-smoke` instead. Construction-style calls ([`SETUP_PREFIXES`], `Set*`) and `t.*`,
-/// `defer` are not effective statements.
-const LIFECYCLE_VERBS: &[&str] = &["Start", "Stop", "Shutdown", "Close", "Run"];
-const SETUP_PREFIXES: &[&str] = &["New", "new", "With", "Make", "make", "Default"];
-/// Configuration setters (`poller.SetSource(src)`) count like construction between lifecycle calls.
-const CONFIG_PREFIX: &str = "Set";
 
 /// What a top-level statement of the test body is, as far as the tagger cares.
 #[derive(Debug, PartialEq)]
 enum Stmt {
     BlankDecl,
     BlankAssign(String),
-    Go,
-    Defer,
-    Control,
-    Recv,
-    Bind { setup: bool },
     Call(String),
     Other,
 }
@@ -127,7 +75,7 @@ struct Scanned {
     comments: String,
 }
 
-pub fn tag_go(f: &TestFn, helper_source: &dyn Fn(&str) -> Option<String>) -> OracleTag {
+pub fn tag_go(f: &TestFn, helper_source: &dyn Fn(&str) -> Option<String>) -> Option<OracleTag> {
     let scanned = scan(&f.body);
     let inner = inner_body(&scanned.code);
     let stmts: Vec<Stmt> = split_statements(inner)
@@ -135,34 +83,15 @@ pub fn tag_go(f: &TestFn, helper_source: &dyn Fn(&str) -> Option<String>) -> Ora
         .map(|s| classify(s))
         .collect();
 
-    if inner.trim().is_empty() {
-        return OracleTag::EmptyStub;
+    if inner.trim().is_empty() || delegates_only_to_stubs(&stmts, helper_source) {
+        Some(OracleTag::EmptyStub)
+    } else if is_compile_check(&stmts) || is_compile_note(&stmts, &scanned.comments) {
+        Some(OracleTag::CompileCheck)
+    } else if is_race_smoke(&scanned.code, inner, &f.name, &scanned.comments) {
+        Some(OracleTag::RaceSmoke)
+    } else {
+        None
     }
-    if delegates_only_to_stubs(&stmts, helper_source) {
-        return OracleTag::EmptyStub;
-    }
-    if is_compile_check(&stmts) || is_compile_note(&stmts, &scanned.comments) {
-        return OracleTag::CompileCheck;
-    }
-    if is_race_smoke(&scanned.code, inner, &f.name, &scanned.comments) {
-        return OracleTag::RaceSmoke;
-    }
-    let has_blank_assign = BLANK_ASSIGN_ANYWHERE.is_match(inner);
-    let promises = PROMISE_NAME.is_match(&f.name) && !PANIC_ONLY_NAME.is_match(&f.name);
-    if promises && has_blank_assign {
-        return OracleTag::DiscardedResult;
-    }
-    let cued = NO_PANIC_CUE.is_match(&scanned.comments) || NO_PANIC_NAME_CUE.is_match(&f.name);
-    if is_lifecycle_only(&stmts, inner) && (LIFECYCLE_NAME.is_match(&f.name) || !cued) {
-        return OracleTag::LifecycleSmoke;
-    }
-    if cued {
-        return OracleTag::NoPanicSmoke { cued: true };
-    }
-    if is_uncued_no_panic(&stmts) {
-        return OracleTag::NoPanicSmoke { cued: false };
-    }
-    OracleTag::Untagged
 }
 
 /// The body is only calls to same-file helpers that are themselves stubs (empty, TODO-only, or
@@ -217,48 +146,6 @@ fn is_race_smoke(code: &str, inner: &str, name: &str, comments: &str) -> bool {
         return false;
     }
     cue || go_count >= 2 || go_in_loop(inner)
-}
-
-fn is_lifecycle_call(last: &str) -> bool {
-    LIFECYCLE_VERBS.iter().any(|v| {
-        last.strip_prefix(v)
-            .is_some_and(|rest| rest.chars().next().is_none_or(char::is_uppercase))
-    })
-}
-
-fn is_lifecycle_only(stmts: &[Stmt], inner: &str) -> bool {
-    if count_go_statements(inner) > 0 {
-        return false;
-    }
-    let mut lifecycle_calls = 0;
-    for s in stmts {
-        match s {
-            Stmt::Call(c) => {
-                if is_lifecycle_call(last_segment(c)) {
-                    lifecycle_calls += 1;
-                } else if !(c.starts_with("t.") || is_construction(c)) {
-                    return false;
-                }
-            }
-            Stmt::Bind { setup: true } | Stmt::Defer | Stmt::Recv => {}
-            _ => return false,
-        }
-    }
-    lifecycle_calls > 0
-}
-
-fn is_uncued_no_panic(stmts: &[Stmt]) -> bool {
-    let mut subject_calls = 0;
-    for s in stmts {
-        match s {
-            Stmt::Call(c) if c.starts_with("t.") => {}
-            Stmt::Call(_) => subject_calls += 1,
-            Stmt::BlankAssign(_) => subject_calls += 1,
-            Stmt::Bind { setup: true } | Stmt::Defer => {}
-            _ => return false,
-        }
-    }
-    subject_calls > 0
 }
 
 fn last_segment(callee: &str) -> &str {
@@ -386,55 +273,34 @@ fn find_assign(s: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn is_setup_rhs(rhs: &str) -> bool {
-    let rhs = rhs.trim();
-    if rhs.starts_with('&')
-        || rhs.starts_with("[]")
-        || rhs.starts_with("map[")
-        || COMPOSITE_RHS.is_match(rhs)
-    {
-        return true;
-    }
-    let Some(paren) = rhs.find('(') else {
-        return true;
-    };
-    let callee = rhs[..paren].trim();
-    callee.starts_with("t.")
-        || callee.starts_with("context.")
-        || callee.starts_with("time.")
-        || is_construction(callee)
-        || is_lifecycle_call(last_segment(callee))
-}
-
-fn is_construction(callee: &str) -> bool {
-    let last = last_segment(callee);
-    last.starts_with(CONFIG_PREFIX) || SETUP_PREFIXES.iter().any(|p| last.starts_with(p))
-}
-
 fn classify(s: &str) -> Stmt {
     let word = first_word(s);
     if s.starts_with("var _ ") || s.starts_with("var _\t") {
         return Stmt::BlankDecl;
     }
-    match word {
-        "go" => return Stmt::Go,
-        "defer" => return Stmt::Defer,
-        "for" | "if" | "switch" | "select" | "return" | "func" | "var" | "const" | "break"
-        | "continue" => return Stmt::Control,
-        _ => {}
-    }
-    if s.starts_with("<-") {
-        return Stmt::Recv;
+    if matches!(
+        word,
+        "go" | "defer"
+            | "for"
+            | "if"
+            | "switch"
+            | "select"
+            | "return"
+            | "func"
+            | "var"
+            | "const"
+            | "break"
+            | "continue"
+    ) || s.starts_with("<-")
+    {
+        return Stmt::Other;
     }
     if let Some((at, len)) = find_assign(s) {
-        let lhs = s[..at].trim();
         let rhs = s[at + len..].trim();
-        if lhs.split(',').all(|p| p.trim() == "_") {
+        if s[..at].split(',').all(|p| p.trim() == "_") {
             return Stmt::BlankAssign(rhs.to_string());
         }
-        return Stmt::Bind {
-            setup: is_setup_rhs(rhs) || lhs.contains('.'),
-        };
+        return Stmt::Other;
     }
     if s.ends_with(')')
         && let Some(paren) = s.find('(')
@@ -499,51 +365,79 @@ mod tests {
         Some(rest[..rest.find("\n}\n")? + 3].to_string())
     }
 
-    fn labels() -> BTreeMap<String, &'static str> {
+    fn labels() -> BTreeMap<String, Option<&'static str>> {
         functions(Language::Go, FIXTURE)
             .iter()
-            .map(|f| (f.name.clone(), tag_go(f, &fixture_helper).label()))
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    tag_go(f, &fixture_helper).map(OracleTag::label),
+                )
+            })
             .collect()
     }
 
     #[test]
     fn fixture_cases_get_the_expected_tag() {
-        let expected: &[(&str, &str)] = &[
-            ("TestCompile_interfaceAssertion", "compile-check"),
-            ("TestCompile_compositeBlankAssign", "compile-check"),
-            ("TestRace_waitGroupLoop", "race-smoke"),
-            ("TestRace_namedConcurrent", "race-smoke"),
-            ("TestLifecycle_startStop", "lifecycle-smoke"),
-            ("TestAuditHook_nilLogger", "no-panic-smoke"),
-            ("TestAddCadvisorFlagsDoesNotPanic", "no-panic-smoke"),
-            ("TestEndpointSlice_handlers", "no-panic-smoke:uncued"),
-            ("TestDiscarded_nameNoDetection", "discarded-result"),
-            ("TestDiscarded_returnsEmpty", "discarded-result"),
-            ("TestStub_todoOnly", "empty-stub"),
-            ("TestStub_empty", "empty-stub"),
-            ("TestUntagged_logOnly", "untagged"),
-            ("TestStub_delegatesToSkipHelper", "empty-stub"),
-            ("TestStub_delegatesToSkipHelperWithOptions", "empty-stub"),
-            ("TestStub_delegatesToEmptyHelper", "empty-stub"),
-            ("TestStub_delegatesToTodoHelper", "empty-stub"),
-            ("TestRace_waitGroupGoMethod", "race-smoke"),
-            ("TestRace_bareGoNamedConcurrent", "race-smoke"),
-            ("TestBareGo_noCue", "untagged"),
-            ("TestLifecycle_runServerMultiShutdown", "lifecycle-smoke"),
-            ("TestLifecycle_prefixedVerbs", "lifecycle-smoke"),
-            ("TestStartStop_withSleep", "no-panic-smoke:uncued"),
-            ("TestStartStop_withSubjectCall", "no-panic-smoke:uncued"),
-            ("TestDelegates_toWorkingHelper", "no-panic-smoke:uncued"),
-            ("TestDelegates_twoLevels", "no-panic-smoke:uncued"),
+        let expected: &[(&str, Option<&str>)] = &[
+            ("TestCompile_interfaceAssertion", Some("compile-check")),
+            ("TestCompile_compositeBlankAssign", Some("compile-check")),
+            ("TestRace_waitGroupLoop", Some("race-smoke")),
+            ("TestRace_namedConcurrent", Some("race-smoke")),
+            ("TestLifecycle_startStop", None),
+            ("TestAuditHook_nilLogger", None),
+            ("TestAddCadvisorFlagsDoesNotPanic", None),
+            ("TestEndpointSlice_handlers", None),
+            ("TestDiscarded_nameNoDetection", None),
+            ("TestDiscarded_returnsEmpty", None),
+            ("TestStub_todoOnly", Some("empty-stub")),
+            ("TestStub_empty", Some("empty-stub")),
+            ("TestUntagged_logOnly", None),
+            ("TestStub_delegatesToSkipHelper", Some("empty-stub")),
             (
-                "TestDelegates_skipHelperPlusRealCall",
-                "no-panic-smoke:uncued",
+                "TestStub_delegatesToSkipHelperWithOptions",
+                Some("empty-stub"),
             ),
+            ("TestStub_delegatesToEmptyHelper", Some("empty-stub")),
+            ("TestStub_delegatesToTodoHelper", Some("empty-stub")),
+            ("TestRace_waitGroupGoMethod", Some("race-smoke")),
+            ("TestRace_bareGoNamedConcurrent", Some("race-smoke")),
+            ("TestBareGo_noCue", None),
+            ("TestLifecycle_runServerMultiShutdown", None),
+            ("TestLifecycle_prefixedVerbs", None),
+            ("TestStartStop_withSleep", None),
+            ("TestStartStop_withSubjectCall", None),
+            ("TestDelegates_toWorkingHelper", None),
+            ("TestDelegates_twoLevels", None),
+            ("TestDelegates_skipHelperPlusRealCall", None),
         ];
         let got = labels();
         for (name, tag) in expected {
             assert_eq!(got.get(*name).copied(), Some(*tag), "{name}");
         }
+    }
+
+    #[test]
+    fn dropped_classes_emit_no_tag() {
+        // lifecycle-smoke, no-panic-smoke (cued and uncued), discarded-result and untagged
+        // bodies in the fixture; none of them generalized across held-out rounds.
+        let dropped = [
+            "TestLifecycle_startStop",
+            "TestLifecycle_runServerMultiShutdown",
+            "TestLifecycle_prefixedVerbs",
+            "TestAuditHook_nilLogger",
+            "TestAddCadvisorFlagsDoesNotPanic",
+            "TestEndpointSlice_handlers",
+            "TestStartStop_withSleep",
+            "TestDiscarded_nameNoDetection",
+            "TestDiscarded_returnsEmpty",
+        ];
+        let got = labels();
+        for name in dropped {
+            assert_eq!(got.get(name).copied(), Some(None), "{name}");
+        }
+        let kept = ["compile-check", "race-smoke", "empty-stub"];
+        assert!(got.values().flatten().all(|l| kept.contains(l)));
     }
 
     #[test]
@@ -553,7 +447,11 @@ mod tests {
                 .annotation()
                 .ends_with("[tag=race-smoke]")
         );
-        assert!(OracleTag::Untagged.annotation().ends_with("[tag=untagged]"));
+        assert!(
+            OracleTag::EmptyStub
+                .annotation()
+                .ends_with("[tag=empty-stub]")
+        );
     }
 
     #[test]

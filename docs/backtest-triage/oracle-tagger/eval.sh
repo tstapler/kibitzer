@@ -19,10 +19,10 @@ done > "$OUT/tagged.tsv"
 jq -R -s -c 'split("\n")[:-1] | map(split("\t") | {repo:.[0], file:.[1], line:(.[2]|tonumber), got:.[3]})[]' \
   "$OUT/tagged.tsv" > "$OUT/tagged.jsonl"
 
-# Join ground truth to tagger output; a GT finding the tagger never reported is "missing".
+# Join ground truth to tagger output; a finding with no tag line (the tagger emits only empty-stub, race-smoke, compile-check) is "untagged".
 jq -s -c --slurpfile gt "$GT" '
   (map({key: "\(.repo)|\(.file)|\(.line)", value: .got}) | from_entries) as $got
-  | $gt[] | {repo, file, line, want: .tag, got: ($got["\(.repo)|\(.file)|\(.line)"] // "missing")}' \
+  | $gt[] | {repo, file, line, want: .tag, got: ($got["\(.repo)|\(.file)|\(.line)"] // "untagged")}' \
   "$OUT/tagged.jsonl" > "$OUT/joined.jsonl"
 
 cp "$OUT/joined.jsonl" docs/backtest-triage/oracle-tagger/joined.jsonl
