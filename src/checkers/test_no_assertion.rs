@@ -48,10 +48,11 @@ const PYTHON_ORACLE_METHODS: &[&str] = &[
 ];
 /// Synthetic callee for a `validate(...)` call whose failure is re-raised by its `except`.
 const RERAISED_VALIDATE: &str = "assert";
-/// Synthetic Go callee for `if err != nil { panic(...) }` inside a `go` statement: `t.Fatal` is
-/// unsafe off the test goroutine, so the guarded panic is how that goroutine fails the test.
-/// Outside a goroutine it is not counted: setup helpers panic on setup errors without asserting
-/// anything about the code under test (nats `TestSystemAccountWithBadRemoteLatencyUpdate`).
+/// Synthetic Go callee for an `if <cond> { panic(...) }` that checks behaviour: a test without a
+/// testing handle, or a helper it calls, fails by panicking on a violated condition. A bare
+/// `panic` is not counted, and neither is an `if err != nil { panic(err) }` outside a `go`
+/// statement: there `t.Fatal` is available, so the panic is setup-error propagation (nats
+/// `TestSystemAccountWithBadRemoteLatencyUpdate` via `createAccount`), not an oracle.
 const GUARDED_PANIC: &str = "guarded-panic";
 /// Testing-handle methods that fail the test; passing one as a function value (`apply(t.Errorf)`)
 /// makes the receiving helper an assertion site. `Log*` and `Skip*` do not fail, so are absent.
@@ -74,6 +75,26 @@ const NON_CLAIM: &str =
 struct Call {
     callee: String,
     args: Vec<String>,
+    /// Go only: not a call but a function value handed to one (`run(testX)`, `{fn: testX}`); it
+    /// asserts only through the same-file function it names, never by its name or arguments.
+    fn_value: bool,
+}
+
+impl Call {
+    fn new(callee: String, args: Vec<String>) -> Self {
+        Self {
+            callee,
+            args,
+            fn_value: false,
+        }
+    }
+
+    fn value(name: String) -> Self {
+        Self {
+            fn_value: true,
+            ..Self::new(name, Vec::new())
+        }
+    }
 }
 
 /// One function in the file with every call in its subtree (closures included) and the
@@ -191,33 +212,54 @@ impl TestNoAssertionChecker {
         depth: usize,
     ) -> bool {
         calls.iter().any(|call| {
+            if call.fn_value {
+                return self
+                    .follow_helper(ctx, call, handles, owner, depth)
+                    .unwrap_or(false);
+            }
             if ctx.vocab.contains(&call.callee) || self.supplemental(ctx, call) {
                 return true;
             }
             if self.lang == Language::Go && callback_asserts(ctx, call, handles) {
                 return true;
             }
-            if depth < MAX_HELPER_DEPTH
-                && let Some(helper) = ctx.resolve(self.lang, &call.callee, handles, owner)
-            {
-                let mut seen = ctx.seen.borrow_mut();
-                if !seen.contains(&helper.line) {
-                    seen.push(helper.line);
-                    drop(seen);
-                    let found = self.asserts(
-                        ctx,
-                        &helper.calls,
-                        &helper.handles,
-                        helper.class.as_deref(),
-                        depth + 1,
-                    );
-                    ctx.seen.borrow_mut().pop();
-                    return found;
-                }
+            if let Some(found) = self.follow_helper(ctx, call, handles, owner, depth) {
+                return found;
             }
             passes_handle(call, handles)
                 || (self.precision_first && self.looks_assertion_ish(&call.callee))
         })
+    }
+
+    /// Whether the same-file function `call` names asserts; `None` when it cannot be resolved,
+    /// the depth bound is hit, or it is already being followed (recursion).
+    fn follow_helper(
+        &self,
+        ctx: &Scan,
+        call: &Call,
+        handles: &[String],
+        owner: Option<&str>,
+        depth: usize,
+    ) -> Option<bool> {
+        if depth >= MAX_HELPER_DEPTH {
+            return None;
+        }
+        let helper = ctx.resolve(self.lang, &call.callee, handles, owner)?;
+        let mut seen = ctx.seen.borrow_mut();
+        if seen.contains(&helper.line) {
+            return None;
+        }
+        seen.push(helper.line);
+        drop(seen);
+        let found = self.asserts(
+            ctx,
+            &helper.calls,
+            &helper.handles,
+            helper.class.as_deref(),
+            depth + 1,
+        );
+        ctx.seen.borrow_mut().pop();
+        Some(found)
     }
 
     /// Assertion shapes the profile vocabulary cannot express with a fixed receiver name.
@@ -355,7 +397,7 @@ impl Scan {
         let Some(param) = f.params.get(idx).filter(|p| !p.is_empty() && *p != "_") else {
             return false;
         };
-        f.calls.iter().any(|c| {
+        f.calls.iter().filter(|c| !c.fn_value).any(|c| {
             c.callee == *param
                 || c.args.iter().enumerate().any(|(j, a)| {
                     a == param
@@ -709,15 +751,22 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
             let callee = node_text(func, source).to_string();
             if lang == Language::Go && callee.ends_with(".Run") {
                 // `t.Run(name, tc.runner)`: a named function or method value is a call target.
-                calls.extend(arg_texts.iter().filter(|a| is_go_path(a)).map(|a| Call {
-                    callee: a.clone(),
-                    args: Vec::new(),
-                }));
+                calls.extend(
+                    arg_texts
+                        .iter()
+                        .filter(|a| is_go_path(a))
+                        .map(|a| Call::new(a.clone(), Vec::new())),
+                );
+            } else if lang == Language::Go {
+                // `ExecAPITest(t, testX)`: a function value handed to a runner.
+                calls.extend(
+                    arg_texts
+                        .iter()
+                        .filter(|a| is_go_path(a))
+                        .map(|a| Call::value(a.clone())),
+                );
             }
-            calls.push(Call {
-                callee,
-                args: arg_texts,
-            });
+            calls.push(Call::new(callee, arg_texts));
         } else if lang == Language::Go
             && node.kind() == "type_conversion_expression"
             && let Some(generic) = node
@@ -725,70 +774,65 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
                 .filter(|t| t.kind() == "generic_type")
         {
             // tree-sitter-go reads the one-argument call `helper[T](t)` as a conversion.
-            calls.push(Call {
-                callee: node_text(generic, source).to_string(),
-                args: node
-                    .child_by_field_name("operand")
+            calls.push(Call::new(
+                node_text(generic, source).to_string(),
+                node.child_by_field_name("operand")
                     .map(|o| node_text(o, source).to_string())
                     .into_iter()
                     .collect(),
-            });
+            ));
         } else if lang == Language::Go
             && node.kind() == "if_statement"
             && is_guarded_panic(node, source)
         {
-            calls.push(Call {
-                callee: GUARDED_PANIC.to_string(),
-                args: Vec::new(),
-            });
+            calls.push(Call::new(GUARDED_PANIC.to_string(), Vec::new()));
+        } else if lang == Language::Go
+            && node.kind() == "keyed_element"
+            && let Some(value) = node.named_child(node.named_child_count().saturating_sub(1) as u32)
+            && node.named_child_count() == 2
+            && is_go_path(node_text(value, source))
+        {
+            // `Args{objAPITest: testX}`: a function value stored in a struct field.
+            calls.push(Call::value(node_text(value, source).to_string()));
         } else if lang == Language::Python && node.kind() == "try_statement" {
             if reraises_validate(node, source) {
-                calls.push(Call {
-                    callee: RERAISED_VALIDATE.to_string(),
-                    args: Vec::new(),
-                });
+                calls.push(Call::new(RERAISED_VALIDATE.to_string(), Vec::new()));
             }
         } else if lang == Language::Python && PythonKind::of(node) == PythonKind::AssertStatement {
-            calls.push(Call {
-                callee: "assert".to_string(),
-                args: Vec::new(),
-            });
+            calls.push(Call::new("assert".to_string(), Vec::new()));
         }
         true
     });
     calls
 }
 
-/// `if <...err...> != nil { ...panic(...)... }` lexically inside a `go` statement.
+/// `if <cond> { ...panic(...)... }` (or its `else`) where the condition tests behaviour, or any
+/// guard at all when lexically inside a `go` statement.
 fn is_guarded_panic(if_node: Node, source: &str) -> bool {
-    let mut ancestor = if_node.parent();
-    while let Some(n) = ancestor {
-        if n.kind() == "go_statement" {
-            break;
-        }
-        ancestor = n.parent();
-    }
-    if ancestor.is_none() {
-        return false;
-    }
     let Some(cond) = if_node.child_by_field_name("condition") else {
         return false;
     };
     let cond = node_text(cond, source);
-    if !(cond.contains("err") && cond.contains("!= nil")) {
+    let error_propagation = cond.contains("err") && cond.contains("!= nil");
+    if error_propagation && !inside_go_statement(if_node) {
         return false;
     }
-    let Some(body) = if_node.child_by_field_name("consequence") else {
-        return false;
-    };
     let mut panics = false;
-    walk_preorder(body, &mut |n| {
-        panics |= GoKind::of(n) == GoKind::CallExpression
-            && n.child_by_field_name("function")
-                .is_some_and(|f| node_text(f, source) == "panic");
-        true
-    });
+    for field in ["consequence", "alternative"] {
+        if let Some(branch) = if_node.child_by_field_name(field) {
+            walk_preorder(branch, &mut |n| {
+                panics |= GoKind::of(n) == GoKind::CallExpression
+                    && n.child_by_field_name("function")
+                        .is_some_and(|f| node_text(f, source) == "panic");
+                true
+            });
+        }
+    }
     panics
+}
+
+fn inside_go_statement(node: Node) -> bool {
+    std::iter::successors(node.parent(), |n| n.parent()).any(|n| n.kind() == "go_statement")
 }
 
 /// Parameter names of a Go function or method in order, `""` standing in for an unnamed one.
@@ -866,10 +910,7 @@ fn kotlin_calls_in(root: Node, source: &str) -> Vec<Call> {
                             );
                         }
                     }
-                    calls.push(Call {
-                        callee: kotlin_callee(callee, source),
-                        args,
-                    });
+                    calls.push(Call::new(kotlin_callee(callee, source), args));
                 }
             }
             "infix_expression" => {
@@ -877,10 +918,7 @@ fn kotlin_calls_in(root: Node, source: &str) -> Vec<Call> {
                     .named_child(1)
                     .filter(|_| node.named_child_count() == 3)
                 {
-                    calls.push(Call {
-                        callee: node_text(op, source).to_string(),
-                        args: Vec::new(),
-                    });
+                    calls.push(Call::new(node_text(op, source).to_string(), Vec::new()));
                 }
             }
             // The grammar reads `f<T> { ... }` as `f < T > lambda`; recover `f` as the callee.
@@ -890,10 +928,7 @@ fn kotlin_calls_in(root: Node, source: &str) -> Vec<Call> {
                         .get(name.end_byte()..)
                         .is_some_and(|r| r.starts_with('<'))
                 {
-                    calls.push(Call {
-                        callee: node_text(name, source).to_string(),
-                        args: Vec::new(),
-                    });
+                    calls.push(Call::new(node_text(name, source).to_string(), Vec::new()));
                 }
             }
             _ => {}
