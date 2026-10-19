@@ -1,0 +1,1 @@
+{"commit": "a0602a9e6eb0374deeb2d265d79d76cccbfebf15", "file": "scripts/run-fast-specs.sh", "line": 51, "note": "\"in order to\" in a comment is real filler", "permalink": "https://github.com/gitlabhq/gitlabhq/blob/a0602a9e6eb0374deeb2d265d79d76cccbfebf15/scripts/run-fast-specs.sh#L51", "rule": "verbose-comment", "verdict": "true_positive"}

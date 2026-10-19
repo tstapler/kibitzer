@@ -124,7 +124,7 @@ fn current_findings(repo_root: &Path) -> Result<(ArchModel, Vec<ArchFinding>)> {
 
     let mut findings: Vec<ArchFinding> = Vec::new();
     for checker in architecture_checks::registry() {
-        findings.extend(checker.check(&graph, &config));
+        findings.extend(checker.check(&graph, &config, Some(&model)));
     }
     for checker in architecture_checks::model_registry() {
         findings.extend(checker.check(&model, &config));

@@ -6,10 +6,10 @@ use anyhow::Result;
 use regex::Regex;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::checkers::duplicate_code::{
-    DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES, qualifying_windows,
-};
+use crate::checkers::duplicate_code::{DuplicateCodeChecker, MIN_BLOCK_LINES, MIN_OCCURRENCES};
 use crate::checkers::file_size::is_generated;
+use crate::checkers::import_preamble::{lang_ext, non_preamble_windows};
+use crate::checkers::is_test_file;
 
 /// Opt-in near-duplicate counterpart to `duplicate-code` (issue #47): same window-hashing,
 /// but the key is computed after replacing literals with a placeholder, so
@@ -39,48 +39,8 @@ impl Checker for FuzzyDuplicateCodeChecker {
         if is_generated(ctx.source) || is_test_file(file) {
             return Ok(Vec::new());
         }
-        Ok(find_fuzzy_duplicate_blocks(ctx.source))
+        Ok(find_fuzzy_duplicate_blocks(ctx.source, lang_ext(file)))
     }
-}
-
-/// Skips common test-file naming conventions across supported languages. Backtesting
-/// against `kubernetes/kubernetes` found ~97% of raw findings were `_test.go` table-driven
-/// cases — already the Parameterize-Function shape, so flagging them back is backwards.
-/// See `docs/duplicate-code-fuzzy.md`.
-fn is_test_file(file: &Path) -> bool {
-    // Rust integration tests and JS/TS test suites both conventionally live in a `tests/`
-    // or `__tests__/` directory rather than following a filename suffix (e.g.
-    // `crates/cli/tests/browser_session.rs`, confirmed as a real backtest hit before this
-    // check was added — see docs/duplicate-code-fuzzy.md).
-    if file
-        .components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some("tests") | Some("__tests__")))
-    {
-        return true;
-    }
-
-    let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with("_test.go")
-        || lower.ends_with("_test.py")
-        || (lower.starts_with("test_") && lower.ends_with(".py"))
-        || [
-            ".test.ts",
-            ".test.tsx",
-            ".test.js",
-            ".test.jsx",
-            ".spec.ts",
-            ".spec.tsx",
-            ".spec.js",
-            ".spec.jsx",
-        ]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-        || (lower.ends_with(".java")
-            && (name.ends_with("Test.java") || name.ends_with("Tests.java")))
-        || (lower.ends_with(".kt") && (name.ends_with("Test.kt") || name.ends_with("Tests.kt")))
 }
 
 inventory::submit! {
@@ -149,11 +109,13 @@ fn trimmed_lines_before_rust_test_module(source: &str) -> Vec<String> {
 /// Fuzzy counterpart to `duplicate_code::find_duplicate_blocks` — same windowing and
 /// occurrence-count bar, but grouped by literal-normalized text and reported only when
 /// at least one literal actually differs across occurrences.
-fn find_fuzzy_duplicate_blocks(source: &str) -> Vec<Finding> {
+fn find_fuzzy_duplicate_blocks(source: &str, ext: &str) -> Vec<Finding> {
     let trimmed = trimmed_lines_before_rust_test_module(source);
 
     let mut occurrences: HashMap<String, Vec<usize>> = HashMap::new();
-    for (start, window) in qualifying_windows(&trimmed) {
+    // The preamble filter matters here: literal normalization makes a run of distinct
+    // quoted Go import paths collapse to one key.
+    for (start, window) in non_preamble_windows(&trimmed, ext) {
         let fuzzy_key = window
             .iter()
             .map(|l| normalize_literals(l))
@@ -429,5 +391,11 @@ mod tests {
             vec!["a".to_string()],
         ];
         assert_eq!(differing_literals(&literal_sets), None);
+    }
+
+    #[test]
+    fn does_not_flag_a_go_import_block_whose_paths_normalize_alike() {
+        let src = "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"net/http/httptest\"\n\t\"path/filepath\"\n\t\"database/sql\"\n\t\"text/template\"\n\t\"sync/atomic\"\n\t\"os/signal\"\n)\n\nfunc main() {}\n";
+        assert!(check_source(src).is_empty());
     }
 }

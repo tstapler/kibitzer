@@ -302,6 +302,10 @@ fn fixture(lang: Language) -> (&'static str, &'static str) {
             "# kibitzer:ignore flag-argument -- legacy API, callers pinned\ndef f():\n    pass\n",
             line,
         ),
+        Language::Bash => (
+            "# kibitzer:ignore flag-argument -- legacy API, callers pinned\nf() { :; }\n",
+            line,
+        ),
         Language::Java => (
             "// kibitzer:ignore flag-argument -- legacy API, callers pinned\nclass A {}\n",
             line,
@@ -974,6 +978,7 @@ fn known_rule_should_AcceptRulesCheckersAndMeta_When_Queried() {
     assert!(known_rule("primitive-obsession"));
     assert!(known_rule("syntax-rules-rust"));
     assert!(known_rule("ignore-syntax"));
+    assert!(known_rule("remove-middle-man"));
     assert!(!known_rule("made-up-rule"));
 }
 
@@ -1656,4 +1661,15 @@ fn covers_should_UseFileHead_When_OnlyCheckerNameIsFileScope() {
         "[oversized] too big",
         Line::new(80)
     ));
+}
+
+#[test]
+fn comment_leader_should_BeHash_When_ShellScript() {
+    for path in ["a.sh", "a.bash"] {
+        assert_eq!(
+            super::hint::comment_leader(Path::new(path)).open,
+            "#",
+            "{path}"
+        );
+    }
 }

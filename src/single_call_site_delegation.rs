@@ -7,13 +7,17 @@
 //! Scope mirrors `unreferenced_symbols`'s precedent for the same `call_edges`-derived
 //! signal: exported symbols and zero-caller symbols (dead code, a different smell) are
 //! never candidates, and only `symbol_extract::call_graph_supports` languages apply.
-//! No interface-implementation carve-out yet (a single call site today may not be the
-//! only one once a second implementer/caller appears) — `ArchModel` has no
-//! type-implements-interface edge to detect it with; tracked as #117.
+//! Interface-method carve-out: a method whose owning type has a resolved `Implements`
+//! edge in `ArchModel.type_edges` is skipped when any interface it implements has
+//! another implementer (a second caller may appear through that interface) — but still
+//! flagged when the type is the sole implementer of every interface it declares.
+//! Only explicit `implements` syntax is covered; Go structural interface satisfaction
+//! (method-set matching) is not in `type_edges` v1 (`arch_model.rs:226-230`), so a Go
+//! method that implicitly satisfies an interface can still be a false positive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::arch_model::{ArchModel, SymbolKind, SymbolNode};
+use crate::arch_model::{ArchModel, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 
@@ -63,6 +67,50 @@ fn call_site_counts(model: &ArchModel) -> HashMap<&str, usize> {
         .collect()
 }
 
+/// Resolved `Implements` edges, deduplicated by (type, interface) pair.
+struct ImplementsIndex<'a> {
+    interfaces_of: HashMap<&'a str, Vec<&'a str>>,
+    implementer_counts: HashMap<&'a str, usize>,
+}
+
+fn implements_index(model: &ArchModel) -> ImplementsIndex<'_> {
+    let pairs: HashSet<(&str, &str)> = model
+        .type_edges
+        .iter()
+        .filter(|e| e.resolved && e.kind == Some(TypeRelationKind::Implements))
+        .map(|e| (e.from.as_str(), e.to.as_str()))
+        .collect();
+    let mut interfaces_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut implementer_counts: HashMap<&str, usize> = HashMap::new();
+    for (from, to) in pairs {
+        interfaces_of.entry(from).or_default().push(to);
+        *implementer_counts.entry(to).or_default() += 1;
+    }
+    ImplementsIndex {
+        interfaces_of,
+        implementer_counts,
+    }
+}
+
+/// True when `symbol`'s owning type implements an interface that has another
+/// implementer. A type that is the sole implementer of everything it implements is not
+/// suppressed — the interface is effectively private to it.
+fn implements_shared_interface(symbol: &SymbolNode, index: &ImplementsIndex<'_>) -> bool {
+    // Method ids are `{pkg}::{type}.{name}`, the same shape `type_edges.from` uses for the type.
+    let Some(type_id) = symbol
+        .id
+        .strip_suffix(symbol.name.as_str())
+        .and_then(|rest| rest.strip_suffix('.'))
+    else {
+        return false;
+    };
+    index.interfaces_of.get(type_id).is_some_and(|interfaces| {
+        interfaces
+            .iter()
+            .any(|iface| index.implementer_counts.get(iface).is_some_and(|&n| n > 1))
+    })
+}
+
 fn is_candidate(symbol: &SymbolNode) -> bool {
     !symbol.exported
         && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
@@ -86,11 +134,13 @@ fn finding_for(symbol: &SymbolNode) -> ArchFinding {
 
 fn single_call_site_delegation_findings(model: &ArchModel) -> Vec<ArchFinding> {
     let counts = call_site_counts(model);
+    let implements = implements_index(model);
     let mut findings: Vec<ArchFinding> = model
         .packages
         .values()
         .flat_map(|pkg| pkg.symbols.iter())
         .filter(|symbol| is_candidate(symbol))
+        .filter(|symbol| !implements_shared_interface(symbol, &implements))
         .filter(|symbol| counts.get(symbol.id.as_str()).copied().unwrap_or(0) == 1)
         .map(finding_for)
         .collect();
@@ -262,6 +312,21 @@ mod tests {
     }
 
     #[test]
+    fn does_not_flag_ts_method_on_type_sharing_an_interface_with_another_implementer() {
+        let model = model_from(vec![(
+            "/repo/src/a.ts",
+            "interface Shape { area(): number; }\n\
+             class Sq implements Shape {\n  private thin() { return this.compute(); }\n  compute() { return 1; }\n  area() { return this.thin(); }\n}\n\
+             class Circ implements Shape {\n  area() { return 2; }\n}\n",
+        )]);
+        let findings = single_call_site_delegation_findings(&model);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("`thin`")),
+            "Sq implements Shape alongside Circ: {findings:?}"
+        );
+    }
+
+    #[test]
     fn a_module_level_callback_counts_as_a_second_caller() {
         let model = model_from(vec![(
             "/repo/pkg/a.ts",
@@ -273,6 +338,20 @@ mod tests {
         assert!(
             single_call_site_delegation_findings(&model).is_empty(),
             "`thin` is called from `named` and from a describe() callback"
+        );
+    }
+
+    #[test]
+    fn flags_ts_method_on_sole_implementer_of_its_interface() {
+        let model = model_from(vec![(
+            "/repo/src/a.ts",
+            "interface Shape { area(): number; }\n\
+             class Sq implements Shape {\n  private thin() { return this.compute(); }\n  compute() { return 1; }\n  area() { return this.thin(); }\n}\n",
+        )]);
+        let findings = single_call_site_delegation_findings(&model);
+        assert!(
+            findings.iter().any(|f| f.message.contains("`thin`")),
+            "sole implementer is not exempted from the finding: {findings:?}"
         );
     }
 
@@ -316,5 +395,25 @@ mod tests {
             single_call_site_delegation_findings(&model).is_empty(),
             "two call sites in one caller are still two call sites"
         );
+    }
+
+    #[test]
+    fn go_method_without_implements_edges_is_still_flagged() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.go",
+            "package pkg\n\ntype I interface{ thin() }\n\ntype T struct{}\n\n\
+             func (t T) thin() {\n\thelper()\n}\n\nfunc helper() {}\n\n\
+             func Live() {\n\tvar t T\n\tt.thin()\n}\n",
+        )]);
+        assert!(
+            !model
+                .type_edges
+                .iter()
+                .any(|e| e.kind == Some(TypeRelationKind::Implements)),
+            "Go structural satisfaction produces no Implements edge"
+        );
+        let findings = single_call_site_delegation_findings(&model);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("method `thin`"));
     }
 }

@@ -86,6 +86,19 @@ pub struct SymbolNode {
     /// precedent as `ArchFinding::severity_override`).
     #[serde(default)]
     pub is_pure_delegation: bool,
+    /// Receiver field a pure-delegation method routes through (`s.inner.Foo()` →
+    /// `Some("inner")`), for `middle_man::MiddleManChecker`. `None` for non-delegating
+    /// symbols, delegation that isn't a direct receiver-field call (free functions,
+    /// `s.Get().Foo()`, deeper chains), and languages without call-graph coverage.
+    #[serde(default)]
+    pub delegation_field: Option<String>,
+    /// `(name, type_text)` per declared parameter of a `Function`/`Method`, in
+    /// declaration order, receiver excluded. Populated for Go and TypeScript/TSX only
+    /// (`symbol_extract::extract_params`); empty for every other language and for
+    /// `Type`/`Interface` symbols. `#[serde(default)]` so a `cache.json` written before
+    /// this field existed still deserializes.
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -301,7 +314,7 @@ pub fn looks_generated(source: &str) -> bool {
 /// no recognized extension return `None` and are counted as `unsupported_language_files`,
 /// not silently dropped.
 pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
-    Language::for_path(path)
+    Language::for_path(path).filter(|l| l.has_symbol_extraction())
 }
 
 /// The package/directory key a file groups under. `ImportGraph` is the single source of
@@ -1151,6 +1164,11 @@ mod tests {
     /// "unsupported," never reaching `symbol_extract.rs`'s Rust support) until this
     /// arm was added.
     #[test]
+    fn language_for_path_skips_bash_which_has_no_symbol_extraction() {
+        assert_eq!(language_for_path(Path::new("run.sh")), None);
+    }
+
+    #[test]
     fn language_for_path_recognizes_rust() {
         assert_eq!(language_for_path(Path::new("foo.rs")), Some(Language::Rust));
     }
@@ -1205,6 +1223,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         }
     }
 
@@ -1346,6 +1366,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2110,6 +2132,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2121,6 +2145,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
 
         let mut packages = BTreeMap::new();
@@ -2156,6 +2182,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         let api_pkg = empty_package("server/api");
 
@@ -2192,6 +2220,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         let api_pkg = empty_package("server/api");
 
@@ -2463,6 +2493,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2479,6 +2511,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2529,6 +2563,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2570,6 +2606,8 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
         });
         packages.insert("app".to_string(), pkg);
 

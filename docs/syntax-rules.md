@@ -20,6 +20,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | Java       | `syntax-rules-java`            | `**/*.java`                               |
 | Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
 | Rust       | `syntax-rules-rust`            | `**/*.rs`                                 |
+| Bash       | `syntax-rules-bash`            | `**/*.sh`, `**/*.bash`                    |
 
 The rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
@@ -27,7 +28,7 @@ kinds each language's `lang_config()` entry checks against differ:
 
 | Rule ID               | Category   | Default severity | Threshold             | Description |
 |------------------------|------------|-------------------|------------------------|--------------|
-| `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this — Fowler's *Extract Function*. |
+| `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this — Fowler's *Extract Function*. Exempt: a body that is a single `return` of a flat collection literal (Go composite literal, TS/JS array/object, Python list/dict) with no calls, ternaries, comprehensions or control flow — a table-test case list has nothing to extract. |
 | `deep-nesting`         | complexity | advisory          | > 4 levels             | Function/method body nests control-flow constructs deeper than this — Fowler's *Replace Nested Conditional with Guard Clauses*. An `else if` chain is treated as one flat branch, not added nesting, in every language. |
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
@@ -205,3 +206,14 @@ arguments (e.g. a multi-argument factory call) can still reach the threshold.
   ]
 }
 ```
+
+### Bash caveats
+
+`bash_lang_config` (`src/checkers/rules.rs`) was checked against the vendored `codegen/node-types/bash.json`:
+
+- `return`, `break` and `continue` parse as plain `command` nodes (no `return_statement` etc.), so `unreachable-code` and the `return` side of `extract-variable` never fire.
+- `function_definition` has no parameter list, so `long-parameter-list` and `flag-argument` never fire.
+- `if_statement`'s `then` statements, `elif_clause` and `else_clause` are flat siblings, so `deep-nesting` under-counts nesting inside later branches (false negatives only).
+- A quoted string made only of expansions (`"$@"`, `"${1}"`) is exempt from `replace-magic-literal`; a string mixing text and expansions is still flagged.
+- Files are recognised by extension only (`.sh`, `.bash`). Extension-less scripts (`bin/*`, git hooks), `.zsh`/`.ksh`, `.bats`, `.envrc` and dotfiles like `.bashrc` are skipped silently: there is no shebang detection yet.
+- `replace-magic-literal` reports nothing in a file whose parse tree has an error (tree-sitter-bash can mis-pair quotes after odd quoting earlier in the file; about 7% of 300 sampled scripts), and exempts redirect targets and plain command-argument numbers (`>&2`, `exit 2`), shell boolean/separator strings and `echo`/`printf` arguments. `long-function` uses the shared 40-line threshold, untuned for case-driven installer scripts.
