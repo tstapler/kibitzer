@@ -191,6 +191,7 @@ impl CommentQualityChecker {
             Language::Java => "comment-quality-java",
             Language::Kotlin => "comment-quality-kotlin",
             Language::Rust => "comment-quality-rust",
+            Language::Bash => "comment-quality-bash",
         }
     }
 }

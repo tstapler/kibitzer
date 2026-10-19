@@ -39,6 +39,7 @@ const GRAMMARS: &[(&str, &str, &str)] = &[
     ("java", "JavaKind", "codegen/node-types/java.json"),
     ("kotlin", "KotlinKind", "codegen/node-types/kotlin.json"),
     ("rust", "RustKind", "codegen/node-types/rust.json"),
+    ("bash", "BashKind", "codegen/node-types/bash.json"),
 ];
 
 fn main() {

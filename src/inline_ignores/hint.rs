@@ -16,7 +16,7 @@ pub(crate) struct CommentLeader {
 /// Leader by grammar language, `.md`, else `#` (the fallback scanner accepts it).
 pub(crate) fn comment_leader(path: &Path) -> CommentLeader {
     let (open, close) = match Language::for_path(path) {
-        Some(Language::Python) => ("#", ""),
+        Some(Language::Python | Language::Bash) => ("#", ""),
         Some(_) => ("//", ""),
         None if path.extension().is_some_and(|e| e == "md") => ("<!--", " -->"),
         None => ("#", ""),

@@ -51,6 +51,8 @@ impl Checker for DuplicateCodeChecker {
             "**/*.java",
             "**/*.kt",
             "**/*.rs",
+            "**/*.sh",
+            "**/*.bash",
         ]
     }
 

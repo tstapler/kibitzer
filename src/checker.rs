@@ -76,6 +76,7 @@ pub enum Language {
     Java,
     Kotlin,
     Rust,
+    Bash,
 }
 
 impl Language {
@@ -90,6 +91,7 @@ impl Language {
         Language::Java,
         Language::Kotlin,
         Language::Rust,
+        Language::Bash,
     ];
 
     fn ts_language(self) -> tree_sitter::Language {
@@ -102,6 +104,7 @@ impl Language {
             Language::Java => tree_sitter_java::LANGUAGE.into(),
             Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Language::Bash => tree_sitter_bash::LANGUAGE.into(),
         }
     }
 
@@ -131,6 +134,7 @@ impl Language {
             Language::Java => &["java"],
             Language::Kotlin => &["kt", "kts"],
             Language::Rust => &["rs"],
+            Language::Bash => &["sh", "bash"],
         }
     }
 

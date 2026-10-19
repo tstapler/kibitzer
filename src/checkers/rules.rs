@@ -903,6 +903,7 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
         Language::Java => java_lang_config(),
         Language::Kotlin => kotlin_lang_config(),
         Language::Rust => rust_lang_config(),
+        Language::Bash => bash_lang_config(),
     }
 }
 
@@ -1189,6 +1190,90 @@ fn kotlin_lang_config() -> LangRuleConfig {
         density_boundary_kinds: &["lambda_literal", "anonymous_function"],
         collection_literal_kinds: &[],
         slog_key_predicate: None,
+    }
+}
+
+/// Bash has no constant-binding idiom the `replace-magic-literal` exclusion pass can
+/// recognise (`readonly X=1` parses as a `declaration_command`, not tried here).
+fn no_const_binding<'a>(_node: Node<'a>, _src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    None
+}
+
+/// Bash has no formal parameter list (arguments are positional `$1`/`$2` at call time),
+/// so there is nothing for `long-parameter-list`/`flag-argument` to inspect.
+fn no_params(_decl: Node) -> Option<Node> {
+    None
+}
+
+fn zero_params(_params: Node) -> usize {
+    0
+}
+
+fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
+    Vec::new()
+}
+
+/// A bash `string` containing `$var`/`${var}`/`$(cmd)`/`$((expr))` is a variable
+/// reference in quotes (`"$@"`, `"${1}"`), not a literal — a backtest over ~150 real
+/// scripts had these dominate `replace-magic-literal` output, so they are exempt.
+fn bash_is_expansion_string(node: Node, _src: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(|c| {
+        matches!(
+            c.kind(),
+            "expansion" | "simple_expansion" | "command_substitution" | "arithmetic_expansion"
+        )
+    })
+}
+
+/// Verified against the vendored `codegen/node-types/bash.json` (tree-sitter-bash 0.23.3):
+/// - ABSENT as named node kinds: `return_statement`, `break_statement`,
+///   `continue_statement`, `until_statement` — `return`/`break`/`continue` parse as plain
+///   `command` nodes, and `until` parses as `while_statement`. So `terminal_kinds` is empty
+///   (`unreachable-code` never fires for bash) and `return_kind` is a never-matching
+///   placeholder (`extract-variable` only sees `if`/`while` conditions).
+/// - `function_definition` has a `body` field but no parameter list, so
+///   `long-parameter-list` and `flag-argument` never fire for bash.
+/// - `if_statement` exposes a `condition` field, but its then-statements, `elif_clause`
+///   and `else_clause` are flat sibling children, not `consequence`/`alternative`;
+///   `walk_if_chain` therefore only inspects the first then-statement, so nesting inside
+///   later branches is under-counted (false negatives, not false positives).
+/// - `number` exists but bash digits are mostly bare `word` tokens, so
+///   `replace-magic-literal` has little to match; `word` is deliberately excluded as too broad.
+fn bash_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-bash",
+        file_globs: &["**/*.sh", "**/*.bash"],
+        function_kinds: &["function_definition"],
+        if_kind: "if_statement",
+        nesting_kinds: &[
+            "for_statement",
+            "c_style_for_statement",
+            "while_statement",
+            "case_statement",
+            "subshell",
+        ],
+        else_wrapper_kinds: &[],
+        chain_kinds: &[],
+        param_counter: zero_params,
+        body_finder: field_body,
+        params_finder: no_params,
+        bool_param_finder: no_bool_params,
+        ternary_kind: None,
+        block_kind: "compound_statement",
+        statement_container: identity_stmt,
+        unwrap_statement: identity_stmt,
+        terminal_kinds: &[],
+        panic_detector: no_panic_detector,
+        literal_kinds: &["string", "number"],
+        numeric_literal_kinds: &["number"],
+        binding_finder: no_const_binding,
+        return_kind: "return_statement",
+        call_kinds: &["command"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &["subshell"],
+        collection_literal_kinds: &[],
+        slog_key_predicate: Some(bash_is_expansion_string),
     }
 }
 
@@ -2170,6 +2255,10 @@ mod tests {
             tree_sitter_rust::LANGUAGE.into(),
             &lang_config(Language::Rust),
         );
+        assert_valid(
+            tree_sitter_bash::LANGUAGE.into(),
+            &lang_config(Language::Bash),
+        );
     }
 
     /// Epic 1.0's equivalence probe (validation.md): confirms the dispatcher wiring
@@ -2197,6 +2286,7 @@ mod tests {
             kotlin_lang_config().name
         );
         assert_eq!(lang_config(Language::Rust).name, rust_lang_config().name);
+        assert_eq!(lang_config(Language::Bash).name, bash_lang_config().name);
     }
 
     /// Epic 1.0's equivalence probe (validation.md): catches a mistranslation of the
@@ -3203,6 +3293,48 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[long-function]"))
         );
+    }
+
+    fn check_bash_source(src: &str) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let cfg = lang_config(Language::Bash);
+        let mut findings = Vec::new();
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
+        findings
+    }
+
+    #[test]
+    fn bash_flags_deep_nesting() {
+        let src = "f() {\n\
+             \tfor a in 1 2; do\n\
+             \t\twhile true; do\n\
+             \t\t\tfor b in 1 2; do\n\
+             \t\t\t\twhile true; do\n\
+             \t\t\t\t\tfor c in 1 2; do\n\
+             \t\t\t\t\t\techo deep\n\
+             \t\t\t\t\tdone\n\
+             \t\t\t\tdone\n\
+             \t\t\tdone\n\
+             \t\tdone\n\
+             \tdone\n\
+             }\n";
+        let findings = check_bash_source(src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]")),
+            "got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn bash_allows_a_simple_function() {
+        let findings = check_bash_source("greet() {\n\techo \"hi $1\"\n}\n");
+        assert!(findings.is_empty(), "got: {findings:?}");
     }
 
     #[test]

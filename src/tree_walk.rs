@@ -9,7 +9,8 @@ pub(crate) fn comment_kinds(lang: Language) -> &'static [&'static str] {
         | Language::Python
         | Language::TypeScript
         | Language::Tsx
-        | Language::JavaScript => &["comment"],
+        | Language::JavaScript
+        | Language::Bash => &["comment"],
         Language::Java | Language::Kotlin | Language::Rust => &["line_comment", "block_comment"],
     }
 }

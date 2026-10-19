@@ -302,6 +302,10 @@ fn fixture(lang: Language) -> (&'static str, &'static str) {
             "# kibitzer:ignore flag-argument -- legacy API, callers pinned\ndef f():\n    pass\n",
             line,
         ),
+        Language::Bash => (
+            "# kibitzer:ignore flag-argument -- legacy API, callers pinned\nf() { :; }\n",
+            line,
+        ),
         Language::Java => (
             "// kibitzer:ignore flag-argument -- legacy API, callers pinned\nclass A {}\n",
             line,
