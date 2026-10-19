@@ -291,3 +291,7 @@ The triad review (product, UX and engineering all `needs-work`) found the CLAUDE
 - **Flaky tests**: `tests/daemon_spawn.rs` also fails intermittently on a clean `master` checkout (2 of 3 runs), so it is not caused by this change. `backtest_isolates_the_duplicate_cross_file_index_and_still_finds_duplicates` failed once on this branch and passed on `master` once and on this branch in later runs; its origin is unconfirmed.
 - **Docs**: extension-only detection, inert rules and the comment-quality gating are documented in `docs/syntax-rules.md` and `docs/comment-quality.md`; requirements AC1 reconciled (0.23.3 shipped).
 - Still open: fresh-sample FP run, shebang detection, uncapped "also lines" list (shared across languages), `import_preamble`/arch_export follow-ups listed above.
+
+### Flaky-test origin (confirmed)
+
+`backtest::tests::backtest_isolates_the_duplicate_cross_file_index_and_still_finds_duplicates` is a pre-existing race, not caused by this change: the `backtest::` tests share the process-global `KIBITZER_DUPLICATE_INDEX_DIR` env var (`src/backtest.rs:217,238`), so concurrent backtest tests trip the "must be restored" assertion. Evidence: on this branch 2 of 12 parallel runs of `cargo test --bin kibitzer backtest::` failed (0 of 1 serial); on a clean `master` checkout (`d76c1ab`) 1 of 25 failed. Both `tests/daemon_spawn.rs` and this test pass with `--test-threads=1`. Not fixed here.
