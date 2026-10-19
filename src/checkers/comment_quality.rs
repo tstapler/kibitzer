@@ -1134,7 +1134,9 @@ mod tests {
         let src = "# /// script\n# note\nx = 1\n# y = foo(1)\n";
         let findings = run(Language::Python, src);
         assert!(
-            findings.iter().any(|f| f.message.contains("[commented-out-code]")),
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
     }
