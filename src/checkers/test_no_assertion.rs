@@ -63,7 +63,7 @@ const GO_VERIFYING_WORDS: &[&str] = &[
     "check", "verify", "assert", "require", "expect", "validate", "contract", "test",
 ];
 /// Last-segment prefixes of the call that starts a subprocess entrypoint's server or plugin main.
-const GO_ENTRYPOINT_PREFIXES: &[&str] = &["Serve", "Run", "Main", "Start", "Listen"];
+const GO_ENTRYPOINT_PREFIXES: &[&str] = &["Serve", "Run", "Main", "Start", "Listen", "Sleep"];
 const OPT_HELPERS: &str = "assertion_helpers";
 const OPT_PRECISION: &str = "precision_first";
 const OPT_ISH: &str = "assertion_ish";
@@ -88,6 +88,9 @@ struct Call {
     /// Go only: an argument is a struct literal (or a variable bound to one) with a field set to
     /// the testing handle, so the callee can fail the test through it.
     carries_handle: bool,
+    /// Go only: a `t.Run(name, v.Field)` value read off a local variable. When no same-file
+    /// method resolves, it is a func-typed field set elsewhere, so the body is unknowable here.
+    dynamic_dispatch: bool,
 }
 
 impl Call {
@@ -97,6 +100,7 @@ impl Call {
             args,
             fn_value: false,
             carries_handle: false,
+            dynamic_dispatch: false,
         }
     }
 
@@ -104,6 +108,13 @@ impl Call {
         Self {
             fn_value: true,
             ..Self::new(name, Vec::new())
+        }
+    }
+
+    fn dispatched(name: String) -> Self {
+        Self {
+            dynamic_dispatch: true,
+            ..Self::value(name)
         }
     }
 }
@@ -228,7 +239,12 @@ impl TestNoAssertionChecker {
             if call.fn_value {
                 return self
                     .follow_helper(ctx, call, handles, owner, depth)
-                    .unwrap_or(false);
+                    .unwrap_or(
+                        call.dynamic_dispatch
+                            && ctx
+                                .resolve(self.lang, &call.callee, handles, owner)
+                                .is_none(),
+                    );
             }
             if ctx.vocab.contains(&call.callee) || self.supplemental(ctx, call) {
                 return true;
@@ -770,6 +786,14 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
     } else {
         Vec::new()
     };
+    let (locals, aliases) = if lang == Language::Go {
+        (
+            go_locals(root, source),
+            failing_aliases(root, source, handles),
+        )
+    } else {
+        (Vec::new(), HashMap::new())
+    };
     let mut calls = Vec::new();
     walk_preorder(root, &mut |node| {
         let call_node = match lang {
@@ -795,11 +819,23 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
                 });
             if lang == Language::Go && callee.ends_with(".Run") {
                 // `t.Run(name, tc.runner)`: a named function or method value is a call target.
+                let last = arg_texts.len().saturating_sub(1);
                 calls.extend(
                     arg_texts
                         .iter()
-                        .filter(|a| is_go_path(a))
-                        .map(|a| Call::new(a.clone(), Vec::new())),
+                        .enumerate()
+                        .filter(|(_, a)| is_go_path(a))
+                        .map(|(i, a)| {
+                            let on_local = i == last
+                                && i > 0
+                                && a.split_once('.')
+                                    .is_some_and(|(root, _)| locals.iter().any(|l| l == root));
+                            if on_local {
+                                Call::dispatched(a.clone())
+                            } else {
+                                Call::new(a.clone(), Vec::new())
+                            }
+                        }),
                 );
             } else if lang == Language::Go {
                 // `ExecAPITest(t, testX)`: a function value handed to a runner.
@@ -813,6 +849,7 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
             if lang == Language::Go && is_mock_panic_expectation(&callee) {
                 calls.push(Call::new(GUARDED_PANIC.to_string(), Vec::new()));
             }
+            let callee = aliases.get(&callee).cloned().unwrap_or(callee);
             let mut call = Call::new(callee, arg_texts);
             call.carries_handle = carries_handle;
             calls.push(call);
@@ -853,6 +890,60 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
         true
     });
     calls
+}
+
+/// Go: names bound inside `root` (parameters, `:=`, `var`, range variables), so a selector on one
+/// is a field or method of a value rather than a package-qualified name.
+fn go_locals(root: Node, source: &str) -> Vec<String> {
+    let mut names = go_params(root, source);
+    walk_preorder(root, &mut |n| {
+        let bound = match n.kind() {
+            "short_var_declaration" | "range_clause" => n.child_by_field_name("left"),
+            "var_spec" => n.child_by_field_name("name"),
+            _ => None,
+        };
+        if let Some(bound) = bound {
+            names.push(node_text(bound, source).to_string());
+            let mut cursor = bound.walk();
+            names.extend(
+                bound
+                    .named_children(&mut cursor)
+                    .map(|x| node_text(x, source).to_string()),
+            );
+        }
+        true
+    });
+    names
+}
+
+/// Go: `f := tb.Errorf` / `var f = t.Fatalf` / `f = tb.Fatalf` bind `f` to a failing testing
+/// method, so calling `f(..)` fails the test. Maps alias name -> the method value it holds.
+fn failing_aliases(root: Node, source: &str, handles: &[String]) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    if handles.is_empty() {
+        return aliases;
+    }
+    walk_preorder(root, &mut |n| {
+        let (left, right) = match n.kind() {
+            "short_var_declaration" | "assignment_statement" => (
+                n.child_by_field_name("left"),
+                n.child_by_field_name("right"),
+            ),
+            "var_spec" => (
+                n.child_by_field_name("name"),
+                n.child_by_field_name("value"),
+            ),
+            _ => (None, None),
+        };
+        if let (Some(left), Some(right)) = (left, right) {
+            let (left, right) = (node_text(left, source), node_text(right, source));
+            if is_failing_method_value(right, handles) && is_go_path(left) && !left.contains('.') {
+                aliases.insert(left.to_string(), right.to_string());
+            }
+        }
+        true
+    });
+    aliases
 }
 
 /// Go: a struct literal field set to the testing handle (`Params{T: t}`), at any depth of `node`.

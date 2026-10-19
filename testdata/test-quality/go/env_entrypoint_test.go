@@ -6,6 +6,7 @@ package fixtures
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestPluginMain_Early(t *testing.T) {
@@ -48,6 +49,15 @@ func TestGatedButNotServing(t *testing.T) {
 
 func TestServeWithoutGate(t *testing.T) {
 	v5.Serve(&plugin{})
+}
+
+// Subprocess re-exec helper (ollama llm/runner_job_windows_test.go): the parent test asserts.
+func TestReexecHelperSleeps(t *testing.T) {
+	if os.Getenv("RUNNER_JOB_HELPER") == "" {
+		return
+	}
+
+	time.Sleep(time.Hour)
 }
 
 func TestPluginMain_ReturnHasValueCheck(t *testing.T) {

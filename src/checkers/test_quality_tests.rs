@@ -68,6 +68,9 @@ const GO_CASES: &[Case] = &[
     ("receiver_method_helper_test.go", &[44, 54], &[44, 54]),
     ("generic_helper_test.go", &[25], &[25]),
     ("method_value_run_test.go", &[34], &[34]),
+    ("subtest_dispatch_test.go", &[], &[]),
+    ("subtest_dispatch_quiet_test.go", &[17], &[17]),
+    ("func_alias_test.go", &[27], &[27]),
     ("cross_file_helper_test.go", &[7], &[]),
     (
         "k8s_stubs_test.go",
@@ -91,7 +94,7 @@ const GO_CASES: &[Case] = &[
         &[40, 42, 44, 49, 51],
     ),
     ("guarded_panic_helper_test.go", &[29, 44, 49], &[29, 44, 49]),
-    ("env_entrypoint_test.go", &[36, 42, 49], &[36, 42, 49]),
+    ("env_entrypoint_test.go", &[37, 43, 50], &[37, 43, 50]),
     ("params_struct_handle_test.go", &[25, 29, 35], &[25, 29, 35]),
     ("mock_panic_expectation_test.go", &[20, 26], &[26]),
     (
