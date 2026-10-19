@@ -45,13 +45,9 @@ pub mod rust {
 }
 pub use rust::RustKind;
 
-// No checker matches bash nodes via `BashKind` yet (`bash_lang_config` uses string kinds
-// like every other `LangRuleConfig`); the generated enum is kept for future bash checks.
-#[expect(dead_code)]
 pub mod bash {
     include!(concat!(env!("OUT_DIR"), "/bash_kind.rs"));
 }
-#[expect(unused_imports)]
 pub use bash::BashKind;
 
 #[cfg(test)]
