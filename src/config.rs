@@ -1469,6 +1469,19 @@ mod tests {
     }
 
     #[test]
+    fn default_checks_register_bash_comment_quality_and_file_size() {
+        let defaults = default_checks();
+        for name in ["comment-quality-bash", "bash-file-size"] {
+            let check = defaults
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing default check: {name}"));
+            assert!(check.scope.iter().any(|g| g == "**/*.sh"), "{name}");
+            assert!(check.scope.iter().any(|g| g == "**/*.bash"), "{name}");
+        }
+    }
+
+    #[test]
     fn default_config_flags_repeated_literal_with_no_inspect_json() {
         // `default_checks()` is what a repo with no `.claude/inspect.json` gets — this
         // exercises `replace-magic-literal` through the actual config-layer dispatch

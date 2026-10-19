@@ -1662,3 +1662,14 @@ fn covers_should_UseFileHead_When_OnlyCheckerNameIsFileScope() {
         Line::new(80)
     ));
 }
+
+#[test]
+fn comment_leader_should_BeHash_When_ShellScript() {
+    for path in ["a.sh", "a.bash"] {
+        assert_eq!(
+            super::hint::comment_leader(Path::new(path)).open,
+            "#",
+            "{path}"
+        );
+    }
+}
