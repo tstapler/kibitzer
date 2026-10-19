@@ -57,6 +57,13 @@ const GUARDED_PANIC: &str = "guarded-panic";
 /// Testing-handle methods that fail the test; passing one as a function value (`apply(t.Errorf)`)
 /// makes the receiving helper an assertion site. `Log*` and `Skip*` do not fail, so are absent.
 const GO_FAILING_METHODS: &[&str] = &["Error", "Errorf", "Fatal", "Fatalf", "Fail", "FailNow"];
+/// Name fragments (any case) of an unresolved Go callee that is taken to verify the struct
+/// literal carrying the testing handle into it (`CheckConsumeContract(Params{T: t})`).
+const GO_VERIFYING_WORDS: &[&str] = &[
+    "check", "verify", "assert", "require", "expect", "validate", "contract", "test",
+];
+/// Last-segment prefixes of the call that starts a subprocess entrypoint's server or plugin main.
+const GO_ENTRYPOINT_PREFIXES: &[&str] = &["Serve", "Run", "Main", "Start", "Listen"];
 const OPT_HELPERS: &str = "assertion_helpers";
 const OPT_PRECISION: &str = "precision_first";
 const OPT_ISH: &str = "assertion_ish";
@@ -78,6 +85,9 @@ struct Call {
     /// Go only: not a call but a function value handed to one (`run(testX)`, `{fn: testX}`); it
     /// asserts only through the same-file function it names, never by its name or arguments.
     fn_value: bool,
+    /// Go only: an argument is a struct literal (or a variable bound to one) with a field set to
+    /// the testing handle, so the callee can fail the test through it.
+    carries_handle: bool,
 }
 
 impl Call {
@@ -86,6 +96,7 @@ impl Call {
             callee,
             args,
             fn_value: false,
+            carries_handle: false,
         }
     }
 
@@ -108,6 +119,8 @@ struct FnInfo {
     span: (usize, usize),
     calls: Vec<Call>,
     handles: Vec<String>,
+    /// Go only: an env-gated subprocess entrypoint (`if os.Getenv(..) == "" { return }; Serve()`).
+    env_entrypoint: bool,
     /// Go only: parameter names in order (`""` for an unnamed one), for callback-argument following.
     params: Vec<String>,
     /// Python only: innermost enclosing class, for `self.method` resolution.
@@ -227,6 +240,7 @@ impl TestNoAssertionChecker {
                 return found;
             }
             passes_handle(call, handles)
+                || (call.carries_handle && names_verifier(&call.callee))
                 || (self.precision_first && self.looks_assertion_ish(&call.callee))
         })
     }
@@ -337,6 +351,16 @@ fn is_failing_method_value(arg: &str, handles: &[String]) -> bool {
     arg.split_once('.').is_some_and(|(recv, method)| {
         handles.iter().any(|h| h == recv) && GO_FAILING_METHODS.contains(&method)
     })
+}
+
+/// `pkg.CheckContract`, `verifyAll`: the last segment contains a verification word.
+fn names_verifier(callee: &str) -> bool {
+    let last = callee
+        .rsplit('.')
+        .next()
+        .unwrap_or(callee)
+        .to_ascii_lowercase();
+    GO_VERIFYING_WORDS.iter().any(|w| last.contains(w))
 }
 
 /// Passing the framework handle to an unresolved function counts as asserting.
@@ -549,6 +573,10 @@ impl Checker for TestNoAssertionChecker {
             else {
                 continue;
             };
+            if self.lang == Language::Go && info.env_entrypoint {
+                // The test binary re-exec'd as a plugin/server process; the parent test asserts.
+                continue;
+            }
             if self.lang == Language::Go && info.calls.iter().any(|c| c.callee == "os.Exit") {
                 // A Go subprocess re-exec stub (`TestHelperProcess`): the parent test asserts.
                 continue;
@@ -585,14 +613,17 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
     if let Some(tree) = ctx.tree {
         walk_preorder(tree.root_node(), &mut |node| {
             if let Some(name) = function_name(lang, node, ctx.source) {
+                let handles = handles_in(lang, node, ctx.source);
                 fns.push(FnInfo {
                     name: name.to_string(),
                     is_method: lang == Language::Go
                         && GoKind::of(node) == GoKind::MethodDeclaration,
                     line: line_of(node),
                     span: (node.start_byte(), node.end_byte()),
-                    calls: calls_in(lang, node, ctx.source),
-                    handles: handles_in(lang, node, ctx.source),
+                    calls: calls_in(lang, node, ctx.source, &handles),
+                    handles,
+                    env_entrypoint: lang == Language::Go
+                        && is_env_gated_entrypoint(node, ctx.source),
                     params: if lang == Language::Go {
                         go_params(node, ctx.source)
                     } else {
@@ -730,10 +761,15 @@ fn function_name<'a>(lang: Language, node: Node, source: &'a str) -> Option<&'a 
     Some(node_text(name, source).trim_matches('`'))
 }
 
-fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
+fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec<Call> {
     if lang == Language::Kotlin {
         return kotlin_calls_in(root, source);
     }
+    let carriers = if lang == Language::Go {
+        handle_carrier_vars(root, source, handles)
+    } else {
+        Vec::new()
+    };
     let mut calls = Vec::new();
     walk_preorder(root, &mut |node| {
         let call_node = match lang {
@@ -749,6 +785,14 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
                 .map(|a| node_text(a, source).to_string())
                 .collect::<Vec<String>>();
             let callee = node_text(func, source).to_string();
+            let carries_handle = lang == Language::Go
+                && args.iter().any(|a| {
+                    let mut c = a.walk();
+                    a.named_children(&mut c).any(|arg| {
+                        has_handle_field(arg, source, handles)
+                            || carriers.iter().any(|v| v == node_text(arg, source))
+                    })
+                });
             if lang == Language::Go && callee.ends_with(".Run") {
                 // `t.Run(name, tc.runner)`: a named function or method value is a call target.
                 calls.extend(
@@ -766,7 +810,12 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
                         .map(|a| Call::value(a.clone())),
                 );
             }
-            calls.push(Call::new(callee, arg_texts));
+            if lang == Language::Go && is_mock_panic_expectation(&callee) {
+                calls.push(Call::new(GUARDED_PANIC.to_string(), Vec::new()));
+            }
+            let mut call = Call::new(callee, arg_texts);
+            call.carries_handle = carries_handle;
+            calls.push(call);
         } else if lang == Language::Go
             && node.kind() == "type_conversion_expression"
             && let Some(generic) = node
@@ -804,6 +853,120 @@ fn calls_in(lang: Language, root: Node, source: &str) -> Vec<Call> {
         true
     });
     calls
+}
+
+/// Go: a struct literal field set to the testing handle (`Params{T: t}`), at any depth of `node`.
+fn has_handle_field(node: Node, source: &str, handles: &[String]) -> bool {
+    let mut found = false;
+    walk_preorder(node, &mut |n| {
+        if n.kind() == "keyed_element"
+            && n.named_child_count() == 2
+            && n.named_child(1)
+                .is_some_and(|v| handles.iter().any(|h| h == node_text(v, source)))
+        {
+            found = true;
+        }
+        !found
+    });
+    found
+}
+
+/// Go: variables bound to a struct literal that carries the testing handle
+/// (`params := Params{T: t}`), so `Check(params)` is seen to pass it on.
+fn handle_carrier_vars(root: Node, source: &str, handles: &[String]) -> Vec<String> {
+    let mut vars = Vec::new();
+    if handles.is_empty() {
+        return vars;
+    }
+    walk_preorder(root, &mut |n| {
+        let (left, right) = match n.kind() {
+            "short_var_declaration" | "assignment_statement" => (
+                n.child_by_field_name("left"),
+                n.child_by_field_name("right"),
+            ),
+            "var_spec" => (
+                n.child_by_field_name("name"),
+                n.child_by_field_name("value"),
+            ),
+            _ => (None, None),
+        };
+        if let (Some(left), Some(right)) = (left, right)
+            && has_handle_field(right, source, handles)
+        {
+            let mut cursor = left.walk();
+            let names: Vec<_> = left.named_children(&mut cursor).collect();
+            if names.is_empty() {
+                vars.push(node_text(left, source).to_string());
+            }
+            vars.extend(names.iter().map(|x| node_text(*x, source).to_string()));
+        }
+        true
+    });
+    vars
+}
+
+/// Mock expectation builder that makes the forbidden call panic and so fail the test:
+/// mockery `m.EXPECT().Foo(..).Panic("..")` or testify `m.On("Foo").Panic("..")`.
+fn is_mock_panic_expectation(callee: &str) -> bool {
+    let callee = without_comments_and_space(callee);
+    callee.ends_with(".Panic") && (callee.contains(".EXPECT()") || callee.contains(".On("))
+}
+
+/// Statements of a Go block, looking through the `statement_list` wrapper, without comments.
+fn block_statements(block: Node) -> Vec<Node> {
+    let mut cursor = block.walk();
+    let mut stmts: Vec<Node> = block.named_children(&mut cursor).collect();
+    if let [only] = stmts[..]
+        && only.kind() == "statement_list"
+    {
+        let mut inner = only.walk();
+        stmts = only.named_children(&mut inner).collect();
+    }
+    stmts.retain(|s| s.kind() != "comment");
+    stmts
+}
+
+/// A test that is the re-exec'd subprocess of another test: it returns unless an environment
+/// variable is set, and its remaining body ends by serving a plugin or running a main. Requires
+/// the gate to cover the whole body, and a serve/run call, so a gated body that does nothing or
+/// only calls ordinary code is still reported.
+fn is_env_gated_entrypoint(func: Node, source: &str) -> bool {
+    let Some(body) = func.child_by_field_name("body") else {
+        return false;
+    };
+    let stmts = block_statements(body);
+    let Some((gate, rest)) = stmts.split_first() else {
+        return false;
+    };
+    if gate.kind() != "if_statement" || gate.child_by_field_name("alternative").is_some() {
+        return false;
+    }
+    let Some(consequence) = gate.child_by_field_name("consequence") else {
+        return false;
+    };
+    let head = &source[gate.start_byte()..consequence.start_byte()];
+    if !(head.contains("os.Getenv(") || head.contains("os.LookupEnv(")) {
+        return false;
+    }
+    let gated = block_statements(consequence);
+    let serving = if rest.is_empty() {
+        gated
+    } else if gated.len() == 1 && gated[0].kind() == "return_statement" {
+        rest.to_vec()
+    } else {
+        return false;
+    };
+    serving.last().is_some_and(|last| {
+        last.kind() == "expression_statement"
+            && last
+                .named_child(0)
+                .filter(|c| GoKind::of(*c) == GoKind::CallExpression)
+                .and_then(|c| c.child_by_field_name("function"))
+                .is_some_and(|f| {
+                    let name = node_text(f, source).rsplit('.').next().unwrap_or("");
+                    GO_ENTRYPOINT_PREFIXES.iter().any(|p| name.starts_with(p))
+                })
+    })
 }
 
 /// `if <cond> { ...panic(...)... }` (or its `else`) where the condition tests behaviour, or any

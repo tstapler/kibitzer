@@ -91,6 +91,9 @@ const GO_CASES: &[Case] = &[
         &[40, 42, 44, 49, 51],
     ),
     ("guarded_panic_helper_test.go", &[29, 44, 49], &[29, 44, 49]),
+    ("env_entrypoint_test.go", &[36, 42, 49], &[36, 42, 49]),
+    ("params_struct_handle_test.go", &[25, 29, 35], &[25, 29, 35]),
+    ("mock_panic_expectation_test.go", &[20, 26], &[26]),
     (
         "six_vacuous_test.go",
         &[6, 7, 8, 9, 10, 11],
