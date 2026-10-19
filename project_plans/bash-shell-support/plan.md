@@ -2,7 +2,7 @@
 
 **Feature**: Shell-script (`.sh`, `.bash`) support for `syntax-rules-bash`, `comment-quality-bash`, `duplicate-code`, `duplicate-code-cross-file` (plus `bash-file-size`), via `tree-sitter-bash`.
 **Date**: 2026-10-18 (retroactive plan of record; the original forward-looking plan is superseded by this file)
-**Status**: Implemented; FP triage not done (see Backtest notes). Commits `e8a422a` (feat) and `1dc4dc3` (sdd:6-verify fixes) on `backlog/kibitzer-bash-shell-support`. PR/ship step not yet done.
+**Status**: Implemented; FP triage done and rules tuned afterwards (see "Update after the Product Triad Review" at the end); fresh-sample check recorded in `docs/backtest-triage/bash-2026-10-18.md`. Commits `e8a422a` (feat) and `1dc4dc3` (sdd:6-verify fixes) on `backlog/kibitzer-bash-shell-support`. PR/ship step not yet done.
 **Complexity**: 2 (no `Complexity` field in `requirements.md`; defaulted)
 **ADRs**: None. No non-standard technology choice was made (same grammar-crate + `LangRuleConfig` shape as Kotlin/Rust).
 

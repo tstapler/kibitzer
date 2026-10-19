@@ -16,6 +16,14 @@ same shape as Kotlin/Rust's rollout. Bash-specific semantic checks (unquoted var
 expansion, unchecked `$?`, `set -e`/`set -o pipefail` auditing) are explicitly out of scope
 for v1.
 
+## Target user, success measure and risky assumption
+
+*(Added retroactively after the Product Triad Review; the original requirements named none of these.)*
+
+- **Target user:** developers and AI coding agents using kibitzer hooks/CI in repos that contain shell scripts (install, bootstrap, CI glue). No transcript evidence of a specific shell-quality miss was gathered, so demand is assumed, not measured.
+- **Success measure (beyond the wiring ACs below):** the CLAUDE.md "Writing a new check" done-bar: a corpus backtest with hand-triaged findings and a strict false-positive rate under the 40% target (ADR-001 bar, cited from the superseded plan at `7634824`; no ADR file exists). Recall and adoption are not measured.
+- **Risky assumption:** that generic grammar-shaped rules (long-function, magic literals, comment heuristics), which worked for Go/Kotlin/Rust, are useful on shell default-on. The first triage disproved it for `comment-quality-bash` (90% FP) and `replace-magic-literal` (52.5% FP); see `docs/backtest-triage/bash-2026-10-18.md`.
+
 ## Acceptance Criteria
 
 1. `Cargo.toml` declares `tree-sitter-bash` at a compatible version (0.25.x on crates.io). *(Reconciled: the backlog's acceptance criterion says 0.23.x and 0.23.3 shipped; both 0.23.3 and 0.25.1 avoid a `tree-sitter` conflict, see `research/stack.md`.)*
@@ -48,6 +56,8 @@ for v1.
     change.
 
 ## Out of Scope
+
+*(As shipped, also not covered: extension-less/shebang-only scripts, `.zsh`/`.ksh`/`.bats`/`.envrc`/dotfiles; `unreachable-code`, `long-parameter-list` and `flag-argument` cannot fire for bash by grammar; `deep-nesting` under-counts inside `elif`/`else`; `comment-quality-bash` runs only `verbose-comment`. See `plan.md` follow-ups.)*
 
 - Shellcheck-equivalent semantic analysis (unquoted expansions, `set -e`, unchecked `$?`).
   Those are proxy/linter-territory per issue #14, not native tree-sitter checks.

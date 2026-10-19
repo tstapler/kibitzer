@@ -1218,10 +1218,14 @@ fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
 /// which exempts any literal it matches.
 /// - `number`: a redirect target (`>&2`) or a plain command argument (`exit 2`, `sleep 5`);
 ///   numbers in arithmetic (`$((a*2))`) and assignments still count.
+/// - any literal in a file whose parse tree has an error (see [`bash_tree_has_error`]).
 /// - `string`: made only of expansions (`"$@"`, `"${1}"`; text mixed in, as in
 ///   `"Usage: $0"`, stays flagged), a shell boolean/`{}` token, only separators/escapes
 ///   (`"===="`, `"\n"`), or an `echo`/`printf` argument (display text, not a value).
 fn bash_is_exempt_literal(node: Node, src: &[u8]) -> bool {
+    if bash_tree_has_error(node) {
+        return true;
+    }
     let parent_kind = node.parent().map(|p| p.kind());
     match node.kind() {
         "number" => matches!(parent_kind, Some("file_redirect" | "command")),
@@ -1232,6 +1236,17 @@ fn bash_is_exempt_literal(node: Node, src: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// tree-sitter-bash can desynchronise quote pairing after odd quoting earlier in a file
+/// (7% of 300 sampled scripts had a parse error), then reports the text *between* two
+/// quoted strings as a literal; none of the literals in such a file can be trusted.
+fn bash_tree_has_error(node: Node) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    root.has_error()
 }
 
 fn bash_is_pure_expansion(node: Node) -> bool {
@@ -3397,6 +3412,14 @@ mod tests {
             bash_magic_literal_findings("a=\"Usage: $0\"\nb=\"Usage: $0\"\nc=\"Usage: $0\"\n"),
             1
         );
+    }
+
+    #[test]
+    fn bash_exempts_literals_in_a_file_with_a_parse_error() {
+        let clean = "a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n";
+        assert_eq!(bash_magic_literal_findings(clean), 1);
+        let broken = format!("{clean}if then fi )\n");
+        assert_eq!(bash_magic_literal_findings(&broken), 0);
     }
 
     #[test]
