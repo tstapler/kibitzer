@@ -228,17 +228,19 @@ impl Checker for CommentQualityChecker {
         // one fence, not re-opened/closed per line. See `check_commented_out_code`.
         let mut in_fence = false;
         let mut in_pep723_block = false;
-        for comment in &comments {
+        for (i, comment) in comments.iter().enumerate() {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
             // PEP 723 inline script metadata is TOML (`key = value`), which reads as
             // Python assignments; it is live data, not commentary or dead code.
             if self.lang == Language::Python {
-                if is_pep723_sentinel_open(text) {
-                    in_pep723_block = true;
+                if in_pep723_block {
+                    if is_pep723_sentinel_close(text) {
+                        in_pep723_block = false;
+                    }
                     continue;
                 }
-                if in_pep723_block {
-                    in_pep723_block = !is_pep723_sentinel_close(text);
+                if is_pep723_sentinel_open(text) {
+                    in_pep723_block = true;
                     continue;
                 }
             }
@@ -863,6 +865,11 @@ fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8])
             cursor = sibling;
             continue;
         }
+        // Walking backward, a PEP 723 closer is the first line of its block we meet; the
+        // block is metadata, not the declaration's doc comment.
+        if is_pep723_sentinel_close(text) {
+            break;
+        }
         if text
             .lines()
             .any(|line| looks_like_code(strip_comment_markers(line)))
@@ -1102,21 +1109,24 @@ mod tests {
         let src = "# /// script\n# dependencies = [\"rich\"]\n# ///\n# x = compute(1, 2)\ndef main():\n    pass\n";
         let findings = run(Language::Python, src);
         assert!(
-            findings.iter().any(|f| f.message.contains("[commented-out-code]")),
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
     }
 
     #[test]
-    fn pep723_pattern_is_not_exempt_outside_python() {
-        let src = "// /// script\n// dependencies = [\n//   \"rich\",\n// ]\n// ///\nfunc f() {}\n";
-        // `#` sentinels are Python's; a Go/Rust file never enters the exemption.
+    fn pep723_block_directly_above_a_function_is_not_counted_as_its_doc_comment() {
+        let src = "# /// script\n# requires-python = \">=3.11\"\n# dependencies = [\n#   \"rich\",\n# ]\n# ///\ndef main():\n    return 1 + 2\n";
+        let findings = run(Language::Python, src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn pep723_sentinels_require_a_hash_prefix() {
         assert!(!is_pep723_sentinel_open("// /// script"));
-        let findings = run(Language::Go, src);
-        assert!(
-            findings.iter().any(|f| f.message.contains("[commented-out-code]")),
-            "findings: {findings:?}"
-        );
+        assert!(!is_pep723_sentinel_close("// ///"));
     }
 
     #[test]
