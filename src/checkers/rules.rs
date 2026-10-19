@@ -7,7 +7,9 @@ use tree_sitter::Node;
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::file_size;
 use crate::config::Severity;
-use crate::node_kind::{GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind};
+use crate::node_kind::{
+    BashKind, GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind,
+};
 
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
@@ -1222,14 +1224,18 @@ fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
 /// - `string`: made only of expansions (`"$@"`, `"${1}"`; text mixed in, as in
 ///   `"Usage: $0"`, stays flagged), a shell boolean/`{}` token, only separators/escapes
 ///   (`"===="`, `"\n"`), or an `echo`/`printf` argument (display text, not a value).
+// Non-goal (typed-node-kind-migration, ADR-001): the bash grammar has no typed kind enum; raw kind strings stay.
 fn bash_is_exempt_literal(node: Node, src: &[u8]) -> bool {
     if bash_tree_has_error(node) {
         return true;
     }
-    let parent_kind = node.parent().map(|p| p.kind());
-    match node.kind() {
-        "number" => matches!(parent_kind, Some("file_redirect" | "command")),
-        "string" => {
+    let parent_kind = node.parent().map(BashKind::of);
+    match BashKind::of(node) {
+        BashKind::Number => matches!(
+            parent_kind,
+            Some(BashKind::FileRedirect | BashKind::Command)
+        ),
+        BashKind::String => {
             bash_is_pure_expansion(node)
                 || bash_is_boilerplate_text(node, src)
                 || bash_is_display_argument(node, src)
@@ -1280,8 +1286,12 @@ fn bash_is_boilerplate_text(node: Node, src: &[u8]) -> bool {
         .all(|c| c.is_whitespace() || "=-*#~_".contains(c))
 }
 
+// Non-goal (typed-node-kind-migration, ADR-001): the bash grammar has no typed kind enum; raw kind strings stay.
 fn bash_is_display_argument(node: Node, src: &[u8]) -> bool {
-    let Some(command) = node.parent().filter(|p| p.kind() == "command") else {
+    let Some(command) = node
+        .parent()
+        .filter(|p| BashKind::of(*p) == BashKind::Command)
+    else {
         return false;
     };
     command
