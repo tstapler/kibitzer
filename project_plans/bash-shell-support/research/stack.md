@@ -33,8 +33,20 @@ Labels: VERIFIED = command/file run in this worktree; INFERRED = reasoned, not r
 Run in parallel (default), `cargo test --test daemon_spawn` fails with `ExecutableFileBusy` on base `7634824`
 (4 of 4 runs: 2, 3, 6, 3 failures) and on this branch (4 of 4 runs: 4, 2, 1, 3 failures); the failing set varies
 per run. On the branch with `-- --test-threads=1` it passes 14/14 (3 of 3). No file under `tests/` differs from
-base. Mechanism (INFERRED): per-test `std::fs::copy` of the test binary (`tests/daemon_spawn.rs:42`) races with
-sibling tests' fork/exec. The cause is the fixture's parallelism, not the bash change.
+base. Root cause (VERIFIED with `strace -f -e trace=openat,execve,clone3,close,copy_file_range` on the test binary,
+captured on the branch; tid 699434 = test thread A, 699445 = test thread B, same process 699431):
+
+1. `/tmp` is tmpfs, `target/` is btrfs, so `Scratch::new`'s `hard_link` (`tests/daemon_spawn.rs:41`) cannot succeed and
+   the `fs::copy` fallback runs; `copy_file_range` returns `EXDEV` and the copy is a read/write loop (~350 ms).
+2. Thread A opens the copy `O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC` as fd 9 (t=.9599) and closes it at t=.3078.
+3. Thread B calls `clone3(CLONE_VM|CLONE_VFORK)` at t=.3077, 0.2 ms *before* A's `close(9)`. Test threads share one fd
+   table, so the child (tid 699484) inherits the write fd; `O_CLOEXEC` releases it only at that child's `execve`,
+   which completes at t=.3140.
+4. Thread A's child (tid 699485) calls `execve` on the copy at t=.3104 and gets `ETXTBSY`, because tid 699484 still
+   holds it open for writing.
+
+So the race is a fork in one test thread overlapping the copy of another thread's binary: the fixture, not the bash
+change. Same code runs on base, which fails identically.
 
 ## node-types.json: 0.23.3 vs 0.25.1
 
