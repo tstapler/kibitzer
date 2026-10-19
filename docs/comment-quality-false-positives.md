@@ -34,6 +34,28 @@ section below for the first such real-world signal.
   or `break;` is no longer flagged as commented-out code. Accepted per this checker's
   stated bias toward missing real dead code over flagging prose.
 
+### PEP 723 inline script metadata block misread as commented-out code
+
+- **Symptom**: a Python file with a `# /// script` … `# ///` block fired
+  `[commented-out-code]` on body lines such as `# dependencies = [`.
+- **Mechanism**: PEP 723 bodies are TOML `key = value` lines, syntactically identical to
+  Python assignments, so `is_assignment` accepted them.
+- **Fixed by**: `check` tracks an `in_pep723_block` state (Python only) and skips every
+  comment node from the `# /// <type>` opener through the `# ///` closer (trailing
+  whitespace tolerated), so no comment-quality rule sees the block. Guarded by
+  `pep723_inline_script_metadata_block_is_not_flagged`,
+  `pep723_block_with_other_type_and_trailing_whitespace_is_not_flagged`,
+  `real_dead_code_after_closed_pep723_block_is_still_flagged` and
+  `pep723_block_directly_above_a_function_is_not_counted_as_its_doc_comment` (the
+  `[over-commented]` walk reads leading comments separately, so `leading_comment_nodes`
+  also stops at a PEP 723 closer). The Python-only guard is a one-line `self.lang`
+  check with no dedicated test: no non-Python grammar here parses `#` lines as comments.
+- **Known trade-off**: an opener only starts a block if a `# ///` closer appears later in
+  the file (guarded by `unclosed_pep723_opener_does_not_silence_later_comments`); a stray
+  closer far below an unrelated opener would still exempt everything between them. A
+  PEP 723 block inside a function body still counts toward that function's `[over-commented]`
+  ratio; the exemption covers the per-comment rules and leading doc comments.
+
 ### 2026-09-06 — Kubernetes/Cassandra/Servo backtest — six findings, all fixed
 
 A real backtest (three cloned OSS repos: `pkg/kubelet` from kubernetes/kubernetes,
