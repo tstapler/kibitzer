@@ -149,3 +149,11 @@ Per kept tag, over all four ground-truth sets (214 rows; correct / predicted for
 | compile-check | 51/51 | 51/54 |
 
 These tags were kept because they matched in all three held-out rounds, so the table is a fit to that data, not a generalisation estimate.
+
+## After round 6
+
+Held-out 4 (`HELDOUT4.md`) found three false-positive classes (14 findings). Rule change only, no tagger change: an env-gated subprocess entrypoint (`if os.Getenv(..) == "" { return }` then a `Serve*`/`Run*`/`Main*`/`Start*`/`Listen*` call) is not reported; a struct literal carrying the testing handle into an unresolved call whose name contains check/verify/assert/require/expect/validate/contract/test counts as asserting; a mockery `.EXPECT()...Panic(..)` or testify `.On(..).Panic(..)` chain counts as a guarded panic. Details and the exact rules are in `HELDOUT4.md` "After round 6".
+
+Guardrails (whole-repo scans, `comm` on `file:line`): in-sample 65 -> 65 (64/64 true positives), held-out 1 12 -> 12 (12/12), held-out 2 72 -> 72 (72/72), held-out 3 37 -> 37 (36/36, rclone `TestTests` still the one false positive), held-out 4 82 -> 68 (68/68). Only the 14 targeted false positives disappeared.
+
+All four held-out sets (1, 2, 3, 4) are now tuning data. The 0 remaining false positives on held-out 4 is a fit, not a generalisation estimate; any accuracy claim needs a fresh batch of repos.

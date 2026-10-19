@@ -121,3 +121,46 @@ the part that needs a human decision.
 Answer: the three kept tags generalise (no wrong tag on a false positive, precision at or near 100%, recall
 near 90%); the final rule does not clearly generalise, because 13 of its 14 false positives come from
 two repos through three idioms it has no handling for.
+
+## After round 6
+
+Commit (this round's rule change): three rule changes aimed at the 14 false positives above, no
+tagger change. All four held-out sets (1, 2, 3 and 4) are now tuning data. Any accuracy claim needs a
+fresh batch of repos; the numbers below measure fit, not generalisation.
+
+Rules (`src/checkers/test_no_assertion.rs`, fixtures `testdata/test-quality/go/{env_entrypoint,params_struct_handle,mock_panic_expectation}_test.go`):
+
+1. Env-gated subprocess entrypoint (7, vault). The test is skipped from reporting when its first
+   statement is an `if` (no `else`) whose condition calls `os.Getenv(` or `os.LookupEnv(`, and either the
+   remaining body or the `if` body (when the `if` is the only statement) ends with a call whose last
+   segment starts with `Serve`, `Run`, `Main`, `Start` or `Listen`. An early `return` gate followed by
+   an empty body, or by an ordinary call such as `doExpensiveThing()`, is still reported, as is a bare
+   `Serve(...)` with no gate.
+2. Params-struct `t` (6, otel-collector). A call counts as asserting when an argument is a struct
+   literal (or `&literal`, or a variable bound to one in the same function) with a field set to the
+   testing handle (`Params{T: t}`), the callee is not resolvable in the file, and its last segment
+   contains `check`, `verify`, `assert`, `require`, `expect`, `validate`, `contract` or `test`
+   (any case). The existing rule that a bare `t` argument to an unresolved call asserts is unchanged and
+   already covered `Foo(t)`; a literal carrying `t` into `newServer(Params{T: t})` still gets reported.
+3. Mock `.Panic` expectation (1, argo-cd). A call whose callee text ends in `.Panic` and contains
+   `.EXPECT()` (mockery) or `.On(` (testify) counts as a guarded panic. `logger.Panic(...)` does not.
+   The narrower form "only when the mock is later asserted" was not feasible: the argo-cd test never
+   asserts the mock, the `Panic` is the oracle. The sibling `TestHandleModEvent_HasChanges` (`Once()`
+   expectations that nothing verifies) is still reported, correctly.
+
+Guardrail: whole-repo scans of `test-no-assertion-go` over 29 repos, `file:line` sets compared with
+`comm`, base = tip 48a563f binary, after = this commit.
+
+| Set | Findings before | After | Ground-truth true positives still reported | False positives left |
+|---|---|---|---|---|
+| In-sample (kubernetes 27, stapler-squad 38) | 65 | 65 | 64/64 | 0 |
+| Held-out 1 (17 rows) | 12 | 12 | 12/12 | 0 |
+| Held-out 2 (79 rows) | 72 | 72 | 72/72 | 0 |
+| Held-out 3 (54 rows) | 37 | 37 | 36/36 | 1 (rclone `TestTests`, unchanged) |
+| Held-out 4 (82 rows) | 82 | 68 | 68/68 | 0 |
+
+The only findings removed anywhere are the 14 held-out 4 false positives (vault 7, otel-collector 6,
+argo-cd 1); no finding was added and no true positive was lost. Loose precision on this set is now
+68/68 by construction, because the rules were written from these 14 cases: that figure is a fit, not
+evidence of generalisation. Rule 2's name filter and rule 1's serve-prefix list are judgment calls
+taken from two repos each.
