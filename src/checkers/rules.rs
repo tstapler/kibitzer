@@ -2093,6 +2093,7 @@ fn expression_nesting(
     let mut deepest = 0;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Cross-grammar argument/index names remain raw (typed-node-kind-migration non-goal).
         let is_arguments = child.kind().contains("argument");
         let child_chain = if is_operator {
             ChainContext {

@@ -828,6 +828,7 @@ pub(crate) fn function_value_names(
     fn is_value(mut node: Node) -> bool {
         while let Some(parent) = node.parent() {
             let field_is_node = |field| parent.child_by_field_name(field) == Some(node);
+            // Value-position shapes span Go and JS/TS (typed-node-kind-migration non-goal).
             match parent.kind() {
                 "parenthesized_expression" | "literal_element" => node = parent,
                 "as_expression" | "satisfies_expression" | "non_null_expression"

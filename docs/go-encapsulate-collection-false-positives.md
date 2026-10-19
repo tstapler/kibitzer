@@ -13,15 +13,15 @@ or whether a doc comment says the sharing is intentional.
 
 ## Log
 
-### 2026-10-12 — stapler-squad/kubernetes corpus backtest — getter fixed by an external interface
+### 2026-10-12 — interface getter sharing — needs discussion
 
-- **Repo**: stapler-squad `session/git/diff.go` (`func (p *diffFilePatch) Chunks() []fdiff.Chunk { return p.chunks }`,
-  unexported type implementing go-git's `fdiff.Patch`); kubernetes `SupportedMediaTypes()`
-  implementing `runtime.NegotiatedSerializer`.
-- **Why it's a false positive**: the interface fixes the return type and the receiver type never
-  leaves the package.
-- **Mechanism**: no receiver-visibility or interface check in `check_method`. Counts (30/218
-  stapler-squad real+worktree, about 10 kubernetes) are agent estimates.
+- **Examples**: stapler-squad `session/git/diff.go` returns `p.chunks` from `Chunks()`;
+  Kubernetes `SupportedMediaTypes()` implements `runtime.NegotiatedSerializer`.
+- **Unresolved judgment**: an interface fixes the return type, not whether the getter can copy
+  the collection. An unexported receiver can also escape through an exported interface. These
+  facts alone do not establish a false positive, so no interface-wide exemption is justified.
+- **Mechanism**: the checker reports direct slice/map field returns. Confirm an intentional
+  sharing contract before treating either example as noise.
 
 ## Fixed
 
