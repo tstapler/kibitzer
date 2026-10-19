@@ -227,8 +227,21 @@ impl Checker for CommentQualityChecker {
         // `///` lines are each their own node, verified via `to_sexp()` — is tracked as
         // one fence, not re-opened/closed per line. See `check_commented_out_code`.
         let mut in_fence = false;
+        let mut in_pep723_block = false;
         for comment in &comments {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
+            // PEP 723 inline script metadata is TOML (`key = value`), which reads as
+            // Python assignments; it is live data, not commentary or dead code.
+            if self.lang == Language::Python {
+                if is_pep723_sentinel_open(text) {
+                    in_pep723_block = true;
+                    continue;
+                }
+                if in_pep723_block {
+                    in_pep723_block = !is_pep723_sentinel_close(text);
+                    continue;
+                }
+            }
             // The fix an agent adds for a finding must not itself produce one, so directive
             // lines are blanked; the comment's other lines are still judged.
             if is_directive_only_comment(text) {
@@ -431,6 +444,22 @@ fn is_brace_closing_annotation(comment: Node, src: &str) -> bool {
         return false;
     };
     before.trim().trim_end_matches([';', ',']).trim_end() == "}"
+}
+
+/// Whether `text` opens a PEP 723 block (`# /// <type>`). The type must start with an
+/// alphanumeric so the closing `# ///` is never mistaken for an open.
+fn is_pep723_sentinel_open(text: &str) -> bool {
+    text.trim()
+        .strip_prefix('#')
+        .and_then(|rest| rest.trim_start().strip_prefix("///"))
+        .is_some_and(|rest| rest.trim_start().starts_with(|c: char| c.is_alphanumeric()))
+}
+
+/// Whether `text` closes a PEP 723 block (`# ///`), tolerating surrounding whitespace.
+fn is_pep723_sentinel_close(text: &str) -> bool {
+    text.trim()
+        .strip_prefix('#')
+        .is_some_and(|rest| rest.trim() == "///")
 }
 
 /// Strips the leading comment-marker noise (`//`, `///`, `//!`, `#`, `/*`, `*/`, a
@@ -1048,6 +1077,44 @@ mod tests {
             !findings
                 .iter()
                 .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    const PEP723_REPRO: &str = "#!/usr/bin/env python3\n# /// script\n# requires-python = \">=3.11\"\n# dependencies = [\n#   \"rich>=13.0.0\",\n#   \"typer>=0.9.0\",\n# ]\n# ///\n\ndef main():\n    pass\n";
+
+    #[test]
+    fn pep723_inline_script_metadata_block_is_not_flagged() {
+        let findings = run(Language::Python, PEP723_REPRO);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn pep723_block_with_other_type_and_trailing_whitespace_is_not_flagged() {
+        let src = "# /// my-tool\n# dependencies = [\n#   \"rich\",\n# ]\n# ///   \n# x = compute(1, 2)\ndef main():\n    pass\n";
+        let findings = run(Language::Python, src);
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert_eq!(findings[0].line, 6);
+    }
+
+    #[test]
+    fn real_dead_code_after_closed_pep723_block_is_still_flagged() {
+        let src = "# /// script\n# dependencies = [\"rich\"]\n# ///\n# x = compute(1, 2)\ndef main():\n    pass\n";
+        let findings = run(Language::Python, src);
+        assert!(
+            findings.iter().any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn pep723_pattern_is_not_exempt_outside_python() {
+        let src = "// /// script\n// dependencies = [\n//   \"rich\",\n// ]\n// ///\nfunc f() {}\n";
+        // `#` sentinels are Python's; a Go/Rust file never enters the exemption.
+        assert!(!is_pep723_sentinel_open("// /// script"));
+        let findings = run(Language::Go, src);
+        assert!(
+            findings.iter().any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
     }

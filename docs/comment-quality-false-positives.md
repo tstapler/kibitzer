@@ -34,6 +34,21 @@ section below for the first such real-world signal.
   or `break;` is no longer flagged as commented-out code. Accepted per this checker's
   stated bias toward missing real dead code over flagging prose.
 
+### PEP 723 inline script metadata block misread as commented-out code
+
+- **Symptom**: a Python file with a `# /// script` … `# ///` block fired
+  `[commented-out-code]` on body lines such as `# dependencies = [`.
+- **Mechanism**: PEP 723 bodies are TOML `key = value` lines, syntactically identical to
+  Python assignments, so `is_assignment` accepted them.
+- **Fixed by**: `check` tracks an `in_pep723_block` state (Python only) and skips every
+  comment node from the `# /// <type>` opener through the `# ///` closer (trailing
+  whitespace tolerated), so no comment-quality rule sees the block. Guarded by
+  `pep723_inline_script_metadata_block_is_not_flagged`,
+  `pep723_block_with_other_type_and_trailing_whitespace_is_not_flagged`,
+  `real_dead_code_after_closed_pep723_block_is_still_flagged` and
+  `pep723_pattern_is_not_exempt_outside_python`.
+- **Known trade-off**: an opener with no closer silences the rest of the file's comments.
+
 ### 2026-09-06 — Kubernetes/Cassandra/Servo backtest — six findings, all fixed
 
 A real backtest (three cloned OSS repos: `pkg/kubelet` from kubernetes/kubernetes,
