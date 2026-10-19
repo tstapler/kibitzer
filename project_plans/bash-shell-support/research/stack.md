@@ -23,6 +23,19 @@ Labels: VERIFIED = command/file run in this worktree; INFERRED = reasoned, not r
   The runtime check is the ABI number in the generated `parser.c` vs. what tree-sitter 0.26 accepts (INFERRED; the
   landed tests pass against 0.23.3 per the commit message, which I did not re-run here).
 
+- Why 0.23 satisfies the item: backlog AC 1 (item db3e0deb, "Cargo.toml declares tree-sitter-bash at a compatible
+  version (0.23.x)") is the acceptance test and names 0.23.x; the description's Proposal step 1 ("0.25.x") is the
+  conflicting text, and the AC takes precedence. Verified 2026-10-19: `Cargo.lock` resolves tree-sitter-bash
+  0.23.3 alongside a single tree-sitter 0.26.12 (`cargo tree -i tree-sitter`), 0 build warnings.
+
+## `tests/daemon_spawn.rs` ETXTBSY is pre-existing
+
+Run in parallel (default), `cargo test --test daemon_spawn` fails with `ExecutableFileBusy` on base `7634824`
+(4 of 4 runs: 2, 3, 6, 3 failures) and on this branch (4 of 4 runs: 4, 2, 1, 3 failures); the failing set varies
+per run. On the branch with `-- --test-threads=1` it passes 14/14 (3 of 3). No file under `tests/` differs from
+base. Mechanism (INFERRED): per-test `std::fs::copy` of the test binary (`tests/daemon_spawn.rs:42`) races with
+sibling tests' fork/exec. The cause is the fixture's parallelism, not the bash change.
+
 ## node-types.json: 0.23.3 vs 0.25.1
 
 - VERIFIED: `codegen/node-types/bash.json` is byte-identical to `tree-sitter-bash-0.23.3/src/node-types.json`
