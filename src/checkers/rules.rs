@@ -1251,19 +1251,16 @@ fn bash_tree_has_error(node: Node) -> bool {
 
 fn bash_is_pure_expansion(node: Node) -> bool {
     let mut cursor = node.walk();
-    let mut expansion_bytes = 0;
-    for c in node.named_children(&mut cursor) {
-        if !matches!(
-            c.kind(),
-            "expansion" | "simple_expansion" | "command_substitution" | "arithmetic_expansion"
-        ) {
-            return false;
-        }
-        expansion_bytes += c.end_byte() - c.start_byte();
-    }
-    // Everything between the two quotes is expansion text (no literal text mixed in).
-    expansion_bytes > 0
-        && expansion_bytes == (node.end_byte() - node.start_byte()).saturating_sub(2)
+    let mut children = node.named_children(&mut cursor).peekable();
+    // Literal text inside the quotes would be a named `string_content` child, which the
+    // `matches!` below rejects.
+    children.peek().is_some()
+        && children.all(|c| {
+            matches!(
+                c.kind(),
+                "expansion" | "simple_expansion" | "command_substitution" | "arithmetic_expansion"
+            )
+        })
 }
 
 fn bash_is_boilerplate_text(node: Node, src: &[u8]) -> bool {

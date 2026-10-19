@@ -295,3 +295,7 @@ The triad review (product, UX and engineering all `needs-work`) found the CLAUDE
 ### Flaky-test origin (confirmed)
 
 `backtest::tests::backtest_isolates_the_duplicate_cross_file_index_and_still_finds_duplicates` is a pre-existing race, not caused by this change: the `backtest::` tests share the process-global `KIBITZER_DUPLICATE_INDEX_DIR` env var (`src/backtest.rs:217,238`), so concurrent backtest tests trip the "must be restored" assertion. Evidence: on this branch 2 of 12 parallel runs of `cargo test --bin kibitzer backtest::` failed (0 of 1 serial); on a clean `master` checkout (`d76c1ab`) 1 of 25 failed. Both `tests/daemon_spawn.rs` and this test pass with `--test-threads=1`. Not fixed here.
+
+### Accepted after the second sdd:6-verify pass (no BLOCKER / MUST FIX)
+
+Deferred, non-blocking: rename `slog_key_predicate` (now used by Go and Bash) to a language-neutral name; evaluate `root.has_error()` once per file instead of walking to the root per literal (measured linear, about 65 µs per line on synthetic scripts of up to 60k lines, so only matters for very large files); add a per-language flag on `LangRuleConfig` instead of `skips_code_heuristics(lang)`; `BashKind` still has no consumer.

@@ -237,13 +237,13 @@ impl Checker for CommentQualityChecker {
             }
             let text = &*without_directive_lines(text);
             check_verbose_phrases(*comment, text, &mut findings);
-            if !BASH_SKIPS_CODE_HEURISTICS || self.lang != Language::Bash {
+            if !skips_code_heuristics(self.lang) {
                 in_fence =
                     check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
             }
         }
 
-        if !BASH_SKIPS_CODE_HEURISTICS || self.lang != Language::Bash {
+        if !skips_code_heuristics(self.lang) {
             let cfg = rules::lang_config(self.lang);
             walk_declarations_for_proportionality(
                 tree.root_node(),
@@ -258,11 +258,13 @@ impl Checker for CommentQualityChecker {
     }
 }
 
-/// `commented-out-code` and `over-commented` are C-family-shaped; on 10 bash findings in the
-/// backtest triage (docs/backtest-triage/bash-2026-10-18.md) all 9 of them were false
-/// positives (usage examples, `#key=value` metadata, why-comments). Only `verbose-comment`
-/// runs for bash until those two heuristics are tuned for shell.
-const BASH_SKIPS_CODE_HEURISTICS: bool = true;
+/// `commented-out-code` and `over-commented` are C-family-shaped; all 9 bash findings from
+/// those two rules in the backtest triage (docs/backtest-triage/bash-2026-10-18.md) were
+/// false positives (usage examples, `#key=value` metadata, why-comments). Only
+/// `verbose-comment` runs for bash until they are tuned for shell.
+fn skips_code_heuristics(lang: Language) -> bool {
+    lang == Language::Bash
+}
 
 fn collect_comments<'a>(node: Node<'a>, kinds: &[&str], out: &mut Vec<Node<'a>>) {
     if kinds.contains(&node.kind()) {

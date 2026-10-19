@@ -58,6 +58,9 @@ pub(crate) fn walk_preorder<'a>(node: Node<'a>, visit: &mut impl FnMut(Node<'a>)
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::node_kind::GoKind;
+
     #[test]
     fn bash_comment_kind_matches_a_real_parsed_comment() {
         let mut parser = tree_sitter::Parser::new();
@@ -68,9 +71,6 @@ mod tests {
         let comment = tree.root_node().child(0).unwrap();
         assert!(comment_kinds(Language::Bash).contains(&comment.kind()));
     }
-
-    use super::*;
-    use crate::node_kind::GoKind;
 
     fn parse_go(src: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
