@@ -191,6 +191,7 @@ impl CommentQualityChecker {
             Language::Java => "comment-quality-java",
             Language::Kotlin => "comment-quality-kotlin",
             Language::Rust => "comment-quality-rust",
+            Language::Bash => "comment-quality-bash",
         }
     }
 }
@@ -257,21 +258,33 @@ impl Checker for CommentQualityChecker {
             }
             let text = &*without_directive_lines(text);
             check_verbose_phrases(*comment, text, &mut findings);
-            in_fence =
-                check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
+            if !skips_code_heuristics(self.lang) {
+                in_fence =
+                    check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
+            }
         }
 
-        let cfg = rules::lang_config(self.lang);
-        walk_declarations_for_proportionality(
-            tree.root_node(),
-            &cfg,
-            kinds,
-            ctx.source.as_bytes(),
-            &mut findings,
-        );
+        if !skips_code_heuristics(self.lang) {
+            let cfg = rules::lang_config(self.lang);
+            walk_declarations_for_proportionality(
+                tree.root_node(),
+                &cfg,
+                kinds,
+                ctx.source.as_bytes(),
+                &mut findings,
+            );
+        }
 
         Ok(findings)
     }
+}
+
+/// `commented-out-code` and `over-commented` are C-family-shaped; all 9 bash findings from
+/// those two rules in the backtest triage (docs/backtest-triage/bash-2026-10-18.md) were
+/// false positives (usage examples, `#key=value` metadata, why-comments). Only
+/// `verbose-comment` runs for bash until they are tuned for shell.
+fn skips_code_heuristics(lang: Language) -> bool {
+    lang == Language::Bash
 }
 
 fn collect_comments<'a>(node: Node<'a>, kinds: &[&str], out: &mut Vec<Node<'a>>) {
@@ -1012,6 +1025,27 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.message.contains("[verbose-comment]") && f.message.contains("leverage")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn bash_skips_code_heuristics_but_keeps_verbose_comment() {
+        // Four comment lines over a multi-line body: Rust flags this as over-commented (see
+        // `rust_flags_over_commented_function`), so only the bash skip can silence it.
+        let src = "# x=$(foo bar)\n# This seamlessly handles requests.\n# It takes a request.\n# It returns a reply.\nhandle() {\n  echo a\n  echo b\n}\n";
+        let findings = run(Language::Bash, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[verbose-comment]")),
+            "findings: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("[commented-out-code]")
+                    && !f.message.contains("[over-commented]")),
             "findings: {findings:?}"
         );
     }

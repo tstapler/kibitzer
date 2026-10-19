@@ -18,7 +18,7 @@ use crate::config::find_config;
 /// former copy made). Lets this command cheaply detect the "no supported languages"
 /// case up front, before doing any parsing.
 fn has_supported_extension(path: &Path) -> bool {
-    Language::for_path(path).is_some()
+    Language::for_path(path).is_some_and(Language::has_symbol_extraction)
 }
 
 /// Runs `kibitzer architecture export`. Always exits `ExitCode::SUCCESS` on a successful

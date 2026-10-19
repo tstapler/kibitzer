@@ -7,7 +7,9 @@ use tree_sitter::Node;
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::file_size;
 use crate::config::Severity;
-use crate::node_kind::{GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind};
+use crate::node_kind::{
+    BashKind, GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind,
+};
 
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
@@ -903,6 +905,7 @@ pub(crate) fn lang_config(lang: Language) -> LangRuleConfig {
         Language::Java => java_lang_config(),
         Language::Kotlin => kotlin_lang_config(),
         Language::Rust => rust_lang_config(),
+        Language::Bash => bash_lang_config(),
     }
 }
 
@@ -1189,6 +1192,143 @@ fn kotlin_lang_config() -> LangRuleConfig {
         density_boundary_kinds: &["lambda_literal", "anonymous_function"],
         collection_literal_kinds: &[],
         slog_key_predicate: None,
+    }
+}
+
+/// Bash has no constant-binding idiom the `replace-magic-literal` exclusion pass can
+/// recognise (`readonly X=1` parses as a `declaration_command`, not tried here).
+fn no_const_binding<'a>(_node: Node<'a>, _src: &'a [u8]) -> Option<ConstBinding<'a>> {
+    None
+}
+
+/// Bash has no formal parameter list (arguments are positional `$1`/`$2` at call time),
+/// so there is nothing for `long-parameter-list`/`flag-argument` to inspect.
+fn no_params(_decl: Node) -> Option<Node> {
+    None
+}
+
+fn zero_params(_params: Node) -> usize {
+    0
+}
+
+fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
+    Vec::new()
+}
+
+/// Bash literals `replace-magic-literal` should not count: redirect targets, plain command
+/// number arguments, pure-expansion/separator/`echo`/`printf` strings, and everything in a
+/// file with a parse error. Rationale and examples: docs/backtest-triage/bash-2026-10-18.md.
+fn bash_is_exempt_literal(node: Node, src: &[u8]) -> bool {
+    if bash_tree_has_error(node) {
+        return true;
+    }
+    let parent_kind = node.parent().map(BashKind::of);
+    match BashKind::of(node) {
+        BashKind::Number => matches!(
+            parent_kind,
+            Some(BashKind::FileRedirect | BashKind::Command)
+        ),
+        BashKind::String => {
+            bash_is_pure_expansion(node)
+                || bash_is_boilerplate_text(node, src)
+                || bash_is_display_argument(node, src)
+        }
+        _ => false,
+    }
+}
+
+/// tree-sitter-bash can desynchronise quote pairing after odd quoting earlier in a file
+/// (7% of 300 sampled scripts had a parse error), then reports the text *between* two
+/// quoted strings as a literal; none of the literals in such a file can be trusted.
+fn bash_tree_has_error(node: Node) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    root.has_error()
+}
+
+fn bash_is_pure_expansion(node: Node) -> bool {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor).peekable();
+    // Literal text inside the quotes would be a named `string_content` child, which the
+    // `matches!` below rejects.
+    children.peek().is_some()
+        && children.all(|c| {
+            matches!(
+                c.kind(),
+                "expansion" | "simple_expansion" | "command_substitution" | "arithmetic_expansion"
+            )
+        })
+}
+
+fn bash_is_boilerplate_text(node: Node, src: &[u8]) -> bool {
+    let Ok(text) = node.utf8_text(src) else {
+        return false;
+    };
+    let inner = text.trim_matches('"');
+    if matches!(inner, "true" | "false" | "yes" | "no" | "y" | "n" | "{}") {
+        return true;
+    }
+    let stripped = inner
+        .replace("\\n", "")
+        .replace("\\t", "")
+        .replace("\\r", "");
+    stripped
+        .chars()
+        .all(|c| c.is_whitespace() || "=-*#~_".contains(c))
+}
+
+fn bash_is_display_argument(node: Node, src: &[u8]) -> bool {
+    let Some(command) = node
+        .parent()
+        .filter(|p| BashKind::of(*p) == BashKind::Command)
+    else {
+        return false;
+    };
+    command
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src).ok())
+        .is_some_and(|name| matches!(name, "echo" | "printf"))
+}
+
+/// Verified against the vendored `codegen/node-types/bash.json` (tree-sitter-bash 0.23.3):
+/// no return/break/continue/until nodes, no parameter list, flat `if` branches (nesting is
+/// under-counted, never over-counted). Per-rule consequences: docs/syntax-rules.md "Bash caveats".
+fn bash_lang_config() -> LangRuleConfig {
+    LangRuleConfig {
+        name: "syntax-rules-bash",
+        file_globs: &["**/*.sh", "**/*.bash"],
+        function_kinds: &["function_definition"],
+        if_kind: "if_statement",
+        nesting_kinds: &[
+            "for_statement",
+            "c_style_for_statement",
+            "while_statement",
+            "case_statement",
+            "subshell",
+        ],
+        else_wrapper_kinds: &[],
+        chain_kinds: &[],
+        param_counter: zero_params,
+        body_finder: field_body,
+        params_finder: no_params,
+        bool_param_finder: no_bool_params,
+        ternary_kind: None,
+        block_kind: "compound_statement",
+        statement_container: identity_stmt,
+        unwrap_statement: identity_stmt,
+        terminal_kinds: &[],
+        panic_detector: no_panic_detector,
+        literal_kinds: &["string", "number"],
+        numeric_literal_kinds: &["number"],
+        binding_finder: no_const_binding,
+        return_kind: "return_statement",
+        call_kinds: &["command"],
+        operator_kinds: &["binary_expression"],
+        density_boundary_kinds: &["subshell"],
+        collection_literal_kinds: &[],
+        slog_key_predicate: Some(bash_is_exempt_literal),
     }
 }
 
@@ -2170,6 +2310,10 @@ mod tests {
             tree_sitter_rust::LANGUAGE.into(),
             &lang_config(Language::Rust),
         );
+        assert_valid(
+            tree_sitter_bash::LANGUAGE.into(),
+            &lang_config(Language::Bash),
+        );
     }
 
     /// Epic 1.0's equivalence probe (validation.md): confirms the dispatcher wiring
@@ -2197,6 +2341,7 @@ mod tests {
             kotlin_lang_config().name
         );
         assert_eq!(lang_config(Language::Rust).name, rust_lang_config().name);
+        assert_eq!(lang_config(Language::Bash).name, bash_lang_config().name);
     }
 
     /// Epic 1.0's equivalence probe (validation.md): catches a mistranslation of the
@@ -3203,6 +3348,144 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[long-function]"))
         );
+    }
+
+    fn check_bash_source(src: &str) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let cfg = lang_config(Language::Bash);
+        let mut findings = Vec::new();
+        walk_declarations(tree.root_node(), &cfg, src.as_bytes(), &mut findings);
+        findings
+    }
+
+    #[test]
+    fn bash_flags_deep_nesting() {
+        let src = "f() {\n\
+             \tfor a in 1 2; do\n\
+             \t\twhile true; do\n\
+             \t\t\tfor b in 1 2; do\n\
+             \t\t\t\twhile true; do\n\
+             \t\t\t\t\tfor c in 1 2; do\n\
+             \t\t\t\t\t\techo deep\n\
+             \t\t\t\t\tdone\n\
+             \t\t\t\tdone\n\
+             \t\t\tdone\n\
+             \t\tdone\n\
+             \tdone\n\
+             }\n";
+        let findings = check_bash_source(src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[deep-nesting]")),
+            "got: {findings:?}"
+        );
+    }
+
+    fn bash_magic_literal_findings(src: &str) -> usize {
+        magic_literal_findings(Language::Bash, tree_sitter_bash::LANGUAGE.into(), src).len()
+    }
+
+    #[test]
+    fn bash_flags_repeated_plain_string_and_mixed_expansion_string() {
+        assert_eq!(
+            bash_magic_literal_findings("a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n"),
+            1
+        );
+        assert_eq!(
+            bash_magic_literal_findings("a=\"Usage: $0\"\nb=\"Usage: $0\"\nc=\"Usage: $0\"\n"),
+            1
+        );
+    }
+
+    #[test]
+    fn bash_exempts_literals_in_a_file_with_a_parse_error() {
+        let clean = "a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n";
+        assert_eq!(bash_magic_literal_findings(clean), 1);
+        let broken = format!("{clean}if then fi )\n");
+        let tree = crate::checker::GrammarCache::new()
+            .parse(Language::Bash, &broken)
+            .unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "fixture must be a parse error"
+        );
+        assert_eq!(bash_magic_literal_findings(&broken), 0);
+    }
+
+    #[test]
+    fn bash_exempts_repeated_pure_expansion_string() {
+        assert_eq!(
+            bash_magic_literal_findings(
+                "f \"$@\"\nf \"$@\"\nf \"$@\"\nf \"${1}\"\nf \"${1}\"\nf \"${1}\"\n"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn bash_exempts_redirect_targets_and_plain_command_number_arguments() {
+        let src = "a >&2\nb >&2\nc 2>&1\nd 2>&1\nexit 2\nexit 2\nsleep 5\nsleep 5\nsleep 5\n";
+        assert_eq!(bash_magic_literal_findings(src), 0);
+    }
+
+    #[test]
+    fn bash_still_flags_repeated_number_in_arithmetic() {
+        let src = "a=$((x*7))\nb=$((y*7))\nc=$((z*7))\n";
+        assert_eq!(bash_magic_literal_findings(src), 1);
+    }
+
+    #[test]
+    fn bash_exempts_repeated_boolean_strings() {
+        assert_eq!(
+            bash_magic_literal_findings("a=\"true\"\nb=\"true\"\nc=\"true\"\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn bash_exempts_repeated_separator_strings() {
+        assert_eq!(
+            bash_magic_literal_findings("d=\"====\"\ne=\"====\"\nf=\"====\"\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn bash_exempts_repeated_echo_and_printf_arguments() {
+        let src = "echo \"done!\"\necho \"done!\"\necho \"done!\"\nprintf \"ok\"\nprintf \"ok\"\nprintf \"ok\"\n";
+        assert_eq!(bash_magic_literal_findings(src), 0);
+    }
+
+    #[test]
+    fn bash_still_flags_repeated_string_arguments_to_other_commands() {
+        assert_eq!(
+            bash_magic_literal_findings("log \"done!\"\nlog \"done!\"\nlog \"done!\"\n"),
+            1
+        );
+    }
+
+    /// Locks in the known `if_branches` limitation (see `bash_lang_config`): nesting inside an
+    /// `elif`/`else` body isn't counted, so a later fix has to change this expectation on purpose.
+    #[test]
+    fn bash_deep_nesting_inside_else_branch_is_not_yet_counted() {
+        let deep = "for a in 1; do\n while true; do\n for b in 1; do\n while true; do\n for c in 1; do\n echo x\n done\n done\n done\n done\n done\n";
+        let src = format!("f() {{\n if true; then\n echo a\n echo b\n else\n{deep} fi\n}}\n");
+        assert!(
+            check_bash_source(&src)
+                .iter()
+                .all(|f| !f.message.contains("[deep-nesting]"))
+        );
+    }
+
+    #[test]
+    fn bash_allows_a_simple_function() {
+        let findings = check_bash_source("greet() {\n\techo \"hi $1\"\n}\n");
+        assert!(findings.is_empty(), "got: {findings:?}");
     }
 
     #[test]

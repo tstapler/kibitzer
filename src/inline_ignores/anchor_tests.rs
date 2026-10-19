@@ -48,6 +48,7 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("java-file-size", "C.java", || long_file("//")),
     ("kotlin-file-size", "x.kt", || long_file("//")),
     ("rust-file-size", "x.rs", || long_file("//")),
+    ("bash-file-size", "x.sh", || long_file("#")),
     ("syntax-rules-go", "x.go", || {
         "package main\n\nfunc f() {\n\ta := 86400\n\tb := 86400\n\tc := 86400\n}\n".into()
     }),
@@ -66,6 +67,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("syntax-rules-rust", "x.rs", || {
         "fn f() {\n    use_it(42);\n    use_it(42);\n    use_it(42);\n}\n".into()
     }),
+    ("syntax-rules-bash", "x.sh", || {
+        "f() {\n  for a in 1; do\n    while true; do\n      for b in 1; do\n        while true; do\n          for c in 1; do\n            echo x\n          done\n        done\n      done\n    done\n  done\n}\n".into()
+    }),
     ("comment-quality-go", "x.go", || {
         "package main\n\n// This seamlessly handles requests.\nfunc handle() {}\n".into()
     }),
@@ -83,6 +87,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     }),
     ("comment-quality-rust", "x.rs", || {
         "// This seamlessly handles requests.\nfn handle() {}\n".into()
+    }),
+    ("comment-quality-bash", "x.sh", || {
+        "# This seamlessly handles requests.\nhandle() { :; }\n".into()
     }),
     ("repetitive-sentence-structure", "n.md", || {
         "# T\n\nThis is bad. This is worse. This is worst.\n".into()
@@ -256,7 +263,7 @@ fn checker_name(check: &Check) -> &str {
 fn comment_syntax(path: &str) -> (&'static str, &'static str) {
     match Path::new(path).extension().and_then(|e| e.to_str()) {
         Some("md") => ("<!-- ", " -->"),
-        Some("py") => ("# ", ""),
+        Some("py" | "sh" | "bash") => ("# ", ""),
         _ => ("// ", ""),
     }
 }

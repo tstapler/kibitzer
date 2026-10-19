@@ -288,6 +288,16 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             name_finder: field_name,
             is_exported: rust_is_exported,
         },
+        // Architecture-model symbol extraction isn't implemented for shell scripts (they
+        // have no types, and no parameter lists for call-graph analysis) — empty kinds
+        // make a `.sh` file parse to zero symbols instead of being half-supported.
+        Language::Bash => LangSymbolConfig {
+            type_kinds: &[],
+            interface_kinds: &[],
+            function_kinds: &[],
+            name_finder: field_name,
+            is_exported: |_, _| false,
+        },
     }
 }
 

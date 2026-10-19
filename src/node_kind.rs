@@ -45,6 +45,11 @@ pub mod rust {
 }
 pub use rust::RustKind;
 
+pub mod bash {
+    include!(concat!(env!("OUT_DIR"), "/bash_kind.rs"));
+}
+pub use bash::BashKind;
+
 #[cfg(test)]
 mod tests {
     use super::*;

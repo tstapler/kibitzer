@@ -15,6 +15,7 @@ enum PreambleLang {
     Rust,
     Python,
     Js,
+    Shell,
 }
 
 impl PreambleLang {
@@ -30,6 +31,8 @@ impl PreambleLang {
             Some(Self::Python)
         } else if is(&["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"]) {
             Some(Self::Js)
+        } else if is(&["sh", "bash"]) {
+            Some(Self::Shell)
         } else {
             None
         }
@@ -123,7 +126,8 @@ impl PreambleState {
     }
 
     fn accepts_line(&mut self, line: &str, lang: PreambleLang) -> bool {
-        use PreambleLang::{Go, Js, Python};
+        use PreambleLang::{Go, Js, Python, Shell};
+        let hash_comments = matches!(lang, Python | Shell);
         if self.in_block_comment {
             self.in_block_comment = !line.contains("*/");
             return true;
@@ -135,15 +139,13 @@ impl PreambleState {
             return true;
         }
         if line.is_empty()
-            || (lang == Python && line.starts_with('#'))
-            || (lang != Python && line.starts_with("//"))
+            || (hash_comments && line.starts_with('#'))
+            || (!hash_comments && line.starts_with("//"))
             || (lang == Js && line.starts_with("#!"))
         {
             return true;
         }
-        if lang != Python
-            && let Some(rest) = line.strip_prefix("/*")
-        {
+        if !hash_comments && let Some(rest) = line.strip_prefix("/*") {
             self.in_block_comment = !rest.contains("*/");
             return true;
         }
@@ -199,11 +201,11 @@ fn adjust_depth(depth: usize, line: &str, lang: PreambleLang) -> usize {
 /// them (`from "a(b"`, `// (see x`) aren't counted. Not a full lexer: an unterminated
 /// quote drops the rest of the line.
 fn strip_noise(line: &str, lang: PreambleLang) -> String {
-    use PreambleLang::{Go, Js, JvmKt, Python, Rust};
+    use PreambleLang::{Go, Js, JvmKt, Python, Rust, Shell};
     let quotes: &[char] = match lang {
         Rust => &['"'],
         Go | Js => &['"', '\'', '`'],
-        JvmKt | Python => &['"', '\''],
+        JvmKt | Python | Shell => &['"', '\''],
     };
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -221,7 +223,7 @@ fn strip_noise(line: &str, lang: PreambleLang) -> String {
             quote = Some(c);
             continue;
         }
-        if lang == Python {
+        if matches!(lang, Python | Shell) {
             if c == '#' {
                 break;
             }
@@ -276,6 +278,9 @@ fn is_import_statement(line: &str, lang: PreambleLang) -> bool {
                 || (item.starts_with("mod ") && item.ends_with(';'))
         }
         PreambleLang::Python => line.starts_with("import ") || line.starts_with("from "),
+        // Shell has no import statements; only its leading `#` comments (license header,
+        // shebang) count as preamble, which `accepts_line` handles before this is reached.
+        PreambleLang::Shell => false,
         PreambleLang::Js => line.starts_with("import ") || line.starts_with("export * from "),
     }
 }
@@ -402,6 +407,23 @@ mod tests {
                 "{ext}"
             );
         }
+    }
+
+    #[test]
+    fn does_not_flag_shell_license_header_cross_file() {
+        let header = "#!/usr/bin/env bash\n#\n# Licensed under the Apache License, Version 2.0\n# you may not use this file except in compliance\n# with the License. You may obtain a copy at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n";
+        for ext in ["sh", "bash"] {
+            assert!(
+                cross_file(ext, header, "echo run\nexit 0").is_empty(),
+                "{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_flags_a_shell_code_block_repeated_cross_file() {
+        let body = "cd \"$build_dir\"\nmake clean-all-targets\nmake all-targets-parallel\nmake test-all-targets\nmake install-to-prefix\nmake dist-source-tarball\n";
+        assert!(!cross_file("sh", "#!/bin/sh", body).is_empty());
     }
 
     const RUST_USE_BLOCK: &str = "use std::collections::HashMap;\nuse std::collections::HashSet;\nuse std::path::{Path, PathBuf};\nuse anyhow::Result;\nuse serde::Serialize;\nuse serde::Deserialize;\n";

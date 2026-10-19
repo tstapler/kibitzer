@@ -9,7 +9,8 @@ pub(crate) fn comment_kinds(lang: Language) -> &'static [&'static str] {
         | Language::Python
         | Language::TypeScript
         | Language::Tsx
-        | Language::JavaScript => &["comment"],
+        | Language::JavaScript
+        | Language::Bash => &["comment"],
         Language::Java | Language::Kotlin | Language::Rust => &["line_comment", "block_comment"],
     }
 }
@@ -59,6 +60,17 @@ pub(crate) fn walk_preorder<'a>(node: Node<'a>, visit: &mut impl FnMut(Node<'a>)
 mod tests {
     use super::*;
     use crate::node_kind::GoKind;
+
+    #[test]
+    fn bash_comment_kind_matches_a_real_parsed_comment() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("# note\n", None).unwrap();
+        let comment = tree.root_node().child(0).unwrap();
+        assert!(comment_kinds(Language::Bash).contains(&comment.kind()));
+    }
 
     fn parse_go(src: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();

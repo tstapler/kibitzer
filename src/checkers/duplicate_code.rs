@@ -51,6 +51,8 @@ impl Checker for DuplicateCodeChecker {
             "**/*.java",
             "**/*.kt",
             "**/*.rs",
+            "**/*.sh",
+            "**/*.bash",
         ]
     }
 
@@ -262,6 +264,18 @@ fn check_source(src: &str) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scans_shell_scripts_in_both_checker_and_default_config() {
+        assert!(DuplicateCodeChecker.file_globs().contains(&"**/*.sh"));
+        assert!(DuplicateCodeChecker.file_globs().contains(&"**/*.bash"));
+        for name in ["duplicate-code", "duplicate-code-cross-file"] {
+            let defaults = crate::config::default_checks();
+            let check = defaults.iter().find(|c| c.name == name).unwrap();
+            assert!(check.scope.iter().any(|g| g == "**/*.sh"), "{name}");
+            assert!(check.scope.iter().any(|g| g == "**/*.bash"), "{name}");
+        }
+    }
 
     #[test]
     fn does_not_flag_a_block_repeated_only_twice() {

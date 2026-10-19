@@ -827,6 +827,8 @@ fn core_checks() -> Vec<Check> {
                 "**/*.java",
                 "**/*.kt",
                 "**/*.rs",
+                "**/*.sh",
+                "**/*.bash",
             ],
         ),
         native_check(
@@ -842,6 +844,8 @@ fn core_checks() -> Vec<Check> {
                 "**/*.java",
                 "**/*.kt",
                 "**/*.rs",
+                "**/*.sh",
+                "**/*.bash",
             ],
         ),
     ]
@@ -920,6 +924,11 @@ fn file_size_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("rust-file-size", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "bash-file-size",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -944,6 +953,11 @@ fn syntax_rules_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("syntax-rules-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "syntax-rules-bash",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -969,6 +983,11 @@ fn comment_quality_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("comment-quality-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "comment-quality-bash",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -1422,10 +1441,10 @@ mod tests {
     }
 
     #[test]
-    fn default_checks_still_registers_all_eight_syntax_rules_checkers() {
+    fn default_checks_still_registers_all_nine_syntax_rules_checkers() {
         // Regression guard for `replace-magic-literal` (validation.md): this rule needed
         // zero edits to `syntax_rules_checks()` since it rides along inside the existing
-        // per-language `SyntaxRulesChecker` — this locks in that the 8 pre-existing
+        // per-language `SyntaxRulesChecker` — this locks in that all 9
         // `syntax-rules-*` checker names are still exactly what's registered, catching an
         // accidental checker-registration change future work might introduce.
         let defaults = default_checks();
@@ -1440,11 +1459,25 @@ mod tests {
             "syntax-rules-java",
             "syntax-rules-kotlin",
             "syntax-rules-rust",
+            "syntax-rules-bash",
         ] {
             assert!(
                 names.contains(expected),
                 "missing default check: {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn default_checks_register_bash_comment_quality_and_file_size() {
+        let defaults = default_checks();
+        for name in ["comment-quality-bash", "bash-file-size"] {
+            let check = defaults
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing default check: {name}"));
+            assert!(check.scope.iter().any(|g| g == "**/*.sh"), "{name}");
+            assert!(check.scope.iter().any(|g| g == "**/*.bash"), "{name}");
         }
     }
 
