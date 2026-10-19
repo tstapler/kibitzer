@@ -19,7 +19,7 @@ Evidence labels: **VERIFIED** = command run in this worktree on 2026-10-18 (comm
 
 ## Evidence and status per P1 (and notable P2)
 
-### #1 (P1): license-header duplicate blocks. Status: **STILL OPEN**
+### #1 (P1): license-header duplicate blocks. Status: **RESOLVED in 41af6d3 (see "Resolution" at the end)**
 
 Root cause (VERIFIED by reading):
 - `find_duplicate_blocks` in `src/checkers/duplicate_code.rs:88` and the cross-file path at `duplicate_code.rs:159` and `src/checkers/duplicate_cross_file_checker.rs:302` all go through `non_preamble_windows`.
@@ -41,8 +41,8 @@ Why the plan's checks missed it:
 Why P1: it is near-universal (any repo whose shell scripts carry a license header, which is most OSS and many corporate repos), default-on with no config, and fires per edited file, so a user's first impression is a flood. No test covers it: `grep -in bash src/checkers/import_preamble.rs src/checkers/duplicate_cross_file_checker.rs` finds nothing.
 
 ### P1 count
-- Total P1: **1**.
-- Open P1: **1** (#1). Prevented-in-code P1: **0**.
+- Total P1: **1** (resolved in 41af6d3; 0 open).
+- Open P1: **0** (#1 resolved in 41af6d3).
 
 ### #2 (P2): noise, partially mitigated
 - Mitigated: the pure-expansion exemption (`rules.rs:1216-1234`, tests `bash_exempts_repeated_pure_expansion_string` and `bash_flags_repeated_plain_string_and_mixed_expansion_string`).
