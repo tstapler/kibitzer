@@ -1625,23 +1625,42 @@ fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
         "--exclude-standard",
     ])
     .filter(|o| o.status.success())?;
-    let mut files: Vec<PathBuf> = listed
+    let root = dir.canonicalize().ok()?;
+    let mut files = Vec::new();
+    for rel in listed
         .stdout
         .split(|&b| b == 0)
         .filter(|rel| !rel.is_empty())
-        .map(|rel| Path::new(&*String::from_utf8_lossy(rel)).to_path_buf())
-        .filter(|rel| {
-            !rel.components().any(|c| {
-                c.as_os_str()
-                    .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
-            })
-        })
-        .map(|rel| dir.join(rel))
-        // `--cached` still lists tracked files deleted from the work tree.
-        .filter(|path| path.is_file())
-        .collect();
+    {
+        #[cfg(unix)]
+        let rel = {
+            use std::os::unix::ffi::OsStrExt;
+            Path::new(std::ffi::OsStr::from_bytes(rel)).to_path_buf()
+        };
+        #[cfg(not(unix))]
+        let rel = PathBuf::from(std::str::from_utf8(rel).ok()?);
+        if rel.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|name| SKIP_DIRS.contains(&name))
+        }) {
+            continue;
+        }
+        let path = dir.join(rel);
+        let Ok(resolved) = path.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&root) || (path.is_symlink() && path.is_dir()) {
+            continue;
+        }
+        if path.is_dir() && path.join(".git").exists() {
+            files.extend(git_visible_files(&path)?);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
     files.sort();
+    files.dedup();
     Some(files)
 }
 

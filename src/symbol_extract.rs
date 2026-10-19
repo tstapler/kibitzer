@@ -417,6 +417,7 @@ fn go_type_declaration_symbols(
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
     }
 }
@@ -562,6 +563,7 @@ fn classify_node(
         is_pure_delegation,
         delegation_field,
         params,
+        used_as_value: false,
     })
 }
 
@@ -815,6 +817,56 @@ pub fn extract_symbols_for_file(
         &mut symbols,
     );
     symbols
+}
+
+/// Bare identifiers in value positions, kept separate from invocation edges.
+pub(crate) fn function_value_names(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+) -> std::collections::HashSet<String> {
+    fn is_value(mut node: Node) -> bool {
+        while let Some(parent) = node.parent() {
+            let field_is_node = |field| parent.child_by_field_name(field) == Some(node);
+            match parent.kind() {
+                "parenthesized_expression" | "literal_element" => node = parent,
+                "as_expression" | "satisfies_expression" | "non_null_expression"
+                    if parent.named_child(0) == Some(node) =>
+                {
+                    node = parent
+                }
+                "index_expression" if field_is_node("operand") => node = parent,
+                "arguments" | "argument_list" | "return_statement" | "array" | "literal_value" => {
+                    return true;
+                }
+                "keyed_element" | "pair" | "variable_declarator" | "var_spec" | "const_spec" => {
+                    return field_is_node("value");
+                }
+                "assignment_expression" | "assignment_statement" | "short_var_declaration" => {
+                    return field_is_node("right");
+                }
+                "expression_list" => node = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+    fn visit(node: Node, source: &str, names: &mut std::collections::HashSet<String>) {
+        if (node.kind() == "identifier" && is_value(node))
+            || node.kind() == "shorthand_property_identifier"
+        {
+            names.insert(node_text(node, source).to_string());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(child, source, names);
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    if call_graph_supports(language) {
+        visit(tree.root_node(), source, &mut names);
+    }
+    names
 }
 
 /// One call site found inside a function/method body: the id of the enclosing

@@ -1,5 +1,51 @@
 use super::*;
 
+#[test]
+fn nested_git_roots_are_scanned_with_their_own_ignores() {
+    let dir = scratch_dir("nested");
+    git(&dir, &["init", "-q"]);
+    write(&dir, "module/main.go", "package main\n");
+    let nested = dir.join("module");
+    git(&nested, &["init", "-q"]);
+    write(&nested, ".gitignore", "ignored.go\n");
+    write(&nested, "ignored.go", "package ignored\n");
+    git(&nested, &["add", "."]);
+    git(
+        &nested,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    for staged in [false, true] {
+        if staged {
+            git(&dir, &["add", "module"]);
+        }
+        let names = rel_names(&dir, &walk_and_collect_files(&dir).unwrap());
+        assert_eq!(names, ["module/.gitignore", "module/main.go"]);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn git_walk_does_not_follow_symlinks_outside_root() {
+    let dir = scratch_dir("links");
+    let outside = scratch_dir("outside");
+    git(&dir, &["init", "-q"]);
+    write(&outside, "a.go", "package a\n");
+    std::os::unix::fs::symlink(outside.join("a.go"), dir.join("link.go")).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
+    assert!(walk_and_collect_files(&dir).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = git_command(dir).args(args).status().unwrap();
     assert!(status.success(), "git {args:?} failed");

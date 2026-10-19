@@ -113,6 +113,7 @@ fn implements_shared_interface(symbol: &SymbolNode, index: &ImplementsIndex<'_>)
 
 fn is_candidate(symbol: &SymbolNode) -> bool {
     !symbol.exported
+        && !symbol.used_as_value
         && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
         && symbol.is_pure_delegation
 }
@@ -168,6 +169,121 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn kubernetes_checkpod_registration_is_not_an_inline_candidate() {
+        // Reduced from policy/check_sysctls.go:63-88,122-124 in the frozen corpus.
+        let model = model_from(vec![
+            (
+                "/repo/policy/check_sysctls.go",
+                r#"package policy
+func CheckSysctls() Check {
+    return Check{Versions: []VersionedCheck{{CheckPod: sysctlsV1Dot27}}}
+}
+func sysctlsV1Dot27(podMetadata *ObjectMeta, podSpec *PodSpec) CheckResult {
+    return sysctls(podMetadata, podSpec, sysctlsAllowedV1Dot27)
+}
+"#,
+            ),
+            (
+                "/repo/policy/check_sysctls_test.go",
+                "package policy\nfunc TestSysctls() { sysctlsV1Dot27(nil, nil) }\n",
+            ),
+        ]);
+        let symbols = model.find_symbol("sysctlsV1Dot27");
+        let symbol = symbols[0].1;
+        assert!(symbol.used_as_value);
+        assert_eq!(
+            model
+                .call_edges
+                .iter()
+                .filter(|e| e.resolved && e.to == symbol.id)
+                .count(),
+            1
+        );
+        assert!(single_call_site_delegation_findings(&model).is_empty());
+    }
+
+    #[test]
+    fn bare_function_value_contexts_are_not_inline_candidates() {
+        for (file, source) in [
+            (
+                "/repo/p/a.go",
+                "package p\nfunc thin() { helper() }\nfunc test() { thin() }\nvar callback = thin\n",
+            ),
+            (
+                "/repo/p/a.go",
+                "package p\nfunc thin() { helper() }\nfunc test() { thin(); register(thin) }\n",
+            ),
+            (
+                "/repo/p/a.go",
+                "package p\nfunc thin() { helper() }\nfunc test() { thin(); callback := thin; _ = callback }\n",
+            ),
+            (
+                "/repo/p/a.go",
+                "package p\nfunc thin() { helper() }\nfunc test() { thin() }\nfunc value() func() { return thin }\n",
+            ),
+            (
+                "/repo/p/a.ts",
+                "function thin() { helper(); } function test() { thin(); register(thin); }",
+            ),
+            (
+                "/repo/p/a.ts",
+                "function thin() { helper(); } function test() { thin(); } const callbacks = { check: thin };",
+            ),
+            (
+                "/repo/p/a.js",
+                "function thin() { helper(); } function test() { thin(); } const callbacks = [thin];",
+            ),
+            (
+                "/repo/p/a.tsx",
+                "function thin() { helper(); } function test() { thin(); } const callback = (thin);",
+            ),
+        ] {
+            let model = model_from(vec![(file, source)]);
+            assert!(model.pruning.files_with_parse_errors.is_empty(), "{source}");
+            assert!(
+                single_call_site_delegation_findings(&model).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_property_keys_and_other_packages_do_not_hide_real_delegation() {
+        let model = model_from(vec![
+            (
+                "/repo/p/a.ts",
+                "function thin() { helper(); } function test() { thin(); } const callbacks = { thin: unrelated };",
+            ),
+            ("/repo/q/a.ts", "register(thin);"),
+        ]);
+        let findings = single_call_site_delegation_findings(&model);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("`thin`"));
+    }
+
+    #[test]
+    fn matching_go_struct_keys_do_not_hide_real_delegation() {
+        let model = model_from(vec![(
+            "/repo/p/a.go",
+            "package p\nfunc thin() { helper() }\nfunc test() { thin() }\nvar callback = Check{thin: unrelated}\n",
+        )]);
+        let findings = single_call_site_delegation_findings(&model);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("`thin`"));
+    }
+
+    #[test]
+    fn vscode_json_parse_wrapper_remains_an_inline_candidate() {
+        let model = model_from(vec![(
+            "/repo/p/strings.ts",
+            "function getGraphemeBreakRawData(): number[] { return JSON.parse('[0,0,0]'); } function load() { getGraphemeBreakRawData(); }",
+        )]);
+        let findings = single_call_site_delegation_findings(&model);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("`getGraphemeBreakRawData`"));
     }
 
     #[test]
@@ -395,6 +511,24 @@ mod tests {
             single_call_site_delegation_findings(&model).is_empty(),
             "two call sites in one caller are still two call sites"
         );
+    }
+
+    #[test]
+    fn shorthand_and_asserted_callbacks_are_not_inline_candidates() {
+        for registration in [
+            "const callbacks = { thin };",
+            "const callback = thin as () => void;",
+            "const callback = thin satisfies (() => void);",
+        ] {
+            let source = format!(
+                "function helper() {{}}\nfunction thin() {{ helper(); }}\nfunction test() {{ thin(); }}\n{registration}\n"
+            );
+            let model = model_from(vec![("/repo/pkg/a.ts", &source)]);
+            assert!(
+                single_call_site_delegation_findings(&model).is_empty(),
+                "{registration}"
+            );
+        }
     }
 
     #[test]

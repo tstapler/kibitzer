@@ -8,14 +8,14 @@ tracked as #117 and are not repeated here, except where TypeScript makes them mu
 
 ## Log
 
-### 2026-10-12 — kubernetes/vscode corpus backtest — function used as a value (callback registration)
+### 2026-10-19 — callback registration resolution
 
-- **Repo**: `kubernetes/kubernetes` `staging/src/k8s.io/pod-security-admission/policy/check_sysctls.go:122`
-  (`sysctlsV1Dot27`, registered as `CheckPod: sysctlsV1Dot27,` at line 74; the only counted caller
-  is a test); 24 `describe*` helpers in `staging/src/k8s.io/kubectl/pkg/describe/describe.go`.
-- **Why it's a false positive**: inlining would break the registration.
-- **Mechanism**: only `call_expression` nodes produce edges, so a bare identifier in a struct field
-  or map value creates none. About 43 of 489 kubernetes findings (agent estimate, not re-derived).
+Bare same-package function references now set `SymbolNode.used_as_value`; the checker does
+not recommend inlining those functions. This covers `CheckPod: sysctlsV1Dot27` in Kubernetes.
+Qualified references, method values and lexical shadowing are not resolved. Controlled package
+backtests removed six policy findings without adding findings in the checked describe, actions
+and folding packages. The merged transcript CLI accepts architecture checkers, but models each
+file in isolation; it does not reconstruct historical cross-file callers.
 
 ### 2026-10-12 — vscode/stapler-squad corpus backtest — callers resolved by name only
 
@@ -42,14 +42,12 @@ tracked as #117 and are not repeated here, except where TypeScript makes them mu
   This is the TypeScript-scale instance of #117. In kubernetes, the agent's regex found 0 of 87
   method findings with a same-named interface method in the package.
 
-### 2026-10-12 — vscode corpus backtest — wrappers of builtin/global calls
+### 2026-10-12 — vscode corpus backtest — builtin-wrapper hypothesis withdrawn
 
-- **Repo**: `microsoft/vscode` `src/vs/base/common/strings.ts:1157` (`JSON.parse`),
-  `src/vs/editor/contrib/folding/browser/foldingRanges.ts:143` (`Map.set`).
-- **Why it's debatable**: the callee isn't a repo function, so there is nothing to inline into.
-  Classed needs_discussion, not a clear false positive (about 825 in vscode, agent regex estimate).
-- **Mechanism**: `is_pure_delegation_body` accepts any single call, with no check that the callee
-  is a repo function.
+The original report misidentified `foldingRanges.ts:143` as a `Map.set` wrapper; it calls
+`BitField.set`. A wrapper around a builtin can still be inlined into its caller: the
+refactoring does not require the callee to be a repo function. No blanket exclusion is
+justified by these examples.
 
 ## Fixed
 

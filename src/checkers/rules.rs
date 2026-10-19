@@ -2104,6 +2104,14 @@ fn expression_nesting(
                 logical_op: None,
                 receiver: !is_arguments,
             }
+        } else if matches!(
+            node.kind(),
+            "subscript_expression" | "subscript" | "index_expression"
+        ) {
+            ChainContext {
+                logical_op: None,
+                receiver: chain.receiver && node.named_child(0) == Some(child),
+            }
         } else {
             chain
         };
@@ -2118,6 +2126,13 @@ fn is_constructor_call(call: Node, cfg: &LangRuleConfig, src: &[u8]) -> bool {
     cfg.uppercase_call_is_constructor
         && call
             .child_by_field_name("function")
+            .and_then(|callee| {
+                if callee.kind() == "generic_function" {
+                    callee.child_by_field_name("function")
+                } else {
+                    Some(callee)
+                }
+            })
             .and_then(|callee| callee.utf8_text(src).ok())
             .and_then(|text| text.rsplit(['.', ':']).next())
             .is_some_and(|last| last.starts_with(|c: char| c.is_uppercase()))
@@ -4498,6 +4513,27 @@ mod tests {
             &format!("fn f() {{\n    return {};\n}}\n", nested(5)),
         );
         assert_eq!(fns.len(), 1, "findings: {fns:?}");
+    }
+
+    #[test]
+    fn computed_callee_arguments_are_not_receiver_chain_links() {
+        let findings = extract_variable_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() { return methods[f1(f2(f3(f4(1))))](); }",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("nests 5 levels"));
+    }
+
+    #[test]
+    fn rust_turbofish_constructors_do_not_count() {
+        let findings = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() { return Some::<_>(Some::<_>(Some::<_>(Some::<_>(Some::<_>(1))))); }",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
     }
 
     #[test]
