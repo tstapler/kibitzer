@@ -237,22 +237,32 @@ impl Checker for CommentQualityChecker {
             }
             let text = &*without_directive_lines(text);
             check_verbose_phrases(*comment, text, &mut findings);
-            in_fence =
-                check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
+            if !BASH_SKIPS_CODE_HEURISTICS || self.lang != Language::Bash {
+                in_fence =
+                    check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
+            }
         }
 
-        let cfg = rules::lang_config(self.lang);
-        walk_declarations_for_proportionality(
-            tree.root_node(),
-            &cfg,
-            kinds,
-            ctx.source.as_bytes(),
-            &mut findings,
-        );
+        if !BASH_SKIPS_CODE_HEURISTICS || self.lang != Language::Bash {
+            let cfg = rules::lang_config(self.lang);
+            walk_declarations_for_proportionality(
+                tree.root_node(),
+                &cfg,
+                kinds,
+                ctx.source.as_bytes(),
+                &mut findings,
+            );
+        }
 
         Ok(findings)
     }
 }
+
+/// `commented-out-code` and `over-commented` are C-family-shaped; on 10 bash findings in the
+/// backtest triage (docs/backtest-triage/bash-2026-10-18.md) all 9 of them were false
+/// positives (usage examples, `#key=value` metadata, why-comments). Only `verbose-comment`
+/// runs for bash until those two heuristics are tuned for shell.
+const BASH_SKIPS_CODE_HEURISTICS: bool = true;
 
 fn collect_comments<'a>(node: Node<'a>, kinds: &[&str], out: &mut Vec<Node<'a>>) {
     if kinds.contains(&node.kind()) {
@@ -971,6 +981,25 @@ mod tests {
             findings
                 .iter()
                 .any(|f| f.message.contains("[verbose-comment]") && f.message.contains("leverage")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn bash_skips_code_heuristics_but_keeps_verbose_comment() {
+        let src = "# x=$(foo bar)\n# This seamlessly handles requests.\nhandle() { :; }\n";
+        let findings = run(Language::Bash, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[verbose-comment]")),
+            "findings: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("[commented-out-code]")
+                    && !f.message.contains("[over-commented]")),
             "findings: {findings:?}"
         );
     }

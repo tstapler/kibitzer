@@ -18,7 +18,7 @@ for v1.
 
 ## Acceptance Criteria
 
-1. `Cargo.toml` declares `tree-sitter-bash` at a compatible version (0.25.x on crates.io).
+1. `Cargo.toml` declares `tree-sitter-bash` at a compatible version (0.25.x on crates.io). *(Reconciled: the backlog's acceptance criterion says 0.23.x and 0.23.3 shipped; both 0.23.3 and 0.25.1 avoid a `tree-sitter` conflict, see `research/stack.md`.)*
 2. `codegen/node-types/bash.json` is vendored from the same `tree-sitter-bash` release, and
    `build.rs`'s `GRAMMARS` table includes a `("bash", "BashKind", …)` entry so the
    `BashKind` enum is generated at build time.

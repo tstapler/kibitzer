@@ -282,3 +282,12 @@ Follow-ups not done in this change:
 - `slog_key_predicate` is now used by two languages (Go, Bash), not one; rename it (field plus `collector.slog_key_ids`, 19 occurrences) when convenient, not only at a fourth user.
 - The ADR-001 "<40% false-positive rate" bar has no source outside the superseded plan at `7634824`, and no triage was done.
 - Move the `*_lang_config` functions out of `src/checkers/rules.rs` (about 2040 production lines) and run hotspot analysis before the next language.
+
+## Update after the Product Triad Review (iteration 1)
+
+The triad review (product, UX and engineering all `needs-work`) found the CLAUDE.md done-bar unmet: no false-positive triage. Done since:
+- **FP triage** of 116 findings on 150 shell scripts: `docs/backtest-triage/bash-2026-10-18.md` plus per-finding records. Result before fixes: 42.1% strict FP overall, 52.5% for `replace-magic-literal`, 90% for `comment-quality-bash`; the <40% bar was NOT met.
+- **Fixes** (commit after `094bbdf`): `bash_is_exempt_literal` in `src/checkers/rules.rs` (redirect/command-arg numbers, boolean/separator/escape strings, `echo`/`printf` arguments); `comment-quality-bash` runs only `verbose-comment` (`BASH_SKIPS_CODE_HEURISTICS`). Re-measured on the same sample: 72 findings, 52 TP, 0 FP, 20 debatable. This is tuned-on-sample, not an independent estimate (see the caveat in the triage doc); a fresh-sample run is still open.
+- **Flaky tests**: `tests/daemon_spawn.rs` also fails intermittently on a clean `master` checkout (2 of 3 runs), so it is not caused by this change. `backtest_isolates_the_duplicate_cross_file_index_and_still_finds_duplicates` failed once on this branch and passed on `master` once and on this branch in later runs; its origin is unconfirmed.
+- **Docs**: extension-only detection, inert rules and the comment-quality gating are documented in `docs/syntax-rules.md` and `docs/comment-quality.md`; requirements AC1 reconciled (0.23.3 shipped).
+- Still open: fresh-sample FP run, shebang detection, uncapped "also lines" list (shared across languages), `import_preamble`/arch_export follow-ups listed above.

@@ -215,3 +215,5 @@ arguments (e.g. a multi-argument factory call) can still reach the threshold.
 - `function_definition` has no parameter list, so `long-parameter-list` and `flag-argument` never fire.
 - `if_statement`'s `then` statements, `elif_clause` and `else_clause` are flat siblings, so `deep-nesting` under-counts nesting inside later branches (false negatives only).
 - A quoted string made only of expansions (`"$@"`, `"${1}"`) is exempt from `replace-magic-literal`; a string mixing text and expansions is still flagged.
+- Files are recognised by extension only (`.sh`, `.bash`). Extension-less scripts (`bin/*`, git hooks), `.zsh`/`.ksh`, `.bats`, `.envrc` and dotfiles like `.bashrc` are skipped silently: there is no shebang detection yet.
+- `replace-magic-literal` exempts redirect targets and plain command-argument numbers (`>&2`, `exit 2`), shell boolean/separator strings and `echo`/`printf` arguments. `long-function` uses the shared 40-line threshold, untuned for case-driven installer scripts.

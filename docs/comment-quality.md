@@ -49,3 +49,7 @@ severity or scope for one repo (see `docs/suppressing-checks.md`):
   ]
 }
 ```
+
+### Bash
+
+`comment-quality-bash` matches `.sh`/`.bash` files by extension only; extension-less scripts and `.zsh`/`.bats` files are not checked. Only `verbose-comment` runs for shell: `commented-out-code` and `over-commented` are skipped because their heuristics are C-family-shaped (all 9 shell findings in the backtest triage were false positives, see `docs/backtest-triage/bash-2026-10-18.md`).

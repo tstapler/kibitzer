@@ -1213,10 +1213,28 @@ fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
     Vec::new()
 }
 
-/// A bash `string` made only of `$var`/`${var}`/`$(cmd)`/`$((expr))` (`"$@"`, `"${1}"`) is
-/// a quoted variable reference, not a literal; text mixed in (`"Usage: $0"`) stays flagged.
-/// Plugged into the `slog_key_predicate` exemption hook, which exempts any literal it matches.
-fn bash_is_expansion_string(node: Node, _src: &[u8]) -> bool {
+/// Bash literals `replace-magic-literal` should not count (backtest triage:
+/// docs/backtest-triage/bash-2026-10-18.md). Plugged into the `slog_key_predicate` hook,
+/// which exempts any literal it matches.
+/// - `number`: a redirect target (`>&2`) or a plain command argument (`exit 2`, `sleep 5`);
+///   numbers in arithmetic (`$((a*2))`) and assignments still count.
+/// - `string`: made only of expansions (`"$@"`, `"${1}"`; text mixed in, as in
+///   `"Usage: $0"`, stays flagged), a shell boolean/`{}` token, only separators/escapes
+///   (`"===="`, `"\n"`), or an `echo`/`printf` argument (display text, not a value).
+fn bash_is_exempt_literal(node: Node, src: &[u8]) -> bool {
+    let parent_kind = node.parent().map(|p| p.kind());
+    match node.kind() {
+        "number" => matches!(parent_kind, Some("file_redirect" | "command")),
+        "string" => {
+            bash_is_pure_expansion(node)
+                || bash_is_boilerplate_text(node, src)
+                || bash_is_display_argument(node, src)
+        }
+        _ => false,
+    }
+}
+
+fn bash_is_pure_expansion(node: Node) -> bool {
     let mut cursor = node.walk();
     let mut expansion_bytes = 0;
     for c in node.named_children(&mut cursor) {
@@ -1231,6 +1249,33 @@ fn bash_is_expansion_string(node: Node, _src: &[u8]) -> bool {
     // Everything between the two quotes is expansion text (no literal text mixed in).
     expansion_bytes > 0
         && expansion_bytes == (node.end_byte() - node.start_byte()).saturating_sub(2)
+}
+
+fn bash_is_boilerplate_text(node: Node, src: &[u8]) -> bool {
+    let Ok(text) = node.utf8_text(src) else {
+        return false;
+    };
+    let inner = text.trim_matches('"');
+    if matches!(inner, "true" | "false" | "yes" | "no" | "y" | "n" | "{}") {
+        return true;
+    }
+    let stripped = inner
+        .replace("\\n", "")
+        .replace("\\t", "")
+        .replace("\\r", "");
+    stripped
+        .chars()
+        .all(|c| c.is_whitespace() || "=-*#~_".contains(c))
+}
+
+fn bash_is_display_argument(node: Node, src: &[u8]) -> bool {
+    let Some(command) = node.parent().filter(|p| p.kind() == "command") else {
+        return false;
+    };
+    command
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src).ok())
+        .is_some_and(|name| matches!(name, "echo" | "printf"))
 }
 
 /// Verified against the vendored `codegen/node-types/bash.json` (tree-sitter-bash 0.23.3):
@@ -1280,7 +1325,7 @@ fn bash_lang_config() -> LangRuleConfig {
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["subshell"],
         collection_literal_kinds: &[],
-        slog_key_predicate: Some(bash_is_expansion_string),
+        slog_key_predicate: Some(bash_is_exempt_literal),
     }
 }
 
@@ -3345,13 +3390,11 @@ mod tests {
     #[test]
     fn bash_flags_repeated_plain_string_and_mixed_expansion_string() {
         assert_eq!(
-            bash_magic_literal_findings("echo \"linux\"\necho \"linux\"\necho \"linux\"\n"),
+            bash_magic_literal_findings("a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n"),
             1
         );
         assert_eq!(
-            bash_magic_literal_findings(
-                "echo \"Usage: $0\"\necho \"Usage: $0\"\necho \"Usage: $0\"\n"
-            ),
+            bash_magic_literal_findings("a=\"Usage: $0\"\nb=\"Usage: $0\"\nc=\"Usage: $0\"\n"),
             1
         );
     }
@@ -3364,6 +3407,25 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn bash_exempts_redirect_targets_and_plain_command_number_arguments() {
+        let src = "a >&2\nb >&2\nc 2>&1\nd 2>&1\nexit 2\nexit 2\nsleep 5\nsleep 5\nsleep 5\n";
+        assert_eq!(bash_magic_literal_findings(src), 0);
+    }
+
+    #[test]
+    fn bash_still_flags_repeated_number_in_arithmetic() {
+        let src = "a=$((x*7))\nb=$((y*7))\nc=$((z*7))\n";
+        assert_eq!(bash_magic_literal_findings(src), 1);
+    }
+
+    #[test]
+    fn bash_exempts_boolean_separator_and_display_strings() {
+        let src = "a=\"true\"\nb=\"true\"\nc=\"true\"\nd=\"====\"\ne=\"====\"\nf=\"====\"\n\
+                   echo \"done!\"\necho \"done!\"\nprintf \"ok\"\nprintf \"ok\"\nprintf \"ok\"\necho \"done!\"\n";
+        assert_eq!(bash_magic_literal_findings(src), 0);
     }
 
     /// Locks in the known `if_branches` limitation (see `bash_lang_config`): nesting inside an
