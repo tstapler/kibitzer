@@ -1213,17 +1213,24 @@ fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
     Vec::new()
 }
 
-/// A bash `string` containing `$var`/`${var}`/`$(cmd)`/`$((expr))` is a variable
-/// reference in quotes (`"$@"`, `"${1}"`), not a literal — a backtest over ~150 real
-/// scripts had these dominate `replace-magic-literal` output, so they are exempt.
+/// A bash `string` made only of `$var`/`${var}`/`$(cmd)`/`$((expr))` (`"$@"`, `"${1}"`) is
+/// a quoted variable reference, not a literal; text mixed in (`"Usage: $0"`) stays flagged.
+/// Plugged into the `slog_key_predicate` exemption hook, which exempts any literal it matches.
 fn bash_is_expansion_string(node: Node, _src: &[u8]) -> bool {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).any(|c| {
-        matches!(
+    let mut expansion_bytes = 0;
+    for c in node.named_children(&mut cursor) {
+        if !matches!(
             c.kind(),
             "expansion" | "simple_expansion" | "command_substitution" | "arithmetic_expansion"
-        )
-    })
+        ) {
+            return false;
+        }
+        expansion_bytes += c.end_byte() - c.start_byte();
+    }
+    // Everything between the two quotes is expansion text (no literal text mixed in).
+    expansion_bytes > 0
+        && expansion_bytes == (node.end_byte() - node.start_byte()).saturating_sub(2)
 }
 
 /// Verified against the vendored `codegen/node-types/bash.json` (tree-sitter-bash 0.23.3):
@@ -1236,8 +1243,8 @@ fn bash_is_expansion_string(node: Node, _src: &[u8]) -> bool {
 ///   `long-parameter-list` and `flag-argument` never fire for bash.
 /// - `if_statement` exposes a `condition` field, but its then-statements, `elif_clause`
 ///   and `else_clause` are flat sibling children, not `consequence`/`alternative`;
-///   `walk_if_chain` therefore only inspects the first then-statement, so nesting inside
-///   later branches is under-counted (false negatives, not false positives).
+///   `if_branches` only inspects the first two non-condition children, so nesting inside
+///   later statements/branches is under-counted (false negatives, not false positives).
 /// - `number` exists but bash digits are mostly bare `word` tokens, so
 ///   `replace-magic-literal` has little to match; `word` is deliberately excluded as too broad.
 fn bash_lang_config() -> LangRuleConfig {
@@ -3328,6 +3335,47 @@ mod tests {
                 .iter()
                 .any(|f| f.message.contains("[deep-nesting]")),
             "got: {findings:?}"
+        );
+    }
+
+    fn bash_magic_literal_findings(src: &str) -> usize {
+        magic_literal_findings(Language::Bash, tree_sitter_bash::LANGUAGE.into(), src).len()
+    }
+
+    #[test]
+    fn bash_flags_repeated_plain_string_and_mixed_expansion_string() {
+        assert_eq!(
+            bash_magic_literal_findings("echo \"linux\"\necho \"linux\"\necho \"linux\"\n"),
+            1
+        );
+        assert_eq!(
+            bash_magic_literal_findings(
+                "echo \"Usage: $0\"\necho \"Usage: $0\"\necho \"Usage: $0\"\n"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn bash_exempts_repeated_pure_expansion_string() {
+        assert_eq!(
+            bash_magic_literal_findings(
+                "f \"$@\"\nf \"$@\"\nf \"$@\"\nf \"${1}\"\nf \"${1}\"\nf \"${1}\"\n"
+            ),
+            0
+        );
+    }
+
+    /// Locks in the known `if_branches` limitation (see `bash_lang_config`): nesting inside an
+    /// `elif`/`else` body isn't counted, so a later fix has to change this expectation on purpose.
+    #[test]
+    fn bash_deep_nesting_inside_else_branch_is_not_yet_counted() {
+        let deep = "for a in 1; do\n while true; do\n for b in 1; do\n while true; do\n for c in 1; do\n echo x\n done\n done\n done\n done\n done\n";
+        let src = format!("f() {{\n if true; then\n echo a\n echo b\n else\n{deep} fi\n}}\n");
+        assert!(
+            check_bash_source(&src)
+                .iter()
+                .all(|f| !f.message.contains("[deep-nesting]"))
         );
     }
 

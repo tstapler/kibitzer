@@ -20,6 +20,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | Java       | `syntax-rules-java`            | `**/*.java`                               |
 | Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
 | Rust       | `syntax-rules-rust`            | `**/*.rs`                                 |
+| Bash       | `syntax-rules-bash`            | `**/*.sh`, `**/*.bash`                    |
 
 The rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
@@ -205,3 +206,12 @@ arguments (e.g. a multi-argument factory call) can still reach the threshold.
   ]
 }
 ```
+
+### Bash caveats
+
+`bash_lang_config` (`src/checkers/rules.rs`) was checked against the vendored `codegen/node-types/bash.json`:
+
+- `return`, `break` and `continue` parse as plain `command` nodes (no `return_statement` etc.), so `unreachable-code` and the `return` side of `extract-variable` never fire.
+- `function_definition` has no parameter list, so `long-parameter-list` and `flag-argument` never fire.
+- `if_statement`'s `then` statements, `elif_clause` and `else_clause` are flat siblings, so `deep-nesting` under-counts nesting inside later branches (false negatives only).
+- A quoted string made only of expansions (`"$@"`, `"${1}"`) is exempt from `replace-magic-literal`; a string mixing text and expansions is still flagged.

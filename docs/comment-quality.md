@@ -22,6 +22,7 @@ built on.
 | Java       | `comment-quality-java`           | `**/*.java`                               |
 | Kotlin     | `comment-quality-kotlin`         | `**/*.kt`, `**/*.kts`                     |
 | Rust       | `comment-quality-rust`           | `**/*.rs`                                 |
+| Bash       | `comment-quality-bash`           | `**/*.sh`, `**/*.bash`                    |
 
 ## Findings
 

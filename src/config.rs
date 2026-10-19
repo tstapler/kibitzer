@@ -924,6 +924,11 @@ fn file_size_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("rust-file-size", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "bash-file-size",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -1439,7 +1444,7 @@ mod tests {
     fn default_checks_still_registers_all_nine_syntax_rules_checkers() {
         // Regression guard for `replace-magic-literal` (validation.md): this rule needed
         // zero edits to `syntax_rules_checks()` since it rides along inside the existing
-        // per-language `SyntaxRulesChecker` — this locks in that the 9 pre-existing
+        // per-language `SyntaxRulesChecker` — this locks in that all 9
         // `syntax-rules-*` checker names are still exactly what's registered, catching an
         // accidental checker-registration change future work might introduce.
         let defaults = default_checks();
@@ -1455,7 +1460,6 @@ mod tests {
             "syntax-rules-kotlin",
             "syntax-rules-rust",
             "syntax-rules-bash",
-            "comment-quality-bash",
         ] {
             assert!(
                 names.contains(expected),
