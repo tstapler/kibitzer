@@ -1215,16 +1215,9 @@ fn no_bool_params(_params: Node, _src: &[u8]) -> Vec<String> {
     Vec::new()
 }
 
-/// Bash literals `replace-magic-literal` should not count (backtest triage:
-/// docs/backtest-triage/bash-2026-10-18.md). Plugged into the `slog_key_predicate` hook,
-/// which exempts any literal it matches.
-/// - `number`: a redirect target (`>&2`) or a plain command argument (`exit 2`, `sleep 5`);
-///   numbers in arithmetic (`$((a*2))`) and assignments still count.
-/// - any literal in a file whose parse tree has an error (see [`bash_tree_has_error`]).
-/// - `string`: made only of expansions (`"$@"`, `"${1}"`; text mixed in, as in
-///   `"Usage: $0"`, stays flagged), a shell boolean/`{}` token, only separators/escapes
-///   (`"===="`, `"\n"`), or an `echo`/`printf` argument (display text, not a value).
-// Non-goal (typed-node-kind-migration, ADR-001): the bash grammar has no typed kind enum; raw kind strings stay.
+/// Bash literals `replace-magic-literal` should not count: redirect targets, plain command
+/// number arguments, pure-expansion/separator/`echo`/`printf` strings, and everything in a
+/// file with a parse error. Rationale and examples: docs/backtest-triage/bash-2026-10-18.md.
 fn bash_is_exempt_literal(node: Node, src: &[u8]) -> bool {
     if bash_tree_has_error(node) {
         return true;
@@ -1286,7 +1279,6 @@ fn bash_is_boilerplate_text(node: Node, src: &[u8]) -> bool {
         .all(|c| c.is_whitespace() || "=-*#~_".contains(c))
 }
 
-// Non-goal (typed-node-kind-migration, ADR-001): the bash grammar has no typed kind enum; raw kind strings stay.
 fn bash_is_display_argument(node: Node, src: &[u8]) -> bool {
     let Some(command) = node
         .parent()
@@ -1301,19 +1293,8 @@ fn bash_is_display_argument(node: Node, src: &[u8]) -> bool {
 }
 
 /// Verified against the vendored `codegen/node-types/bash.json` (tree-sitter-bash 0.23.3):
-/// - ABSENT as named node kinds: `return_statement`, `break_statement`,
-///   `continue_statement`, `until_statement` — `return`/`break`/`continue` parse as plain
-///   `command` nodes, and `until` parses as `while_statement`. So `terminal_kinds` is empty
-///   (`unreachable-code` never fires for bash) and `return_kind` is a never-matching
-///   placeholder (`extract-variable` only sees `if`/`while` conditions).
-/// - `function_definition` has a `body` field but no parameter list, so
-///   `long-parameter-list` and `flag-argument` never fire for bash.
-/// - `if_statement` exposes a `condition` field, but its then-statements, `elif_clause`
-///   and `else_clause` are flat sibling children, not `consequence`/`alternative`;
-///   `if_branches` only inspects the first two non-condition children, so nesting inside
-///   later statements/branches is under-counted (false negatives, not false positives).
-/// - `number` exists but bash digits are mostly bare `word` tokens, so
-///   `replace-magic-literal` has little to match; `word` is deliberately excluded as too broad.
+/// no return/break/continue/until nodes, no parameter list, flat `if` branches (nesting is
+/// under-counted, never over-counted). Per-rule consequences: docs/syntax-rules.md "Bash caveats".
 fn bash_lang_config() -> LangRuleConfig {
     LangRuleConfig {
         name: "syntax-rules-bash",
@@ -3426,6 +3407,13 @@ mod tests {
         let clean = "a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n";
         assert_eq!(bash_magic_literal_findings(clean), 1);
         let broken = format!("{clean}if then fi )\n");
+        let tree = crate::checker::GrammarCache::new()
+            .parse(Language::Bash, &broken)
+            .unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "fixture must be a parse error"
+        );
         assert_eq!(bash_magic_literal_findings(&broken), 0);
     }
 
@@ -3452,10 +3440,33 @@ mod tests {
     }
 
     #[test]
-    fn bash_exempts_boolean_separator_and_display_strings() {
-        let src = "a=\"true\"\nb=\"true\"\nc=\"true\"\nd=\"====\"\ne=\"====\"\nf=\"====\"\n\
-                   echo \"done!\"\necho \"done!\"\nprintf \"ok\"\nprintf \"ok\"\nprintf \"ok\"\necho \"done!\"\n";
+    fn bash_exempts_repeated_boolean_strings() {
+        assert_eq!(
+            bash_magic_literal_findings("a=\"true\"\nb=\"true\"\nc=\"true\"\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn bash_exempts_repeated_separator_strings() {
+        assert_eq!(
+            bash_magic_literal_findings("d=\"====\"\ne=\"====\"\nf=\"====\"\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn bash_exempts_repeated_echo_and_printf_arguments() {
+        let src = "echo \"done!\"\necho \"done!\"\necho \"done!\"\nprintf \"ok\"\nprintf \"ok\"\nprintf \"ok\"\n";
         assert_eq!(bash_magic_literal_findings(src), 0);
+    }
+
+    #[test]
+    fn bash_still_flags_repeated_string_arguments_to_other_commands() {
+        assert_eq!(
+            bash_magic_literal_findings("log \"done!\"\nlog \"done!\"\nlog \"done!\"\n"),
+            1
+        );
     }
 
     /// Locks in the known `if_branches` limitation (see `bash_lang_config`): nesting inside an

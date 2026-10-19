@@ -156,6 +156,12 @@ impl Language {
             .find(|lang| lang.extensions().contains(&ext))
     }
 
+    /// False for languages the architecture model cannot extract symbols from (shell scripts
+    /// would otherwise appear as empty packages and parse-error noise).
+    pub(crate) fn has_symbol_extraction(self) -> bool {
+        self != Language::Bash
+    }
+
     /// Convenience wrapper over [`Language::from_extension`] for a whole `Path`.
     pub(crate) fn for_path(path: &Path) -> Option<Language> {
         Self::from_extension(path.extension()?.to_str()?)

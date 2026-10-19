@@ -314,7 +314,7 @@ pub fn looks_generated(source: &str) -> bool {
 /// no recognized extension return `None` and are counted as `unsupported_language_files`,
 /// not silently dropped.
 pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
-    Language::for_path(path)
+    Language::for_path(path).filter(|l| l.has_symbol_extraction())
 }
 
 /// The package/directory key a file groups under. `ImportGraph` is the single source of
@@ -1163,6 +1163,11 @@ mod tests {
     /// against Servo — a `.rs` file silently fell through to `None` (counted as
     /// "unsupported," never reaching `symbol_extract.rs`'s Rust support) until this
     /// arm was added.
+    #[test]
+    fn language_for_path_skips_bash_which_has_no_symbol_extraction() {
+        assert_eq!(language_for_path(Path::new("run.sh")), None);
+    }
+
     #[test]
     fn language_for_path_recognizes_rust() {
         assert_eq!(language_for_path(Path::new("foo.rs")), Some(Language::Rust));

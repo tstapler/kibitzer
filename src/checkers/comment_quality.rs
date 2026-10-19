@@ -989,7 +989,9 @@ mod tests {
 
     #[test]
     fn bash_skips_code_heuristics_but_keeps_verbose_comment() {
-        let src = "# x=$(foo bar)\n# This seamlessly handles requests.\nhandle() { :; }\n";
+        // Four comment lines over a multi-line body: Rust flags this as over-commented (see
+        // `rust_flags_over_commented_function`), so only the bash skip can silence it.
+        let src = "# x=$(foo bar)\n# This seamlessly handles requests.\n# It takes a request.\n# It returns a reply.\nhandle() {\n  echo a\n  echo b\n}\n";
         let findings = run(Language::Bash, src);
         assert!(
             findings
