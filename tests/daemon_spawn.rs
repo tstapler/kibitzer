@@ -46,7 +46,10 @@ impl Scratch {
             .unwrap()
             .canonicalize()
             .unwrap()
-            .join(format!("spawntest-{}", root.file_name().unwrap().to_string_lossy()));
+            .join(format!(
+                "spawntest-{}",
+                root.file_name().unwrap().to_string_lossy()
+            ));
         std::fs::create_dir_all(&exe_dir).unwrap();
         let exe = exe_dir.join("kibitzer-under-test");
         std::fs::hard_link(built, &exe)
