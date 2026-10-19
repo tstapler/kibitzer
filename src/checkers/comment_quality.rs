@@ -239,7 +239,13 @@ impl Checker for CommentQualityChecker {
                     }
                     continue;
                 }
-                if is_pep723_sentinel_open(text) {
+                // An opener with no closer anywhere after it is not a block; exempting it
+                // would silence every later comment in the file.
+                if is_pep723_sentinel_open(text)
+                    && comments[i + 1..].iter().any(|c| {
+                        is_pep723_sentinel_close(c.utf8_text(ctx.source.as_bytes()).unwrap_or(""))
+                    })
+                {
                     in_pep723_block = true;
                     continue;
                 }
@@ -1121,6 +1127,16 @@ mod tests {
         let src = "# /// script\n# requires-python = \">=3.11\"\n# dependencies = [\n#   \"rich\",\n# ]\n# ///\ndef main():\n    return 1 + 2\n";
         let findings = run(Language::Python, src);
         assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn unclosed_pep723_opener_does_not_silence_later_comments() {
+        let src = "# /// script\n# note\nx = 1\n# y = foo(1)\n";
+        let findings = run(Language::Python, src);
+        assert!(
+            findings.iter().any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
     }
 
     #[test]
