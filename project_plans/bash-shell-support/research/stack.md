@@ -81,3 +81,10 @@ change. Same code runs on base, which fails identically.
 5. INCOMPLETE: no mention that 0.25.1 is a drop-in with identical named kinds, nor that the vendored JSON must be
    re-vendored with any crate bump. No mention of the issue-vs-AC version mismatch (0.25 vs 0.23).
 6. INCOMPLETE: line 44 uses `|_| 0` for param_counter; not checked against the landed code (not in scope here).
+
+## `daemon_spawn` fixture fix
+
+`Scratch::new` now hard-links the built binary into a `spawntest-*` dir beside it (same filesystem as `target/`),
+so no test thread ever holds a write fd on an exec target; the `fs::copy` fallback remains for filesystems without
+hard links. Result: `cargo test --test daemon_spawn` passed 14/14 in 5 of 5 default-parallel runs (was 0 of 8 on
+base and branch), and a full `cargo test` had 0 failures and 0 warnings.

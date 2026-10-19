@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 struct Scratch {
     root: PathBuf,
+    exe_dir: PathBuf,
     exe: PathBuf,
     runtime: PathBuf,
     repo: PathBuf,
@@ -37,12 +38,23 @@ impl Scratch {
         std::fs::create_dir_all(repo.join(".kibitzer")).unwrap();
         std::fs::write(repo.join(".kibitzer/inspect.json"), r#"{"checks": []}"#).unwrap();
         std::fs::write(repo.join("a.txt"), "x\n").unwrap();
-        let exe = root.join("kibitzer-under-test");
-        std::fs::hard_link(env!("CARGO_BIN_EXE_kibitzer"), &exe)
-            .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_kibitzer"), &exe).map(|_| ()))
+        // Beside the built binary, not under /tmp: a hard link needs the same filesystem, and a copy
+        // leaves a write fd that a sibling test's fork can hold past our exec (ETXTBSY).
+        let built = Path::new(env!("CARGO_BIN_EXE_kibitzer"));
+        let exe_dir = built
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(format!("spawntest-{}", root.file_name().unwrap().to_string_lossy()));
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("kibitzer-under-test");
+        std::fs::hard_link(built, &exe)
+            .or_else(|_| std::fs::copy(built, &exe).map(|_| ()))
             .unwrap();
         Self {
             root,
+            exe_dir,
             exe,
             runtime,
             repo,
@@ -149,6 +161,7 @@ impl Drop for Scratch {
             let _ = Command::new("kill").arg(pid.to_string()).status();
         }
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.exe_dir);
     }
 }
 
