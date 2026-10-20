@@ -217,6 +217,7 @@ mod tests {
             parent: None,
             is_pure_delegation: false,
             delegation_field: None,
+            used_as_value: false,
             params: params
                 .iter()
                 .map(|(n, t)| (n.to_string(), t.to_string()))

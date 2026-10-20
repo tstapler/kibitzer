@@ -39,6 +39,8 @@ const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// in the allow-list anyway as defense-in-depth for any future grammar/version where it
 /// might be.
 const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
+/// An `if`/`return`/ternary expression whose operator/call nesting depth reaches this is flagged.
+const EXTRACT_VARIABLE_NESTING_THRESHOLD: usize = 5;
 
 /// Method name suffixes whose calls follow the alternating key-value convention:
 ///   receiver.Method(message, key1, val1, key2, val2, …)
@@ -52,12 +54,6 @@ const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
 /// `slog.With(key, val, …)` is NOT included: index 0 is already a key (no message
 /// prefix), making the even/odd convention opposite to the calls here.
 const SLOG_METHOD_NAMES: &[&str] = &["Info", "Warn", "Error", "Debug", "Log"];
-/// An `if`/`return`/ternary expression whose nested binary/logical-operator and
-/// function-call count reaches this is flagged by `extract-variable`. Set from a
-/// `kubernetes/kubernetes` backtest (non-vendor Go, generated files excluded): at 4-8 the
-/// samples were ordinary readable `&&` chains and string concatenation; at 10+ they were
-/// genuinely long conditions. Lower only with a fresh backtest (#49's false-positive note).
-const EXTRACT_VARIABLE_DENSITY_THRESHOLD: usize = 10;
 
 // `replace-magic-literal`'s per-language `literal_kinds`/`numeric_literal_kinds` node-kind
 // tables, hoisted to named constants (rather than inline in each `*_lang_config()`) so
@@ -320,14 +316,11 @@ pub(crate) struct LangRuleConfig {
     /// statements, not part of the surrounding expression's readability cost (found by a
     /// `kubernetes/kubernetes` backtest where `return func(...) {...}` scored 93).
     density_boundary_kinds: &'static [&'static str],
-    /// Pure data-container literal kinds `long-function` exempts when a body is nothing but
-    /// `return <literal>` with no logic inside (a table-test case list has nothing to
-    /// extract). Empty where the idiom is a call (`listOf(...)`, `vec![...]`) or an
-    /// initializer that isn't a standalone literal node (Java), so those stay unexempted.
+    /// Rust UpperCamelCase callees construct values rather than running logic.
+    uppercase_call_is_constructor: bool,
+    /// Pure data-container literals exempt from `long-function` when returned without logic.
     collection_literal_kinds: &'static [&'static str],
-    /// Returns `true` if `node` is a string literal in a language-specific idiomatic exempt
-    /// position — e.g. a slog attribute key in Go (odd-indexed argument of Info/Warn/etc.).
-    /// `None` for languages with no such idiom; `None` means "never exempt by this rule."
+    /// Language-specific literal positions exempt from `replace-magic-literal`.
     slog_key_predicate: Option<fn(Node, &[u8]) -> bool>,
 }
 
@@ -978,6 +971,7 @@ fn go_lang_config() -> LangRuleConfig {
         return_kind: "return_statement",
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
+        uppercase_call_is_constructor: false,
         density_boundary_kinds: &["func_literal", "composite_literal"],
         collection_literal_kinds: &["composite_literal"],
         slog_key_predicate: Some(go_is_slog_key_literal),
@@ -1023,6 +1017,7 @@ fn typescript_lang_config() -> LangRuleConfig {
         return_kind: "return_statement",
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
+        uppercase_call_is_constructor: false,
         density_boundary_kinds: &[
             "arrow_function",
             "function_expression",
@@ -1096,6 +1091,7 @@ fn python_lang_config() -> LangRuleConfig {
         return_kind: "return_statement",
         call_kinds: &["call"],
         operator_kinds: &["boolean_operator", "comparison_operator"],
+        uppercase_call_is_constructor: false,
         density_boundary_kinds: &["lambda", "dictionary", "list", "set", "tuple"],
         collection_literal_kinds: &["list", "dictionary"],
         slog_key_predicate: None,
@@ -1137,6 +1133,7 @@ fn java_lang_config() -> LangRuleConfig {
         return_kind: "return_statement",
         call_kinds: &["method_invocation"],
         operator_kinds: &["binary_expression"],
+        uppercase_call_is_constructor: false,
         density_boundary_kinds: &["lambda_expression", "array_initializer", "class_body"],
         collection_literal_kinds: &[],
         slog_key_predicate: None,
@@ -1189,6 +1186,7 @@ fn kotlin_lang_config() -> LangRuleConfig {
         return_kind: "return_expression",
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
+        uppercase_call_is_constructor: false,
         density_boundary_kinds: &["lambda_literal", "anonymous_function"],
         collection_literal_kinds: &[],
         slog_key_predicate: None,
@@ -1327,6 +1325,7 @@ fn bash_lang_config() -> LangRuleConfig {
         call_kinds: &["command"],
         operator_kinds: &["binary_expression"],
         density_boundary_kinds: &["subshell"],
+        uppercase_call_is_constructor: false,
         collection_literal_kinds: &[],
         slog_key_predicate: Some(bash_is_exempt_literal),
     }
@@ -1380,6 +1379,7 @@ fn rust_lang_config() -> LangRuleConfig {
         return_kind: "return_expression",
         call_kinds: &["call_expression"],
         operator_kinds: &["binary_expression"],
+        uppercase_call_is_constructor: true,
         density_boundary_kinds: &[
             "closure_expression",
             "struct_expression",
@@ -1433,7 +1433,7 @@ impl Checker for SyntaxRulesChecker {
         // where `zz_generated.*.go`/`generated.pb.go` dominated the raw finding count).
         // Scoped to just these 2 passes; the other 5 rules are untouched.
         if !file_size::is_generated(ctx.source) {
-            walk_dense_expressions(tree.root_node(), &cfg, &mut findings);
+            walk_dense_expressions(tree.root_node(), &cfg, src, &mut findings);
             let mut collector = LiteralCollector::default();
             walk_literals(tree.root_node(), &cfg, src, &mut collector);
             let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
@@ -2000,13 +2000,18 @@ fn walk_if_chain(if_node: Node, depth: usize, cfg: &LangRuleConfig) -> usize {
 }
 
 /// Recurses the whole tree looking for an `if`/ternary condition or a `return` value
-/// whose [`expression_density`] reaches [`EXTRACT_VARIABLE_DENSITY_THRESHOLD`] —
+/// whose [`expression_nesting`] reaches [`EXTRACT_VARIABLE_NESTING_THRESHOLD`] —
 /// Fowler's *Extract Variable* (née Introduce Explaining Variable), per #49. Each
 /// qualifying expression gets its own finding, anchored at its own line (not the
 /// enclosing declaration's), since a dense expression can appear anywhere in a
 /// function body.
 // SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
-fn walk_dense_expressions(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<Finding>) {
+fn walk_dense_expressions(
+    node: Node,
+    cfg: &LangRuleConfig,
+    src: &[u8],
+    findings: &mut Vec<Finding>,
+) {
     let dense = if is_branching_node(node, cfg) {
         node.child_by_field_name("condition")
             .map(|condition| ("condition", condition))
@@ -2016,13 +2021,13 @@ fn walk_dense_expressions(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<F
         None
     };
     if let Some((position, expr)) = dense {
-        let density = expression_density(expr, expr, cfg);
-        if density >= EXTRACT_VARIABLE_DENSITY_THRESHOLD {
+        let depth = expression_nesting(expr, expr, cfg, src, ChainContext::default());
+        if depth >= EXTRACT_VARIABLE_NESTING_THRESHOLD {
             findings.push(Finding {
                 line: node.start_position().row + 1,
                 message: format!(
-                    "[extract-variable] {position} expression nests {density} operators/calls \
-                     (at or over {EXTRACT_VARIABLE_DENSITY_THRESHOLD}) — consider Fowler's Extract Variable \
+                    "[extract-variable] {position} expression nests {depth} levels of operators/calls \
+                     (at or over {EXTRACT_VARIABLE_NESTING_THRESHOLD}) — consider Fowler's Extract Variable \
                      (https://refactoring.com/catalog/extractVariable.html)"
                 ),
             });
@@ -2030,7 +2035,7 @@ fn walk_dense_expressions(node: Node, cfg: &LangRuleConfig, findings: &mut Vec<F
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_dense_expressions(child, cfg, findings);
+        walk_dense_expressions(child, cfg, src, findings);
     }
 }
 
@@ -2042,26 +2047,96 @@ fn is_branching_node(node: Node, cfg: &LangRuleConfig) -> bool {
         || Some(node.kind()) == cfg.ternary_kind
 }
 
-/// Count of [`LangRuleConfig::operator_kinds`] and [`LangRuleConfig::call_kinds`] nodes
-/// under `node` — `extract-variable`'s expression-complexity proxy. Does not descend into
-/// `density_boundary_kinds` (closures, literals) or into a nested if/ternary other than
-/// `root`: a nested branch's own condition is checked separately, so counting it here
+/// Logical-operator tokens whose same-operator runs (`a && b && c`) read as one flat list.
+const LOGICAL_OPERATORS: &[&str] = &["&&", "||", "and", "or"];
+
+/// What the parent of the node being measured tells `expression_nesting` about chains.
+#[derive(Clone, Copy, Default)]
+struct ChainContext {
+    /// The parent's logical operator token, when the parent is a logical operator.
+    logical_op: Option<&'static str>,
+    /// This node is the receiver/callee side of a parent call (`recv.a().b()`'s `recv.a()`).
+    receiver: bool,
+}
+
+/// Nesting depth of [`LangRuleConfig::operator_kinds`] and [`LangRuleConfig::call_kinds`]
+/// nodes under `node` — `extract-variable`'s expression-complexity proxy. A flat
+/// same-operator `&&`/`||` run and a receiver call chain (`a.b().c().d()`) each count as
+/// one level however long they are: each link is read left to right, so none nests inside
+/// another the way a call argument or a mixed `&&`/`||` operand does. Does not descend
+/// into `density_boundary_kinds` (closures, literals) or into a nested if/ternary other
+/// than `root`: a nested branch's own condition is checked separately, so counting it here
 /// too would report the same text twice (e.g. `return (a ? b : c)`). The cost is that a
 /// dense `return cond ? dense_a : dense_b` arm goes uncounted — accepted, low-frequency.
-fn expression_density(node: Node, root: Node, cfg: &LangRuleConfig) -> usize {
+fn expression_nesting(
+    node: Node,
+    root: Node,
+    cfg: &LangRuleConfig,
+    src: &[u8],
+    chain: ChainContext,
+) -> usize {
     if cfg.density_boundary_kinds.contains(&node.kind())
         || (node.id() != root.id() && is_branching_node(node, cfg))
     {
         return 0;
     }
-    let counts = (cfg.operator_kinds.contains(&node.kind()) && !is_arithmetic_operator(node))
-        || cfg.call_kinds.contains(&node.kind());
-    let mut count = usize::from(counts);
+    let is_operator = cfg.operator_kinds.contains(&node.kind()) && !is_arithmetic_operator(node);
+    let is_call = cfg.call_kinds.contains(&node.kind()) && !is_constructor_call(node, cfg, src);
+    let operator = node
+        .child_by_field_name("operator")
+        .map(|token| token.kind())
+        .filter(|_| is_operator);
+    let continues_chain = (operator.is_some_and(|op| LOGICAL_OPERATORS.contains(&op))
+        && chain.logical_op == operator)
+        || (is_call && chain.receiver);
+    let own = usize::from((is_operator || is_call) && !continues_chain);
+    let mut deepest = 0;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count += expression_density(child, root, cfg);
+        // Cross-grammar argument/index names remain raw (typed-node-kind-migration non-goal).
+        let is_arguments = child.kind().contains("argument");
+        let child_chain = if is_operator {
+            ChainContext {
+                logical_op: operator,
+                receiver: false,
+            }
+        } else if is_call {
+            ChainContext {
+                logical_op: None,
+                receiver: !is_arguments,
+            }
+        } else if matches!(
+            node.kind(),
+            "subscript_expression" | "subscript" | "index_expression"
+        ) {
+            ChainContext {
+                logical_op: None,
+                receiver: chain.receiver && node.named_child(0) == Some(child),
+            }
+        } else {
+            chain
+        };
+        deepest = deepest.max(expression_nesting(child, root, cfg, src, child_chain));
     }
-    count
+    own + deepest
+}
+
+/// True for a call that [`LangRuleConfig::uppercase_call_is_constructor`] says builds a value
+/// rather than running logic: the callee's last `::`/`.`-separated segment starts uppercase.
+fn is_constructor_call(call: Node, cfg: &LangRuleConfig, src: &[u8]) -> bool {
+    cfg.uppercase_call_is_constructor
+        && call
+            .child_by_field_name("function")
+            .and_then(|callee| {
+                if callee.kind() == "generic_function" {
+                    callee.child_by_field_name("function")
+                } else {
+                    Some(callee)
+                }
+            })
+            .and_then(|callee| callee.utf8_text(src).ok())
+            .and_then(|text| text.rsplit(['.', ':']).next())
+            .is_some_and(|last| last.starts_with(|c: char| c.is_uppercase()))
 }
 
 /// True for a binary node whose operator token is arithmetic/bitwise. Not counted toward
@@ -4249,11 +4324,10 @@ mod tests {
 
     #[test]
     fn go_flags_dense_if_condition() {
-        // density 11: 5 calls + 6 operators.
         let findings = extract_variable_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package m\nfunc f() {\n\tif a.F1() && a.F2() && a.F3() && a.F4() && a.F5() && c > 1 {\n\t}\n}\n",
+            &format!("package m\nfunc f() {{\n\tif {} {{\n\t}}\n}}\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
         assert!(findings[0].message.contains("condition"));
@@ -4276,7 +4350,7 @@ mod tests {
         let findings = extract_variable_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package m\nfunc f() bool {\n\treturn a.F1() && a.F2() && a.F3() && a.F4() && a.F5() && c > 1\n}\n",
+            &format!("package m\nfunc f() bool {{\n\treturn {}\n}}\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
         assert!(findings[0].message.contains("return"));
@@ -4287,18 +4361,17 @@ mod tests {
         let findings = extract_variable_findings(
             Language::TypeScript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "function f() {\n  return a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1 ? 1 : 2;\n}\n",
+            &format!("function f() {{\n  return {} ? 1 : 2;\n}}\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
 
     #[test]
     fn python_flags_dense_condition_across_operator_kinds() {
-        // density 11: 5 calls + 5 boolean_operator + 1 comparison_operator.
         let findings = extract_variable_findings(
             Language::Python,
             tree_sitter_python::LANGUAGE.into(),
-            "def f():\n    if a.f1() and a.f2() and a.f3() and a.f4() and a.f5() and c < 2:\n        pass\n",
+            &format!("def f():\n    if {}:\n        pass\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
@@ -4308,7 +4381,7 @@ mod tests {
         let findings = extract_variable_findings(
             Language::Java,
             tree_sitter_java::LANGUAGE.into(),
-            "class C { void f() {\n  if (a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1) {}\n} }\n",
+            &format!("class C {{ void f() {{\n  if ({}) {{}}\n}} }}\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
@@ -4318,7 +4391,7 @@ mod tests {
         let findings = extract_variable_findings(
             Language::Kotlin,
             tree_sitter_kotlin_ng::LANGUAGE.into(),
-            "fun f(): Boolean {\n  return a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1\n}\n",
+            &format!("fun f(): Boolean {{\n  return {}\n}}\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
@@ -4328,7 +4401,7 @@ mod tests {
         let findings = extract_variable_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
-            "fn f() {\n    if a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1 {\n    }\n}\n",
+            &format!("fn f() {{\n    if {} {{\n    }}\n}}\n", nested(5)),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
@@ -4354,6 +4427,13 @@ mod tests {
         assert!(findings.is_empty(), "findings: {findings:?}");
     }
 
+    /// `a.f1(a.f2(...a.fN(1)...))`: N call levels, each nested in the previous call's argument.
+    fn nested(n: usize) -> String {
+        (1..=n).fold("1".to_string(), |inner, i| {
+            format!("a.f{}({inner})", n + 1 - i)
+        })
+    }
+
     fn calls(n: usize, sep: &str) -> String {
         (1..=n)
             .map(|i| format!("a.f{i}()"))
@@ -4362,23 +4442,114 @@ mod tests {
     }
 
     #[test]
-    fn density_threshold_boundary_is_nine_vs_ten() {
-        // n calls joined by && = n calls + (n-1) operators.
+    fn nesting_threshold_boundary_is_four_vs_five() {
         let go = |cond: String| {
             let src = format!("package m\nfunc f() {{\n\tif {cond} {{\n\t}}\n}}\n");
             extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src)
         };
-        assert!(go(calls(5, " && ")).is_empty(), "density 9 must not fire");
-        assert_eq!(
-            go(format!("{} && c", calls(5, " && "))).len(),
-            1,
-            "density 10 must fire"
+        assert!(go(nested(4)).is_empty(), "depth 4 must not fire");
+        assert_eq!(go(nested(5)).len(), 1, "depth 5 must fire");
+    }
+
+    #[test]
+    fn flat_same_operator_chain_does_not_fire_however_long() {
+        let go = |cond: String| {
+            let src = format!("package m\nfunc f() {{\n\tif {cond} {{\n\t}}\n}}\n");
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src)
+        };
+        assert!(go(calls(20, " && ")).is_empty());
+        assert!(go(calls(20, " || ")).is_empty());
+    }
+
+    #[test]
+    fn mixed_operator_alternation_nests() {
+        let src = "package m\nfunc f() {\n\tif a && (b || (c && (d || (e && f)))) {\n\t}\n}\n";
+        let findings =
+            extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn receiver_call_chain_does_not_fire_however_long() {
+        let chain = (1..=15).map(|i| format!(".f{i}()")).collect::<String>();
+        let cases: Vec<(Language, tree_sitter::Language, String)> = vec![
+            (
+                Language::Go,
+                tree_sitter_go::LANGUAGE.into(),
+                format!("package m\nfunc f() {{\n\treturn a{chain}\n}}\n"),
+            ),
+            (
+                Language::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                format!("function f() {{\n  return a{chain};\n}}\n"),
+            ),
+            (
+                Language::Java,
+                tree_sitter_java::LANGUAGE.into(),
+                format!("class C {{ Object f() {{\n  return a{chain};\n}} }}\n"),
+            ),
+            (
+                Language::Rust,
+                tree_sitter_rust::LANGUAGE.into(),
+                format!("fn f() {{\n    return a{chain};\n}}\n"),
+            ),
+        ];
+        for (lang, ts, src) in cases {
+            let findings = extract_variable_findings(lang, ts, &src);
+            assert!(findings.is_empty(), "{lang:?}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn rust_nested_constructors_do_not_count_but_nested_functions_do() {
+        let ctors = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() {\n    return Err(E::A(B::C(D(E::F(g(1))))));\n}\n",
         );
+        assert!(ctors.is_empty(), "findings: {ctors:?}");
+        let fns = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            &format!("fn f() {{\n    return {};\n}}\n", nested(5)),
+        );
+        assert_eq!(fns.len(), 1, "findings: {fns:?}");
+    }
+
+    #[test]
+    fn computed_callee_arguments_are_not_receiver_chain_links() {
+        let findings = extract_variable_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() { return methods[f1(f2(f3(f4(1))))](); }",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(findings[0].message.contains("nests 5 levels"));
+    }
+
+    #[test]
+    fn rust_turbofish_constructors_do_not_count() {
+        let findings = extract_variable_findings(
+            Language::Rust,
+            tree_sitter_rust::LANGUAGE.into(),
+            "fn f() { return Some::<_>(Some::<_>(Some::<_>(Some::<_>(Some::<_>(1))))); }",
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn go_uppercase_calls_are_functions_not_constructors() {
+        let findings = extract_variable_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package m\nfunc f() {\n\treturn F1(F2(F3(F4(F5(1)))))\n}\n",
+        );
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
     }
 
     #[test]
     fn closure_bodies_do_not_count_toward_density_in_other_languages() {
-        let dense = calls(6, " && ");
+        let dense = nested(5);
         let cases: Vec<(Language, tree_sitter::Language, String)> = vec![
             (
                 Language::TypeScript,
@@ -4388,7 +4559,7 @@ mod tests {
             (
                 Language::Python,
                 tree_sitter_python::LANGUAGE.into(),
-                format!("def f():\n    return lambda: {}\n", calls(6, " and ")),
+                format!("def f():\n    return lambda: {}\n", nested(5)),
             ),
             (
                 Language::Java,
@@ -4411,7 +4582,7 @@ mod tests {
     fn python_flags_dense_elif_condition() {
         let src = format!(
             "def f():\n    if x:\n        pass\n    elif {}:\n        pass\n",
-            calls(6, " and ")
+            nested(5)
         );
         let findings =
             extract_variable_findings(Language::Python, tree_sitter_python::LANGUAGE.into(), &src);
@@ -4421,10 +4592,7 @@ mod tests {
 
     #[test]
     fn typescript_parenthesized_return_ternary_reports_once_at_the_condition() {
-        let src = format!(
-            "function f() {{\n  return ({} ? 1 : 2);\n}}\n",
-            calls(6, " && ")
-        );
+        let src = format!("function f() {{\n  return ({} ? 1 : 2);\n}}\n", nested(5));
         let findings = extract_variable_findings(
             Language::TypeScript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -4438,7 +4606,7 @@ mod tests {
     fn extract_variable_skips_generated_files() {
         let src = format!(
             "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage m\nfunc f() {{\n\tif {} {{\n\t}}\n}}\n",
-            calls(6, " && ")
+            nested(5)
         );
         let findings =
             extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
@@ -4498,7 +4666,10 @@ mod tests {
         let findings = extract_variable_findings(
             Language::Rust,
             tree_sitter_rust::LANGUAGE.into(),
-            "fn f() -> i32 {\n    return if a.f1() && a.f2() && a.f3() && a.f4() && a.f5() && c > 1 { 1 } else { 2 };\n}\n",
+            &format!(
+                "fn f() -> i32 {{\n    return if {} {{ 1 }} else {{ 2 }};\n}}\n",
+                nested(5)
+            ),
         );
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
         assert!(findings[0].message.contains("condition"));

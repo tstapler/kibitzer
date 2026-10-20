@@ -1588,6 +1588,9 @@ fn relativize(root: &Path, path: &Path) -> String {
 
 /// Convenience for batch mode: walk `dir` and run checks against every file within it.
 pub fn walk_and_collect_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(files) = git_visible_files(dir) {
+        return Ok(files);
+    }
     let mut files = Vec::new();
     for entry in walk(dir)? {
         if entry.is_file() {
@@ -1595,6 +1598,70 @@ pub fn walk_and_collect_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+/// Files under `dir` git considers part of the work tree (tracked, or untracked and not
+/// gitignored), minus `SKIP_DIRS`. `None` — fall back to [`walk`] — when `dir` isn't in a
+/// work tree, is itself gitignored (a plain walk is the only way to see into it), or git fails.
+fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
+    let git = |args: &[&str]| {
+        let mut cmd = git_command(dir);
+        cmd.args(args);
+        bounded_output(cmd, ARCHIVE_TIMEOUT)
+    };
+    let in_work_tree = git(&["rev-parse", "--is-inside-work-tree"])?;
+    if !in_work_tree.status.success() || !in_work_tree.stdout.starts_with(b"true") {
+        return None;
+    }
+    // Exit 0 means ignored; 1 means not ignored; anything else (e.g. 128) is a git error.
+    if git(&["check-ignore", "-q", "."])?.status.code() != Some(1) {
+        return None;
+    }
+    let listed = git(&[
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ])
+    .filter(|o| o.status.success())?;
+    let root = dir.canonicalize().ok()?;
+    let mut files = Vec::new();
+    for rel in listed
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|rel| !rel.is_empty())
+    {
+        #[cfg(unix)]
+        let rel = {
+            use std::os::unix::ffi::OsStrExt;
+            Path::new(std::ffi::OsStr::from_bytes(rel)).to_path_buf()
+        };
+        #[cfg(not(unix))]
+        let rel = PathBuf::from(std::str::from_utf8(rel).ok()?);
+        if rel.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|name| SKIP_DIRS.contains(&name))
+        }) {
+            continue;
+        }
+        let path = dir.join(rel);
+        let Ok(resolved) = path.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&root) || (path.is_symlink() && path.is_dir()) {
+            continue;
+        }
+        if path.is_dir() && path.join(".git").exists() {
+            files.extend(git_visible_files(&path)?);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Some(files)
 }
 
 /// Directories never worth descending into for batch-mode scans: VCS internals and
@@ -1658,6 +1725,9 @@ mod head_mapping_tests;
 
 #[cfg(test)]
 mod git_head_integration_tests;
+
+#[cfg(test)]
+mod walk_tests;
 
 #[cfg(test)]
 mod native_check_tests;

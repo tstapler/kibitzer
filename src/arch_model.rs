@@ -86,19 +86,15 @@ pub struct SymbolNode {
     /// precedent as `ArchFinding::severity_override`).
     #[serde(default)]
     pub is_pure_delegation: bool,
-    /// Receiver field a pure-delegation method routes through (`s.inner.Foo()` →
-    /// `Some("inner")`), for `middle_man::MiddleManChecker`. `None` for non-delegating
-    /// symbols, delegation that isn't a direct receiver-field call (free functions,
-    /// `s.Get().Foo()`, deeper chains), and languages without call-graph coverage.
+    /// Receiver field a pure-delegation method routes through (`s.inner.Foo()` → `inner`).
     #[serde(default)]
     pub delegation_field: Option<String>,
-    /// `(name, type_text)` per declared parameter of a `Function`/`Method`, in
-    /// declaration order, receiver excluded. Populated for Go and TypeScript/TSX only
-    /// (`symbol_extract::extract_params`); empty for every other language and for
-    /// `Type`/`Interface` symbols. `#[serde(default)]` so a `cache.json` written before
-    /// this field existed still deserializes.
+    /// `(name, type_text)` per declared parameter, receiver excluded.
     #[serde(default)]
     pub params: Vec<(String, String)>,
+    /// A same-package bare name occurs in a value position; lexical shadowing is not resolved.
+    #[serde(default)]
+    pub used_as_value: bool,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -427,6 +423,7 @@ pub fn build_model(
     let mut unsupported_language_files = 0usize;
     let total_files_scanned = files.len();
     let mut raw_call_sites: Vec<RawCallSite> = Vec::new();
+    let mut value_names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut raw_field_access_sites: Vec<RawFieldAccessSite> = Vec::new();
     let mut raw_type_relation_sites: Vec<RawTypeRelationSite> = Vec::new();
     let mut struct_fields: HashMap<(String, String), std::collections::HashSet<String>> =
@@ -479,6 +476,9 @@ pub fn build_model(
             }
         }
 
+        value_names.entry(package_path.clone()).or_default().extend(
+            crate::symbol_extract::function_value_names(language, source, &tree),
+        );
         let symbols = extract_symbols_for_file(language, source, &tree, &package_path);
         for symbol in symbols {
             if !prune.include_private && !symbol.exported {
@@ -523,6 +523,15 @@ pub fn build_model(
         ));
     }
 
+    for (path, package) in &mut packages {
+        for symbol in &mut package.symbols {
+            // Bare names are package-scoped evidence, not resolved invocation edges.
+            symbol.used_as_value = symbol.kind == SymbolKind::Function
+                && value_names
+                    .get(path)
+                    .is_some_and(|names| names.contains(&symbol.name));
+        }
+    }
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
     let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites);
     let file_import_aliases =
@@ -1225,6 +1234,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         }
     }
 
@@ -1368,12 +1378,17 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
         let round_tripped: SymbolNode = serde_json::from_str(&json).expect("deserializes");
 
         assert_eq!(original, round_tripped);
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("used_as_value");
+        let legacy: SymbolNode = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.used_as_value);
     }
 
     #[test]
@@ -2134,6 +2149,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2147,6 +2163,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
 
         let mut packages = BTreeMap::new();
@@ -2184,6 +2201,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2222,6 +2240,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2495,6 +2514,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2513,6 +2533,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2565,6 +2586,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2608,6 +2630,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         });
         packages.insert("app".to_string(), pkg);
 

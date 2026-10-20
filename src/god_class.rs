@@ -510,6 +510,7 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             params: vec![],
+            used_as_value: false,
         }
     }
 
