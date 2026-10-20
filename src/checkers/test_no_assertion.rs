@@ -13,7 +13,7 @@
 //! `precision_first` (an unresolved call whose name looks assertion-ish counts as asserting),
 //! `assertion_ish` (extra words for that look). Any other key is a load-time error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +64,11 @@ const GO_VERIFYING_WORDS: &[&str] = &[
 ];
 /// Last-segment prefixes of the call that starts a subprocess entrypoint's server or plugin main.
 const GO_ENTRYPOINT_PREFIXES: &[&str] = &["Serve", "Run", "Main", "Start", "Listen", "Sleep"];
+/// Import path whose `Run(t, s)` hands the test to the suite's own methods.
+const TESTIFY_SUITE_PATH: &str = "github.com/stretchr/testify/suite";
+/// Marks a synthetic call: the body builds a struct literal that stores the testing handle in a
+/// field (`Type.field` follows), so a same-file method of `Type` may fail the test through it.
+const HOLDER_PREFIX: &str = "\0holder:";
 const OPT_HELPERS: &str = "assertion_helpers";
 const OPT_PRECISION: &str = "precision_first";
 const OPT_ISH: &str = "assertion_ish";
@@ -132,6 +137,11 @@ struct FnInfo {
     handles: Vec<String>,
     /// Go only: an env-gated subprocess entrypoint (`if os.Getenv(..) == "" { return }; Serve()`).
     env_entrypoint: bool,
+    /// Go only: the body has a parse error (e.g. Go 1.26 `new(expr)`, unsupported by the grammar),
+    /// so the calls seen here are incomplete and the test cannot be judged.
+    parse_error: bool,
+    /// Go methods only: `(receiver name, receiver type)`.
+    receiver: Option<(String, String)>,
     /// Go only: parameter names in order (`""` for an unnamed one), for callback-argument following.
     params: Vec<String>,
     /// Python only: innermost enclosing class, for `self.method` resolution.
@@ -249,6 +259,11 @@ impl TestNoAssertionChecker {
             if ctx.vocab.contains(&call.callee) || self.supplemental(ctx, call) {
                 return true;
             }
+            if self.lang == Language::Go
+                && (delegates_to_handle_holder(ctx, call) || runs_testify_suite(ctx, call, handles))
+            {
+                return true;
+            }
             if self.lang == Language::Go && callback_asserts(ctx, call, handles) {
                 return true;
             }
@@ -363,6 +378,21 @@ fn callback_asserts(ctx: &Scan, call: &Call, handles: &[String]) -> bool {
     }
 }
 
+/// `suite.Run(t, s)` (under any import alias of testify's suite package): the assertions live in
+/// the suite's methods. A `Run` on any other receiver does not qualify.
+fn runs_testify_suite(ctx: &Scan, call: &Call, handles: &[String]) -> bool {
+    call.callee
+        .strip_suffix(".Run")
+        .is_some_and(|pkg| ctx.suite_aliases.iter().any(|a| a == pkg))
+        && call.args.first().is_some_and(|a| handles.contains(a))
+}
+
+fn delegates_to_handle_holder(ctx: &Scan, call: &Call) -> bool {
+    call.callee
+        .strip_prefix(HOLDER_PREFIX)
+        .is_some_and(|key| ctx.failing_holders.contains(key))
+}
+
 fn is_failing_method_value(arg: &str, handles: &[String]) -> bool {
     arg.split_once('.').is_some_and(|(recv, method)| {
         handles.iter().any(|h| h == recv) && GO_FAILING_METHODS.contains(&method)
@@ -394,6 +424,10 @@ struct Scan {
     methods: HashMap<(String, String), usize>,
     bases: HashMap<String, Vec<String>>,
     seen: std::cell::RefCell<Vec<usize>>,
+    /// Go only: local names the testify `suite` package is imported under.
+    suite_aliases: Vec<String>,
+    /// Go only: `Type.field` pairs where a same-file method of `Type` fails the test through `field`.
+    failing_holders: HashSet<String>,
     /// Kotlin only: the file mentions screenshots, so `capture*` calls compare against goldens.
     screenshot_file: bool,
 }
@@ -589,6 +623,10 @@ impl Checker for TestNoAssertionChecker {
             else {
                 continue;
             };
+            if self.lang == Language::Go && info.parse_error {
+                // Fail quiet: an unparsed body may hold the assertions.
+                continue;
+            }
             if self.lang == Language::Go && info.env_entrypoint {
                 // The test binary re-exec'd as a plugin/server process; the parent test asserts.
                 continue;
@@ -640,6 +678,11 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
                     handles,
                     env_entrypoint: lang == Language::Go
                         && is_env_gated_entrypoint(node, ctx.source),
+                    parse_error: lang == Language::Go
+                        && (node.has_error() || node.child_by_field_name("body").is_none()),
+                    receiver: (lang == Language::Go)
+                        .then(|| go_receiver(node, ctx.source))
+                        .flatten(),
                     params: if lang == Language::Go {
                         go_params(node, ctx.source)
                     } else {
@@ -665,8 +708,15 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
             by_method.entry(f.name.clone()).or_insert(i);
         }
     }
+    let suite_aliases = match ctx.tree {
+        Some(tree) if lang == Language::Go => testify_suite_aliases(tree.root_node(), ctx.source),
+        _ => Vec::new(),
+    };
+    let failing_holders = failing_holders(&fns, &vocab);
     Scan {
         vocab,
+        suite_aliases,
+        failing_holders,
         fns,
         by_name,
         by_method,
@@ -680,6 +730,91 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
         screenshot_file: lang == Language::Kotlin
             && ctx.source.to_ascii_lowercase().contains("screenshot"),
     }
+}
+
+/// Go: `(receiver name, receiver type)` of a method declaration; the type loses `*` and type args.
+fn go_receiver(func: Node, source: &str) -> Option<(String, String)> {
+    let decl = func.child_by_field_name("receiver")?.named_child(0)?;
+    let name = node_text(decl.child_by_field_name("name")?, source);
+    let ty = node_text(decl.child_by_field_name("type")?, source);
+    let ty = ty.trim_start_matches('*');
+    let ty = ty.split('[').next().unwrap_or(ty);
+    Some((name.to_string(), ty.to_string()))
+}
+
+/// Go: `Type.field` for each type with a same-file method that fails the test through its `field`
+/// (`w.t.Error(..)`, or `require.NoError(w.t, ..)` with a vocabulary assertion).
+fn failing_holders(fns: &[FnInfo], vocab: &AssertionVocabulary) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for f in fns {
+        let Some((recv, ty)) = &f.receiver else {
+            continue;
+        };
+        for call in &f.calls {
+            let parts: Vec<&str> = call.callee.split('.').collect();
+            if let [r, field, method] = parts[..]
+                && r == recv
+                && GO_FAILING_METHODS.contains(&method)
+            {
+                out.insert(format!("{ty}.{field}"));
+            }
+            if vocab.contains(&call.callee)
+                && let Some(field) = call
+                    .args
+                    .first()
+                    .and_then(|a| a.strip_prefix(recv.as_str()))
+                    .and_then(|a| a.strip_prefix('.'))
+            {
+                out.insert(format!("{ty}.{field}"));
+            }
+        }
+    }
+    out
+}
+
+/// Go: local names the file imports testify's `suite` package under (`suite`, or an explicit alias).
+fn testify_suite_aliases(root: Node, source: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    walk_preorder(root, &mut |n| {
+        if n.kind() == "import_spec"
+            && n.child_by_field_name("path").is_some_and(|p| {
+                node_text(p, source).trim_matches(['"', '`']) == TESTIFY_SUITE_PATH
+            })
+        {
+            aliases.push(
+                n.child_by_field_name("name")
+                    .map_or("suite", |a| node_text(a, source))
+                    .to_string(),
+            );
+        }
+        true
+    });
+    aliases
+}
+
+/// Go: `Type{field: t}` stores the testing handle in a field; emits a synthetic call per field.
+fn handle_holder_calls(node: Node, source: &str, handles: &[String]) -> Vec<Call> {
+    let (Some(ty), Some(body)) = (
+        node.child_by_field_name("type"),
+        node.child_by_field_name("body"),
+    ) else {
+        return Vec::new();
+    };
+    let ty = node_text(ty, source);
+    let ty = ty.split('[').next().unwrap_or(ty);
+    let mut calls = Vec::new();
+    let mut cursor = body.walk();
+    for el in body.named_children(&mut cursor) {
+        if el.kind() == "keyed_element"
+            && el.named_child_count() == 2
+            && let (Some(key), Some(value)) = (el.named_child(0), el.named_child(1))
+            && handles.iter().any(|h| h == node_text(value, source))
+        {
+            let key = node_text(key, source);
+            calls.push(Call::new(format!("{HOLDER_PREFIX}{ty}.{key}"), Vec::new()));
+        }
+    }
+    calls
 }
 
 /// `try: validate(...)` / `except ...: ...; raise e`: the schema validator's failure is the
@@ -872,6 +1007,8 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
             && is_guarded_panic(node, source)
         {
             calls.push(Call::new(GUARDED_PANIC.to_string(), Vec::new()));
+        } else if lang == Language::Go && node.kind() == "composite_literal" {
+            calls.extend(handle_holder_calls(node, source, handles));
         } else if lang == Language::Go
             && node.kind() == "keyed_element"
             && let Some(value) = node.named_child(node.named_child_count().saturating_sub(1) as u32)
