@@ -1654,7 +1654,10 @@ fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
             continue;
         }
         if path.is_dir() && path.join(".git").exists() {
-            files.extend(git_visible_files(&path)?);
+            // A broken nested checkout must not invalidate the parent's filtered listing.
+            if let Some(nested) = git_visible_files(&path) {
+                files.extend(nested);
+            }
         } else if path.is_file() {
             files.push(path);
         }

@@ -837,6 +837,16 @@ pub(crate) fn function_value_names(
                     node = parent
                 }
                 "index_expression" if field_is_node("operand") => node = parent,
+                "ternary_expression"
+                    if field_is_node("consequence") || field_is_node("alternative") =>
+                {
+                    node = parent
+                }
+                "member_expression" | "selector_expression"
+                    if field_is_node("property") || field_is_node("field") =>
+                {
+                    node = parent
+                }
                 "arguments" | "argument_list" | "return_statement" | "array" | "literal_value" => {
                     return true;
                 }
@@ -853,7 +863,8 @@ pub(crate) fn function_value_names(
         false
     }
     fn visit(node: Node, source: &str, names: &mut std::collections::HashSet<String>) {
-        if (node.kind() == "identifier" && is_value(node))
+        if (["identifier", "property_identifier", "field_identifier"].contains(&node.kind())
+            && is_value(node))
             || node.kind() == "shorthand_property_identifier"
         {
             names.insert(node_text(node, source).to_string());

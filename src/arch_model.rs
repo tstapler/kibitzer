@@ -526,7 +526,7 @@ pub fn build_model(
     for (path, package) in &mut packages {
         for symbol in &mut package.symbols {
             // Bare names are package-scoped evidence, not resolved invocation edges.
-            symbol.used_as_value = symbol.kind == SymbolKind::Function
+            symbol.used_as_value = matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
                 && value_names
                     .get(path)
                     .is_some_and(|names| names.contains(&symbol.name));

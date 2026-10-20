@@ -41,30 +41,17 @@ impl ArchModelChecker for SingleCallSiteDelegationChecker {
     }
 }
 
-/// Number of distinct resolved call sites per callee `SymbolNode::id` (distinct by caller,
-/// file and line). The finding says "inline it at that call site", so a callee called twice
-/// from one caller has two sites, not one: inlining would duplicate its body.
+/// Number of resolved invocation edges per callee; separate same-line calls remain separate.
 fn call_site_counts(model: &ArchModel) -> HashMap<&str, usize> {
-    // A self-edge (a wrapper calling a same-named method on another receiver, which the
-    // receiver-blind resolver maps back to itself) is not a call site of the wrapper.
-    let mut sites_by_target: HashMap<
-        &str,
-        std::collections::HashSet<(&str, &std::path::Path, usize)>,
-    > = HashMap::new();
+    let mut counts = HashMap::new();
     for edge in model
         .call_edges
         .iter()
-        .filter(|e| e.resolved && e.from != e.to)
+        .filter(|edge| edge.resolved && edge.from != edge.to)
     {
-        sites_by_target
-            .entry(edge.to.as_str())
-            .or_default()
-            .insert((edge.from.as_str(), edge.file.as_path(), edge.line));
+        *counts.entry(edge.to.as_str()).or_default() += 1;
     }
-    sites_by_target
-        .into_iter()
-        .map(|(target, sites)| (target, sites.len()))
-        .collect()
+    counts
 }
 
 /// Resolved `Implements` edges, deduplicated by (type, interface) pair.
@@ -519,6 +506,7 @@ func sysctlsV1Dot27(podMetadata *ObjectMeta, podSpec *PodSpec) CheckResult {
             "const callbacks = { thin };",
             "const callback = thin as () => void;",
             "const callback = thin satisfies (() => void);",
+            "const callback = enabled ? thin : other;",
         ] {
             let source = format!(
                 "function helper() {{}}\nfunction thin() {{ helper(); }}\nfunction test() {{ thin(); }}\n{registration}\n"
@@ -529,6 +517,24 @@ func sysctlsV1Dot27(podMetadata *ObjectMeta, podSpec *PodSpec) CheckResult {
                 "{registration}"
             );
         }
+    }
+
+    #[test]
+    fn registered_method_value_is_not_an_inline_candidate() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.ts",
+            "class C { inner: C; thin() { this.inner.helper(); } named() { this.thin(); } register() { register(this.thin); } }",
+        )]);
+        assert!(single_call_site_delegation_findings(&model).is_empty());
+    }
+
+    #[test]
+    fn two_same_line_calls_are_two_sites() {
+        let model = model_from(vec![(
+            "/repo/pkg/a.go",
+            "package pkg\nfunc thin() { helper() }\nfunc helper() {}\nfunc Live() { thin(); thin() }\n",
+        )]);
+        assert!(single_call_site_delegation_findings(&model).is_empty());
     }
 
     #[test]

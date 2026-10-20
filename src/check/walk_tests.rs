@@ -46,6 +46,21 @@ fn git_walk_does_not_follow_symlinks_outside_root() {
     let _ = std::fs::remove_dir_all(outside);
 }
 
+#[test]
+fn broken_nested_checkout_does_not_disable_parent_ignores() {
+    let dir = scratch_dir("broken-nested");
+    git(&dir, &["init", "-q"]);
+    write(&dir, ".gitignore", "ignored/\n");
+    write(&dir, "main.go", "package main\n");
+    write(&dir, "ignored/copy.go", "package ignored\n");
+    write(&dir, "module/.git", "gitdir: missing\n");
+    write(&dir, "module/child.go", "package child\n");
+    let names = rel_names(&dir, &walk_and_collect_files(&dir).unwrap());
+    assert!(names.contains(&"main.go".to_string()));
+    assert!(!names.iter().any(|name| name.starts_with("ignored/")));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let status = git_command(dir).args(args).status().unwrap();
     assert!(status.success(), "git {args:?} failed");

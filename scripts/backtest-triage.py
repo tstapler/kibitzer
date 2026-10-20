@@ -349,7 +349,10 @@ def main() -> None:
     p_list.set_defaults(func=cmd_list)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        parser.exit(1, f"Corpus operation failed: {error}\n")
 
 
 if __name__ == "__main__":
