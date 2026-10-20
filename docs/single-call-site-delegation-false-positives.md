@@ -10,9 +10,10 @@ tracked as #117 and are not repeated here, except where TypeScript makes them mu
 
 ### 2026-10-19 — callback registration resolution
 
-Bare same-package function references now set `SymbolNode.used_as_value`; the checker does
-not recommend inlining those functions. This covers `CheckPod: sysctlsV1Dot27` in Kubernetes.
-Qualified references, method values and lexical shadowing are not resolved. Controlled package
+Same-package function and method value references set `SymbolNode.used_as_value`; the checker
+does not recommend inlining those symbols. This covers `CheckPod: sysctlsV1Dot27`, object
+shorthand, conditional callback arms and direct method references. Matching is conservative
+by package and name, without lexical-shadow or receiver-type resolution. Controlled package
 backtests removed six policy findings without adding findings in the checked describe, actions
 and folding packages. The merged transcript CLI accepts architecture checkers, but models each
 file in isolation; it does not reconstruct historical cross-file callers.

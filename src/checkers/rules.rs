@@ -2113,6 +2113,11 @@ fn expression_nesting(
                 logical_op: None,
                 receiver: chain.receiver && node.named_child(0) == Some(child),
             }
+        } else if matches!(
+            node.kind(),
+            "unary_expression" | "unary_operator" | "not_operator"
+        ) {
+            ChainContext::default()
         } else {
             chain
         };
@@ -4467,6 +4472,16 @@ mod tests {
         let findings =
             extract_variable_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
         assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    }
+
+    #[test]
+    fn negation_breaks_a_flat_logical_chain() {
+        let findings = extract_variable_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            "package p\nfunc f() bool { return a && !(b && !(c && !(d && !(e && f)))) }\n",
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
     }
 
     #[test]
