@@ -18,3 +18,12 @@ func TestResetEditions(t *testing.T) {
 	defer editions.Unlock()
 	editions.m = make(map[string]int)
 }
+
+// A t.Helper() inside a closure marks the closure, not the test (minio ring_buffer_test.go).
+func TestHelperOnlyInClosure(t *testing.T) {
+	check := func(fn func()) {
+		t.Helper()
+		fn()
+	}
+	check(func() {})
+}

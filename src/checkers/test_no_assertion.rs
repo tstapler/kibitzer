@@ -142,6 +142,8 @@ struct FnInfo {
     handles: Vec<String>,
     /// Go only: an env-gated subprocess entrypoint (`if os.Getenv(..) == "" { return }; Serve()`).
     env_entrypoint: bool,
+    /// Go only: a top-level `t.Helper()` statement (not one inside a closure).
+    marks_helper: bool,
     /// Go only: the body has a parse error (e.g. Go 1.26 `new(expr)`, unsupported by the grammar),
     /// so the calls seen here are incomplete and the test cannot be judged.
     parse_error: bool,
@@ -683,12 +685,7 @@ impl Checker for TestNoAssertionChecker {
                 // A Go subprocess re-exec stub (`TestHelperProcess`): the parent test asserts.
                 continue;
             }
-            if self.lang == Language::Go
-                && info
-                    .handles
-                    .iter()
-                    .any(|h| info.calls.iter().any(|c| c.callee == format!("{h}.Helper")))
-            {
+            if self.lang == Language::Go && info.marks_helper {
                 // `t.Helper()` marks a function other tests call (boundary export_test.go), not a test.
                 continue;
             }
@@ -734,6 +731,8 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
         walk_preorder(tree.root_node(), &mut |node| {
             if let Some(name) = function_name(lang, node, ctx.source) {
                 let handles = handles_in(lang, node, ctx.source);
+                let marks_helper =
+                    lang == Language::Go && calls_handle_helper(node, ctx.source, &handles);
                 fns.push(FnInfo {
                     name: name.to_string(),
                     is_method: lang == Language::Go
@@ -746,6 +745,7 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
                         && (is_env_gated_entrypoint(node, ctx.source)
                             || is_gated_main_harness(node, ctx.source)
                             || is_helper_process_mode(node, ctx.source, name, &env_vars)),
+                    marks_helper,
                     parse_error: lang == Language::Go
                         && (node.has_error() || node.child_by_field_name("body").is_none()),
                     receiver: (lang == Language::Go)
@@ -1394,7 +1394,10 @@ fn is_mock_panic_expectation(callee: &str) -> bool {
 /// Statements of a Go block, looking through the `statement_list` wrapper, without comments.
 fn block_statements(block: Node) -> Vec<Node> {
     let mut cursor = block.walk();
-    let mut stmts: Vec<Node> = block.named_children(&mut cursor).collect();
+    let mut stmts: Vec<Node> = block
+        .named_children(&mut cursor)
+        .filter(|s| s.kind() != "comment")
+        .collect();
     if let [only] = stmts[..]
         && only.kind() == "statement_list"
     {
@@ -1444,6 +1447,22 @@ fn is_env_gated_entrypoint(func: Node, source: &str) -> bool {
                 .is_some_and(|f| {
                     let name = node_text(f, source).rsplit('.').next().unwrap_or("");
                     GO_ENTRYPOINT_PREFIXES.iter().any(|p| name.starts_with(p))
+                })
+    })
+}
+
+fn calls_handle_helper(func: Node, source: &str, handles: &[String]) -> bool {
+    let Some(body) = func.child_by_field_name("body") else {
+        return false;
+    };
+    block_statements(body).iter().any(|s| {
+        s.kind() == "expression_statement"
+            && s.named_child(0)
+                .filter(|c| GoKind::of(*c) == GoKind::CallExpression)
+                .and_then(|c| c.child_by_field_name("function"))
+                .is_some_and(|f| {
+                    let text = node_text(f, source);
+                    handles.iter().any(|h| text == format!("{h}.Helper"))
                 })
     })
 }

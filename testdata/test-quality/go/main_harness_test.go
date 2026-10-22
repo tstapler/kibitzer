@@ -53,6 +53,8 @@ func TestHelper_OK(t *testing.T) {
 	if !gotestHelperMode {
 		return
 	}
+
+	// A trailing comment after the gate must not hide it (beats gotest_test.go:147).
 }
 
 func TestHelper_WithPanic(t *testing.T) {
