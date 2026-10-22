@@ -69,6 +69,8 @@ const TESTIFY_SUITE_PATH: &str = "github.com/stretchr/testify/suite";
 /// Marks a synthetic call: the body builds a struct literal that stores the testing handle in a
 /// field (`Type.field` follows), so a same-file method of `Type` may fail the test through it.
 const HOLDER_PREFIX: &str = "\0holder:";
+/// Field marker of a positional struct literal element (`T{t, 1}`); resolved to a name by index.
+const POSITIONAL_FIELD: &str = "#";
 const OPT_HELPERS: &str = "assertion_helpers";
 const OPT_PRECISION: &str = "precision_first";
 const OPT_ISH: &str = "assertion_ish";
@@ -93,6 +95,8 @@ struct Call {
     /// Go only: an argument is a struct literal (or a variable bound to one) with a field set to
     /// the testing handle, so the callee can fail the test through it.
     carries_handle: bool,
+    /// Go only: a method call on a variable bound to a struct literal carrying the testing handle.
+    on_handle_holder: bool,
     /// Go only: a `t.Run(name, v.Field)` value read off a local variable. When no same-file
     /// method resolves, it is a func-typed field set elsewhere, so the body is unknowable here.
     dynamic_dispatch: bool,
@@ -105,6 +109,7 @@ impl Call {
             args,
             fn_value: false,
             carries_handle: false,
+            on_handle_holder: false,
             dynamic_dispatch: false,
         }
     }
@@ -260,7 +265,9 @@ impl TestNoAssertionChecker {
                 return true;
             }
             if self.lang == Language::Go
-                && (delegates_to_handle_holder(ctx, call) || runs_testify_suite(ctx, call, handles))
+                && (delegates_to_handle_holder(ctx, call)
+                    || runs_unseen_holder_method(ctx, call, handles)
+                    || runs_testify_suite(ctx, call, handles))
             {
                 return true;
             }
@@ -391,6 +398,12 @@ fn delegates_to_handle_holder(ctx: &Scan, call: &Call) -> bool {
     call.callee
         .strip_prefix(HOLDER_PREFIX)
         .is_some_and(|key| ctx.failing_holders.contains(key))
+}
+
+/// `ts.Run()` on a variable bound to a handle-carrying literal, where no same-file method is
+/// named `Run`: the type's methods live in a sibling file of the package and cannot be judged.
+fn runs_unseen_holder_method(ctx: &Scan, call: &Call, handles: &[String]) -> bool {
+    call.on_handle_holder && ctx.resolve_go(&call.callee, handles).is_none()
 }
 
 fn is_failing_method_value(arg: &str, handles: &[String]) -> bool {
@@ -712,7 +725,11 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
         Some(tree) if lang == Language::Go => testify_suite_aliases(tree.root_node(), ctx.source),
         _ => Vec::new(),
     };
-    let failing_holders = failing_holders(&fns, &vocab);
+    let declared_types = match ctx.tree {
+        Some(tree) if lang == Language::Go => go_declared_types(tree.root_node(), ctx.source),
+        _ => HashMap::new(),
+    };
+    let failing_holders = failing_holders(&fns, &vocab, &declared_types);
     Scan {
         vocab,
         suite_aliases,
@@ -744,13 +761,17 @@ fn go_receiver(func: Node, source: &str) -> Option<(String, String)> {
 
 /// Go: `Type.field` for each type with a same-file method that fails the test through its `field`
 /// (`w.t.Error(..)`, or `require.NoError(w.t, ..)` with a vocabulary assertion).
-fn failing_holders(fns: &[FnInfo], vocab: &AssertionVocabulary) -> HashSet<String> {
+fn failing_holders(
+    fns: &[FnInfo],
+    vocab: &AssertionVocabulary,
+    types: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
     let mut out = HashSet::new();
     for f in fns {
         let Some((recv, ty)) = &f.receiver else {
             continue;
         };
-        for call in &f.calls {
+        for call in f.calls.iter().filter(|c| !c.fn_value) {
             let parts: Vec<&str> = call.callee.split('.').collect();
             if let [r, field, method] = parts[..]
                 && r == recv
@@ -758,18 +779,76 @@ fn failing_holders(fns: &[FnInfo], vocab: &AssertionVocabulary) -> HashSet<Strin
             {
                 out.insert(format!("{ty}.{field}"));
             }
-            if vocab.contains(&call.callee)
-                && let Some(field) = call
-                    .args
-                    .first()
-                    .and_then(|a| a.strip_prefix(recv.as_str()))
+            for (i, arg) in call.args.iter().enumerate() {
+                let Some(field) = arg
+                    .strip_prefix(recv.as_str())
                     .and_then(|a| a.strip_prefix('.'))
-            {
-                out.insert(format!("{ty}.{field}"));
+                    .filter(|a| is_go_path(a) && !a.contains('.'))
+                else {
+                    continue;
+                };
+                if vocab.contains(&call.callee)
+                    || forwards_to_failure(fns, vocab, &call.callee, i, 0)
+                {
+                    out.insert(format!("{ty}.{field}"));
+                }
             }
         }
     }
+    let positional: Vec<String> = out
+        .iter()
+        .filter_map(|key| {
+            let (ty, field) = key.split_once('.')?;
+            let at = types.get(ty)?.iter().position(|n| n == field)?;
+            Some(format!("{ty}.{POSITIONAL_FIELD}{at}"))
+        })
+        .collect();
+    out.extend(positional);
     out
+}
+
+/// Go: the same-file function `callee` names, by bare name or, for a selector, by method name.
+fn find_same_file_fn<'a>(fns: &'a [FnInfo], callee: &str) -> Option<&'a FnInfo> {
+    let name = callee.rsplit('.').next().unwrap_or(callee);
+    let selector = callee.contains('.');
+    fns.iter()
+        .find(|f| f.name == name && f.is_method == selector)
+}
+
+/// Go: does handing the testing handle to `callee` as its `idx`-th argument fail the test? An
+/// unresolvable callee is assumed to (as `passes_handle` does); a same-file one must fail on the
+/// parameter itself, or hand it on. Depth-bounded, so recursion terminates.
+fn forwards_to_failure(
+    fns: &[FnInfo],
+    vocab: &AssertionVocabulary,
+    callee: &str,
+    idx: usize,
+    depth: usize,
+) -> bool {
+    let Some(target) = find_same_file_fn(fns, callee) else {
+        return true;
+    };
+    let Some(param) = target
+        .params
+        .get(idx)
+        .filter(|p| !p.is_empty() && *p != "_")
+    else {
+        return false;
+    };
+    target.calls.iter().filter(|c| !c.fn_value).any(|c| {
+        let fails_directly = c
+            .callee
+            .strip_prefix(param.as_str())
+            .and_then(|m| m.strip_prefix('.'))
+            .is_some_and(|m| GO_FAILING_METHODS.contains(&m));
+        fails_directly
+            || c.args.iter().enumerate().any(|(j, a)| {
+                a == param
+                    && (vocab.contains(&c.callee)
+                        || (depth < MAX_HELPER_DEPTH
+                            && forwards_to_failure(fns, vocab, &c.callee, j, depth + 1)))
+            })
+    })
 }
 
 /// Go: local names the file imports testify's `suite` package under (`suite`, or an explicit alias).
@@ -804,17 +883,71 @@ fn handle_holder_calls(node: Node, source: &str, handles: &[String]) -> Vec<Call
     let ty = ty.split('[').next().unwrap_or(ty);
     let mut calls = Vec::new();
     let mut cursor = body.walk();
-    for el in body.named_children(&mut cursor) {
-        if el.kind() == "keyed_element"
-            && el.named_child_count() == 2
-            && let (Some(key), Some(value)) = (el.named_child(0), el.named_child(1))
-            && handles.iter().any(|h| h == node_text(value, source))
-        {
-            let key = node_text(key, source);
-            calls.push(Call::new(format!("{HOLDER_PREFIX}{ty}.{key}"), Vec::new()));
+    for (index, el) in body.named_children(&mut cursor).enumerate() {
+        let field = if el.kind() == "keyed_element" && el.named_child_count() == 2 {
+            let (Some(key), Some(value)) = (el.named_child(0), el.named_child(1)) else {
+                continue;
+            };
+            handles
+                .iter()
+                .any(|h| h == node_text(value, source))
+                .then(|| node_text(key, source).to_string())
+        } else if el.kind() == "literal_element" || el.kind() == "element" {
+            handles
+                .iter()
+                .any(|h| h == node_text(el, source))
+                .then(|| format!("{POSITIONAL_FIELD}{index}"))
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            calls.push(Call::new(
+                format!("{HOLDER_PREFIX}{ty}.{field}"),
+                Vec::new(),
+            ));
         }
     }
     calls
+}
+
+/// Go: `type Name struct { ... }` -> its field names in declaration order; every other type
+/// declaration maps to an empty list.
+fn go_declared_types(root: Node, source: &str) -> HashMap<String, Vec<String>> {
+    let mut types = HashMap::new();
+    walk_preorder(root, &mut |n| {
+        if n.kind() == "type_spec"
+            && let Some(name) = n.child_by_field_name("name")
+        {
+            let fields = n
+                .child_by_field_name("type")
+                .filter(|t| t.kind() == "struct_type")
+                .map(|decl| struct_field_names(decl, source))
+                .unwrap_or_default();
+            types.insert(node_text(name, source).to_string(), fields);
+        }
+        true
+    });
+    types
+}
+
+/// Field names of a Go `struct_type` in order; an embedded field is `""`.
+fn struct_field_names(decl: Node, source: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    walk_preorder(decl, &mut |f| {
+        if f.kind() == "field_declaration" {
+            let mut cursor = f.walk();
+            let names: Vec<String> = f
+                .children_by_field_name("name", &mut cursor)
+                .map(|x| node_text(x, source).to_string())
+                .collect();
+            if names.is_empty() {
+                fields.push(String::new());
+            }
+            fields.extend(names);
+        }
+        true
+    });
+    fields
 }
 
 /// `try: validate(...)` / `except ...: ...; raise e`: the schema validator's failure is the
@@ -987,6 +1120,10 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
             let callee = aliases.get(&callee).cloned().unwrap_or(callee);
             let mut call = Call::new(callee, arg_texts);
             call.carries_handle = carries_handle;
+            call.on_handle_holder = lang == Language::Go
+                && call.callee.split_once('.').is_some_and(|(root, m)| {
+                    !m.contains('.') && carriers.iter().any(|v| v == root)
+                });
             calls.push(call);
         } else if lang == Language::Go
             && node.kind() == "type_conversion_expression"
