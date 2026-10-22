@@ -77,6 +77,18 @@ static JOIN_PRIMITIVE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"WaitGroup|\bMutex\b|\bRWMutex\b|errgroup").expect("valid regex"));
 static COMPILE_NOTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)compile.?time|compiles").expect("valid regex"));
+/// A comment that says the point of the test is that the code compiles ("just checking that this
+/// compiles", "we are testing compilation completes"), whatever the body does.
+static COMPILE_INTENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:check|test|ensur|verif)\w*\s+(?:that\s+)?(?:this\s+|it\s+)?(?:compiles|compilation)\b")
+        .expect("valid regex")
+});
+static STUB_PHRASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)to be implemented|not (?:yet )?implemented|\btodo\b|will be (?:added|implemented)",
+    )
+    .expect("valid regex")
+});
 static INTERFACE_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)interface|implements|satisf|conform|compile").expect("valid regex")
 });
@@ -112,7 +124,7 @@ pub fn leading_comment(source: &str, line: usize) -> String {
         if !above.starts_with("//") {
             break;
         }
-        out.push(above);
+        out.push(above.trim_start_matches('/').trim());
         at -= 1;
     }
     out.reverse();
@@ -133,11 +145,14 @@ pub fn tag_go(
     let comments = format!("{leading_comment}\n{}", scanned.comments);
 
     if inner.trim().is_empty()
+        || is_logged_stub(&stmts, &f.body)
         || delegates_only_to_stubs(&stmts, helper_source)
         || loops_over_stub_subtests(&scanned.code, inner, helper_source)
     {
         Some(OracleTag::EmptyStub)
-    } else if is_compile_check(&stmts, &f.name, inner) || is_compile_note(&stmts, &scanned.comments)
+    } else if is_compile_check(&stmts, &f.name, inner)
+        || is_compile_note(&stmts, &scanned.comments)
+        || (COMPILE_INTENT.is_match(&comments) && !logs_results(&stmts))
     {
         Some(OracleTag::CompileCheck)
     } else if is_race_smoke(&scanned.code, inner, &f.name, &comments) {
@@ -145,6 +160,23 @@ pub fn tag_go(
     } else {
         None
     }
+}
+
+/// A `t.Log*` call means the author looks at what the code returned, so "just compiles" is not the
+/// whole story (tailscale safesocket `t.Logf("got %v", ..)`).
+fn logs_results(stmts: &[Stmt]) -> bool {
+    stmts
+        .iter()
+        .any(|s| matches!(s, Stmt::Call(c) if c.starts_with("t.Log")))
+}
+
+/// The body is only `t.Log*` calls and says it is unimplemented ("to be implemented", TODO).
+fn is_logged_stub(stmts: &[Stmt], raw_body: &str) -> bool {
+    !stmts.is_empty()
+        && stmts
+            .iter()
+            .all(|s| matches!(s, Stmt::Call(c) if c.starts_with("t.Log")))
+        && STUB_PHRASE.is_match(raw_body)
 }
 
 /// The body is only calls to same-file helpers that are themselves stubs (empty, TODO-only, or
@@ -186,6 +218,8 @@ fn is_compile_check(stmts: &[Stmt], name: &str, inner: &str) -> bool {
         })
         .collect();
     let named_for_interface = INTERFACE_NAME.is_match(name);
+    // A discarded call next to an interface assertion is the constructor half of that assertion.
+    let has_decl = relevant.iter().any(|s| matches!(s, Stmt::BlankDecl));
     !relevant.is_empty()
         && relevant.iter().all(|s| match s {
             Stmt::BlankDecl => true,
@@ -195,6 +229,7 @@ fn is_compile_check(stmts: &[Stmt], name: &str, inner: &str) -> bool {
                     || rhs.contains("(nil)")
                     || COMPOSITE_RHS.is_match(rhs)
                     || named_for_interface
+                    || has_decl
             }
             _ => false,
         })
@@ -402,9 +437,31 @@ fn find_assign(s: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// `var ( _ I = New(); _ = Const )`: every entry of a grouped declaration is a blank identifier.
+fn is_blank_var_group(s: &str) -> bool {
+    let Some(group) = s
+        .strip_prefix("var")
+        .map(str::trim)
+        .and_then(|r| r.strip_prefix('('))
+        .and_then(|r| r.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let entries: Vec<&str> = group
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    !entries.is_empty()
+        && entries.iter().all(|l| {
+            l.strip_prefix('_')
+                .is_some_and(|r| r.starts_with([' ', '\t', '=']))
+        })
+}
+
 fn classify(s: &str) -> Stmt {
     let word = first_word(s);
-    if s.starts_with("var _ ") || s.starts_with("var _\t") {
+    if s.starts_with("var _ ") || s.starts_with("var _\t") || is_blank_var_group(s) {
         return Stmt::BlankDecl;
     }
     if matches!(
@@ -551,6 +608,19 @@ mod tests {
             ("TestTraceExporter_noGoroutines", None),
             ("TestStub_tableLoopToSkipHelper", Some("empty-stub")),
             ("TestDelegates_tableLoopToWorkingHelper", None),
+            ("TestCompile_groupedVarBlock", Some("compile-check")),
+            ("Test_Fake_group", Some("compile-check")),
+            ("Test_Fake_declAndDiscardedCall", Some("compile-check")),
+            ("TestBuild_discardedCallNoDecl", None),
+            ("TestCompile_commentJustChecking", Some("compile-check")),
+            (
+                "TestCompile_leadingCommentTestingCompilation",
+                Some("compile-check"),
+            ),
+            ("TestCompile_commentMentionsCompilerInPassing", None),
+            ("TestStub_logToBeImplemented", Some("empty-stub")),
+            ("TestUntagged_logWithoutStubWords", None),
+            ("TestCompile_commentButLogsResult", None),
         ];
         let got = labels();
         for (name, tag) in expected {

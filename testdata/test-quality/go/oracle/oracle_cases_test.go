@@ -332,3 +332,69 @@ func TestDelegates_tableLoopToWorkingHelper(t *testing.T) {
 		})
 	}
 }
+
+// Grouped blank declarations (cockroach protectedts_test.go).
+func TestCompile_groupedVarBlock(t *testing.T) {
+	var (
+		_ Provider
+		_ Storage
+		_ = ErrNotExists
+	)
+}
+
+// A grouped block of constructor-backed assertions (dapr hotreload/loader/fake).
+func Test_Fake_group(t *testing.T) {
+	var (
+		_ loader.Interface                       = New()
+		_ loader.Loader[componentsapi.Component] = NewFake[componentsapi.Component]()
+	)
+}
+
+// An interface assertion next to a discarded constructor call (dapr targets/fake).
+func Test_Fake_declAndDiscardedCall(t *testing.T) {
+	var _ targets.Factory = fake.NewFactory()
+	_ = fake.New("")
+}
+
+// A discarded constructor with no interface assertion and no interface-named test is no cue.
+func TestBuild_discardedCallNoDecl(t *testing.T) {
+	_ = fake.New("")
+}
+
+func TestCompile_commentJustChecking(t *testing.T) {
+	// Just checking that this compiles.
+	var x []int
+	y := x
+	for range 5 {
+		x = append(x, 5)
+	}
+	_ = y
+}
+
+// By storing a pointer in a global, the compiler must heap-allocate it. Hence, we are testing
+// compilation completes successfully for zerorange calls of various sizes.
+func TestCompile_leadingCommentTestingCompilation(t *testing.T) {
+	testZeroRange8(t)
+	testZeroRange16(t)
+}
+
+func TestCompile_commentMentionsCompilerInPassing(t *testing.T) {
+	// The compiler version does not matter here.
+	run(t)
+}
+
+func TestStub_logToBeImplemented(t *testing.T) {
+	// Test implementation will be added
+	t.Log("V36 migration tests - to be implemented")
+}
+
+func TestUntagged_logWithoutStubWords(t *testing.T) {
+	t.Log("running migration")
+}
+
+// "Just compiles" next to a logged result is a smoke call, not a compile check.
+func TestCompile_commentButLogsResult(t *testing.T) {
+	// Just test that it compiles for now (is available on all platforms).
+	port, token, err := LocalTCPPortAndToken()
+	t.Logf("got %v, %s, %v", port, token, err)
+}
