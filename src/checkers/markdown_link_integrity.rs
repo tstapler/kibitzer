@@ -225,13 +225,19 @@ fn reference_style_flags(link_type: LinkType) -> (bool, bool) {
     (is_reference_style, is_dangling)
 }
 
-/// A `[x]`/`[X]` mark used mid-sentence (outside `ENABLE_TASKLISTS`' leading-list-item
-/// position) parses as a shortcut reference-style link labeled "x", almost never backed
-/// by a `[x]: target` def. Scoped to `Shortcut`/`ShortcutUnknown` only — `Reference`/
-/// `Collapsed` require an explicit `[label][ref]`/`[label][]`, still flagged. Related
-/// open case: `docs/markdown-link-integrity-false-positives.md`'s `[SEVERITY: High]` entry.
-fn is_bracketed_checkbox_mark(link_type: LinkType, normalized_label: &str) -> bool {
-    matches!(link_type, LinkType::Shortcut | LinkType::ShortcutUnknown) && normalized_label == "x"
+/// Bracketed text that is almost never a reference-link attempt: a `[x]`/`[X]` mark used
+/// mid-sentence (outside `ENABLE_TASKLISTS`' list-item position), a `[LABEL: text]` tag, or
+/// an ALL-CAPS tag like `[BLOCKER]`. Scoped to `Shortcut`/`ShortcutUnknown` only —
+/// `Reference`/`Collapsed` require an explicit `[label][ref]`/`[label][]`, still flagged.
+/// Trade-off: a genuine ALL-CAPS shortcut reference with no definition is also skipped.
+fn is_non_link_bracket_usage(link_type: LinkType, raw_label: &str) -> bool {
+    if !matches!(link_type, LinkType::Shortcut | LinkType::ShortcutUnknown) {
+        return false;
+    }
+    let label = raw_label.trim();
+    label.eq_ignore_ascii_case("x")
+        || label.contains(':')
+        || (!label.is_empty() && label.chars().all(|c| c.is_ascii_uppercase()))
 }
 
 /// Handles one `Link`/`Image` start event: records a dangling reference-style use as a
@@ -257,7 +263,7 @@ fn record_link_or_image(
         if is_dangling
             && !is_image
             && !normalized.starts_with('^')
-            && !is_bracketed_checkbox_mark(link_type, &normalized)
+            && !is_non_link_bracket_usage(link_type, &id)
         {
             parsed.findings.push(Finding {
                 line: line_for_offset(line_starts, range.start),
