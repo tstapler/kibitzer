@@ -1105,6 +1105,7 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
                             }
                         }),
                 );
+                calls.extend(returned_test_body(args, source));
             } else if lang == Language::Go {
                 // `ExecAPITest(t, testX)`: a function value handed to a runner.
                 calls.extend(
@@ -1164,6 +1165,22 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
         true
     });
     calls
+}
+
+/// Go: `t.Run(name, helper(..))` -- the last argument is a call returning the subtest body. Followed
+/// into a same-file `helper` (whose returned closure is part of its subtree); a helper defined
+/// elsewhere returns a body this parse cannot see, so it is unknowable rather than assertion-free.
+fn returned_test_body(args: Option<Node>, source: &str) -> Option<Call> {
+    let args = args?;
+    let mut cursor = args.walk();
+    let all: Vec<Node> = args.named_children(&mut cursor).collect();
+    let [_, .., last] = all[..] else { return None };
+    let callee = match last.kind() {
+        "call_expression" => last.child_by_field_name("function")?,
+        "type_conversion_expression" => last.child_by_field_name("type")?,
+        _ => return None,
+    };
+    Some(Call::dispatched(node_text(callee, source).to_string()))
 }
 
 /// Go: names bound inside `root` (parameters, `:=`, `var`, range variables), so a selector on one

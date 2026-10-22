@@ -75,6 +75,7 @@ const GO_CASES: &[Case] = &[
     ("testify_suite_run_test.go", &[30], &[30]),
     ("handle_holder_collaborator_test.go", &[33], &[33]),
     ("handle_holder_generalized_test.go", &[86, 99], &[86, 99]),
+    ("run_helper_returned_func_test.go", &[16, 24], &[16, 24]),
     ("cross_file_helper_test.go", &[7], &[]),
     (
         "k8s_stubs_test.go",
