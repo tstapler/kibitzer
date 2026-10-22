@@ -274,3 +274,34 @@ fn fully_consistent_document_has_zero_findings() {
     let body = "# Heading One\n\nSee [the site][site-ref] and [Heading One](#heading-one).\n\n[site-ref]: https://example.com\n";
     assert!(check_source(&path(), body).unwrap().is_empty());
 }
+
+#[test]
+fn ignores_severity_tag_in_heading() {
+    let body = "# BUG-105: service crash [SEVERITY: High]\n\nBody text.\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
+fn ignores_code_review_severity_tags() {
+    for tag in ["[BLOCKER]", "[CRITICAL]", "[MAJOR]", "[NIT]"] {
+        let body = format!("{tag} Fix the null check.\n");
+        assert!(
+            check_source(&path(), &body).unwrap().is_empty(),
+            "expected no findings for {tag}"
+        );
+    }
+}
+
+#[test]
+fn still_flags_explicit_reference_with_colon_label_and_lowercase_shortcut() {
+    let explicit = check_source(&path(), "See [link][foo: bar] for details.\n").unwrap();
+    assert_eq!(explicit.len(), 1);
+    let shortcut = check_source(&path(), "See [foo] for details.\n").unwrap();
+    assert_eq!(shortcut.len(), 1);
+}
+
+#[test]
+fn still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set() {
+    let findings = check_source(&path(), "See [RFC] for details.\n").unwrap();
+    assert_eq!(findings.len(), 1);
+}

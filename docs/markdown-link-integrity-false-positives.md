@@ -388,11 +388,12 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   edit and no suppression was in place — worked around rather than fixed at the
   source, logged here per this doc's own instruction not to just note a false positive
   in passing.
-- **Related, narrower fix landed separately**: `is_bracketed_checkbox_mark`
-  (`src/checkers/markdown_link_integrity.rs`) suppresses the single-character `[x]`/`[X]`
-  case of this same mechanism (a checkbox mark used mid-sentence, outside GFM task-list
-  position). It's a point-patch for one specific label, not the general slug-shape
-  heuristic this entry's fix direction proposes — this entry stays open.
+- **Status: resolved in `83145b3`.** `is_bracketed_checkbox_mark` became
+  `is_non_link_bracket_usage` (`src/checkers/markdown_link_integrity.rs`): a
+  `Shortcut`/`ShortcutUnknown` label is skipped if it is `x`, contains `:`, or is one of
+  `BLOCKER`/`CRITICAL`/`MAJOR`/`NIT` (`SEVERITY_TAGS`). Tests: `ignores_severity_tag_in_heading`,
+  `ignores_code_review_severity_tags`. Other all-caps labels such as `[RFC]` are
+  still flagged (`still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set`).
 
 ## Resolution: native `markdown-link-integrity` checker + grace period
 
