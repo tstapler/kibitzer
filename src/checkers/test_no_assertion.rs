@@ -688,6 +688,10 @@ impl Checker for TestNoAssertionChecker {
 
 fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) -> Scan {
     let mut fns = Vec::new();
+    let env_vars = match ctx.tree {
+        Some(tree) if lang == Language::Go => env_derived_vars(tree.root_node(), ctx.source),
+        _ => Vec::new(),
+    };
     if let Some(tree) = ctx.tree {
         walk_preorder(tree.root_node(), &mut |node| {
             if let Some(name) = function_name(lang, node, ctx.source) {
@@ -701,7 +705,9 @@ fn build_scan(lang: Language, ctx: &CheckContext, vocab: AssertionVocabulary) ->
                     calls: calls_in(lang, node, ctx.source, &handles),
                     handles,
                     env_entrypoint: lang == Language::Go
-                        && is_env_gated_entrypoint(node, ctx.source),
+                        && (is_env_gated_entrypoint(node, ctx.source)
+                            || is_gated_main_harness(node, ctx.source)
+                            || is_helper_process_mode(node, ctx.source, name, &env_vars)),
                     parse_error: lang == Language::Go
                         && (node.has_error() || node.child_by_field_name("body").is_none()),
                     receiver: (lang == Language::Go)
@@ -1402,6 +1408,90 @@ fn is_env_gated_entrypoint(func: Node, source: &str) -> bool {
                     GO_ENTRYPOINT_PREFIXES.iter().any(|p| name.starts_with(p))
                 })
     })
+}
+
+/// A coverage/system-test harness: the body ends in `if <cond> { main() }` (beats `TestSystem` under
+/// `-systemTest`, tidb `TestRunMain` under `isCoverageServer`). The gate may not be error handling,
+/// and an ungated `main()` (mattermost `TestRunMain`) is deliberately left reported.
+fn is_gated_main_harness(func: Node, source: &str) -> bool {
+    let Some(body) = func.child_by_field_name("body") else {
+        return false;
+    };
+    let Some(gate) = block_statements(body).pop() else {
+        return false;
+    };
+    if gate.kind() != "if_statement" || gate.child_by_field_name("alternative").is_some() {
+        return false;
+    }
+    let Some(consequence) = gate.child_by_field_name("consequence") else {
+        return false;
+    };
+    let head = &source[gate.start_byte()..consequence.start_byte()];
+    !head.contains("err")
+        && block_statements(consequence).iter().any(|s| {
+            s.kind() == "expression_statement"
+                && s.named_child(0)
+                    .filter(|c| GoKind::of(*c) == GoKind::CallExpression)
+                    .and_then(|c| c.child_by_field_name("function"))
+                    .is_some_and(|f| node_text(f, source) == "main")
+        })
+}
+
+/// Package-level `var x = ... os.Getenv(..) ...` names: switches that put the test binary in a
+/// re-exec'd mode.
+fn env_derived_vars(root: Node, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for decl in root.named_children(&mut cursor) {
+        if decl.kind() != "var_declaration" {
+            continue;
+        }
+        walk_preorder(decl, &mut |n| {
+            if n.kind() == "var_spec"
+                && let Some(value) = n.child_by_field_name("value")
+                && let text = node_text(value, source)
+                && (text.contains("os.Getenv(") || text.contains("os.LookupEnv("))
+                && let Some(name) = n.child_by_field_name("name")
+            {
+                out.push(node_text(name, source).to_string());
+            }
+            true
+        });
+    }
+    out
+}
+
+/// `func TestX_Helper(t) { if !helperMode { return }; ... }` where `helperMode` is an env-derived
+/// package var: the test binary re-exec'd as a helper process (beats `gotest_test.go`), whose
+/// parent test asserts. Needs "helper" in the test or switch name, so an ordinary env-gated
+/// test (`slowMode`) is still reported.
+fn is_helper_process_mode(func: Node, source: &str, name: &str, env_vars: &[String]) -> bool {
+    let Some(body) = func.child_by_field_name("body") else {
+        return false;
+    };
+    let Some(gate) = block_statements(body).first().copied() else {
+        return false;
+    };
+    if gate.kind() != "if_statement" || gate.child_by_field_name("alternative").is_some() {
+        return false;
+    }
+    let (Some(cond), Some(consequence)) = (
+        gate.child_by_field_name("condition"),
+        gate.child_by_field_name("consequence"),
+    ) else {
+        return false;
+    };
+    let switch = node_text(cond, source)
+        .trim()
+        .trim_start_matches('!')
+        .trim();
+    let returns =
+        matches!(block_statements(consequence).as_slice(), [r] if r.kind() == "return_statement");
+    returns
+        && env_vars.iter().any(|v| v == switch)
+        && [name, switch]
+            .iter()
+            .any(|n| n.to_ascii_lowercase().contains("helper"))
 }
 
 /// `if <cond> { ...panic(...)... }` (or its `else`) where the condition tests behaviour, or any
