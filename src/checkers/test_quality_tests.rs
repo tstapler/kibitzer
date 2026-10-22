@@ -101,6 +101,7 @@ const GO_CASES: &[Case] = &[
     ),
     ("guarded_panic_helper_test.go", &[29, 44, 49], &[29, 44, 49]),
     ("env_entrypoint_test.go", &[37, 43, 50], &[37, 43, 50]),
+    ("t_helper_in_export_test.go", &[16], &[16]),
     ("params_struct_handle_test.go", &[25, 29, 35], &[25, 29, 35]),
     ("mock_panic_expectation_test.go", &[20, 26], &[26]),
     (
@@ -237,6 +238,31 @@ fn test_no_assertion_should_SkipNonTestDirs_When_PathHasTestdataVendorOrThirdPar
         }
         assert!(run_source(checker, Path::new(skipped), &source, None).is_empty());
     }
+}
+
+#[test]
+fn test_no_assertion_should_SkipGo_When_DirComponentStartsWithUnderscore() {
+    // Go tooling ignores `_*` directories (teleport render-tests `_sample`, delve `_fixtures`).
+    let source = std::fs::read_to_string(fixture_path("go", "scanner_handler_test.go")).unwrap();
+    for path in [
+        "tooling/render-tests/_sample/package1/foo_test.go",
+        "_fixtures/buildtest/main_test.go",
+    ] {
+        let got = run_source("test-no-assertion-go", Path::new(path), &source, None);
+        assert!(got.is_empty(), "{path}: {got:?}");
+    }
+    // Controls: a mid-name underscore, and a `__tests__`-style dir for other languages, still count.
+    let in_scope = "tooling/sample_dir/package1/foo_test.go";
+    let got = run_source("test-no-assertion-go", Path::new(in_scope), &source, None);
+    assert_eq!(lines(&got), [5], "{in_scope}");
+    let py = std::fs::read_to_string(fixture_path("python", "test_cross_file_base.py")).unwrap();
+    let got = run_source(
+        "test-no-assertion-python",
+        Path::new("pkg/_internal/tests/test_a.py"),
+        &py,
+        None,
+    );
+    assert!(!got.is_empty(), "underscore dirs are only skipped for Go");
 }
 
 #[test]

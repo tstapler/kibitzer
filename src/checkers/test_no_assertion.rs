@@ -607,7 +607,7 @@ impl Checker for TestNoAssertionChecker {
     }
 
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        if in_non_test_dir(file) {
+        if in_non_test_dir(file, self.lang) {
             return Ok(Vec::new());
         }
         let profile = TestCodeProfile::for_language(self.lang);
@@ -646,6 +646,15 @@ impl Checker for TestNoAssertionChecker {
             }
             if self.lang == Language::Go && info.calls.iter().any(|c| c.callee == "os.Exit") {
                 // A Go subprocess re-exec stub (`TestHelperProcess`): the parent test asserts.
+                continue;
+            }
+            if self.lang == Language::Go
+                && info
+                    .handles
+                    .iter()
+                    .any(|h| info.calls.iter().any(|c| c.callee == format!("{h}.Helper")))
+            {
+                // `t.Helper()` marks a function other tests call (boundary export_test.go), not a test.
                 continue;
             }
             scan.seen.borrow_mut().clear();
@@ -977,9 +986,13 @@ fn reraises_validate(try_node: Node, source: &str) -> bool {
     validates && reraises
 }
 
-fn in_non_test_dir(file: &Path) -> bool {
-    file.components()
-        .any(|c| NON_TEST_DIRS.iter().any(|d| c.as_os_str() == *d))
+/// Go only for the `_` rule: the toolchain ignores `_*` directories (`_sample`, `_fixtures`), but
+/// `_internal` / `__tests__` hold real tests in other ecosystems.
+fn in_non_test_dir(file: &Path, lang: Language) -> bool {
+    file.components().any(|c| {
+        NON_TEST_DIRS.iter().any(|d| c.as_os_str() == *d)
+            || (lang == Language::Go && c.as_os_str().to_string_lossy().starts_with('_'))
+    })
 }
 
 fn class_name<'a>(class: Node, source: &'a str) -> Option<&'a str> {
