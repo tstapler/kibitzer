@@ -37,7 +37,8 @@ fn run_source(
 fn run_fixture(checker_name: &str, dir: &str, file: &str, options: Option<&Value>) -> Vec<Finding> {
     let path = fixture_path(dir, file);
     let source = std::fs::read_to_string(&path).unwrap();
-    run_source(checker_name, &path, &source, options)
+    // Bare file name: the real path sits under `testdata/`, which the rule skips as non-test code.
+    run_source(checker_name, Path::new(file), &source, options)
 }
 
 fn lines(findings: &[Finding]) -> Vec<usize> {
@@ -64,10 +65,51 @@ const GO_CASES: &[Case] = &[
     ("generated_test.go", &[], &[]),
     ("weak_oracle_test.go", &[], &[]),
     ("tautology_pending_test.go", &[], &[]),
+    ("receiver_method_helper_test.go", &[44, 54], &[44, 54]),
+    ("generic_helper_test.go", &[25], &[25]),
+    ("method_value_run_test.go", &[34], &[34]),
+    ("subtest_dispatch_test.go", &[], &[]),
+    ("subtest_dispatch_quiet_test.go", &[17], &[17]),
+    ("func_alias_test.go", &[27], &[27]),
+    ("go126_new_expr_test.go", &[16], &[16]),
+    ("testify_suite_run_test.go", &[30], &[30]),
+    ("handle_holder_collaborator_test.go", &[33], &[33]),
+    ("handle_holder_generalized_test.go", &[86, 99], &[86, 99]),
+    ("run_helper_returned_func_test.go", &[16, 24], &[16, 24]),
+    ("run_generic_value_test.go", &[70, 75, 80], &[70, 75, 80]),
+    ("cross_file_helper_test.go", &[7], &[]),
+    (
+        "k8s_stubs_test.go",
+        &[7, 11, 14, 18, 22],
+        &[7, 11, 14, 18, 22],
+    ),
     ("empty_test.go", &[6], &[6]),
+    ("helper_process_test.go", &[27, 34], &[27, 34]),
+    ("scanner_handler_test.go", &[5], &[5]),
     ("a_test.go", &[6], &[6]),
     ("unresolved_helper_test.go", &[7], &[]),
     ("helper_depth_test.go", &[18, 25], &[18, 25]),
+    (
+        "callback_assertion_test.go",
+        &[53, 55, 58, 60, 67, 99, 102],
+        &[53, 55, 58, 60, 67, 99, 102],
+    ),
+    (
+        "func_value_callback_test.go",
+        &[40, 42, 44, 49, 51],
+        &[40, 42, 44, 49, 51],
+    ),
+    ("guarded_panic_helper_test.go", &[29, 44, 49], &[29, 44, 49]),
+    ("env_entrypoint_test.go", &[37, 43, 50], &[37, 43, 50]),
+    ("t_helper_in_export_test.go", &[16, 23], &[16]),
+    ("gomock_controller_test.go", &[37, 44], &[37]),
+    (
+        "main_harness_test.go",
+        &[36, 40, 46, 67, 74],
+        &[36, 40, 46, 67, 74],
+    ),
+    ("params_struct_handle_test.go", &[25, 29, 35], &[25, 29, 35]),
+    ("mock_panic_expectation_test.go", &[20, 26], &[26]),
     (
         "six_vacuous_test.go",
         &[6, 7, 8, 9, 10, 11],
@@ -88,6 +130,11 @@ const PYTHON_CASES: &[Case] = &[
     ("test_unresolved_helper.py", &[6, 10], &[10]),
     ("test_helper_depth.py", &[32, 40], &[32, 40]),
     ("test_unittest_class.py", &[6], &[6]),
+    ("test_pytester_linematcher.py", &[21], &[21]),
+    ("test_raises_alias.py", &[23], &[23]),
+    ("test_same_class_helpers.py", &[25], &[25]),
+    ("test_cross_file_base.py", &[7], &[7]),
+    ("test_validate_reraise.py", &[11, 18], &[11, 18]),
     (
         "test_six_vacuous.py",
         &[4, 5, 6, 7, 8, 9],
@@ -134,6 +181,107 @@ fn test_no_assertion_should_MatchLabelsOnEveryPythonFixture_When_StrictAndPrecis
 #[test]
 fn test_no_assertion_should_MatchLabelsOnEveryKotlinFixture_When_StrictAndPrecisionFirst() {
     assert_cases("test-no-assertion-kotlin", "kotlin", KOTLIN_CASES);
+}
+
+#[test]
+fn test_no_assertion_should_ReportZero_When_CrossFileHelperListedInAssertionHelpers() {
+    let options = json!({"assertion_helpers": ["assertFailures"]});
+    let got = run_fixture(
+        "test-no-assertion-go",
+        "go",
+        "cross_file_helper_test.go",
+        Some(&options),
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[test]
+fn test_no_assertion_should_ReportZero_When_CrossFileBaseHelperListedInAssertionHelpers() {
+    let options = json!({"assertion_helpers": ["self.run_wrapper_test"]});
+    let got = run_fixture(
+        "test-no-assertion-python",
+        "python",
+        "test_cross_file_base.py",
+        Some(&options),
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[test]
+fn test_no_assertion_should_SkipNonTestDirs_When_PathHasTestdataVendorOrThirdParty() {
+    for (dir, file, checker, in_scope, skipped) in [
+        (
+            "go",
+            "scanner_handler_test.go",
+            "test-no-assertion-go",
+            "tools/scanner/backend/handler_test.go",
+            "tools/scanner/backend/testdata/handler_test.go",
+        ),
+        (
+            "python",
+            "test_cross_file_base.py",
+            "test-no-assertion-python",
+            "tests/test_a.py",
+            "third_party/pytest/testing/test_a.py",
+        ),
+        (
+            "kotlin",
+            "EmptyTest.kt",
+            "test-no-assertion-kotlin",
+            "app/FooTest.kt",
+            "vendor/lib/FooTest.kt",
+        ),
+    ] {
+        let source = std::fs::read_to_string(fixture_path(dir, file)).unwrap();
+        let got = run_source(checker, Path::new(in_scope), &source, None);
+        assert!(!got.is_empty(), "{checker} must flag {in_scope}");
+        for d in ["testdata", "vendor", "node_modules", "third_party"] {
+            let path = format!("x/{d}/y/{}", in_scope.rsplit('/').next().unwrap());
+            assert!(
+                run_source(checker, Path::new(&path), &source, None).is_empty(),
+                "{checker} must skip {path}"
+            );
+        }
+        assert!(run_source(checker, Path::new(skipped), &source, None).is_empty());
+    }
+}
+
+#[test]
+fn test_no_assertion_should_SkipGo_When_DirComponentStartsWithUnderscore() {
+    // Go tooling ignores `_*` directories (teleport render-tests `_sample`, delve `_fixtures`).
+    let source = std::fs::read_to_string(fixture_path("go", "scanner_handler_test.go")).unwrap();
+    for path in [
+        "tooling/render-tests/_sample/package1/foo_test.go",
+        "_fixtures/buildtest/main_test.go",
+    ] {
+        let got = run_source("test-no-assertion-go", Path::new(path), &source, None);
+        assert!(got.is_empty(), "{path}: {got:?}");
+    }
+    // Controls: a mid-name underscore, and a `__tests__`-style dir for other languages, still count.
+    let in_scope = "tooling/sample_dir/package1/foo_test.go";
+    let got = run_source("test-no-assertion-go", Path::new(in_scope), &source, None);
+    assert_eq!(lines(&got), [5], "{in_scope}");
+    let py = std::fs::read_to_string(fixture_path("python", "test_cross_file_base.py")).unwrap();
+    let got = run_source(
+        "test-no-assertion-python",
+        Path::new("pkg/_internal/tests/test_a.py"),
+        &py,
+        None,
+    );
+    assert!(!got.is_empty(), "underscore dirs are only skipped for Go");
+}
+
+#[test]
+fn test_no_assertion_should_StillFlag_When_DirNameOnlyContainsNonTestWord() {
+    let source = std::fs::read_to_string(fixture_path("go", "scanner_handler_test.go")).unwrap();
+    for path in [
+        "testdata_utils/h_test.go",
+        "fixtures/h_test.go",
+        "example_scripts/h_test.go",
+    ] {
+        let got = run_source("test-no-assertion-go", Path::new(path), &source, None);
+        assert_eq!(lines(&got), [5], "{path}");
+    }
 }
 
 #[test]

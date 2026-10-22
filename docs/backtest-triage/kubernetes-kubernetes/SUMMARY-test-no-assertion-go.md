@@ -41,3 +41,42 @@ reports 21 `test-no-assertion-go` rows, matching the shard (the script has no
 4. Look up helpers declared in other files of the same package (`*_test.go` siblings), at least those taking `testing.TB`/`*testing.T` and calling `Errorf/Fatalf/Error/Fatal`; also recognise helpers that forward `t` to a known assertion-bearing API (`field.ErrorMatcher.Test(t, ...)`, `assertFailures(t, ...)`). Covers 1 here, more on repos with shared helper files.
 5. Add a lower-severity / separate category for the smoke-only pattern: bodies with no assertion whose name matches `NoPanic|NoCrash|DoesNotPanic|Race|Smoke`, or whose doc comment says "must not panic"/"smoke"/"expected to timeout", so these are not reported as defects. Would reclassify most of the 21 smoke-only TPs.
 6. Split out the empty-body stub (`func TestX(t) { /* TODO */ }`) as its own higher-confidence finding; it is the only class here a reviewer would call a defect (5 of 5 real TPs).
+
+## After improvements
+
+Improvements 1-3 are implemented in `src/checkers/test_no_assertion.rs`; the shard above is left unchanged as the
+pre-change history (`scripts/backtest-triage.py mark` has no "fixed" verdict). Re-run on the same commit
+(`0ba07e08`) with a debug build over every `*_test.go` (`find` + `xargs -P8`), compared by `file:line`
+against the shard with `jq`/`comm`:
+
+| | Before | After |
+|---|---|---|
+| Findings | 47 | 27 |
+| true_positive records still reported | 26 of 26 | 26 of 26 |
+| false_positive records still reported | 21 | 1 |
+| Findings not in the shard | 0 | 0 |
+
+Precision = 26 / 27 = **96.3%** (was 55.3%). Strict "real" TP only: 5 / 27 = 18.5%.
+
+- Fixed (20 of 21): receiver and chained method helpers (13, including a `// comment` line between chain links),
+  explicit generic instantiation `helper[T](t)` (5; tree-sitter-go parses the one-argument form as a
+  type-conversion expression, so it was never seen as a call), and method values passed to `t.Run` (2).
+- Remaining (1): `TestValidateResourceSlice` (`validation_resourceslice_test.go:210`) calls `assertFailures`, declared in a
+  sibling file (`validation_common_test.go`). The checker parses one file per run, so cross-file lookup is not done;
+  list the helper under the `assertion_helpers` option (tested by
+  `test_no_assertion_should_ReportZero_When_CrossFileHelperListedInAssertionHelpers`).
+- Not attempted: improvements 5 and 6 (separate smoke-only / empty-stub categories); they change classification, not precision.
+
+## After round 2
+
+Round 2 adds the `testdata`/`vendor`/`node_modules`/`third_party` path skip (no Go oracle change). Same commit
+`0ba07e08`; `find` + `xargs -P8` over `kibitzer check native <rule> <file>`, debug builds before/after, compared by `file:line` against the shard with `comm`.
+
+| | After round 1 | After round 2 |
+|---|---|---|
+| Findings | 27 | 27 |
+| true_positive records still reported | 26 of 26 | 26 of 26 |
+| false_positive records still reported | 1 | 1 |
+
+Precision unchanged at 26 / 27 = **96.3%**. The remaining FP is the cross-file `assertFailures` helper
+(`validation_resourceslice_test.go:210`); fix via `assertion_helpers`.

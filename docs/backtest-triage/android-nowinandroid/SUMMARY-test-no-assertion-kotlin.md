@@ -22,3 +22,17 @@ The 44 FP records stay in the shard as history; they no longer reproduce, so `ru
 - The wrapper heuristic (`capture*` plus the file-level "screenshot" mention) is name-based. A real fix needs a cross-file helper index; `assertion_helpers` is the escape hatch until then.
 - Paparazzi and Shot idioms are not covered.
 - One corpus is thin evidence: 240 tests, 1 finding after the fix. Re-run on a second Kotlin repo (JUnit/MockK/Turbine, no screenshot tests) once one is added to `docs/backtest-repos.md`.
+
+## After round 2
+
+Round 2 adds the shared path skip (`testdata`/`vendor`/`node_modules`/`third_party`) for Kotlin as well. Same commit
+`a49ed25`; `find` + `xargs -P8` over `kibitzer check native <rule> <file>`, debug builds before/after, compared by `file:line` against the shard with `comm`.
+
+| | Before | After |
+|---|---|---|
+| Findings | 1 | 1 |
+| true_positive records still reported | 1 of 1 | 1 of 1 |
+
+Precision unchanged at 1 / 1; the 44 historical FP records still do not reproduce. No Kotlin path under these
+directory names exists in this corpus, so the skip is covered only by the unit test
+(`test_no_assertion_should_SkipNonTestDirs_When_PathHasTestdataVendorOrThirdParty`).

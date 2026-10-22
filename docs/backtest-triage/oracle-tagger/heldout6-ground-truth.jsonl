@@ -1,0 +1,54 @@
+{"repo":"charmbracelet/bubbletea","file":"tea_test.go","line":538,"tag":"no-panic-smoke","reason":"TestTeaNoRun: constructs a Program without running it; only checks construction does not panic"}
+{"repo":"containers/podman","file":"pkg/specgen/generate/kube/kube_test.go","line":191,"tag":"false-positive","reason":"TestSetupSecurityContextSeccompProfile: assert.NoError/Equal present in t.Run closure and at top; rule misses it because tree-sitter-go does not parse Go 1.26 new(expr) calls in the table"}
+{"repo":"coredns/coredns","file":"plugin/auto/walk_test.go","line":117,"tag":"no-panic-smoke","reason":"TestWalkNonExistent: Walk on a missing dir; result dropped; checks no panic"}
+{"repo":"coredns/coredns","file":"plugin/dnstap/handler_test.go","line":132,"tag":"false-positive","reason":"TestTapMessage: assertions are in injected writer.Dnstap which calls w.t.Error; test passes t into the collaborator"}
+{"repo":"coredns/coredns","file":"plugin/dnstap/listener_test.go","line":38,"tag":"no-panic-smoke","reason":"TestListenerBroadcast: comments: should not panic with no clients / nil encoder"}
+{"repo":"coredns/coredns","file":"plugin/file/lookup_test.go","line":184,"tag":"no-panic-smoke","reason":"TestLookupNil: ServeDNS on a nil zone; recorder not inspected"}
+{"repo":"coredns/coredns","file":"plugin/metrics/metrics_test.go","line":586,"tag":"no-panic-smoke","reason":"TestMustRegister_DuplicateOK: duplicate registration must be ignored; no assertion"}
+{"repo":"coredns/coredns","file":"test/bind_test.go","line":5,"tag":"untagged","reason":"TestBind_FilterAll: only t.Log of start result"}
+{"repo":"coredns/coredns","file":"test/etcd_test.go","line":38,"tag":"empty-stub","reason":"TestEtcdStubLoop: body is only a TODO comment"}
+{"repo":"dolthub/dolt","file":"go/cmd/dolt/commands/commands_test.go","line":52,"tag":"discarded-result","reason":"TestCommandsRequireInitializedDir: Exec return code dropped for a table of commands"}
+{"repo":"dolthub/dolt","file":"go/cmd/dolt/errhand/derr_test.go","line":42,"tag":"untagged","reason":"TestDError: only t.Log of error strings"}
+{"repo":"dolthub/dolt","file":"go/libraries/doltcore/diff/column_identity_test.go","line":64,"tag":"empty-stub","reason":"TestTableMatching: table dispatched to testIdentity which only calls t.Skip(\"implement me\")"}
+{"repo":"dolthub/dolt","file":"go/libraries/doltcore/diff/column_identity_test.go","line":193,"tag":"empty-stub","reason":"TestColumnMatching: same testIdentity skip stub"}
+{"repo":"dolthub/dolt","file":"go/store/nbs/journal_index_record_test.go","line":173,"tag":"empty-stub","reason":"TestRoundTripIndexLookupMeta: comments only"}
+{"repo":"dolthub/dolt","file":"go/store/nbs/journal_index_record_test.go","line":178,"tag":"empty-stub","reason":"TestRoundTripIndexLookupsMeta: comments only"}
+{"repo":"dolthub/dolt","file":"go/store/nbs/store_test.go","line":671,"tag":"liveness-smoke","reason":"TestWaitForGC: waitForGC must return when contexts are cancelled; wg.Wait is the oracle"}
+{"repo":"dolthub/dolt","file":"go/store/util/verbose/verbose_test.go","line":22,"tag":"untagged","reason":"TestVerbose: logging calls only"}
+{"repo":"gin-gonic/gin","file":"tree_test.go","line":533,"tag":"no-panic-smoke","reason":"TestTreeCatchMaxParams: addRoute only; regression for catch-all max params"}
+{"repo":"gin-gonic/gin","file":"tree_test.go","line":901,"tag":"no-panic-smoke","reason":"TestTreeInvalidParamsType: comment: try to trigger slice bounds out of range"}
+{"repo":"gofiber/fiber","file":"app_test.go","line":1447,"tag":"untagged","reason":"Test_App_New: construction and route registration only"}
+{"repo":"gofiber/fiber","file":"domain_test.go","line":3706,"tag":"race-smoke","reason":"Test_Domain_UseMountConcurrentRegistration: concurrent registration with WaitGroup; oracle is -race"}
+{"repo":"gofiber/fiber","file":"middleware/adaptor/adaptor_test.go","line":1680,"tag":"no-panic-smoke","reason":"Test_CopyContextToFiberContext_Safe: comment: should not panic"}
+{"repo":"gofiber/fiber","file":"prefork_test.go","line":126,"tag":"no-panic-smoke","reason":"Test_Prefork_Logger: comment: should not panic"}
+{"repo":"go-git/go-git","file":"x/plugin/plugin_test.go","line":117,"tag":"race-smoke","reason":"TestConcurrentAccess: 100 goroutines Get/Has on plugin registry"}
+{"repo":"junegunn/fzf","file":"src/tokenizer_test.go","line":122,"tag":"no-panic-smoke","reason":"TestTransformIndexOutOfBounds: Transform with empty tokens, index out of bounds regression"}
+{"repo":"labstack/echo","file":"router_test.go","line":2040,"tag":"no-panic-smoke","reason":"TestRouterIssue1348: issue regression: route registration panicked"}
+{"repo":"moby/buildkit","file":"frontend/dockerfile/instructions/parse_test.go","line":154,"tag":"no-panic-smoke","reason":"TestNilLinter: parses every command with nil linter; errors ignored"}
+{"repo":"moby/buildkit","file":"solver/llbsolver/history/pubsub_test.go","line":55,"tag":"no-panic-smoke","reason":"TestPubsubCloseIdempotent: double close should not panic"}
+{"repo":"nektos/act","file":"main_test.go","line":8,"tag":"no-panic-smoke","reason":"TestMain: runs main with --help"}
+{"repo":"nektos/act","file":"pkg/gh/gh_test.go","line":8,"tag":"untagged","reason":"TestGetToken: t.Log(token) only"}
+{"repo":"temporalio/temporal","file":"client/matching/partition_cache_test.go","line":78,"tag":"race-smoke","reason":"TestPartitionCache_ConcurrentAccess: comment: no panic or data races detected"}
+{"repo":"temporalio/temporal","file":"common/cache/lru_test.go","line":146,"tag":"race-smoke","reason":"TestLRUCacheConcurrentAccess: concurrent Get/Put/Iterator"}
+{"repo":"temporalio/temporal","file":"common/cache/simple_test.go","line":60,"tag":"race-smoke","reason":"TestSimpleCacheConcurrentAccess: concurrent Get/Put/Iterator"}
+{"repo":"temporalio/temporal","file":"common/collection/sync_map_test.go","line":12,"tag":"race-smoke","reason":"TestMap_MultiThreaded: 5 goroutines on SyncMap"}
+{"repo":"temporalio/temporal","file":"common/goro/goro_test.go","line":68,"tag":"liveness-smoke","reason":"TestGoroSimpleReturn: waits on Done only"}
+{"repo":"temporalio/temporal","file":"common/goro/goro_test.go","line":75,"tag":"liveness-smoke","reason":"TestGoroGoexit: waits on Done after Goexit"}
+{"repo":"temporalio/temporal","file":"common/goro/group_test.go","line":11,"tag":"liveness-smoke","reason":"TestMultiCancelAndWait: Cancel/Wait must return"}
+{"repo":"temporalio/temporal","file":"common/goro/group_test.go","line":30,"tag":"liveness-smoke","reason":"TestWaitOnNothing: Wait on empty group must return"}
+{"repo":"temporalio/temporal","file":"common/goro/group_test.go","line":35,"tag":"liveness-smoke","reason":"TestWaitOnDifferentThread: waits for Done"}
+{"repo":"temporalio/temporal","file":"common/goro/keyed_set_test.go","line":124,"tag":"race-smoke","reason":"TestKeyedSet_ConcurrentSync: concurrent Sync; comment should not panic"}
+{"repo":"temporalio/temporal","file":"common/streambatcher/batcher_test.go","line":298,"tag":"race-smoke","reason":"TestStreamBatcher_Random: random concurrent stress; comment: make sure there are no errors"}
+{"repo":"temporalio/temporal","file":"service/frontend/operator_handler_test.go","line":59,"tag":"false-positive","reason":"TestOperatorHandlerSuite: suite.Run; assertions are in suite methods (77 s.* assertions)"}
+{"repo":"temporalio/temporal","file":"service/matching/reachability_test.go","line":97,"tag":"empty-stub","reason":"TestExistsBackloggedActivityOrWFAssignedTo: comment-only todo"}
+{"repo":"temporalio/temporal","file":"service/worker/scanner/executor/executor_test.go","line":24,"tag":"false-positive","reason":"TestExecutionTestSuite: suite.Run; assertions in suite methods"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"app/vmalert/rule/rule_test.go","line":64,"tag":"race-smoke","reason":"TestRule_stateConcurrent: 50 workers add/getAll/getLast"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"app/vmselect/promql/rollup_result_cache_test.go","line":12,"tag":"lifecycle-smoke","reason":"TestRollupResultCacheInitStop: init/stop cycles"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/chunkedbuffer/buffer_test.go","line":153,"tag":"no-panic-smoke","reason":"TestBuffer_MustReadAtZeroData: MustReadAt with nil buffer"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/fs/reader_at_test.go","line":8,"tag":"no-panic-smoke","reason":"TestReaderAt: helper does MustReadAt only, no assertions"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/mergeset/table_test.go","line":14,"tag":"lifecycle-smoke","reason":"TestTableOpenClose: open/close cycles"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/mergeset/table_test.go","line":33,"tag":"no-panic-smoke","reason":"TestTableAddItemsTooLongItem: too-long item is dropped; no assertion"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/persistentqueue/fastqueue_test.go","line":12,"tag":"lifecycle-smoke","reason":"TestFastQueueOpenClose: open/close cycles"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/storage/storage_test.go","line":310,"tag":"lifecycle-smoke","reason":"TestStorageOpenClose: open/close cycles"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/storage/table_test.go","line":11,"tag":"lifecycle-smoke","reason":"TestTableOpenClose: open/close cycles"}
+{"repo":"VictoriaMetrics/VictoriaMetrics","file":"lib/streamaggr/dedup_test.go","line":61,"tag":"race-smoke","reason":"TestDedupAggrConcurrent: concurrent pushSamples"}

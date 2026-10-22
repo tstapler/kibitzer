@@ -1,0 +1,64 @@
+{"repo":"sq","file":"executor/audit_test.go","line":150,"tag":"no-panic-smoke","reason":"comment \"Should not panic\"; OnExec result unused"}
+{"repo":"sq","file":"executor/audit_test.go","line":159,"tag":"no-panic-smoke","reason":"comment \"Should not panic\"; single call, no result"}
+{"repo":"sq","file":"executor/safeexec/safeexec_pg_test.go","line":356,"tag":"race-smoke","reason":"8 goroutines + WaitGroup; result discarded with _ ="}
+{"repo":"sq","file":"github/user_pr_cache_test.go","line":21,"tag":"race-smoke","reason":"goroutine + channel handoff racing SetOnUpdated"}
+{"repo":"sq","file":"github/user_pr_cache_test.go","line":33,"tag":"lifecycle-smoke","reason":"Start/Start/Stop only"}
+{"repo":"sq","file":"pkg/classifier/classifier_test.go","line":2520,"tag":"no-panic-smoke","reason":"comment \"should not panic\"; result dropped (_ = result) but name does not promise a result"}
+{"repo":"sq","file":"pkg/warren/wire_test.go","line":111,"tag":"no-panic-smoke","reason":"comment \"Should not panic\"; MustValidate"}
+{"repo":"sq","file":"server/mcp/rate_limiter_test.go","line":73,"tag":"race-smoke","reason":"50 goroutines + WaitGroup; allow() result unused; name RaceSafety"}
+{"repo":"sq","file":"server/services/backlog_item_event_publisher_test.go","line":117,"tag":"no-panic-smoke","reason":"comment \"did not panic\""}
+{"repo":"sq","file":"server/services/connectrpc_websocket_test.go","line":1157,"tag":"race-smoke","reason":"goroutines + WaitGroup; name ConcurrentAccess"}
+{"repo":"sq","file":"server/services/session_service_client_log_test.go","line":204,"tag":"no-panic-smoke","reason":"comment \"Should not panic\""}
+{"repo":"sq","file":"server/services/slack_notifier_test.go","line":652,"tag":"race-smoke","reason":"goroutines + WaitGroup; name NoDataRace"}
+{"repo":"sq","file":"session/circular_buffer_test.go","line":222,"tag":"race-smoke","reason":"goroutines + WaitGroup; results discarded"}
+{"repo":"sq","file":"session/circular_buffer_test.go","line":249,"tag":"race-smoke","reason":"goroutines + WaitGroup; results discarded"}
+{"repo":"sq","file":"session/command_queue_test.go","line":604,"tag":"race-smoke","reason":"goroutines + WaitGroup; \"No crashes = success\""}
+{"repo":"sq","file":"session/detection/approval_test.go","line":184,"tag":"discarded-result","reason":"name NoDetection promises empty result but requests dropped with _ ="}
+{"repo":"sq","file":"session/detection/asterism_test.go","line":151,"tag":"discarded-result","reason":"name NoAiderFalsePositive promises a negative result but Detect() output dropped"}
+{"repo":"sq","file":"session/detection/detector_test.go","line":1111,"tag":"race-smoke","reason":"goroutines + WaitGroup; results discarded"}
+{"repo":"sq","file":"session/detection/idle_test.go","line":694,"tag":"discarded-result","reason":"name should_acceptInjectedDetector but state dropped with _ ="}
+{"repo":"sq","file":"session/detection/idle_test.go","line":719,"tag":"discarded-result","reason":"name should_createOwn_When_nilInjected but state dropped with _ ="}
+{"repo":"sq","file":"session/detection/ratelimit/integration_test.go","line":18,"tag":"race-smoke","reason":"goroutines + WaitGroup around Start/Stop; name Concurrent"}
+{"repo":"sq","file":"session/detection/terminal_detector_test.go","line":18,"tag":"compile-check","reason":"var _ I = (*T)(nil)"}
+{"repo":"sq","file":"session/external_streamer_transport_test.go","line":24,"tag":"compile-check","reason":"var _ I = (*T)(nil)"}
+{"repo":"sq","file":"session/external_tmux_streamer_transport_test.go","line":24,"tag":"compile-check","reason":"var _ I = (*T)(nil)"}
+{"repo":"sq","file":"session/headless/pool_test.go","line":390,"tag":"race-smoke","reason":"goroutines + WaitGroup; error ignored; \"No panic = pass\""}
+{"repo":"sq","file":"session/headless/pool_test.go","line":542,"tag":"race-smoke","reason":"goroutines + WaitGroup; name ThreadSafe"}
+{"repo":"sq","file":"session/history_linker_test.go","line":195,"tag":"lifecycle-smoke","reason":"Start then wait on ctx; name StartAndStop"}
+{"repo":"sq","file":"session/instance_concurrency_test.go","line":204,"tag":"race-smoke","reason":"goroutines + WaitGroup; \"No data race should occur\""}
+{"repo":"sq","file":"session/native_process_manager_test.go","line":39,"tag":"compile-check","reason":"only t.Log documenting a compile-time check"}
+{"repo":"sq","file":"session/pipeline_engine_test.go","line":73,"tag":"compile-check","reason":"var _ I = (*T)(nil)"}
+{"repo":"sq","file":"session/procinfo/inspector_test.go","line":79,"tag":"discarded-result","reason":"name ReturnsEmptyNotError but files and err dropped with _ ="}
+{"repo":"sq","file":"session/session_driver_test.go","line":354,"tag":"no-panic-smoke","reason":"comment \"Should not panic\""}
+{"repo":"sq","file":"session/tmux/ssh_pty_factory_test.go","line":85,"tag":"compile-check","reason":"var _ I = (*T)(nil)"}
+{"repo":"sq","file":"session/tymux/fanout_test.go","line":85,"tag":"race-smoke","reason":"goroutines + WaitGroup; name RaceFree"}
+{"repo":"sq","file":"session/vnc/display_alloc_test.go","line":211,"tag":"no-panic-smoke","reason":"comment \"must not panic\""}
+{"repo":"sq","file":"session/worktree_pr_poller_test.go","line":37,"tag":"no-panic-smoke","reason":"comment \"should not panic\""}
+{"repo":"sq","file":"session/worktree_pr_poller_test.go","line":48,"tag":"lifecycle-smoke","reason":"Start/Start/Stop only"}
+{"repo":"sq","file":"session/worktree_pr_poller_test.go","line":61,"tag":"no-panic-smoke","reason":"comment \"should not cause panics\"; Start/Sleep/Stop"}
+{"repo":"k8s","file":"cmd/kube-controller-manager/app/controllermanager_test.go","line":112,"tag":"no-panic-smoke","reason":"name ShouldNotPanic; single call"}
+{"repo":"k8s","file":"cmd/kubelet/app/options/globalflags_linux_test.go","line":51,"tag":"no-panic-smoke","reason":"name DoesNotPanic; single call"}
+{"repo":"k8s","file":"pkg/controller/resourcepoolstatusrequest/metrics/metrics_test.go","line":100,"tag":"no-panic-smoke","reason":"comment \"does not panic\""}
+{"repo":"k8s","file":"pkg/proxy/winkernel/proxier_test.go","line":1659,"tag":"no-panic-smoke:uncued","reason":"Noop handlers called, nothing asserted, no cue"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/schema/unfold_test.go","line":25,"tag":"no-panic-smoke:uncued","reason":"single call, nothing asserted, no cue"}
+{"repo":"k8s","file":"staging/src/k8s.io/apimachinery/pkg/api/resource/quantity_test.go","line":1222,"tag":"no-panic-smoke","reason":"name NoCrash"}
+{"repo":"k8s","file":"staging/src/k8s.io/apimachinery/pkg/util/wait/wait_test.go","line":664,"tag":"untagged","reason":"goroutine+channel handshake; oracle is completion/no-hang, not a race or panic"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/admission/configuration/warning_test.go","line":71,"tag":"no-panic-smoke:uncued","reason":"log helpers called, nothing asserted, no cue"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/admission/plugin/manifest/metrics/metrics_test.go","line":97,"tag":"no-panic-smoke","reason":"comment \"Should not panic\""}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/admission/plugin/manifest/metrics/metrics_test.go","line":161,"tag":"no-panic-smoke","reason":"comment \"Should not panic\""}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/endpoints/filters/audit_test.go","line":799,"tag":"no-panic-smoke","reason":"name NoPanicOnNilUser"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher_test.go","line":402,"tag":"empty-stub","reason":"only TODO comment"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher_test.go","line":406,"tag":"empty-stub","reason":"only TODO comment"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher_test.go","line":416,"tag":"empty-stub","reason":"only TODO comment"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher_test.go","line":426,"tag":"empty-stub","reason":"only TODO comment"}
+{"repo":"k8s","file":"staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher_test.go","line":442,"tag":"empty-stub","reason":"only TODO comment"}
+{"repo":"k8s","file":"staging/src/k8s.io/client-go/tools/watch/informerwatcher_test.go","line":46,"tag":"untagged","reason":"goroutine+channel liveness test (exit without hang); not a race or panic smoke"}
+{"repo":"k8s","file":"staging/src/k8s.io/client-go/util/workqueue/queue_test.go","line":300,"tag":"untagged","reason":"shutdown/drain liveness; completion of WaitGroup is the oracle"}
+{"repo":"k8s","file":"staging/src/k8s.io/client-go/util/workqueue/queue_test.go","line":332,"tag":"untagged","reason":"shutdown liveness; comment says test would time out"}
+{"repo":"k8s","file":"staging/src/k8s.io/client-go/util/workqueue/queue_test.go","line":355,"tag":"untagged","reason":"shutdown liveness; comment says test would time out"}
+{"repo":"k8s","file":"staging/src/k8s.io/component-base/metrics/counter_test.go","line":547,"tag":"race-smoke","reason":"4 goroutines + WaitGroup; name Race"}
+{"repo":"k8s","file":"staging/src/k8s.io/component-base/metrics/histogram_test.go","line":665,"tag":"race-smoke","reason":"4 goroutines + WaitGroup; name Race"}
+{"repo":"k8s","file":"staging/src/k8s.io/component-base/tracing/tracing_test.go","line":181,"tag":"no-panic-smoke","reason":"name NoPanic"}
+{"repo":"k8s","file":"staging/src/k8s.io/dynamic-resource-allocation/api/type_test.go","line":41,"tag":"untagged","reason":"only t.Logf of a formatted value; visual/log check"}
+{"repo":"k8s","file":"test/integration/openshift/openshift_test.go","line":29,"tag":"compile-check","reason":"only _ = &T{...} blank assignments"}
+{"repo":"k8s","file":"test/utils/ktesting/examples/without_ktesting/example_test.go","line":30,"tag":"untagged","reason":"deliberate demo that blocks forever"}
