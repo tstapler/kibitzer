@@ -170,7 +170,7 @@ func TestRace_bareGoNamedConcurrent(t *testing.T) {
 	}
 }
 
-// A bare `go` with neither a sync primitive nor a race cue is not enough for race-smoke.
+// A bare `go` with neither a sync primitive nor an intent cue is not enough to tag.
 func TestBareGo_noCue(t *testing.T) {
 	go worker()
 	Parse("x")
@@ -202,4 +202,133 @@ func TestStartStop_withSubjectCall(t *testing.T) {
 	s.Start()
 	s.Process("x")
 	s.Stop()
+}
+
+// Round 9: a typed blank declaration after a setup binding is still a compile-time check
+// (cosmos-sdk internal/blockstm/txnrunner_test.go).
+func TestCompile_blankDeclAfterSetup(t *testing.T) {
+	decoder := mockTxDecoder
+
+	var _ sdk.TxRunner = NewSTMRunner(decoder, []storetypes.StoreKey{}, 1, false, testCoinDenomFunc)
+}
+
+// An interface-named test whose only statement is a subtest that discards a constructor result
+// (mattermost pluginapi poster).
+func TestInterface_constructorDiscarded(t *testing.T) {
+	t.Run("Plugin API satisfy the interface", func(t *testing.T) {
+		api := &plugintest.API{}
+		client := pluginapi.NewClient(api)
+		_ = NewPoster(&client.Post, botID)
+	})
+}
+
+// Discarding a constructor result without an interface cue is not a compile check.
+func TestBuild_constructorDiscarded(t *testing.T) {
+	cfg := loadConfig()
+	_ = NewPoster(&cfg.Post, botID)
+}
+
+// Goroutines and a WaitGroup that only prove nothing deadlocks carry no detector intent.
+func TestFanOut_noDeadlock(t *testing.T) {
+	var wg sync.WaitGroup
+	ch := make(chan int)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feed.Send(i)
+		}()
+	}
+	go func() { wg.Wait(); close(ch) }()
+	for range ch {
+	}
+}
+
+// The oracle is that Close and Reload return when run in parallel: a deadlock probe.
+func TestDeadlockBw_closeAndReload(t *testing.T) {
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			hs.Close()
+			hs.Open()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			se.Broadcast()
+		}
+	}()
+	wg.Wait()
+}
+
+// Producer and consumer goroutines wired by channels: liveness only.
+func TestProduceConsume_pipeline(t *testing.T) {
+	buffer := NewInfiniteBuffer()
+	producer := make(chan Message)
+	consumer := make(chan *Message)
+	go buffer.StartListening(producer)
+	go buffer.Consume(consumer)
+	go func() {
+		for i := 0; i < 10000; i++ {
+			producer <- Message{}
+		}
+	}()
+	for i := 0; i < 10000; i++ {
+		<-consumer
+	}
+}
+
+// Parallel mutation named in a comment counts even without a sync primitive.
+// Regression test to ensure we can safely mutate labels in parallel
+func TestParallelLabels_commentOnly(t *testing.T) {
+	for i := range 100 {
+		go func() {
+			m.With(fmt.Sprint(i)).Record(1)
+		}()
+	}
+}
+
+// The race detector is the oracle and the concurrency lives in the callee: no `go` here.
+// TestProxyDataRace find the concurrent data race bug ( go test -race -run TestProxyDataRace -v ).
+func TestProxyDataRace(t *testing.T) {
+	p := NewProxy(logger, endpoints)
+	_ = p.MetricMetadata(req, s)
+}
+
+// A word that merely contains the letters, as in Trace or Grace, is no cue.
+func TestTraceExporter_noGoroutines(t *testing.T) {
+	exp := NewTraceExporter()
+	exp.Export(span)
+}
+
+// Subtests delegating to a helper that only skips are a stub even through a table loop (dolt).
+func TestStub_tableLoopToSkipHelper(t *testing.T) {
+	var tests = []identityTest{
+		{
+			name: "smoke test",
+			left: []table{{name: "t", cols: []column{{name: "pk", enc: val.Int32Enc}}}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testIdentity(t, test)
+		})
+	}
+}
+
+func testIdentity(t *testing.T, test identityTest) {
+	t.Skip("implement me")
+}
+
+// A table loop whose helper really runs something is not a stub.
+func TestDelegates_tableLoopToWorkingHelper(t *testing.T) {
+	tests := []identityTest{{name: "a"}}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workingHelper(t)
+		})
+	}
 }

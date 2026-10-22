@@ -655,9 +655,11 @@ impl Checker for TestNoAssertionChecker {
             let mut message = self.message(test);
             if self.lang == Language::Go
                 && crate::test_code::oracle_tag::enabled()
-                && let Some(tag) = crate::test_code::oracle_tag::tag_go(test, &|name| {
-                    scan.helper_source(name, ctx.source)
-                })
+                && let Some(tag) = crate::test_code::oracle_tag::tag_go(
+                    test,
+                    &crate::test_code::oracle_tag::leading_comment(ctx.source, test.line),
+                    &|name| scan.helper_source(name, ctx.source),
+                )
             {
                 message.push_str("\n  ");
                 message.push_str(&tag.annotation());

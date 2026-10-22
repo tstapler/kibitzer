@@ -49,13 +49,37 @@ pub fn enabled() -> bool {
     std::env::var(ENV_FLAG).is_ok_and(|v| v == "1")
 }
 
-static RACE_CUE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)concurren|race|thread.?safe|atomic").expect("valid regex"));
-static SYNC_PRIMITIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"WaitGroup|\bchan\b|<-|\bMutex\b|\bRWMutex\b|errgroup").expect("valid regex")
+/// Race intent in a test name. `race` must be a CamelCase or snake word (`TestRace_x`,
+/// `TestProxyDataRace`), never a substring (`Trace`, `Grace`).
+static RACE_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)data.?race|racy|race.?(cond|detect)|concurren|thread.?safe|atomic|multi.?thread|hammer|stress|contention|parallelism|mutex|(?-i:(?:^|[a-z_])Races?(?:[A-Z_0-9]|$))")
+        .expect("valid regex")
 });
+/// Race intent in a comment: the race detector, a race condition, or concurrent / parallel access.
+static RACE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\braces?\b|-race\b|data.?race|racy|concurren|thread.?safe|atomic|in parallel|simultaneous")
+        .expect("valid regex")
+});
+/// Race intent in the test name strong enough to tag a body with no goroutine of its own (the
+/// callee spawns them).
+static RACE_DETECTOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)data.?race|racy|race.?(cond|detect)|(?-i:(?:^|[a-z_])Races?(?:[A-Z_0-9]|$))")
+        .expect("valid regex")
+});
+/// Deadlock / hang intent: the oracle is "returns", which the race detector adds nothing to.
+static LIVENESS_INTENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)dead.?lock|live.?lock|hangs?\b").expect("valid regex"));
+static EXPLICIT_RACE_COMMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)-race\b|data.?race|race.?detect").expect("valid regex"));
+static CHANNEL_USE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<-|\bchan\b|\bselect\b").expect("valid regex"));
+static JOIN_PRIMITIVE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"WaitGroup|\bMutex\b|\bRWMutex\b|errgroup").expect("valid regex"));
 static COMPILE_NOTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)compile.?time|compiles").expect("valid regex"));
+static INTERFACE_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)interface|implements|satisf|conform|compile").expect("valid regex")
+});
 static COMPOSITE_RHS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^&?[A-Za-z_][\w.\[\]*]*\s*\{").expect("valid regex"));
 
@@ -64,6 +88,8 @@ static COMPOSITE_RHS: LazyLock<Regex> =
 enum Stmt {
     BlankDecl,
     BlankAssign(String),
+    /// A `:=` binding with at least one named variable.
+    Define,
     Call(String),
     Other,
 }
@@ -75,19 +101,46 @@ struct Scanned {
     comments: String,
 }
 
-pub fn tag_go(f: &TestFn, helper_source: &dyn Fn(&str) -> Option<String>) -> Option<OracleTag> {
+/// Comment lines directly above the 1-based `line` of a declaration, joined; they hold intent
+/// ("find the data race", "safe to mutate in parallel") that the function body does not.
+pub fn leading_comment(source: &str, line: usize) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = Vec::new();
+    let mut at = line.saturating_sub(1);
+    while at > 0 {
+        let above = lines.get(at - 1).map_or("", |l| l.trim());
+        if !above.starts_with("//") {
+            break;
+        }
+        out.push(above);
+        at -= 1;
+    }
+    out.reverse();
+    out.join("\n")
+}
+
+pub fn tag_go(
+    f: &TestFn,
+    leading_comment: &str,
+    helper_source: &dyn Fn(&str) -> Option<String>,
+) -> Option<OracleTag> {
     let scanned = scan(&f.body);
     let inner = inner_body(&scanned.code);
     let stmts: Vec<Stmt> = split_statements(inner)
         .iter()
         .map(|s| classify(s))
         .collect();
+    let comments = format!("{leading_comment}\n{}", scanned.comments);
 
-    if inner.trim().is_empty() || delegates_only_to_stubs(&stmts, helper_source) {
+    if inner.trim().is_empty()
+        || delegates_only_to_stubs(&stmts, helper_source)
+        || loops_over_stub_subtests(&scanned.code, inner, helper_source)
+    {
         Some(OracleTag::EmptyStub)
-    } else if is_compile_check(&stmts) || is_compile_note(&stmts, &scanned.comments) {
+    } else if is_compile_check(&stmts, &f.name, inner) || is_compile_note(&stmts, &scanned.comments)
+    {
         Some(OracleTag::CompileCheck)
-    } else if is_race_smoke(&scanned.code, inner, &f.name, &scanned.comments) {
+    } else if is_race_smoke(&scanned.code, inner, &f.name, &comments) {
         Some(OracleTag::RaceSmoke)
     } else {
         None
@@ -114,20 +167,88 @@ fn is_stub_body(helper_src: &str) -> bool {
     })
 }
 
-fn is_compile_check(stmts: &[Stmt]) -> bool {
+/// Setup bindings (`x := f()`) and `t.*` calls may surround the blank declarations. A discarded
+/// constructor result (`_ = NewX(..)`) counts only when the test is named for an interface check.
+/// A lone `t.Run(.., func(t *testing.T) {..})` is looked through to its closure body.
+fn is_compile_check(stmts: &[Stmt], name: &str, inner: &str) -> bool {
+    let unwrapped: Vec<Stmt>;
+    let stmts = match unwrap_single_subtest(inner) {
+        Some(body) if stmts.len() == 1 => {
+            unwrapped = split_statements(body).iter().map(|s| classify(s)).collect();
+            &unwrapped[..]
+        }
+        _ => stmts,
+    };
     let relevant: Vec<&Stmt> = stmts
         .iter()
-        .filter(|s| !matches!(s, Stmt::Call(c) if c.starts_with("t.")))
+        .filter(|s| {
+            !matches!(s, Stmt::Define) && !matches!(s, Stmt::Call(c) if c.starts_with("t."))
+        })
         .collect();
+    let named_for_interface = INTERFACE_NAME.is_match(name);
     !relevant.is_empty()
         && relevant.iter().all(|s| match s {
             Stmt::BlankDecl => true,
             Stmt::BlankAssign(rhs) => {
                 let rhs = rhs.trim();
-                rhs.starts_with('&') || rhs.contains("(nil)") || COMPOSITE_RHS.is_match(rhs)
+                rhs.starts_with('&')
+                    || rhs.contains("(nil)")
+                    || COMPOSITE_RHS.is_match(rhs)
+                    || named_for_interface
             }
             _ => false,
         })
+}
+
+/// Body of the closure when the whole test is one `t.Run(name, func(t *testing.T) { .. })`.
+fn unwrap_single_subtest(inner: &str) -> Option<&str> {
+    let trimmed = inner.trim();
+    let rest = trimmed.strip_prefix("t.Run(")?;
+    let open = rest.find("func(")? + rest[rest.find("func(")?..].find('{')?;
+    let mut depth = 0i32;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let tail = rest[open + i + 1..].trim();
+                    return (tail == ")").then(|| &rest[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Subtests run in a loop over a table, and the only calls anywhere in the body are `t.Run` and
+/// same-file helpers that are themselves stubs (dolt `testIdentity` that only `t.Skip`s).
+fn loops_over_stub_subtests(
+    code: &str,
+    inner: &str,
+    helper_source: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    static CALL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"([A-Za-z_][\w.]*)\s*\(").expect("valid regex"));
+    if !code.contains("t.Run(") {
+        return false;
+    }
+    let mut helpers = 0;
+    for caps in CALL.captures_iter(inner) {
+        let callee = &caps[1];
+        match callee {
+            "t.Run" | "func" => {}
+            plain if !plain.contains('.') => {
+                if helper_source(plain).is_none_or(|src| !is_stub_body(&src)) {
+                    return false;
+                }
+                helpers += 1;
+            }
+            _ => return false,
+        }
+    }
+    helpers > 0
 }
 
 /// A body that is only `t.Log`-style calls next to a comment saying the real check is the compiler.
@@ -139,13 +260,21 @@ fn is_compile_note(stmts: &[Stmt], comments: &str) -> bool {
         && COMPILE_NOTE.is_match(comments)
 }
 
+/// Race-detector intent: named in the test name or a comment, or (without that) an identical
+/// goroutine fan-out joined by a WaitGroup/mutex with no channel traffic. Goroutines wired by
+/// channels (producer/consumer, "does not deadlock") are liveness probes and get no tag.
 fn is_race_smoke(code: &str, inner: &str, name: &str, comments: &str) -> bool {
     let go_count = count_go_statements(inner);
-    let cue = RACE_CUE.is_match(name) || RACE_CUE.is_match(comments);
-    if go_count == 0 || !(cue || SYNC_PRIMITIVE.is_match(code)) {
-        return false;
+    if go_count == 0 {
+        return RACE_DETECTOR.is_match(name);
     }
-    cue || go_count >= 2 || go_in_loop(inner)
+    if LIVENESS_INTENT.is_match(name) || LIVENESS_INTENT.is_match(comments) {
+        return RACE_DETECTOR.is_match(name) || EXPLICIT_RACE_COMMENT.is_match(comments);
+    }
+    let cue = RACE_NAME.is_match(name) || RACE_COMMENT.is_match(comments);
+    cue || (JOIN_PRIMITIVE.is_match(code)
+        && !CHANNEL_USE.is_match(code)
+        && (go_count >= 2 || go_in_loop(inner)))
 }
 
 fn last_segment(callee: &str) -> &str {
@@ -300,7 +429,7 @@ fn classify(s: &str) -> Stmt {
         if s[..at].split(',').all(|p| p.trim() == "_") {
             return Stmt::BlankAssign(rhs.to_string());
         }
-        return Stmt::Other;
+        return if len == 2 { Stmt::Define } else { Stmt::Other };
     }
     if s.ends_with(')')
         && let Some(paren) = s.find('(')
@@ -371,7 +500,8 @@ mod tests {
             .map(|f| {
                 (
                     f.name.clone(),
-                    tag_go(f, &fixture_helper).map(OracleTag::label),
+                    tag_go(f, &leading_comment(FIXTURE, f.line), &fixture_helper)
+                        .map(OracleTag::label),
                 )
             })
             .collect()
@@ -410,6 +540,17 @@ mod tests {
             ("TestDelegates_toWorkingHelper", None),
             ("TestDelegates_twoLevels", None),
             ("TestDelegates_skipHelperPlusRealCall", None),
+            ("TestCompile_blankDeclAfterSetup", Some("compile-check")),
+            ("TestInterface_constructorDiscarded", Some("compile-check")),
+            ("TestBuild_constructorDiscarded", None),
+            ("TestFanOut_noDeadlock", None),
+            ("TestDeadlockBw_closeAndReload", None),
+            ("TestProduceConsume_pipeline", None),
+            ("TestParallelLabels_commentOnly", Some("race-smoke")),
+            ("TestProxyDataRace", Some("race-smoke")),
+            ("TestTraceExporter_noGoroutines", None),
+            ("TestStub_tableLoopToSkipHelper", Some("empty-stub")),
+            ("TestDelegates_tableLoopToWorkingHelper", None),
         ];
         let got = labels();
         for (name, tag) in expected {
