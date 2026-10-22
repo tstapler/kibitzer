@@ -394,10 +394,13 @@ fn runs_testify_suite(ctx: &Scan, call: &Call, handles: &[String]) -> bool {
         && call.args.first().is_some_and(|a| handles.contains(a))
 }
 
+/// A same-file holder type is judged by its methods; a package-qualified one (`pkg.Configuration{T: t}`)
+/// is defined elsewhere, so handing it the handle is taken as delegating, as `passes_handle` does.
 fn delegates_to_handle_holder(ctx: &Scan, call: &Call) -> bool {
-    call.callee
-        .strip_prefix(HOLDER_PREFIX)
-        .is_some_and(|key| ctx.failing_holders.contains(key))
+    call.callee.strip_prefix(HOLDER_PREFIX).is_some_and(|key| {
+        ctx.failing_holders.contains(key)
+            || key.rsplit_once('.').is_some_and(|(ty, _)| ty.contains('.'))
+    })
 }
 
 /// `ts.Run()` on a variable bound to a handle-carrying literal, where no same-file method is
@@ -520,6 +523,38 @@ impl Scan {
 
     /// Go callees: `helper`, `helper[T]`, `recv.method`, `recv.m(..).n[T]`. A selector resolves by
     /// its last segment to any same-file method; a test-handle receiver (`t.Run`) never does.
+    /// Go: the body sets gomock expectations (`m.EXPECT().Foo()`) and, in it or a same-file helper it
+    /// reaches (`createSuite(t)`, `defer s.tearDown()`), a controller is made or finished, which is
+    /// what fails the test on an unmet expectation.
+    fn verifies_expectations(&self, calls: &[Call], handles: &[String]) -> bool {
+        calls.iter().any(|c| c.callee.contains(".EXPECT()"))
+            && self.reaches_controller(calls, handles, &mut Vec::new())
+    }
+
+    fn reaches_controller(
+        &self,
+        calls: &[Call],
+        handles: &[String],
+        visited: &mut Vec<usize>,
+    ) -> bool {
+        calls.iter().any(|call| {
+            let last = call.callee.rsplit('.').next().unwrap_or(&call.callee);
+            if last == "NewController" || (last == "Finish" && call.args.is_empty()) {
+                return true;
+            }
+            let Some(helper) = self.resolve_go(&call.callee, handles) else {
+                return false;
+            };
+            if visited.len() >= MAX_HELPER_DEPTH || visited.contains(&helper.line) {
+                return false;
+            }
+            visited.push(helper.line);
+            let found = self.reaches_controller(&helper.calls, &helper.handles, visited);
+            visited.pop();
+            found
+        })
+    }
+
     fn resolve_go(&self, callee: &str, handles: &[String]) -> Option<&FnInfo> {
         let cleaned = without_comments_and_space(callee);
         let callee = strip_type_args(&cleaned);
@@ -655,6 +690,9 @@ impl Checker for TestNoAssertionChecker {
                     .any(|h| info.calls.iter().any(|c| c.callee == format!("{h}.Helper")))
             {
                 // `t.Helper()` marks a function other tests call (boundary export_test.go), not a test.
+                continue;
+            }
+            if self.lang == Language::Go && scan.verifies_expectations(&info.calls, &info.handles) {
                 continue;
             }
             scan.seen.borrow_mut().clear();

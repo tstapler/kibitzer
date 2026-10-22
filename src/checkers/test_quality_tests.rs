@@ -102,6 +102,7 @@ const GO_CASES: &[Case] = &[
     ("guarded_panic_helper_test.go", &[29, 44, 49], &[29, 44, 49]),
     ("env_entrypoint_test.go", &[37, 43, 50], &[37, 43, 50]),
     ("t_helper_in_export_test.go", &[16], &[16]),
+    ("gomock_controller_test.go", &[37, 44], &[37]),
     (
         "main_harness_test.go",
         &[36, 40, 46, 65, 72],

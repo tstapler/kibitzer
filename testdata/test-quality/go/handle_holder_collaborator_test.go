@@ -35,3 +35,9 @@ func TestCollaboratorSilent(t *testing.T) {
 	h := newHandler(&w)
 	h.Handle("x")
 }
+
+// A holder type from another package cannot be judged: knative serving test/upgrade/upgrade_test.go.
+func TestForeignHolderExecutes(t *testing.T) {
+	suite := pkgupgrade.Suite{Tests: pkgupgrade.Tests{}}
+	suite.Execute(pkgupgrade.Configuration{T: t})
+}
