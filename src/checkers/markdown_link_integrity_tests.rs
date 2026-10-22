@@ -299,3 +299,9 @@ fn still_flags_explicit_reference_with_colon_label_and_lowercase_shortcut() {
     let shortcut = check_source(&path(), "See [foo] for details.\n").unwrap();
     assert_eq!(shortcut.len(), 1);
 }
+
+#[test]
+fn still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set() {
+    let findings = check_source(&path(), "See [RFC] for details.\n").unwrap();
+    assert_eq!(findings.len(), 1);
+}

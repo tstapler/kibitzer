@@ -225,19 +225,20 @@ fn reference_style_flags(link_type: LinkType) -> (bool, bool) {
     (is_reference_style, is_dangling)
 }
 
+/// Severity tags emitted by the `code:review` skill, used as plain prose markers.
+const SEVERITY_TAGS: [&str; 4] = ["BLOCKER", "CRITICAL", "MAJOR", "NIT"];
+
 /// Bracketed text that is almost never a reference-link attempt: a `[x]`/`[X]` mark used
 /// mid-sentence (outside `ENABLE_TASKLISTS`' list-item position), a `[LABEL: text]` tag, or
-/// an ALL-CAPS tag like `[BLOCKER]`. Scoped to `Shortcut`/`ShortcutUnknown` only —
+/// one of [`SEVERITY_TAGS`]. Scoped to `Shortcut`/`ShortcutUnknown` only —
 /// `Reference`/`Collapsed` require an explicit `[label][ref]`/`[label][]`, still flagged.
-/// Trade-off: a genuine ALL-CAPS shortcut reference with no definition is also skipped.
+/// Other all-caps labels (`[RFC]`) stay flagged: they are indistinguishable from real refs.
 fn is_non_link_bracket_usage(link_type: LinkType, raw_label: &str) -> bool {
     if !matches!(link_type, LinkType::Shortcut | LinkType::ShortcutUnknown) {
         return false;
     }
     let label = raw_label.trim();
-    label.eq_ignore_ascii_case("x")
-        || label.contains(':')
-        || (!label.is_empty() && label.chars().all(|c| c.is_ascii_uppercase()))
+    label.eq_ignore_ascii_case("x") || label.contains(':') || SEVERITY_TAGS.contains(&label)
 }
 
 /// Handles one `Link`/`Image` start event: records a dangling reference-style use as a

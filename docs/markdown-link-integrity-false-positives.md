@@ -390,10 +390,10 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   in passing.
 - **Status: resolved in `83145b3`.** `is_bracketed_checkbox_mark` became
   `is_non_link_bracket_usage` (`src/checkers/markdown_link_integrity.rs`): a
-  `Shortcut`/`ShortcutUnknown` label is skipped if it is `x`, contains `:`, or is ALL-CAPS
-  (`[BLOCKER]`, `[NIT]`). Tests: `ignores_severity_tag_in_heading`,
-  `ignores_code_review_severity_tags`. Trade-off: an undefined ALL-CAPS shortcut
-  reference (`[RFC]`) is no longer flagged.
+  `Shortcut`/`ShortcutUnknown` label is skipped if it is `x`, contains `:`, or is one of
+  `BLOCKER`/`CRITICAL`/`MAJOR`/`NIT` (`SEVERITY_TAGS`). Tests: `ignores_severity_tag_in_heading`,
+  `ignores_code_review_severity_tags`. Other all-caps labels such as `[RFC]` are
+  still flagged (`still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set`).
 
 ## Resolution: native `markdown-link-integrity` checker + grace period
 
