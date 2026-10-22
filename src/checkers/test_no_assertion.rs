@@ -1064,6 +1064,11 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
     } else {
         (Vec::new(), HashMap::new())
     };
+    let range_vars = if lang == Language::Go {
+        go_range_vars(root, source)
+    } else {
+        Vec::new()
+    };
     let mut calls = Vec::new();
     walk_preorder(root, &mut |node| {
         let call_node = match lang {
@@ -1088,33 +1093,18 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
                     })
                 });
             if lang == Language::Go && callee.ends_with(".Run") {
-                // `t.Run(name, tc.runner)`: a named function or method value is a call target.
-                let last = arg_texts.len().saturating_sub(1);
-                calls.extend(
-                    arg_texts
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, a)| is_go_path(a))
-                        .map(|(i, a)| {
-                            let on_local = i == last
-                                && i > 0
-                                && a.split_once('.')
-                                    .is_some_and(|(root, _)| locals.iter().any(|l| l == root));
-                            if on_local {
-                                Call::dispatched(a.clone())
-                            } else {
-                                Call::new(a.clone(), Vec::new())
-                            }
-                        }),
-                );
-                calls.extend(returned_test_body(args, source));
+                calls.extend(subtest_body_call(args, source, &locals, &range_vars));
             } else if lang == Language::Go {
-                // `ExecAPITest(t, testX)`: a function value handed to a runner.
+                // `ExecAPITest(t, testX)` / `run(t, testX[int])`: a function value handed to a runner.
+                let mut c = node.walk();
                 calls.extend(
-                    arg_texts
-                        .iter()
-                        .filter(|a| is_go_path(a))
-                        .map(|a| Call::value(a.clone())),
+                    args.iter()
+                        .flat_map(|a| a.named_children(&mut c).collect::<Vec<_>>())
+                        .filter(|a| {
+                            !matches!(a.kind(), "call_expression" | "type_conversion_expression")
+                        })
+                        .filter_map(|a| go_function_target(a, source))
+                        .map(Call::value),
                 );
             }
             if lang == Language::Go && is_mock_panic_expectation(&callee) {
@@ -1169,20 +1159,68 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
     calls
 }
 
-/// Go: `t.Run(name, helper(..))` -- the last argument is a call returning the subtest body. Followed
-/// into a same-file `helper` (whose returned closure is part of its subtree); a helper defined
-/// elsewhere returns a body this parse cannot see, so it is unknowable rather than assertion-free.
-fn returned_test_body(args: Option<Node>, source: &str) -> Option<Call> {
+/// Go: the name a function-valued expression resolves through, or `None` when it is not one
+/// (a literal, which the caller's own subtree walk already covers). Accepts an identifier, a
+/// selector, a generic instantiation (`f[T]`, `f[A, B]`), a parenthesized form, and a call or
+/// conversion of any of those (`f[T](..)`, `x.m(..)`), where the callee stands for the value
+/// the call returns.
+fn go_function_target(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "parenthesized_expression" => go_function_target(node.named_child(0)?, source),
+        "call_expression" => go_function_target(node.child_by_field_name("function")?, source),
+        "type_conversion_expression" => {
+            go_function_target(node.child_by_field_name("type")?, source)
+        }
+        "identifier"
+        | "selector_expression"
+        | "index_expression"
+        | "generic_type"
+        | "type_instantiation_expression" => Some(node_text(node, source).to_string()),
+        _ => None,
+    }
+}
+
+/// Go: `t.Run(name, body)` -- the last argument names or builds the subtest body. Followed into a
+/// same-file function (a returned closure is part of its subtree); one defined elsewhere, or read
+/// off a value, is unknowable rather than assertion-free. A bare local that is not a range
+/// variable (`body := func(..){..}`) keeps being an ordinary call so its literal is judged.
+fn subtest_body_call(
+    args: Option<Node>,
+    source: &str,
+    locals: &[String],
+    range_vars: &[String],
+) -> Option<Call> {
     let args = args?;
     let mut cursor = args.walk();
     let all: Vec<Node> = args.named_children(&mut cursor).collect();
     let [_, .., last] = all[..] else { return None };
-    let callee = match last.kind() {
-        "call_expression" => last.child_by_field_name("function")?,
-        "type_conversion_expression" => last.child_by_field_name("type")?,
-        _ => return None,
-    };
-    Some(Call::dispatched(node_text(callee, source).to_string()))
+    let target = go_function_target(last, source)?;
+    let bare_local = !target.contains(['.', '(', '['])
+        && locals.contains(&target)
+        && !range_vars.contains(&target);
+    Some(if bare_local {
+        Call::new(target, Vec::new())
+    } else {
+        Call::dispatched(target)
+    })
+}
+
+/// Go: names a `for ... range` loop binds, which can hold any function value.
+fn go_range_vars(root: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    walk_preorder(root, &mut |n| {
+        if n.kind() == "range_clause"
+            && let Some(left) = n.child_by_field_name("left")
+        {
+            let mut cursor = left.walk();
+            names.extend(
+                left.named_children(&mut cursor)
+                    .map(|x| node_text(x, source).to_string()),
+            );
+        }
+        true
+    });
+    names
 }
 
 /// Go: names bound inside `root` (parameters, `:=`, `var`, range variables), so a selector on one
