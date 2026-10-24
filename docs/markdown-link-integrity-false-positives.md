@@ -395,6 +395,25 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   `ignores_code_review_severity_tags`. Other all-caps labels such as `[RFC]` are
   still flagged (`still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set`).
 
+### 2026-10-23 — Logseq wiki — single-letter `[H]`/`[W]`/`[R]` bullet labels misread as undefined shortcut references
+
+- **What changed**: a Logseq page built from a planning template used inspection
+  hold-point labels at the start of bullets (`- [H] Hold`, `- [W] Witness`,
+  `- [R] Review`). Repro: `printf -- "- [H] Sash\n- [W] Even\n" > a.md` then
+  `kibitzer check native markdown-link-integrity a.md` reported
+  `a.md:1: [H] used but never defined` (exit 2), repeating on every edit.
+- **Why it's a false positive**: the labels are plain-text designations, not link
+  attempts; no `[H]: url` definition was ever intended.
+- **Root cause**: same CommonMark ambiguity as the 2026-09-11 entry — `[H]` parses as
+  `LinkType::ShortcutUnknown`. `is_non_link_bracket_usage` only exempted `x`/`X`, a
+  colon-containing label, or `SEVERITY_TAGS`, so every other single letter fell through.
+- **Status: resolved in `eb07bee`.** The `x` exemption became "any single ASCII letter"
+  (`src/checkers/markdown_link_integrity.rs`). Still scoped to `Shortcut`/`ShortcutUnknown`:
+  `[text][H]` and `[H][]` with no definition are still flagged, and a defined `[H]: url`
+  was never dangling. Tests: `ignores_single_letter_inspection_labels`,
+  `single_letter_label_with_a_definition_is_not_flagged`,
+  `still_flags_explicit_and_collapsed_single_letter_references_when_dangling`.
+
 ## Resolution: native `markdown-link-integrity` checker + grace period
 
 `markdown-link-integrity` is no longer a `markdownlint-cli2`/`doc_report.py`
