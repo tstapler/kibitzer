@@ -193,6 +193,8 @@ threshold in both directions. Example: `k8s.io/api/batch/v1beta1` had `Ca` 25 (r
 "only removals"; the plan's expectation of removals only did not hold for the
 `I`-threshold checks.
 
+Reproduce with `scripts/fan-in-out-backtest.sh ad3202d` (builds the baseline in a throwaway worktree, prints identity counts with numbers normalized; reproduced the table above on 2026-10-24).
+
 ## Changing thresholds
 
 Backtest first: [backtesting.md](backtesting.md) and [backtest-repos.md](backtest-repos.md).
