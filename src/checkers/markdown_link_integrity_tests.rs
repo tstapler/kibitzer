@@ -253,6 +253,35 @@ fn ignores_an_uppercase_checkbox_mark_mid_sentence() {
 }
 
 #[test]
+fn ignores_single_letter_inspection_labels() {
+    for label in ["H", "W", "R", "A", "Z", "a", "z"] {
+        let body = format!("- [{label}] Inspection point description\n");
+        assert!(
+            check_source(&path(), &body).unwrap().is_empty(),
+            "expected no findings for [{label}]"
+        );
+    }
+}
+
+#[test]
+fn single_letter_label_with_a_definition_is_not_flagged() {
+    let body = "See [H] for details.\n\n[H]: https://example.com\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
+fn still_flags_explicit_and_collapsed_single_letter_references_when_dangling() {
+    for body in ["See [details][H] here.\n", "See [H][] here.\n"] {
+        let findings = check_source(&path(), body).unwrap();
+        assert_eq!(findings.len(), 1, "body {body:?}, got: {findings:?}");
+        assert!(
+            findings[0].message.contains("[H] used but never defined")
+                || findings[0].message.contains("never defined")
+        );
+    }
+}
+
+#[test]
 fn ignores_a_checkbox_mark_inside_a_table_cell() {
     let body = "| Task | Status |\n|---|---|\n| Frobnicate | [x] |\n";
     assert!(check_source(&path(), body).unwrap().is_empty());
