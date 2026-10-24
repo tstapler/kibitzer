@@ -21,7 +21,9 @@ mod extract_class;
 mod false_positive;
 mod git_cmd;
 mod glob;
+mod go_build_cost;
 mod go_call_resolution;
+mod go_package_focus;
 mod god_class;
 mod hook;
 mod hook_footer;
@@ -121,6 +123,11 @@ enum Command {
         #[command(subcommand)]
         action: ArchitectureAction,
     },
+    /// Go-specific tooling: build-cost telemetry and package-focus JSON reports.
+    Go {
+        #[command(subcommand)]
+        action: GoAction,
+    },
     /// Install, list, remove, or check the status of optional external checker plugins
     /// (see `src/plugin.rs`).
     Plugin {
@@ -165,6 +172,20 @@ enum PluginAction {
     Status {
         #[arg(value_parser = plugin::PluginName::parse)]
         name: Option<plugin::PluginName>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GoAction {
+    /// Cold and warm `go build -debug-actiongraph` summary for the module at `dir`, using a
+    /// private GOCACHE. Prints a diagnostic and exits 0 on an unsupported Go version.
+    BuildCost { dir: PathBuf },
+    /// Print `go-package-focus` reports as JSON (see docs/go-package-focus.md).
+    PackageFocus {
+        dir: PathBuf,
+        /// Evidence mode: size-only, graph-only, or combined.
+        #[arg(long, default_value = "combined")]
+        mode: String,
     },
 }
 
@@ -586,6 +607,10 @@ fn main() -> Result<ExitCode> {
             ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
             ArchitectureAction::Affected { path, base } => run_affected(&path, &base),
         },
+        Command::Go { action } => match action {
+            GoAction::BuildCost { dir } => run_go_build_cost(&dir),
+            GoAction::PackageFocus { dir, mode } => run_go_package_focus(&dir, &mode),
+        },
         Command::Plugin { action } => match action {
             PluginAction::Install {
                 name,
@@ -677,6 +702,33 @@ fn format_plugin_status_line(report: &plugin::PluginStatusReport) -> String {
 /// Extracted as a plain function (rather than inlined in the `match` arm) so it's directly
 /// callable from `#[cfg(test)]` — `main.rs` has no subprocess-test precedent to match
 /// (Task 1.2.2c).
+fn run_go_build_cost(dir: &Path) -> Result<ExitCode> {
+    match go_build_cost::run_build_cost(dir)? {
+        Ok(report) => print!("{report}"),
+        Err(diagnostic) => println!("{diagnostic}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_go_package_focus(dir: &Path, mode: &str) -> Result<ExitCode> {
+    use go_package_focus::EvidenceMode;
+    let mode = match mode {
+        "size-only" => EvidenceMode::SizeOnly,
+        "graph-only" => EvidenceMode::GraphOnly,
+        "combined" => EvidenceMode::Combined,
+        other => anyhow::bail!("unknown mode '{other}' (size-only, graph-only, combined)"),
+    };
+    let files =
+        check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
+    let model = check::build_arch_model_for_check(dir, &files, true)
+        .with_context(|| format!("building architecture model for {}", dir.display()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&go_package_focus::analyze(&model, mode))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
     let Some(any_checker) = check::lookup_any_architecture_checker(name) else {
         eprintln!("no architecture checker named '{name}' registered");

@@ -95,6 +95,7 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("file-size", OwnerMatch::Suffix("file-size")),
     rule("single-call-site-delegation", OwnerMatch::Unowned),
     rule("god-class", OwnerMatch::Unowned),
+    rule("go-package-focus", OwnerMatch::Unowned),
     rule("isp-fat-interface", OwnerMatch::Unowned),
     rule("remove-middle-man", OwnerMatch::Unowned),
     rule("unreferenced-private-symbol", OwnerMatch::Unowned),
