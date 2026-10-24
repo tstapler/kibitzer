@@ -112,6 +112,9 @@ fn detect_version() -> Result<(u32, u32)> {
         .arg("version")
         .output()
         .context("running `go version`")?;
+    if !out.status.success() {
+        bail!("`go version` exited with {}", out.status);
+    }
     parse_go_version(&String::from_utf8_lossy(&out.stdout))
         .context("could not parse `go version` output")
 }
@@ -119,19 +122,18 @@ fn detect_version() -> Result<(u32, u32)> {
 /// Runs the cold and warm builds, or returns the gate's diagnostic when the toolchain is
 /// outside the tested range.
 pub fn run_build_cost(dir: &Path) -> Result<BuildCostOutcome> {
-    let Ok(version) = detect_version() else {
-        return Ok(BuildCostOutcome::Skipped(
-            "go build-cost: no usable `go` binary found on PATH".to_string(),
-        ));
+    let version = match detect_version() {
+        Ok(version) => version,
+        Err(err) => {
+            return Ok(BuildCostOutcome::Skipped(format!(
+                "go build-cost: no usable `go` toolchain: {err:#}"
+            )));
+        }
     };
     if let VersionGate::Skip(msg) = gate(version) {
         return Ok(BuildCostOutcome::Skipped(msg));
     }
-    // A leftover dir (crash, reused pid) would pre-warm the "cold" cache, so start clean
-    // and fail if something recreates it.
-    let scratch = std::env::temp_dir().join(format!("kibitzer-build-cost-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
+    let scratch = create_scratch_dir()?;
     let result = (|| {
         let cold = build_pass(dir, &scratch, "cold")?;
         let warm = build_pass(dir, &scratch, "warm")?;
@@ -145,6 +147,27 @@ pub fn run_build_cost(dir: &Path) -> Result<BuildCostOutcome> {
     result.map(BuildCostOutcome::Report)
 }
 
+/// Creates a private (0700 on Unix) scratch dir that did not exist before: the name is
+/// unpredictable and creation fails rather than reusing a path, so a planted symlink or
+/// stale dir can neither redirect `GOCACHE` nor be deleted by the cleanup.
+fn create_scratch_dir() -> Result<std::path::PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let scratch = std::env::temp_dir().join(format!(
+        "kibitzer-build-cost-{}-{nanos:x}",
+        std::process::id()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&scratch)
+        .with_context(|| format!("creating {}", scratch.display()))?;
+    Ok(scratch)
+}
+
 fn build_pass(dir: &Path, scratch: &Path, label: &str) -> Result<PassStats> {
     let graph = scratch.join(format!("{label}.json"));
     let output = Command::new("go")
@@ -153,6 +176,7 @@ fn build_pass(dir: &Path, scratch: &Path, label: &str) -> Result<PassStats> {
         .arg("./...")
         .current_dir(dir)
         .env("GOCACHE", scratch.join("gocache"))
+        .env_remove("GOCACHEPROG")
         .output()
         .context("running `go build`")?;
     if !output.status.success() {

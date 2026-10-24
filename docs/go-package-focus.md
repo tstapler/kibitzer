@@ -105,6 +105,7 @@ ordered by package path:
 
 ## Known coverage gaps
 
+- `kibitzer go package-focus` runs the checker directly and does not read `.kibitzer/inspect.json`, so a repo's `disabled` list does not apply to it.
 - **Return types, struct field types and interface satisfaction** are not edges. Two components can look disconnected while one returns the other's type.
 - **Parameter-type matching** is a plain identifier scan; a local type name that coincides with a parameter or generic type-parameter name creates a false edge (this errs toward silence).
 - **Generics**: type-parameterized code may inflate or hide edges (noted in `coverage.notes`).
@@ -121,7 +122,7 @@ Provisional, not calibrated. Constants live in `src/go_package_focus.rs`.
 
 | Constant | Value | Note |
 | --- | --- | --- |
-| types per component | 2 | graph-only mode uses 1 |
+| types per component | 2 | graph-only mode uses 1, and requires at least 2 type nodes in total |
 | minimum type nodes | 4 | the plan proposed 6, but 2 components x 2 types already implies 4, and 6 would reject the decoder/storage case |
 | maximum type nodes | 60 | above it clustering is skipped and an `[informational]` note is emitted |
 | size-only | 15 files or 120 symbols | informational only |

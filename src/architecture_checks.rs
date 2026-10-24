@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -180,7 +180,7 @@ const MAX_FAN_IN: usize = 10;
 pub fn fan_in_out(edges: &[ImportEdge]) -> HashMap<&str, (usize, usize)> {
     // `ImportEdge` is one per import statement, so several files in `from` importing `to`
     // yield several edges; coupling is package-level, so count each pair once.
-    let pairs: std::collections::HashSet<(&str, &str)> = edges
+    let pairs: HashSet<(&str, &str)> = edges
         .iter()
         .map(|edge| (edge.from.as_str(), edge.to.as_str()))
         .collect();
@@ -685,6 +685,7 @@ impl ArchModelChecker for DipConcreteCouplingChecker {
         _config: &ArchitectureConfig,
     ) -> Vec<ArchFinding> {
         let counts = fan_in_out(&model.import_edges);
+        // Distinct pairs here match `fan_in_out`'s Ce/Ca counting; kept separate for sorted output.
         let mut pairs: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
         for edge in &model.import_edges {
             pairs.insert((edge.from.as_str(), edge.to.as_str()));
