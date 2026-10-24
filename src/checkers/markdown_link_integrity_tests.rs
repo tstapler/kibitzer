@@ -274,10 +274,7 @@ fn still_flags_explicit_and_collapsed_single_letter_references_when_dangling() {
     for body in ["See [details][H] here.\n", "See [H][] here.\n"] {
         let findings = check_source(&path(), body).unwrap();
         assert_eq!(findings.len(), 1, "body {body:?}, got: {findings:?}");
-        assert!(
-            findings[0].message.contains("[H] used but never defined")
-                || findings[0].message.contains("never defined")
-        );
+        assert!(findings[0].message.contains("[H] used but never defined"));
     }
 }
 
