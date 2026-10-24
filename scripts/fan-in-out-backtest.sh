@@ -18,14 +18,15 @@ CHECKS=(coupling instability dip-concrete-coupling)
 mkdir -p "$OUT"
 BASE_TREE="$OUT/base"
 [ -d "$BASE_TREE" ] || git -C "$ROOT" worktree add --detach "$BASE_TREE" "$BASE_REV" >/dev/null
-(cd "$BASE_TREE" && cargo build --release -q)
+(cd "$BASE_TREE" && CARGO_TARGET_DIR="$BASE_TREE/target" cargo build --release -q)
+HEAD_BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release/kibitzer
 (cd "$ROOT" && cargo build --release -q)
 
 for repo in "${REPOS[@]}"; do
   tag=${repo//\//_}
   for chk in "${CHECKS[@]}"; do
     "$BASE_TREE/target/release/kibitzer" check architecture "$chk" "$CODE_ROOT/$repo" >"$OUT/$tag.$chk.before.txt" 2>&1 || true
-    "$ROOT/target/release/kibitzer" check architecture "$chk" "$CODE_ROOT/$repo" >"$OUT/$tag.$chk.after.txt" 2>&1 || true
+    "$HEAD_BIN" check architecture "$chk" "$CODE_ROOT/$repo" >"$OUT/$tag.$chk.after.txt" 2>&1 || true
   done
 done
 

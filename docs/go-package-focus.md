@@ -193,7 +193,7 @@ threshold in both directions. Example: `k8s.io/api/batch/v1beta1` had `Ca` 25 (r
 "only removals"; the plan's expectation of removals only did not hold for the
 `I`-threshold checks.
 
-Reproduce with `scripts/fan-in-out-backtest.sh ad3202d` (builds the baseline in a throwaway worktree, prints identity counts with numbers normalized; reproduced the table above on 2026-10-24).
+Reproduce with `scripts/fan-in-out-backtest.sh ad3202d` (builds the baseline in a throwaway worktree, prints identity counts with numbers normalized; re-run on 2026-10-24 with identical counts; the script uses `$CARGO_TARGET_DIR` for the current tree and needs several GB, so keep it off a small tmpfs). Not every change is a removal: `coupling` only loses findings, while `instability` and `dip-concrete-coupling` also gain some, all traced to the `Ca` shift above.
 
 ## Changing thresholds
 
