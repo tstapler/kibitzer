@@ -28,6 +28,17 @@ same way — see `docs/plugins.md`.
 comment corpus for training/testing/tuning a future comment-quality
 classifier — see its README for provenance and known limitations.
 
+## Backtest every functional change
+
+Any change to what kibitzer does — a new or modified checker, a metric or counting
+semantics (e.g. `fan_in_out`), thresholds, parsing/model-building, or a change to which
+files or edits a check sees — needs a backtest before it lands, not just unit tests. Pure
+docs, comment, or test-only changes are exempt. Record what you ran and the before/after
+numbers in the PR or the relevant `docs/` page; a changed result you can't explain is a
+blocker. For a change to existing behavior, compare against the pre-change build
+(`scripts/fan-in-out-backtest.sh` is the model: baseline worktree vs. head, same corpus).
+The two tools below are the means; for a new checker the full procedure follows.
+
 ## Writing a new check
 
 Before landing a new native checker (or a meaningful change to an existing one's

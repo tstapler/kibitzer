@@ -12,13 +12,23 @@
 //! registration are contrary evidence, not connections.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 
 use serde::Serialize;
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode};
-use crate::architecture_checks::{ArchFinding, ArchModelChecker};
+use crate::architecture_checks::{ArchFinding, ArchModelChecker, fan_in_out};
 use crate::checkers::is_test_file;
 use crate::config::{ArchitectureConfig, Severity};
+
+mod render;
+mod source;
+use source::PackageSource;
+#[cfg(test)]
+mod tests;
+
+/// File and line a finding is reported at.
+type Anchor = (PathBuf, usize);
 
 /// Provisional thresholds; `docs/go-package-focus.md` ("Threshold decisions") records why.
 const MIN_TYPES_PER_COMPONENT: usize = 2;
@@ -98,7 +108,7 @@ pub struct PackageFocusReport {
     pub contrary_evidence: Vec<String>,
     pub coverage: Coverage,
     #[serde(skip)]
-    anchor: Option<(std::path::PathBuf, usize)>,
+    anchor: Option<Anchor>,
 }
 
 impl ArchModelChecker for GoPackageFocusChecker {
@@ -114,11 +124,15 @@ impl ArchModelChecker for GoPackageFocusChecker {
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
         analyze(model, self.mode)
             .into_iter()
-            .map(|report| ArchFinding {
-                file: report.anchor.as_ref().map(|(f, _)| f.clone()),
-                line: report.anchor.as_ref().map(|(_, l)| *l),
-                message: render::render(&report),
-                severity_override: Some(Severity::Advisory),
+            .map(|mut report| {
+                let message = render::render(&report);
+                let (file, line) = report.anchor.take().unzip();
+                ArchFinding {
+                    file,
+                    line,
+                    message,
+                    severity_override: Some(Severity::Advisory),
+                }
             })
             .collect()
     }
@@ -133,13 +147,19 @@ pub fn analyze(model: &ArchModel, mode: EvidenceMode) -> Vec<PackageFocusReport>
         .collect()
 }
 
+/// Test-file detection on the repo-relative path, so a checkout living under a directory
+/// named `tests` does not make every file look like a test.
+fn is_test_path(model: &ArchModel, file: &std::path::Path) -> bool {
+    is_test_file(file.strip_prefix(&model.repo_root).unwrap_or(file))
+}
+
 fn go_symbols<'a>(model: &ArchModel, pkg: &'a PackageNode) -> Vec<&'a SymbolNode> {
     pkg.symbols
         .iter()
         .filter(|s| {
             s.file.extension().is_some_and(|e| e == "go")
                 && s.name != "init"
-                && !is_test_file(s.file.strip_prefix(&model.repo_root).unwrap_or(&s.file))
+                && !is_test_path(model, &s.file)
         })
         .collect()
 }
@@ -173,8 +193,8 @@ fn analyze_package(
         return None;
     }
     // Shared package-level state overrides the graph: splitting would expose it.
-    let source = PackageSource::read(pkg);
-    if source.shared_state {
+    let source = PackageSource::read(model, pkg);
+    if source.has_shared_state() {
         return None;
     }
     let fan_out = distinct_imports(model, &pkg.path);
@@ -201,6 +221,24 @@ struct Node<'a> {
     symbols: Vec<&'a SymbolNode>,
 }
 
+/// Index of the type node named `name`, creating it on first use.
+fn type_node<'a>(
+    nodes: &mut Vec<Node<'a>>,
+    by_type: &mut HashMap<String, usize>,
+    name: &str,
+) -> usize {
+    if let Some(&idx) = by_type.get(name) {
+        return idx;
+    }
+    nodes.push(Node {
+        name: name.to_string(),
+        is_type: true,
+        symbols: vec![],
+    });
+    by_type.insert(name.to_string(), nodes.len() - 1);
+    nodes.len() - 1
+}
+
 impl<'a> TypeGraph<'a> {
     fn build(model: &ArchModel, pkg: &'a PackageNode, symbols: &[&'a SymbolNode]) -> Self {
         let mut nodes: Vec<Node<'a>> = Vec::new();
@@ -209,14 +247,7 @@ impl<'a> TypeGraph<'a> {
 
         for sym in symbols {
             if matches!(sym.kind, SymbolKind::Type | SymbolKind::Interface) {
-                let idx = *by_type.entry(sym.name.clone()).or_insert_with(|| {
-                    nodes.push(Node {
-                        name: sym.name.clone(),
-                        is_type: true,
-                        symbols: vec![],
-                    });
-                    nodes.len() - 1
-                });
+                let idx = type_node(&mut nodes, &mut by_type, &sym.name);
                 nodes[idx].symbols.push(sym);
                 by_id.insert(&sym.id, idx);
             }
@@ -227,14 +258,7 @@ impl<'a> TypeGraph<'a> {
                     let Some(owner) = sym.parent.as_deref() else {
                         continue;
                     };
-                    let idx = *by_type.entry(owner.to_string()).or_insert_with(|| {
-                        nodes.push(Node {
-                            name: owner.to_string(),
-                            is_type: true,
-                            symbols: vec![],
-                        });
-                        nodes.len() - 1
-                    });
+                    let idx = type_node(&mut nodes, &mut by_type, owner);
                     nodes[idx].symbols.push(sym);
                     by_id.insert(&sym.id, idx);
                 }
@@ -314,7 +338,7 @@ impl<'a> TypeGraph<'a> {
             .into_values()
             .filter(|g| g.iter().filter(|&&i| self.nodes[i].is_type).count() >= min_types)
             .collect();
-        qualified.sort_by_key(|g| self.first_type_name(g));
+        qualified.sort_by_cached_key(|g| self.first_type_name(g));
         qualified
     }
 
@@ -363,13 +387,9 @@ fn symbol_prefix(pkg: &PackageNode) -> String {
 }
 
 fn distinct_imports(model: &ArchModel, pkg_path: &str) -> usize {
-    model
-        .import_edges
-        .iter()
-        .filter(|e| e.from == pkg_path)
-        .map(|e| e.to.as_str())
-        .collect::<BTreeSet<_>>()
-        .len()
+    fan_in_out(&model.import_edges)
+        .get(pkg_path)
+        .map_or(0, |&(fan_out, _)| fan_out)
 }
 
 fn is_entry_point(pkg: &PackageNode, symbols: &[&SymbolNode], fan_out: usize) -> bool {
@@ -542,13 +562,38 @@ fn label_for(types: &[String]) -> String {
     }
 }
 
-fn first_anchor(groups: &[Vec<usize>], graph: &TypeGraph) -> Option<(std::path::PathBuf, usize)> {
+fn first_anchor(groups: &[Vec<usize>], graph: &TypeGraph) -> Option<Anchor> {
     groups
         .iter()
         .flatten()
         .flat_map(|&i| graph.nodes[i].symbols.iter())
         .map(|s| (s.file.clone(), s.line))
         .min()
+}
+
+impl PackageFocusReport {
+    /// A lead that carries no split evidence: no components, nothing evaluated.
+    fn informational(
+        pkg: &PackageNode,
+        anchor: Option<Anchor>,
+        hypothesis: String,
+        contrary: &str,
+        coverage: Coverage,
+    ) -> Self {
+        Self {
+            package: pkg.path.clone(),
+            level: Level::Informational,
+            hypothesis,
+            components: vec![],
+            cross_boundary_edges: vec![],
+            import_direction: "not evaluated".to_string(),
+            required_new_exports: vec![],
+            cycle_risks: vec![],
+            contrary_evidence: vec![contrary.to_string()],
+            coverage,
+            anchor,
+        }
+    }
 }
 
 fn size_only_report(
@@ -559,55 +604,31 @@ fn size_only_report(
     if pkg.files.len() < SIZE_ONLY_MIN_FILES && symbols.len() < SIZE_ONLY_MIN_SYMBOLS {
         return None;
     }
-    Some(PackageFocusReport {
-        package: pkg.path.clone(),
-        level: Level::Informational,
-        hypothesis: format!(
+    Some(PackageFocusReport::informational(
+        pkg,
+        symbols.iter().map(|s| (s.file.clone(), s.line)).min(),
+        format!(
             "large package ({} files, {} symbols); size alone is not evidence of lost focus",
             pkg.files.len(),
             symbols.len()
         ),
-        anchor: symbols.iter().map(|s| (s.file.clone(), s.line)).min(),
-        components: vec![],
-        cross_boundary_edges: vec![],
-        import_direction: "not evaluated".to_string(),
-        required_new_exports: vec![],
-        cycle_risks: vec![],
-        contrary_evidence: vec![
-            "size-only mode ignores the reference graph; a large cohesive package is fine"
-                .to_string(),
-        ],
-        coverage: coverage_for(model, pkg, &PackageSource::read(pkg)),
-    })
+        "size-only mode ignores the reference graph; a large cohesive package is fine",
+        coverage_for(model, pkg, &PackageSource::read(model, pkg)),
+    ))
 }
 
 fn too_large_report(model: &ArchModel, pkg: &PackageNode, graph: &TypeGraph) -> PackageFocusReport {
-    PackageFocusReport {
-        package: pkg.path.clone(),
-        level: Level::Informational,
-        hypothesis: format!(
+    PackageFocusReport::informational(
+        pkg,
+        pkg.files
+            .iter()
+            .find(|f| !is_test_path(model, f))
+            .map(|f| (f.clone(), 1)),
+        format!(
             "package too large to cluster ({} type nodes > {MAX_TYPE_NODES})",
             graph.type_count()
         ),
-        anchor: pkg
-            .files
-            .iter()
-            .find(|f| !is_test_file(f.strip_prefix(&model.repo_root).unwrap_or(f)))
-            .map(|f| (f.clone(), 1)),
-        components: vec![],
-        cross_boundary_edges: vec![],
-        import_direction: "not evaluated".to_string(),
-        required_new_exports: vec![],
-        cycle_risks: vec![],
-        contrary_evidence: vec![
-            "clustering skipped, so no evidence for or against a split".to_string(),
-        ],
-        coverage: coverage_for(model, pkg, &PackageSource::read(pkg)),
-    }
+        "clustering skipped, so no evidence for or against a split",
+        coverage_for(model, pkg, &PackageSource::read(model, pkg)),
+    )
 }
-
-mod render;
-mod source;
-use source::PackageSource;
-#[cfg(test)]
-mod tests;

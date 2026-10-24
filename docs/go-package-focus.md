@@ -161,6 +161,49 @@ three decisions, which is too small to be a rate. **Do not add `go-package-focus
 `default_checks()`** until the model tracks return/field types and the adjudication is
 repeated on more packages with the owner.
 
+### Wider Go corpus (2026-10-24)
+
+`kibitzer go package-focus <repo> --mode <m>`, reports / of which advisory (the rest are
+informational), release build at the commit of this change, repos as cloned under
+`~/code/github.com`:
+
+| Repo | size-only | graph-only | combined |
+| --- | --- | --- | --- |
+| `kubernetes/kubernetes` | 109 / 0 | 1114 / 921 | 113 / 100 |
+| `etcd-io/etcd` | 16 / 0 | 62 / 58 | 9 / 8 |
+| `caddyserver/caddy` | 7 / 0 | 21 / 17 | 5 / 1 |
+| `cli/cli` | 6 / 0 | 155 / 61 | 9 / 5 |
+| `prometheus/prometheus` | 18 / 0 | 77 / 71 | 13 / 9 |
+
+Graph-only is unusable at this scale (hundreds of advisories on kubernetes). Combined is
+still roughly 100 advisories on kubernetes, far too many to review as defaults.
+
+Adjudicated sample, author's reading of type names, unreviewed by the owner:
+
+| Package | Verdict | Rationale |
+| --- | --- | --- |
+| `caddy/modules/logging` | reject | independent encoders/writers are registered Caddy modules; one package is the plugin convention |
+| `etcd/etcdutl` | reject | cobra command implementations (`HashKV` printers, `migrate`) grouped as one CLI |
+| `etcd/pkg/featuregate` | reject | `Feature`/`FeatureGate` are coupled through return and field types, which the model does not track |
+| `etcd/.../v2stats` | reject | `LeaderStats` and `ServerStats` are siblings of one stats capability |
+| `etcd/.../etcdhttp` | accept | health-check endpoints vs. peer-member handlers are separate HTTP capabilities |
+| `etcd/client/pkg/testutil` | abstain | grab-bag test helpers; a split is possible but low value |
+| `etcd/server/embed` | abstain | `Config` vs. CORS `accessController`; coupling through fields not visible |
+| `etcd/.../storage/schema` | abstain | migration actions vs. backends; unclear without call-site reading |
+| `etcd/.../storage/wal` | abstain | WAL decoding vs. version visitor; unclear |
+
+1 accept, 4 reject, 4 abstain: the precision picture matches the apimachinery sample (most
+decided findings are false positives), so the "do not add to `default_checks()`" decision
+stands. The recurring false-positive shapes are plugin/command registries, types coupled
+through return/field types, and sibling types of one capability.
+
+Refactor check: the output of all three modes is byte-identical before and after the cleanup commit on etcd, caddy, cli and prometheus.
+
+Transcript replay (`kibitzer check backtest go-package-focus`, 4584 transcripts, 2119
+snapshots): 0 findings. Expected, since replay builds a model from one file at a time and
+this check needs the whole package; it shows the check does not fire on single-file edits,
+not that it is quiet on real packages.
+
 ## Build cost (separate axis)
 
 `kibitzer go build-cost <dir>` runs `go build -debug-actiongraph` twice (cold, then warm)
