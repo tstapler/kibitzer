@@ -54,10 +54,10 @@ Prefer `internal/` for the extracted package. Public support and module versioni
 
 ## Keep-together signals
 
-The check stays silent, or marks the finding `[informational]`, when it sees:
+The check stays silent (or, where noted, marks the finding `[informational]`) when it sees:
 
 - a shared parse/session context all symbols receive (cohesive large parser),
-- package-level `sync`/`atomic`/`chan` variables (shared lock or state machine),
+- package-level `sync`/`atomic`/`chan` variables (shared lock or state machine; silent, and the variable names are not surfaced),
 - `init()` registration (the init edge is not a connection),
 - a generated-file banner,
 - `main` or `cmd/` packages with 5 or more distinct imports (wiring, reported `[informational]`),
@@ -96,9 +96,9 @@ ordered by package path:
 | `level` | `"advisory"` \| `"informational"` | |
 | `hypothesis` | string | named responsibility hypothesis |
 | `components[]` | object | `label`, `types[]`, `symbols[]` (declaration ids), `state_fields[]`, `external_calls[]` (unresolved callee text) |
-| `cross_boundary_edges` | string[] | resolved references crossing the boundary |
+| `cross_boundary_edges` | string[] | resolved references crossing the boundary; always empty today, because a report exists only when none cross |
 | `import_direction` | string | direction a split would need |
-| `required_new_exports` | string[] | symbols a split would have to export |
+| `required_new_exports` | string[] | symbols a split would have to export; always empty today, for the same reason |
 | `cycle_risks` | string[] | cycle notes (test-file edges are ignored) |
 | `contrary_evidence` | string[] | always at least one item |
 | `coverage` | object | `private_symbols_skipped`, `generated_files_skipped`, `files_with_parse_errors`, `test_import_edges_excluded`, `unresolved_edges`, `notes[]` |
@@ -106,6 +106,7 @@ ordered by package path:
 ## Known coverage gaps
 
 - **Return types, struct field types and interface satisfaction** are not edges. Two components can look disconnected while one returns the other's type.
+- **Parameter-type matching** is a plain identifier scan; a local type name that coincides with a parameter or generic type-parameter name creates a false edge (this errs toward silence).
 - **Generics**: type-parameterized code may inflate or hide edges (noted in `coverage.notes`).
 - **Embedded interfaces** and promoted methods are only seen through explicit embedding edges.
 - **Dynamic calls** (function values, reflection, interface dispatch) are unresolved; the count is in `coverage.unresolved_edges`.
@@ -164,7 +165,7 @@ repeated on more packages with the owner.
 `kibitzer go build-cost <dir>` runs `go build -debug-actiongraph` twice (cold, then warm)
 with a private `GOCACHE`, so the shared cache is never cleared or written, and prints action,
 compiled and cache-hit counts. On Go below 1.19, or above the newest tested version (1.26),
-it prints a diagnostic and exits 0. `-debug-actiongraph` is internal Go machinery with an
+it prints a diagnostic and exits 0; the same applies when no `go` binary is on `PATH`. `-debug-actiongraph` is internal Go machinery with an
 unversioned schema; the parser reads only `Mode` and `Cmd`. Do not run it from per-edit
 hooks, and do not read build seconds as evidence about responsibilities. See
 [ADR-002](../project_plans/go-package-focus/decisions/adr-002-build-cost-debug-actiongraph.md).

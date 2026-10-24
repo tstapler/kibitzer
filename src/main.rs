@@ -183,9 +183,9 @@ enum GoAction {
     /// Print `go-package-focus` reports as JSON (see docs/go-package-focus.md).
     PackageFocus {
         dir: PathBuf,
-        /// Evidence mode: size-only, graph-only, or combined.
-        #[arg(long, default_value = "combined")]
-        mode: String,
+        /// Evidence mode.
+        #[arg(long, value_enum, default_value = "combined")]
+        mode: go_package_focus::EvidenceMode,
     },
 }
 
@@ -609,7 +609,7 @@ fn main() -> Result<ExitCode> {
         },
         Command::Go { action } => match action {
             GoAction::BuildCost { dir } => run_go_build_cost(&dir),
-            GoAction::PackageFocus { dir, mode } => run_go_package_focus(&dir, &mode),
+            GoAction::PackageFocus { dir, mode } => run_go_package_focus(&dir, mode),
         },
         Command::Plugin { action } => match action {
             PluginAction::Install {
@@ -690,6 +690,26 @@ fn format_plugin_status_line(report: &plugin::PluginStatusReport) -> String {
     format!("{name} v{version}: {}", issues.join(", "))
 }
 
+fn run_go_build_cost(dir: &Path) -> Result<ExitCode> {
+    match go_build_cost::run_build_cost(dir)? {
+        go_build_cost::BuildCostOutcome::Report(report) => print!("{report}"),
+        go_build_cost::BuildCostOutcome::Skipped(diagnostic) => println!("{diagnostic}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_go_package_focus(dir: &Path, mode: go_package_focus::EvidenceMode) -> Result<ExitCode> {
+    let files =
+        check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
+    let model = check::build_arch_model_for_check(dir, &files, true)
+        .with_context(|| format!("building architecture model for {}", dir.display()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&go_package_focus::analyze(&model, mode))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `kibitzer check architecture <name> <dir>` (Story 1.2.2): runs one whole-repo
 /// architecture/declaration checker directly against `dir`, bypassing `.kibitzer/inspect.json`'s
 /// `checks` list entirely — `name` only needs to be registered in
@@ -702,33 +722,6 @@ fn format_plugin_status_line(report: &plugin::PluginStatusReport) -> String {
 /// Extracted as a plain function (rather than inlined in the `match` arm) so it's directly
 /// callable from `#[cfg(test)]` — `main.rs` has no subprocess-test precedent to match
 /// (Task 1.2.2c).
-fn run_go_build_cost(dir: &Path) -> Result<ExitCode> {
-    match go_build_cost::run_build_cost(dir)? {
-        Ok(report) => print!("{report}"),
-        Err(diagnostic) => println!("{diagnostic}"),
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn run_go_package_focus(dir: &Path, mode: &str) -> Result<ExitCode> {
-    use go_package_focus::EvidenceMode;
-    let mode = match mode {
-        "size-only" => EvidenceMode::SizeOnly,
-        "graph-only" => EvidenceMode::GraphOnly,
-        "combined" => EvidenceMode::Combined,
-        other => anyhow::bail!("unknown mode '{other}' (size-only, graph-only, combined)"),
-    };
-    let files =
-        check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
-    let model = check::build_arch_model_for_check(dir, &files, true)
-        .with_context(|| format!("building architecture model for {}", dir.display()))?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&go_package_focus::analyze(&model, mode))?
-    );
-    Ok(ExitCode::SUCCESS)
-}
-
 fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
     let Some(any_checker) = check::lookup_any_architecture_checker(name) else {
         eprintln!("no architecture checker named '{name}' registered");

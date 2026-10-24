@@ -31,7 +31,8 @@ const SIZE_ONLY_MIN_SYMBOLS: usize = 120;
 const ENTRY_POINT_MIN_FAN_OUT: usize = 5;
 
 /// Which evidence a run uses; compared in `docs/go-package-focus.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
 pub enum EvidenceMode {
     /// Package size only; always informational.
     SizeOnly,
@@ -152,21 +153,13 @@ fn analyze_package(
     if symbols.is_empty() {
         return None;
     }
-    let source = PackageSource::read(pkg);
-    let fan_out = distinct_imports(model, &pkg.path);
-    let level = if is_entry_point(pkg, &symbols, fan_out) {
-        Level::Informational
-    } else {
-        Level::Advisory
-    };
-
     if mode == EvidenceMode::SizeOnly {
-        return size_only_report(model, pkg, &symbols, &source);
+        return size_only_report(model, pkg, &symbols);
     }
 
     let mut graph = TypeGraph::build(model, pkg, &symbols);
     if graph.type_count() > MAX_TYPE_NODES {
-        return Some(too_large_report(model, pkg, &graph, &source));
+        return Some(too_large_report(model, pkg, &graph));
     }
     let (min_types, min_total) = match mode {
         EvidenceMode::GraphOnly => (1, 2),
@@ -180,9 +173,16 @@ fn analyze_package(
         return None;
     }
     // Shared package-level state overrides the graph: splitting would expose it.
+    let source = PackageSource::read(pkg);
     if source.shared_state {
         return None;
     }
+    let fan_out = distinct_imports(model, &pkg.path);
+    let level = if is_entry_point(pkg, &symbols, fan_out) {
+        Level::Informational
+    } else {
+        Level::Advisory
+    };
     Some(split_report(model, pkg, &graph, groups, &source, level))
 }
 
@@ -331,20 +331,23 @@ impl<'a> TypeGraph<'a> {
 /// Identifiers in a Go type expression that are not package-qualified (`io.Reader` → none).
 fn unqualified_idents(type_text: &str) -> Vec<&str> {
     let bytes = type_text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
     let mut idents = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let qualified = (start > 0 && bytes[start - 1] == b'.') || bytes.get(i) == Some(&b'.');
-            if !qualified {
-                idents.push(&type_text[start..i]);
-            }
-        } else {
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] >= 0x80) {
             i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        // `pkg.Name` is qualified; the variadic `...Name` is not.
+        let after_selector =
+            start > 0 && bytes[start - 1] == b'.' && start > 1 && is_ident(bytes[start - 2]);
+        if !after_selector && bytes.get(i) != Some(&b'.') {
+            idents.push(&type_text[start..i]);
         }
     }
     idents
@@ -524,7 +527,7 @@ fn component_for(
 /// Longest common type-name prefix of at least 3 characters, else the first type name.
 fn label_for(types: &[String]) -> String {
     let first = types.first().cloned().unwrap_or_default();
-    let prefix_len = types.iter().skip(1).fold(first.len(), |len, t| {
+    let prefix_len = types.iter().skip(1).fold(first.chars().count(), |len, t| {
         first
             .chars()
             .zip(t.chars())
@@ -533,7 +536,7 @@ fn label_for(types: &[String]) -> String {
             .count()
     });
     if prefix_len >= 3 {
-        first[..prefix_len].to_string()
+        first.chars().take(prefix_len).collect()
     } else {
         first
     }
@@ -552,7 +555,6 @@ fn size_only_report(
     model: &ArchModel,
     pkg: &PackageNode,
     symbols: &[&SymbolNode],
-    source: &PackageSource,
 ) -> Option<PackageFocusReport> {
     if pkg.files.len() < SIZE_ONLY_MIN_FILES && symbols.len() < SIZE_ONLY_MIN_SYMBOLS {
         return None;
@@ -575,16 +577,11 @@ fn size_only_report(
             "size-only mode ignores the reference graph; a large cohesive package is fine"
                 .to_string(),
         ],
-        coverage: coverage_for(model, pkg, source),
+        coverage: coverage_for(model, pkg, &PackageSource::read(pkg)),
     })
 }
 
-fn too_large_report(
-    model: &ArchModel,
-    pkg: &PackageNode,
-    graph: &TypeGraph,
-    source: &PackageSource,
-) -> PackageFocusReport {
+fn too_large_report(model: &ArchModel, pkg: &PackageNode, graph: &TypeGraph) -> PackageFocusReport {
     PackageFocusReport {
         package: pkg.path.clone(),
         level: Level::Informational,
@@ -592,7 +589,11 @@ fn too_large_report(
             "package too large to cluster ({} type nodes > {MAX_TYPE_NODES})",
             graph.type_count()
         ),
-        anchor: pkg.files.first().map(|f| (f.clone(), 1)),
+        anchor: pkg
+            .files
+            .iter()
+            .find(|f| !is_test_file(f.strip_prefix(&model.repo_root).unwrap_or(f)))
+            .map(|f| (f.clone(), 1)),
         components: vec![],
         cross_boundary_edges: vec![],
         import_direction: "not evaluated".to_string(),
@@ -601,7 +602,7 @@ fn too_large_report(
         contrary_evidence: vec![
             "clustering skipped, so no evidence for or against a split".to_string(),
         ],
-        coverage: coverage_for(model, pkg, source),
+        coverage: coverage_for(model, pkg, &PackageSource::read(pkg)),
     }
 }
 

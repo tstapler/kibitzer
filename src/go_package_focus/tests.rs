@@ -255,3 +255,53 @@ fn docs_cover_decision_checklist_enforcement_split_and_json_schema() {
         );
     }
 }
+
+#[test]
+fn label_for_handles_non_ascii_type_names() {
+    assert_eq!(label_for(&["ééé1".to_string(), "ééé2".to_string()]), "ééé");
+}
+
+#[test]
+fn package_above_type_node_cap_is_reported_informational_not_clustered() {
+    let types: String = (0..=MAX_TYPE_NODES)
+        .map(|i| format!("type T{i} struct{{}}\n"))
+        .collect();
+    let model = model_of(
+        "gpf-toolarge",
+        &[("big/t.go", &format!("package big\n\n{types}"))],
+    );
+    let findings = run(&model, EvidenceMode::Combined);
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0].message.contains("too large to cluster"),
+        "{}",
+        findings[0].message
+    );
+}
+
+#[test]
+fn package_level_mutex_suppresses_otherwise_split_package() {
+    let lock = "package pkg\n\nimport \"sync\"\n\nvar mu sync.Mutex\n";
+    let model = model_of(
+        "gpf-lock",
+        &[
+            ("pkg/a.go", MIXED_DECODE),
+            ("pkg/b.go", MIXED_STORE),
+            ("pkg/l.go", lock),
+        ],
+    );
+    assert!(run(&model, EvidenceMode::Combined).is_empty());
+}
+
+#[test]
+fn shared_state_scan_ignores_comments_strings_and_blank_identifiers() {
+    let mut src = source::PackageSource::default();
+    src.scan("package p\n\nvar (\n\t// uses sync.Mutex\n\t_ sync.Locker = nil\n\tErrX = errors.New(\"chan x\")\n)\n");
+    assert!(
+        src.shared_state_vars.is_empty(),
+        "{:?}",
+        src.shared_state_vars
+    );
+    src.scan("package p\n\nvar ch = make(chan<- int)\nvar mu, other sync.Mutex\n");
+    assert_eq!(src.shared_state_vars, vec!["ch", "mu"]);
+}

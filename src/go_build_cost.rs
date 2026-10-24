@@ -80,6 +80,12 @@ pub fn parse_action_graph(json: &str) -> Result<PassStats> {
     Ok(stats)
 }
 
+pub enum BuildCostOutcome {
+    Report(BuildCostReport),
+    /// The toolchain is missing or outside the tested range; the message says why.
+    Skipped(String),
+}
+
 #[derive(Debug)]
 pub struct BuildCostReport {
     pub go_version: (u32, u32),
@@ -112,13 +118,20 @@ fn detect_version() -> Result<(u32, u32)> {
 
 /// Runs the cold and warm builds, or returns the gate's diagnostic when the toolchain is
 /// outside the tested range.
-pub fn run_build_cost(dir: &Path) -> Result<std::result::Result<BuildCostReport, String>> {
-    let version = detect_version()?;
+pub fn run_build_cost(dir: &Path) -> Result<BuildCostOutcome> {
+    let Ok(version) = detect_version() else {
+        return Ok(BuildCostOutcome::Skipped(
+            "go build-cost: no usable `go` binary found on PATH".to_string(),
+        ));
+    };
     if let VersionGate::Skip(msg) = gate(version) {
-        return Ok(Err(msg));
+        return Ok(BuildCostOutcome::Skipped(msg));
     }
+    // A leftover dir (crash, reused pid) would pre-warm the "cold" cache, so start clean
+    // and fail if something recreates it.
     let scratch = std::env::temp_dir().join(format!("kibitzer-build-cost-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch)?;
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
     let result = (|| {
         let cold = build_pass(dir, &scratch, "cold")?;
         let warm = build_pass(dir, &scratch, "warm")?;
@@ -129,26 +142,29 @@ pub fn run_build_cost(dir: &Path) -> Result<std::result::Result<BuildCostReport,
         })
     })();
     let _ = std::fs::remove_dir_all(&scratch);
-    result.map(Ok)
+    result.map(BuildCostOutcome::Report)
 }
 
 fn build_pass(dir: &Path, scratch: &Path, label: &str) -> Result<PassStats> {
     let graph = scratch.join(format!("{label}.json"));
-    let status = Command::new("go")
+    let output = Command::new("go")
         .args(["build", "-debug-actiongraph"])
         .arg(&graph)
         .arg("./...")
         .current_dir(dir)
         .env("GOCACHE", scratch.join("gocache"))
-        .status()
+        .output()
         .context("running `go build`")?;
-    if !status.success() {
+    if !output.status.success() {
         bail!(
-            "`go build ./...` failed in {} ({label} pass)",
-            dir.display()
+            "`go build ./...` failed in {} ({label} pass): {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_action_graph(&std::fs::read_to_string(&graph)?)
+    let json =
+        std::fs::read_to_string(&graph).with_context(|| format!("reading {}", graph.display()))?;
+    parse_action_graph(&json)
 }
 
 #[cfg(test)]
@@ -215,7 +231,9 @@ mod tests {
         let dir = crate::test_support::unique_temp_dir("build-cost");
         std::fs::write(dir.join("go.mod"), "module example.test/bc\n\ngo 1.21\n").unwrap();
         std::fs::write(dir.join("m.go"), "package main\n\nfunc main() {}\n").unwrap();
-        let report = run_build_cost(&dir).unwrap().unwrap();
+        let BuildCostOutcome::Report(report) = run_build_cost(&dir).unwrap() else {
+            panic!("skipped")
+        };
         assert!(report.cold.compiled > 0, "{report}");
         assert_eq!(report.warm.compiled, 0, "{report}");
         assert!(report.warm.cache_hits > 0, "{report}");

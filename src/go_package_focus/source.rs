@@ -4,6 +4,7 @@ use crate::arch_model::PackageNode;
 
 /// Facts read straight from the package's non-test `.go` files; unreadable files only
 /// shrink coverage, they never fail the check.
+#[derive(Default)]
 pub(super) struct PackageSource {
     pub(super) shared_state: bool,
     pub(super) shared_state_vars: Vec<String>,
@@ -24,7 +25,7 @@ impl PackageSource {
         for file in pkg
             .files
             .iter()
-            .filter(|f| !f.to_string_lossy().ends_with("_test.go"))
+            .filter(|f| !crate::checkers::is_test_file(f))
         {
             let Ok(text) = std::fs::read_to_string(file) else {
                 out.unreadable += 1;
@@ -36,7 +37,7 @@ impl PackageSource {
         out
     }
 
-    fn scan(&mut self, text: &str) {
+    pub(super) fn scan(&mut self, text: &str) {
         let mut in_var_block = false;
         for line in text.lines() {
             if line.starts_with("//go:build") || line.starts_with("// +build") {
@@ -67,9 +68,39 @@ impl PackageSource {
     }
 
     fn note_var(&mut self, decl: &str) {
-        let shares = decl.contains("sync.") || decl.contains("atomic.") || decl.contains("chan ");
-        if shares && let Some(name) = decl.split_whitespace().next() {
+        let code = strip_comment_and_strings(decl);
+        let shares = code.contains("sync.")
+            || code.contains("atomic.")
+            || code
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|w| w == "chan");
+        let name = code
+            .split_whitespace()
+            .next()
+            .map(|n| n.trim_end_matches(','));
+        if shares && let Some(name) = name.filter(|n| !n.is_empty() && *n != "_") {
             self.shared_state_vars.push(name.to_string());
         }
     }
+}
+
+/// Drops a trailing `//` comment and the contents of `"..."` literals so neither can
+/// match the shared-state keywords.
+fn strip_comment_and_strings(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_str = false;
+    let mut prev = '\0';
+    for c in line.chars() {
+        if !in_str && c == '/' && prev == '/' {
+            out.pop();
+            break;
+        }
+        if c == '"' {
+            in_str = !in_str;
+        } else if !in_str {
+            out.push(c);
+        }
+        prev = c;
+    }
+    out
 }
