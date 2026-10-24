@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -178,10 +178,16 @@ const MAX_FAN_IN: usize = 10;
 /// `&ImportGraph`) so [`InstabilityChecker`] can reuse it from `ArchModel::import_edges`
 /// too — the two checkers can't drift on what `Ca`/`Ce` mean.
 pub fn fan_in_out(edges: &[ImportEdge]) -> HashMap<&str, (usize, usize)> {
+    // `ImportEdge` is one per import statement, so several files in `from` importing `to`
+    // yield several edges; coupling is package-level, so count each pair once.
+    let pairs: HashSet<(&str, &str)> = edges
+        .iter()
+        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+        .collect();
     let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
-    for edge in edges {
-        counts.entry(edge.from.as_str()).or_default().0 += 1;
-        counts.entry(edge.to.as_str()).or_default().1 += 1;
+    for (from, to) in pairs {
+        counts.entry(from).or_default().0 += 1;
+        counts.entry(to).or_default().1 += 1;
     }
     counts
 }
@@ -574,6 +580,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::unreferenced_symbols::UnreferencedPrivateSymbolChecker),
         Box::new(crate::single_call_site_delegation::SingleCallSiteDelegationChecker),
         Box::new(crate::middle_man::MiddleManChecker),
+        Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
     ]
 }
 
@@ -678,6 +685,7 @@ impl ArchModelChecker for DipConcreteCouplingChecker {
         _config: &ArchitectureConfig,
     ) -> Vec<ArchFinding> {
         let counts = fan_in_out(&model.import_edges);
+        // Distinct pairs here match `fan_in_out`'s Ce/Ca counting; kept separate for sorted output.
         let mut pairs: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
         for edge in &model.import_edges {
             pairs.insert((edge.from.as_str(), edge.to.as_str()));
@@ -987,6 +995,52 @@ mod tests {
             file: PathBuf::from(file),
             line,
         }
+    }
+
+    #[test]
+    fn fan_in_out_counts_distinct_package_pairs_when_two_files_import_same_package() {
+        let edges = vec![
+            edge_at("a", "b", "a/f1.go", 3),
+            edge_at("a", "b", "a/f2.go", 4),
+        ];
+        let counts = fan_in_out(&edges);
+        assert_eq!(counts["a"], (1, 0), "Ce(a) must be 1, not 2");
+        assert_eq!(counts["b"], (0, 1), "Ca(b) must be 1, not 2");
+    }
+
+    #[test]
+    fn fan_in_out_keeps_distinct_targets_separate() {
+        let edges = vec![
+            edge_at("a", "b", "a/f1.go", 3),
+            edge_at("a", "c", "a/f1.go", 4),
+        ];
+        assert_eq!(fan_in_out(&edges)["a"], (2, 0));
+    }
+
+    #[test]
+    fn multi_import_fixture_has_efferent_coupling_of_one() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/dogfood-architecture");
+        let files: Vec<std::path::PathBuf> = ["a.go", "b.go"]
+            .iter()
+            .map(|f| root.join("multi_import").join(f))
+            .chain([root.join("domain/domain.go"), root.join("infra/infra.go")])
+            .collect();
+        let graph = crate::import_graph::build(&root, &files).unwrap();
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|e| e.from.ends_with("multi_import"))
+                .count(),
+            2
+        );
+        let counts = fan_in_out(&graph.edges);
+        let (_, (ce, _)) = counts
+            .iter()
+            .find(|(k, _)| k.ends_with("multi_import"))
+            .unwrap();
+        assert_eq!(*ce, 1, "two files importing domain are one package pair");
     }
 
     #[test]
