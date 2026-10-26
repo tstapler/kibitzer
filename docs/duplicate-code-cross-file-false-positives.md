@@ -14,9 +14,10 @@ Shares its window-hashing logic with `duplicate-code`
 lines and a 60-character minimum (`MIN_BLOCK_CHARS`), fires once a window's
 exact text repeats across at least 3 files (`MIN_OCCURRENCES`,
 `spans_multiple_files`). No exclusion for a window that falls entirely inside
-a file's leading `import`/`use` block — see issue #102.
+a file's leading `import`/`use` block was the gap (issue #102), now closed — see
+the Fixed entry below.
 
-## Log
+## Fixed
 
 ### 2026-09-23 — tstapler/stelekit (feat/graph-creation-name-description) — shared import block flagged as duplicated logic
 
@@ -35,5 +36,14 @@ a file's leading `import`/`use` block — see issue #102.
   because they use the same libraries — there is no function to "extract,"
   and each file's own compiler dictates the exact import list it needs.
 - **Mechanism**: `qualifying_window`/`qualifying_windows`
-  (`src/checkers/duplicate_code.rs`) have no import/use-block exclusion — see
-  this doc's "Mechanism" section above and issue #102.
+  (`src/checkers/duplicate_code.rs`) had no import/use-block exclusion — a scope
+  problem, not a matching-logic problem (every match was a genuine verbatim repeat).
+- **Fixed by**: `leading_import_end` computes the end of each file's leading
+  contiguous import/use/package preamble (blank lines and comments allowed; first
+  other line ends it), and `in_preamble` skips any window lying entirely inside it.
+  Applied in `find_duplicate_blocks` and in the cross-file indexes
+  (`index_cross_file_windows`, `file_windows`), so `kibitzer check duplicates` and the
+  `PostToolUse` checker are both covered. Covers `.kt`, `.java`, `.go` (including
+  grouped `import (...)` with quoted paths), `.rs`, `.py`, `.js`, `.ts`, `.tsx`,
+  `.jsx`; unrecognised extensions are not suppressed. A window starting after the
+  preamble, or a genuine duplicated block after it, still flags.

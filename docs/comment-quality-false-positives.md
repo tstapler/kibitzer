@@ -34,6 +34,28 @@ section below for the first such real-world signal.
   or `break;` is no longer flagged as commented-out code. Accepted per this checker's
   stated bias toward missing real dead code over flagging prose.
 
+### PEP 723 inline script metadata block misread as commented-out code
+
+- **Symptom**: a Python file with a `# /// script` … `# ///` block fired
+  `[commented-out-code]` on body lines such as `# dependencies = [`.
+- **Mechanism**: PEP 723 bodies are TOML `key = value` lines, syntactically identical to
+  Python assignments, so `is_assignment` accepted them.
+- **Fixed by**: `check` tracks an `in_pep723_block` state (Python only) and skips every
+  comment node from the `# /// <type>` opener through the `# ///` closer (trailing
+  whitespace tolerated), so no comment-quality rule sees the block. Guarded by
+  `pep723_inline_script_metadata_block_is_not_flagged`,
+  `pep723_block_with_other_type_and_trailing_whitespace_is_not_flagged`,
+  `real_dead_code_after_closed_pep723_block_is_still_flagged` and
+  `pep723_block_directly_above_a_function_is_not_counted_as_its_doc_comment` (the
+  `[over-commented]` walk reads leading comments separately, so `leading_comment_nodes`
+  also stops at a PEP 723 closer). The Python-only guard is a one-line `self.lang`
+  check with no dedicated test: no non-Python grammar here parses `#` lines as comments.
+- **Known trade-off**: an opener only starts a block if a `# ///` closer appears later in
+  the file (guarded by `unclosed_pep723_opener_does_not_silence_later_comments`); a stray
+  closer far below an unrelated opener would still exempt everything between them. A
+  PEP 723 block inside a function body still counts toward that function's `[over-commented]`
+  ratio; the exemption covers the per-comment rules and leading doc comments.
+
 ### 2026-09-06 — Kubernetes/Cassandra/Servo backtest — six findings, all fixed
 
 A real backtest (three cloned OSS repos: `pkg/kubelet` from kubernetes/kubernetes,
@@ -263,4 +285,52 @@ delegation) still fires unchanged.
   either when used for mathematical interval notation in prose. Not independently
   verified against a broader corpus — flagging as a hypothesis with one concrete
   real-world instance, per this file's stated approach to unvalidated constants.
+
+### 2026-10-10 — stapler-squad — multi-line prose comment's mid-sentence continuation line misread as a variable assignment
+
+- **Repo**: `tstapler/stapler-squad`, file
+  `web-app/src/components/sessions/SessionList.tsx:324`.
+- **What changed**: a new doc comment added this session, explaining a `showHidden`
+  filter option:
+  ```
+  // showHidden: same shape as showArchived — when true, re-fetches with
+  // includeHidden=true (server-side default excludes Hidden sessions, e.g.
+  // Diagnose & Nudge/review one-shot dispatches) and stops client-side
+  // filtering them out below.
+  ```
+  Line 324 alone (after stripping `//`) reads: `includeHidden=true (server-side
+  default excludes Hidden sessions, e.g.` — the sentence doesn't end there; it
+  continues onto the next two `//` lines ("...dispatches) and stops client-side
+  filtering them out below.").
+- **Why it's a false positive**: nothing on this line is a real assignment
+  statement — it's one physical line of a four-line prose sentence explaining what
+  the `includeHidden` request flag does. The adjacent, nearly-identical `showArchived`
+  comment immediately above it in the same file reads "...re-fetches sessions with
+  includeArchived=true (server-side" on its own line and is *not* flagged, for an
+  incidental reason confirmed by tracing `is_assignment_lhs`: its `=` isn't at the
+  start of the line, so the LHS slice is the whole multi-word prefix
+  ("showArchived: when true, re-fetches sessions with includeArchived"), which fails
+  the `!lhs.contains(' ')` check. Line 324's `=` happens to be the very first token on
+  its line (`includeHidden=true`), isolating a clean, space-free identifier as the
+  LHS — the two lines differ only in where the sentence was word-wrapped, not in
+  whether either is code.
+- **Mechanism**: `looks_like_code` (`src/checkers/comment_quality.rs`) falls through
+  to `is_assignment(text)` for this line, since it doesn't end in `{`/`}`/`});`/`;`.
+  `is_assignment` finds the `=` in `includeHidden=true`; `is_assignment_lhs` accepts
+  `includeHidden` as a valid-shaped identifier; `is_assignment_rhs` only rejects a RHS
+  containing a second `=` or a `". "` sentence-boundary marker (the fix documented in
+  the "`is_assignment` still under-constrained" entry above) — and neither appears on
+  *this* physical line, because the sentence's terminating period lands on a later,
+  separate `//` line. `check_commented_out_code` (same file) calls `looks_like_code`
+  per physical line via `text.lines()`, with no visibility into the rest of the
+  comment block, so it can't see that the clause continues. This is the same
+  under-constrained-RHS gap one level up: the existing fix catches a sentence
+  boundary *within* one line; this is a sentence boundary that only exists once
+  consecutive `//` lines are read together.
+- **Suggested direction** (not implemented, not verified against a corpus): either
+  join a comment block's lines before running `is_assignment`/`looks_like_code`
+  line-by-line so a mid-clause line can be checked against the full sentence, or
+  narrow `is_assignment` to require the matched line *itself* end in sentence-ending
+  punctuation (`.`/`;`/`:`) or be the comment block's last line before accepting the
+  RHS, treating an ambiguous interior line as inconclusive rather than code-shaped.
 

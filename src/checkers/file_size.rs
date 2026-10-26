@@ -75,6 +75,10 @@ fn lang_config(lang: Language) -> LangConfig {
             name: "rust-file-size",
             file_globs: &["**/*.rs"],
         },
+        Language::Bash => LangConfig {
+            name: "bash-file-size",
+            file_globs: &["**/*.sh", "**/*.bash"],
+        },
     }
 }
 

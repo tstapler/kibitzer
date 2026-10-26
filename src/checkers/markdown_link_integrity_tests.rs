@@ -253,6 +253,32 @@ fn ignores_an_uppercase_checkbox_mark_mid_sentence() {
 }
 
 #[test]
+fn ignores_single_letter_inspection_labels() {
+    for label in ["H", "W", "R", "A", "Z", "a", "z"] {
+        let body = format!("- [{label}] Inspection point description\n");
+        assert!(
+            check_source(&path(), &body).unwrap().is_empty(),
+            "expected no findings for [{label}]"
+        );
+    }
+}
+
+#[test]
+fn single_letter_label_with_a_definition_is_not_flagged() {
+    let body = "See [H] for details.\n\n[H]: https://example.com\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
+fn still_flags_explicit_and_collapsed_single_letter_references_when_dangling() {
+    for body in ["See [details][H] here.\n", "See [H][] here.\n"] {
+        let findings = check_source(&path(), body).unwrap();
+        assert_eq!(findings.len(), 1, "body {body:?}, got: {findings:?}");
+        assert!(findings[0].message.contains("[H] used but never defined"));
+    }
+}
+
+#[test]
 fn ignores_a_checkbox_mark_inside_a_table_cell() {
     let body = "| Task | Status |\n|---|---|\n| Frobnicate | [x] |\n";
     assert!(check_source(&path(), body).unwrap().is_empty());
@@ -273,4 +299,35 @@ fn still_flags_a_genuinely_dangling_shortcut_reference_that_is_not_a_checkbox_ma
 fn fully_consistent_document_has_zero_findings() {
     let body = "# Heading One\n\nSee [the site][site-ref] and [Heading One](#heading-one).\n\n[site-ref]: https://example.com\n";
     assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
+fn ignores_severity_tag_in_heading() {
+    let body = "# BUG-105: service crash [SEVERITY: High]\n\nBody text.\n";
+    assert!(check_source(&path(), body).unwrap().is_empty());
+}
+
+#[test]
+fn ignores_code_review_severity_tags() {
+    for tag in ["[BLOCKER]", "[CRITICAL]", "[MAJOR]", "[NIT]"] {
+        let body = format!("{tag} Fix the null check.\n");
+        assert!(
+            check_source(&path(), &body).unwrap().is_empty(),
+            "expected no findings for {tag}"
+        );
+    }
+}
+
+#[test]
+fn still_flags_explicit_reference_with_colon_label_and_lowercase_shortcut() {
+    let explicit = check_source(&path(), "See [link][foo: bar] for details.\n").unwrap();
+    assert_eq!(explicit.len(), 1);
+    let shortcut = check_source(&path(), "See [foo] for details.\n").unwrap();
+    assert_eq!(shortcut.len(), 1);
+}
+
+#[test]
+fn still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set() {
+    let findings = check_source(&path(), "See [RFC] for details.\n").unwrap();
+    assert_eq!(findings.len(), 1);
 }

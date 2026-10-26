@@ -21,7 +21,9 @@ mod extract_class;
 mod false_positive;
 mod git_cmd;
 mod glob;
+mod go_build_cost;
 mod go_call_resolution;
+mod go_package_focus;
 mod god_class;
 mod hook;
 mod hook_footer;
@@ -37,7 +39,9 @@ mod lsp;
 mod markdown_text;
 mod mcp;
 mod mermaid;
+mod middle_man;
 mod node_kind;
+mod parameter_object;
 mod plugin;
 mod root_cause_clusters;
 mod run;
@@ -127,6 +131,11 @@ enum Command {
         #[command(subcommand)]
         action: ArchitectureAction,
     },
+    /// Go-specific tooling: build-cost telemetry and package-focus JSON reports.
+    Go {
+        #[command(subcommand)]
+        action: GoAction,
+    },
     /// Install, list, remove, or check the status of optional external checker plugins
     /// (see `src/plugin.rs`).
     Plugin {
@@ -171,6 +180,20 @@ enum PluginAction {
     Status {
         #[arg(value_parser = plugin::PluginName::parse)]
         name: Option<plugin::PluginName>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GoAction {
+    /// Cold and warm `go build -debug-actiongraph` summary for the module at `dir`, using a
+    /// private GOCACHE. Prints a diagnostic and exits 0 on an unsupported Go version.
+    BuildCost { dir: PathBuf },
+    /// Print `go-package-focus` reports as JSON (see docs/go-package-focus.md).
+    PackageFocus {
+        dir: PathBuf,
+        /// Evidence mode.
+        #[arg(long, value_enum, default_value = "combined")]
+        mode: go_package_focus::EvidenceMode,
     },
 }
 
@@ -637,6 +660,10 @@ fn main() -> Result<ExitCode> {
             ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
             ArchitectureAction::Affected { path, base } => run_affected(&path, &base),
         },
+        Command::Go { action } => match action {
+            GoAction::BuildCost { dir } => run_go_build_cost(&dir),
+            GoAction::PackageFocus { dir, mode } => run_go_package_focus(&dir, mode),
+        },
         Command::Plugin { action } => match action {
             PluginAction::Install {
                 name,
@@ -717,6 +744,26 @@ fn format_plugin_status_line(report: &plugin::PluginStatusReport) -> String {
     format!("{name} v{version}: {}", issues.join(", "))
 }
 
+fn run_go_build_cost(dir: &Path) -> Result<ExitCode> {
+    match go_build_cost::run_build_cost(dir)? {
+        go_build_cost::BuildCostOutcome::Report(report) => print!("{report}"),
+        go_build_cost::BuildCostOutcome::Skipped(diagnostic) => println!("{diagnostic}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_go_package_focus(dir: &Path, mode: go_package_focus::EvidenceMode) -> Result<ExitCode> {
+    let files =
+        check::walk_and_collect_files(dir).with_context(|| format!("walking {}", dir.display()))?;
+    let model = check::build_arch_model_for_check(dir, &files, true)
+        .with_context(|| format!("building architecture model for {}", dir.display()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&go_package_focus::analyze(&model, mode))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `kibitzer check architecture <name> <dir>` (Story 1.2.2): runs one whole-repo
 /// architecture/declaration checker directly against `dir`, bypassing `.kibitzer/inspect.json`'s
 /// `checks` list entirely — `name` only needs to be registered in
@@ -745,7 +792,9 @@ fn run_architecture_cli(name: &str, dir: &Path) -> Result<ExitCode> {
         check::AnyArchitectureChecker::Import(checker) => {
             let graph = import_graph::build(dir, &files)
                 .with_context(|| format!("building import graph for {}", dir.display()))?;
-            checker.check(&graph, &arch_config)
+            let model = check::model_for_import_checker(checker.as_ref(), dir, &files)
+                .with_context(|| format!("building architecture model for {}", dir.display()))?;
+            checker.check(&graph, &arch_config, model.as_ref())
         }
         check::AnyArchitectureChecker::Model(checker) => {
             let model =

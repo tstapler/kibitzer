@@ -140,6 +140,18 @@ pub struct TestCodeProfile {
     collect: fn(&CheckContext) -> Vec<TestFn>,
 }
 
+/// Shell scripts have no test-function convention, so this profile discovers nothing.
+fn bash_profile() -> TestCodeProfile {
+    TestCodeProfile {
+        language: Language::Bash,
+        assertion_names: &[],
+        snapshot_markers: &[],
+        exemption_markers: &[],
+        is_test_file: None,
+        collect: |_| Vec::new(),
+    }
+}
+
 impl TestCodeProfile {
     pub fn for_language(language: Language) -> TestCodeProfile {
         match language {
@@ -148,6 +160,7 @@ impl TestCodeProfile {
             Language::TypeScript | Language::Tsx | Language::JavaScript => ts::profile(language),
             Language::Java | Language::Kotlin => java::profile(language),
             Language::Rust => rust::profile(),
+            Language::Bash => bash_profile(),
         }
     }
 
@@ -478,11 +491,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_should_Exist_When_LanguageIsGoPythonTsJsJavaKotlinRust() {
+    fn profile_should_Exist_When_LanguageIsGoPythonTsJsJavaKotlinRustBash() {
         for lang in Language::ALL {
             assert_eq!(TestCodeProfile::for_language(*lang).language, *lang);
         }
-        assert_eq!(Language::ALL.len(), 8);
+        assert_eq!(Language::ALL.len(), 9);
         assert!(TestCodeProfile::for_path(Path::new("a/Foo.cs")).is_none());
         assert!(TestCodeProfile::for_path(Path::new("a/foo_test.go")).is_some());
     }

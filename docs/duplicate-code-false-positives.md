@@ -39,6 +39,19 @@ filtering.
   findings, while a genuine true positive (`config/config.go:745`, stapler-squad, three functions sharing
   identical `~/`-expansion logic) still flags.
 
+### 2026-09-23 — tstapler/stelekit — import/use blocks shared across files flagged as duplicated logic
+
+- **Symptom**: a 6-line run of `import` statements at the top of several files flagged as "repeated block —
+  consider extracting a shared function" (originally logged against `duplicate-code-cross-file`; see
+  `docs/duplicate-code-cross-file-false-positives.md`). The in-file `duplicate-code` check shares the same window
+  filter, so a preamble repeating a window 3+ times within one file was equally exposed.
+- **Mechanism**: `qualifying_window`/`find_duplicate_blocks` filtered only blank lines and `MIN_BLOCK_CHARS`;
+  import lines are dictated by what a file references, so there is nothing to extract.
+- **Fixed by**: `leading_import_end`/`in_preamble` in `src/checkers/duplicate_code.rs` skip windows lying entirely
+  inside the file's leading import/use/package preamble, for `.go`, `.kt`, `.java`, `.rs`, `.py`, `.js`, `.ts`,
+  `.tsx`, `.jsx`. Unit tests in that file's test module guard the preamble boundary and that a duplicated block
+  after the preamble still flags.
+
 ## Log
 
 No open entries.

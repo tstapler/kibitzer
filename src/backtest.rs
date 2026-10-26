@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::architecture_checks::ArchModelChecker;
 use crate::checker::{Finding, GrammarCache};
 use crate::glob::matches_scope;
 
@@ -263,18 +264,27 @@ pub fn run_backtest(
     // index — see `DuplicateIndexIsolation`'s doc comment.
     let _index_isolation = DuplicateIndexIsolation::new();
 
-    let checkers: Vec<Box<dyn crate::checker::Checker>> = if checker_names.is_empty() {
-        crate::checker::registry()
+    let mut checkers: Vec<Box<dyn crate::checker::Checker>> = Vec::new();
+    let mut model_checkers: Vec<Box<dyn ArchModelChecker>> = Vec::new();
+    if checker_names.is_empty() {
+        checkers = crate::checker::registry();
     } else {
-        checker_names
-            .iter()
-            .map(|name| {
-                crate::checker::lookup(name)
-                    .ok_or_else(|| anyhow::anyhow!("no checker named '{name}' registered"))
-            })
-            .collect::<Result<_>>()?
-    };
+        for name in checker_names {
+            if let Some(checker) = crate::checker::lookup(name) {
+                checkers.push(checker);
+            } else if let Some(checker) = crate::architecture_checks::lookup_model(name) {
+                model_checkers.push(checker);
+            } else if let Some(checker) =
+                crate::architecture_checks::lookup(name).filter(|c| c.needs_model())
+            {
+                model_checkers.push(Box::new(ModelBacked(checker)));
+            } else {
+                anyhow::bail!("no checker named '{name}' registered");
+            }
+        }
+    }
     let mut sorted_names: Vec<&str> = checkers.iter().map(|c| c.name()).collect();
+    sorted_names.extend(model_checkers.iter().map(|c| c.name()));
     sorted_names.sort_unstable();
     let checkers_key = sorted_names.join(",");
 
@@ -327,7 +337,7 @@ pub fn run_backtest(
                     matches_scope(&path_str, &globs)
                 })
                 .collect();
-            if matching.is_empty() {
+            if matching.is_empty() && model_checkers.is_empty() {
                 continue;
             }
 
@@ -372,6 +382,34 @@ pub fn run_backtest(
                     });
                 }
             }
+            for checker in &model_checkers {
+                transcript_snapshots_checked += 1;
+
+                let after_findings =
+                    replay_model_checker(checker.as_ref(), &snapshot.file_path, &snapshot.after)?;
+                let before_messages: Vec<String> = match &snapshot.before {
+                    Some(before) => {
+                        replay_model_checker(checker.as_ref(), &snapshot.file_path, before)?
+                            .into_iter()
+                            .map(|f| f.message)
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+
+                for finding in after_findings {
+                    let pre_existing = before_messages.contains(&finding.message);
+                    transcript_findings.push(BacktestFinding {
+                        transcript: transcript.clone(),
+                        file_path: snapshot.file_path.clone(),
+                        seq: snapshot.seq,
+                        checker: checker.name().to_string(),
+                        line: finding.line.unwrap_or(0),
+                        message: finding.message,
+                        pre_existing,
+                    });
+                }
+            }
         }
 
         stats.snapshots_checked += transcript_snapshots_checked;
@@ -407,6 +445,56 @@ pub fn run_backtest(
     }
 
     Ok(BacktestReport { findings, stats })
+}
+
+/// Lets an import-graph `ArchitectureChecker` that only needs the model (`needs_model`)
+/// be replayed like an `ArchModelChecker`; it never reads the graph, so an empty one is
+/// passed.
+struct ModelBacked(Box<dyn crate::architecture_checks::ArchitectureChecker>);
+
+impl ArchModelChecker for ModelBacked {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn check(
+        &self,
+        model: &crate::arch_model::ArchModel,
+        config: &crate::config::ArchitectureConfig,
+    ) -> Vec<crate::architecture_checks::ArchFinding> {
+        self.0.check(
+            &crate::import_graph::ImportGraph::default(),
+            config,
+            Some(model),
+        )
+    }
+
+    fn needs_private_symbols(&self) -> bool {
+        self.0.needs_private_symbols()
+    }
+}
+
+/// Runs a whole-repo `ArchModelChecker` against a single reconstructed file: the model
+/// is built from that one snapshot alone, so a cross-file signal (callers or
+/// implementers in other files) is invisible here — only what is derivable within the
+/// edited file is replayed. Shares `check architecture`'s default `ArchitectureConfig`.
+fn replay_model_checker(
+    checker: &dyn ArchModelChecker,
+    file_path: &Path,
+    source: &str,
+) -> Result<Vec<crate::architecture_checks::ArchFinding>> {
+    let root = file_path.parent().unwrap_or(Path::new("/"));
+    let files = vec![(file_path.to_path_buf(), source.to_string())];
+    let model = crate::arch_model::build_model(
+        root,
+        &files,
+        &crate::import_graph::ImportGraph::default(),
+        &crate::arch_model::PruneConfig {
+            include_private: checker.needs_private_symbols(),
+        },
+    )
+    .with_context(|| format!("building architecture model for {}", file_path.display()))?;
+    Ok(checker.check(&model, &crate::config::ArchitectureConfig::default()))
 }
 
 /// Replays a single transcript's Read/Write/Edit/MultiEdit tool_use events in order,
@@ -973,5 +1061,45 @@ mod tests {
             "expected a cross-file duplicate finding, got: {:#?}",
             report.findings
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn backtest_should_ReplayArchModelChecker_When_NamedExplicitly() {
+        let content = "function helper(x: number) { return x; }\n\n\
+                       function thin(x: number) { return helper(x); }\n\n\
+                       function live() { thin(1); }\n";
+        let lines = vec![tool_use(
+            "w1",
+            "Write",
+            serde_json::json!({"file_path": "/repo/src/a.ts", "content": content}),
+        )];
+        let file = write_transcript(&lines);
+        let report = run_backtest(
+            &[file.path().to_path_buf()],
+            &["single-call-site-delegation".to_string()],
+            false,
+            &mut BacktestCache::default(),
+        )
+        .unwrap();
+        assert_eq!(report.stats.snapshots_checked, 1);
+        assert_eq!(report.findings.len(), 1, "got: {:#?}", report.findings);
+        assert_eq!(report.findings[0].checker, "single-call-site-delegation");
+        assert!(report.findings[0].message.contains("`thin`"));
+        assert!(!report.findings[0].pre_existing);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn backtest_should_Reject_When_NameIsNeitherFileNorModelChecker() {
+        let err = run_backtest(
+            &[],
+            &["no-such-checker".to_string()],
+            false,
+            &mut BacktestCache::default(),
+        )
+        .err()
+        .expect("unknown checker must error");
+        assert!(err.to_string().contains("no checker named"));
     }
 }

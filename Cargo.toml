@@ -7,7 +7,7 @@ members = [".", "crates/kibitzer-stub-plugin"]
 
 [package]
 name = "kibitzer"
-version = "0.1.23"
+version = "0.1.24"
 edition = "2024"
 description = "Advisory, diff-aware code/doc quality checks for AI agents, CI, and local dev"
 repository = "https://github.com/tstapler/kibitzer"
@@ -39,6 +39,7 @@ ureq = "3"
 inventory = "0.3.24"
 unicode-ident = "1"
 quick-xml = { version = "0.42.0", default-features = false }
+tree-sitter-bash = "0.23"
 
 # NOTE: this does NOT expose CARGO_BIN_EXE_kibitzer-stub-plugin to tests/*.rs — that
 # requires an "artifact dependency" (`artifact = "bin"`), which needs `-Z bindeps` and is

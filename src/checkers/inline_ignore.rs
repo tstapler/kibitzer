@@ -270,7 +270,7 @@ mod tests {
                 assert!(globs.contains(&format!("**/*.{ext}").as_str()), "{ext}");
             }
         }
-        assert_eq!(globs.len(), 13);
+        assert_eq!(globs.len(), 15);
     }
 
     #[test]

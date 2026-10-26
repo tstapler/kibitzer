@@ -20,6 +20,7 @@ matches on exact name, so each needs a distinct one — see `src/checker.rs`'s
 | Java       | `syntax-rules-java`            | `**/*.java`                               |
 | Kotlin     | `syntax-rules-kotlin`          | `**/*.kt`, `**/*.kts`                     |
 | Rust       | `syntax-rules-rust`            | `**/*.rs`                                 |
+| Bash       | `syntax-rules-bash`            | `**/*.sh`, `**/*.bash`                    |
 
 The rules and their thresholds are the same across languages
 (`rules::CATALOG` is language-agnostic); only the underlying tree-sitter node
@@ -27,13 +28,13 @@ kinds each language's `lang_config()` entry checks against differ:
 
 | Rule ID               | Category   | Default severity | Threshold             | Description |
 |------------------------|------------|-------------------|------------------------|--------------|
-| `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this — Fowler's *Extract Function*. |
+| `long-function`        | complexity | advisory          | > 40 lines             | Function/method body spans more lines than this — Fowler's *Extract Function*. Exempt: a body that is a single `return` of a flat collection literal (Go composite literal, TS/JS array/object, Python list/dict) with no calls, ternaries, comprehensions or control flow — a table-test case list has nothing to extract. |
 | `deep-nesting`         | complexity | advisory          | > 4 levels             | Function/method body nests control-flow constructs deeper than this — Fowler's *Replace Nested Conditional with Guard Clauses*. An `else if` chain is treated as one flat branch, not added nesting, in every language. |
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
 | `unreachable-code`     | dead-code  | advisory          | n/a                    | A statement follows an unconditional `return`/`break`/`continue`/panic-call in the same `{ ... }` block — Fowler's *Remove Dead Code*. Only the first dead statement in a block is flagged (everything after it is dead by construction). Doesn't descend into `switch`/`match`/`when` case bodies. Go's `panic(...)` and Rust's `panic!`/`unreachable!`/`todo!`/`unimplemented!` count as diverging calls; other languages have no such built-in and are return/break/continue-only. Kotlin is return-only — `tree-sitter-kotlin-ng` 1.1.0 has no dedicated node kind for a bare `break`/`continue` (it parses as a plain identifier). |
 | `replace-magic-literal` | duplication | advisory        | >= 3 occurrences       | A non-trivial numeric or string literal (not `0`, `1`, `-1`, `""`, or an empty collection literal) repeats at least this many times in one file with no bound named constant — Fowler's *Replace Magic Literal*. Excludes a literal that's the direct initializer of a `const`/`final`/`val`-style binding (Python: `SCREAMING_SNAKE_CASE`) referenced elsewhere by name; a `let`/non-const binding does not qualify. Bumped from AC2's literal `2` to `3` per a corpus backtest against a pre-committed 40% false-positive bar — see `project_plans/replace-magic-literal/decisions/ADR-001-magic-literal-exclusion-and-threshold-strategy.md`. |
-| `extract-variable`     | readability | advisory          | >= 10 operators/calls  | An `if`/ternary condition, or a `return`'s value, nests this many binary/logical operators and function calls — Fowler's *Extract Variable* (née Introduce Explaining Variable). `user.isActive() && user.hasPermission(p)` (density 3) is deliberately far under this; the threshold came from a `kubernetes/kubernetes` backtest where 4-8 were mostly readable `&&` chains. Closure bodies and struct/map/array literals inside the expression are not counted. A `return` whose entire value is itself an if/ternary expression (Kotlin/Rust's `return if ... else ...`, TS/JS/Java's `return cond ? a : b`) is flagged once, at the nested if/ternary, not twice. |
+| `extract-variable`     | readability | advisory          | nesting depth >= 5 | An `if`/ternary condition, or a `return`'s value, nests binary/logical operators and function calls this deep — Fowler's *Extract Variable* (née Introduce Explaining Variable). The metric is depth, not node count: a flat same-operator `&&`/`||` run and a receiver call chain (`a.b().c().d()`) each count as one level however long, while a call argument or a mixed `&&`/`||` operand adds a level. `user.isActive() && user.hasPermission(p)` (depth 2) is deliberately far under this. Rust tuple-struct/enum-variant constructors (`Some(x)`, `Err(E::A(x))`, an UpperCamelCase callee) are not counted; in other languages an uppercase callee is an exported function and is. The threshold came from a 2026-10-12 corpus backtest: depth 4 fired ~2,000 times on ordinary two-level conditions, depth 5 ~220 times on genuinely nested ones. Closure bodies and struct/map/array literals inside the expression are not counted. A `return` whose entire value is itself an if/ternary expression (Kotlin/Rust's `return if ... else ...`, TS/JS/Java's `return cond ? a : b`) is flagged once, at the nested if/ternary, not twice. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
 each grammar's real `to_sexp()` output:
@@ -205,3 +206,14 @@ arguments (e.g. a multi-argument factory call) can still reach the threshold.
   ]
 }
 ```
+
+### Bash caveats
+
+`bash_lang_config` (`src/checkers/rules.rs`) was checked against the vendored `codegen/node-types/bash.json`:
+
+- `return`, `break` and `continue` parse as plain `command` nodes (no `return_statement` etc.), so `unreachable-code` and the `return` side of `extract-variable` never fire.
+- `function_definition` has no parameter list, so `long-parameter-list` and `flag-argument` never fire.
+- `if_statement`'s `then` statements, `elif_clause` and `else_clause` are flat siblings, so `deep-nesting` under-counts nesting inside later branches (false negatives only).
+- A quoted string made only of expansions (`"$@"`, `"${1}"`) is exempt from `replace-magic-literal`; a string mixing text and expansions is still flagged.
+- Files are recognised by extension only (`.sh`, `.bash`). Extension-less scripts (`bin/*`, git hooks), `.zsh`/`.ksh`, `.bats`, `.envrc` and dotfiles like `.bashrc` are skipped silently: there is no shebang detection yet.
+- `replace-magic-literal` reports nothing in a file whose parse tree has an error (tree-sitter-bash can mis-pair quotes after odd quoting earlier in the file; about 7% of 300 sampled scripts), and exempts redirect targets and plain command-argument numbers (`>&2`, `exit 2`), shell boolean/separator strings and `echo`/`printf` arguments. `long-function` uses the shared 40-line threshold, untuned for case-driven installer scripts.

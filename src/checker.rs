@@ -76,6 +76,7 @@ pub enum Language {
     Java,
     Kotlin,
     Rust,
+    Bash,
 }
 
 impl Language {
@@ -90,6 +91,7 @@ impl Language {
         Language::Java,
         Language::Kotlin,
         Language::Rust,
+        Language::Bash,
     ];
 
     fn ts_language(self) -> tree_sitter::Language {
@@ -102,6 +104,7 @@ impl Language {
             Language::Java => tree_sitter_java::LANGUAGE.into(),
             Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Language::Bash => tree_sitter_bash::LANGUAGE.into(),
         }
     }
 
@@ -131,6 +134,7 @@ impl Language {
             Language::Java => &["java"],
             Language::Kotlin => &["kt", "kts"],
             Language::Rust => &["rs"],
+            Language::Bash => &["sh", "bash"],
         }
     }
 
@@ -150,6 +154,12 @@ impl Language {
             .iter()
             .copied()
             .find(|lang| lang.extensions().contains(&ext))
+    }
+
+    /// False for languages the architecture model cannot extract symbols from (shell scripts
+    /// would otherwise appear as empty packages and parse-error noise).
+    pub(crate) fn has_symbol_extraction(self) -> bool {
+        self != Language::Bash
     }
 
     /// Convenience wrapper over [`Language::from_extension`] for a whole `Path`.

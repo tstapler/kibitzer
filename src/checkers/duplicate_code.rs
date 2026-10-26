@@ -5,6 +5,7 @@ use anyhow::Result;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::file_size::is_generated;
+use crate::checkers::import_preamble::{lang_ext, non_preamble_windows};
 
 /// Minimum number of consecutive lines a duplicated block must span before flagging —
 /// short repeats (a closing brace, a single `return nil`) are normal, not copy-paste.
@@ -50,17 +51,19 @@ impl Checker for DuplicateCodeChecker {
             "**/*.java",
             "**/*.kt",
             "**/*.rs",
+            "**/*.sh",
+            "**/*.bash",
         ]
     }
 
-    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
         // Generated code (protoc, ORM codegen, etc.) mechanically repeats boilerplate
         // per message/entity type; "extract a shared function" isn't actionable on code
         // nobody hand-edits. See docs/duplicate-code-false-positives.md's 2026-09-12 entry.
         if is_generated(ctx.source) {
             return Ok(Vec::new());
         }
-        Ok(find_duplicate_blocks(ctx.source))
+        Ok(find_duplicate_blocks(ctx.source, lang_ext(file)))
     }
 }
 
@@ -78,22 +81,11 @@ inventory::submit! {
 /// shifted start) that all repeat in lockstep — reported once via `covered_until`,
 /// which skips any candidate group whose first occurrence falls inside a block already
 /// reported, the same way the block's later lines would.
-fn find_duplicate_blocks(source: &str) -> Vec<Finding> {
+fn find_duplicate_blocks(source: &str, ext: &str) -> Vec<Finding> {
     let normalized: Vec<String> = source.lines().map(|l| l.trim().to_string()).collect();
-    if normalized.len() < MIN_BLOCK_LINES {
-        return Vec::new();
-    }
 
     let mut occurrences: HashMap<&[String], Vec<usize>> = HashMap::new();
-    for start in 0..=(normalized.len() - MIN_BLOCK_LINES) {
-        let window = &normalized[start..start + MIN_BLOCK_LINES];
-        if window.iter().any(|l| l.is_empty()) {
-            continue;
-        }
-        let total_chars: usize = window.iter().map(|l| l.len()).sum();
-        if total_chars < MIN_BLOCK_CHARS {
-            continue;
-        }
+    for (start, window) in non_preamble_windows(&normalized, ext) {
         occurrences.entry(window).or_default().push(start);
     }
 
@@ -143,9 +135,12 @@ pub struct CrossFileDuplicate {
 /// one, and only reported once a group spans at least two distinct files: a block that
 /// only repeats within a single file is `duplicate-code`'s finding, not this one's.
 pub fn find_cross_file_duplicates(files: &[(PathBuf, String)]) -> Vec<CrossFileDuplicate> {
-    let normalized: Vec<Vec<String>> = files
+    let normalized: Vec<(&Path, Vec<String>)> = files
         .iter()
-        .map(|(_, src)| src.lines().map(|l| l.trim().to_string()).collect())
+        .map(|(path, src)| {
+            let lines = src.lines().map(|l| l.trim().to_string()).collect();
+            (path.as_path(), lines)
+        })
         .collect();
     let occurrences = index_cross_file_windows(&normalized);
     group_cross_file_duplicates(occurrences, files)
@@ -156,10 +151,12 @@ pub fn find_cross_file_duplicates(files: &[(PathBuf, String)]) -> Vec<CrossFileD
 /// the multi-file counterpart to `find_duplicate_blocks`'s single-file occurrence map.
 /// Borrows its window keys from `normalized`, which the caller must keep alive at least
 /// as long as the returned map.
-fn index_cross_file_windows(normalized: &[Vec<String>]) -> HashMap<&[String], Vec<(usize, usize)>> {
+fn index_cross_file_windows<'a>(
+    normalized: &'a [(&Path, Vec<String>)],
+) -> HashMap<&'a [String], Vec<(usize, usize)>> {
     let mut occurrences: HashMap<&[String], Vec<(usize, usize)>> = HashMap::new();
-    for (file_idx, lines) in normalized.iter().enumerate() {
-        for (start, window) in qualifying_windows(lines) {
+    for (file_idx, (path, lines)) in normalized.iter().enumerate() {
+        for (start, window) in non_preamble_windows(lines, lang_ext(path)) {
             occurrences
                 .entry(window)
                 .or_default()
@@ -185,9 +182,8 @@ pub(crate) fn qualifying_window(lines: &[String], start: usize) -> Option<&[Stri
 }
 
 /// Every `MIN_BLOCK_LINES`-line qualifying window in `lines`, as `(0-indexed start,
-/// window slice)` — the shared "slide a window and filter" loop every caller that scans
-/// a file's lines for duplicate candidates builds on (`index_cross_file_windows` here,
-/// and `duplicate_cross_file_checker`'s incremental per-file index).
+/// window slice)`. Callers outside this file go through `non_preamble_windows`, which
+/// layers the import-preamble filter on top.
 pub(crate) fn qualifying_windows(lines: &[String]) -> impl Iterator<Item = (usize, &[String])> {
     let starts = if lines.len() < MIN_BLOCK_LINES {
         0..0
@@ -268,6 +264,18 @@ fn check_source(src: &str) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scans_shell_scripts_in_both_checker_and_default_config() {
+        assert!(DuplicateCodeChecker.file_globs().contains(&"**/*.sh"));
+        assert!(DuplicateCodeChecker.file_globs().contains(&"**/*.bash"));
+        for name in ["duplicate-code", "duplicate-code-cross-file"] {
+            let defaults = crate::config::default_checks();
+            let check = defaults.iter().find(|c| c.name == name).unwrap();
+            assert!(check.scope.iter().any(|g| g == "**/*.sh"), "{name}");
+            assert!(check.scope.iter().any(|g| g == "**/*.bash"), "{name}");
+        }
+    }
 
     #[test]
     fn does_not_flag_a_block_repeated_only_twice() {

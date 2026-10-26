@@ -375,6 +375,9 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
+            used_as_value: false,
         }
     }
 
@@ -388,6 +391,9 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
+            used_as_value: false,
         }
     }
 

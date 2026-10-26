@@ -20,6 +20,7 @@ kibitzer feature; it doesn't need a dependency for what dict + json already do.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -104,8 +105,66 @@ def build_permalink(owner: str, repo: str, sha: str, rec: dict) -> str:
     return f"https://github.com/{owner}/{repo}/blob/{sha}/{rec['file']}#{fragment}"
 
 
+# Keep in sync with `SKIP_DIRS` in src/check.rs, which `kibitzer run` applies.
+SKIP_DIRS = frozenset({
+    ".git", "node_modules", "vendor", "target", "dist", "build", ".next",
+    "__pycache__", ".venv", "venv", ".tox", ".gradle", ".mvn", "out",
+})
+
+
+def matches_recursive_glob(path: Path, pattern: str) -> bool:
+    parts = path.parts
+    tokens = ("**", *Path(pattern).parts)
+
+    def match(i: int, j: int) -> bool:
+        if j == len(tokens):
+            return i == len(parts)
+        if tokens[j] == "**":
+            return match(i, j + 1) or (i < len(parts) and match(i + 1, j))
+        return i < len(parts) and fnmatch.fnmatchcase(parts[i], tokens[j]) and match(i + 1, j + 1)
+
+    return match(0, 0)
+
+
+def _corpus_git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return subprocess.run(
+        ["git", "-c", "core.fsmonitor=false", "-C", str(root), *args],
+        capture_output=True, env=env, timeout=30,
+    )
+
+
+def corpus_files(repo_dir: Path, glob: str) -> list[str]:
+    """Files matching `glob`, honoring .gitignore and SKIP_DIRS like `kibitzer run`.
+
+    Falls back to a plain walk when `repo_dir` isn't a git checkout.
+    """
+    repo_dir = repo_dir.resolve()
+    ignored = _corpus_git(repo_dir, "check-ignore", "-q", ".")
+    listed = _corpus_git(repo_dir, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if ignored.returncode == 1 and listed.returncode == 0:
+        candidates = [os.fsdecode(p) for p in listed.stdout.split(b"\0") if p]
+    else:
+        candidates = [str(p.relative_to(repo_dir)) for p in repo_dir.rglob("*") if p.is_file()]
+    files = set()
+    for rel in candidates:
+        path = repo_dir / rel
+        if SKIP_DIRS.intersection(Path(rel).parts) or (path.is_symlink() and path.is_dir()):
+            continue
+        if not path.resolve().is_relative_to(repo_dir):
+            continue
+        if path.is_dir() and (path / ".git").exists():
+            files.update(
+                str(Path(rel) / child) for child in corpus_files(path, "*")
+                if matches_recursive_glob(Path(rel) / child, glob)
+            )
+        elif matches_recursive_glob(Path(rel), glob) and path.is_file():
+            files.add(rel)
+    return sorted(files)
+
+
 def run_native_outputs(repo_dir: Path, checker: str, glob: str, kibitzer_bin: str) -> list[str]:
-    files = sorted(str(p.relative_to(repo_dir)) for p in repo_dir.rglob(glob) if p.is_file())
+    files = corpus_files(repo_dir, glob)
 
     def check_one(rel_path: str) -> str:
         result = subprocess.run(
@@ -290,7 +349,10 @@ def main() -> None:
     p_list.set_defaults(func=cmd_list)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        parser.exit(1, f"Corpus operation failed: {error}\n")
 
 
 if __name__ == "__main__":

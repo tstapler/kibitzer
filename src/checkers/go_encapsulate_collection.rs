@@ -18,6 +18,10 @@ use crate::node_kind::GoKind;
 /// doing its own defensive copy (or something else this check shouldn't second-guess).
 /// Struct-field resolution is same-file only: a receiver type declared in another file
 /// is silently skipped rather than guessed at.
+///
+/// Skipped as not worth flagging: `_test.go` files (a fake's getter exists to hand back
+/// the slice the test seeded) and exported fields (any caller can already mutate the
+/// field directly, so a copying getter protects nothing).
 pub struct EncapsulateCollectionChecker;
 
 impl Checker for EncapsulateCollectionChecker {
@@ -37,8 +41,12 @@ impl Checker for EncapsulateCollectionChecker {
         &["**/*.go"]
     }
 
-    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        if is_generated(ctx.source) {
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        let is_test_file = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("_test.go"));
+        if is_test_file || is_generated(ctx.source) {
             return Ok(Vec::new());
         }
         let tree = ctx
@@ -73,6 +81,9 @@ fn check_method(method: Node, root: Node, src: &[u8]) -> Option<Finding> {
     let receiver_name = receiver_type_name(method, src)?;
     let (recv_var, field_name) = sole_return_of_receiver_field(method, src)?;
     if recv_var != receiver_var_name(method, src)? {
+        return None;
+    }
+    if field_name.starts_with(char::is_uppercase) {
         return None;
     }
 
@@ -303,6 +314,30 @@ mod tests {
     fn does_not_flag_a_free_function() {
         let src = "package p\n\nfunc Items(s *S) []int {\n\treturn s.items\n}\n";
         assert!(go_findings(src).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_a_getter_returning_an_exported_field() {
+        let src = "package p\n\ntype S struct {\n\tItems []int\n}\n\nfunc (s *S) GetItems() []int {\n\treturn s.Items\n}\n";
+        assert!(go_findings(src).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_a_test_files_fake() {
+        let src = "package p\n\ntype fake struct {\n\titems []int\n}\n\nfunc (f *fake) Items() []int {\n\treturn f.items\n}\n";
+        let tree = crate::test_support::parse_go(src).unwrap();
+        let ctx = CheckContext {
+            source: src,
+            tree: Some(&tree),
+        };
+        let in_test = EncapsulateCollectionChecker
+            .check(Path::new("pkg/thing_test.go"), &ctx)
+            .unwrap();
+        let in_source = EncapsulateCollectionChecker
+            .check(Path::new("pkg/thing.go"), &ctx)
+            .unwrap();
+        assert!(in_test.is_empty(), "got: {in_test:?}");
+        assert_eq!(in_source.len(), 1, "got: {in_source:?}");
     }
 
     #[test]

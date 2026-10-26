@@ -1,0 +1,1 @@
+{"commit": "9d502917ac3d6d7af38e47dc6bed435b59f918e1", "file": "check.sh", "line": 44, "note": "\"    OK\" status echo; display text, not a magic value", "permalink": "https://github.com/gohugoio/hugo/blob/9d502917ac3d6d7af38e47dc6bed435b59f918e1/check.sh#L44", "rule": "replace-magic-literal", "verdict": "false_positive"}

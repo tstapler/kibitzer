@@ -206,6 +206,12 @@ pub struct ArchitectureConfig {
     /// Per-component, per-kind naming pattern rules.
     #[serde(default)]
     pub naming_rules: Vec<NamingRule>,
+    /// `(name, type)` parameter pairs `parameter-object` ignores when clustering — idiomatic
+    /// boilerplate that recurs everywhere without signalling a missing type. Unset means
+    /// `parameter_object::DEFAULT_SUPPRESSED_PAIRS` (`ctx context.Context`, `t *testing.T`, `b *testing.B`); set it
+    /// (even to `[]`) to replace that default outright.
+    #[serde(default)]
+    pub parameter_object_suppress: Option<Vec<(String, String)>>,
 }
 
 /// Hardcoded, portable Go-ecosystem bail-out globs `affected.rs` always checks, on top
@@ -769,11 +775,12 @@ pub fn default_checks() -> Vec<Check> {
 }
 
 /// Mechanical markdown-prose checks. `ai-vocabulary-density`, `filler-phrase-density`,
-/// `formulaic-ai-openers`, `sentence-length-uniformity`, and `em-dash-overuse` are
-/// registered (via `inventory::submit!` in their own modules, so `kibitzer check native
-/// <name>`/an explicit `.claude/inspect.json` entry can still reach them) but deliberately
-/// NOT included here: each carries a real risk of flagging legitimate domain/technical
-/// writing, so they're opt-in per repo rather than on by default.
+/// `formulaic-ai-openers`, `sentence-length-uniformity`, `em-dash-overuse`, and
+/// `hollow-qualifier-phrasing` are registered (via `inventory::submit!` in their own
+/// modules, so `kibitzer check native <name>`/an explicit `.claude/inspect.json` entry can
+/// still reach them) but deliberately NOT included here: each carries a real risk of
+/// flagging legitimate domain/technical writing, so they're opt-in per repo rather than
+/// on by default.
 ///
 /// `sentence-length-uniformity` was originally wired in here as purely structural (word
 /// counts only, no word lists) — backtesting against kubernetes/website found it flagging
@@ -840,6 +847,8 @@ fn core_checks() -> Vec<Check> {
                 "**/*.java",
                 "**/*.kt",
                 "**/*.rs",
+                "**/*.sh",
+                "**/*.bash",
             ],
         ),
         native_check(
@@ -855,6 +864,8 @@ fn core_checks() -> Vec<Check> {
                 "**/*.java",
                 "**/*.kt",
                 "**/*.rs",
+                "**/*.sh",
+                "**/*.bash",
             ],
         ),
     ]
@@ -917,6 +928,7 @@ fn file_size_checks() -> Vec<Check> {
     vec![
         native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
         whole_repo_check("go-package-size", "package-size"),
+        whole_repo_check("parameter-object", "parameter-object"),
         native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
         native_check("tsx-file-size", Severity::Advisory, &["**/*.tsx"]),
         native_check(
@@ -932,6 +944,11 @@ fn file_size_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("rust-file-size", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "bash-file-size",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -956,6 +973,11 @@ fn syntax_rules_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("syntax-rules-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "syntax-rules-bash",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -981,6 +1003,11 @@ fn comment_quality_checks() -> Vec<Check> {
             &["**/*.kt", "**/*.kts"],
         ),
         native_check("comment-quality-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "comment-quality-bash",
+            Severity::Advisory,
+            &["**/*.sh", "**/*.bash"],
+        ),
     ]
 }
 
@@ -1434,10 +1461,10 @@ mod tests {
     }
 
     #[test]
-    fn default_checks_still_registers_all_eight_syntax_rules_checkers() {
+    fn default_checks_still_registers_all_nine_syntax_rules_checkers() {
         // Regression guard for `replace-magic-literal` (validation.md): this rule needed
         // zero edits to `syntax_rules_checks()` since it rides along inside the existing
-        // per-language `SyntaxRulesChecker` — this locks in that the 8 pre-existing
+        // per-language `SyntaxRulesChecker` — this locks in that all 9
         // `syntax-rules-*` checker names are still exactly what's registered, catching an
         // accidental checker-registration change future work might introduce.
         let defaults = default_checks();
@@ -1452,11 +1479,25 @@ mod tests {
             "syntax-rules-java",
             "syntax-rules-kotlin",
             "syntax-rules-rust",
+            "syntax-rules-bash",
         ] {
             assert!(
                 names.contains(expected),
                 "missing default check: {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn default_checks_register_bash_comment_quality_and_file_size() {
+        let defaults = default_checks();
+        for name in ["comment-quality-bash", "bash-file-size"] {
+            let check = defaults
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing default check: {name}"));
+            assert!(check.scope.iter().any(|g| g == "**/*.sh"), "{name}");
+            assert!(check.scope.iter().any(|g| g == "**/*.bash"), "{name}");
         }
     }
 
@@ -1488,6 +1529,25 @@ mod tests {
                 .any(|f| f.message.contains("[replace-magic-literal]")),
             "expected a replace-magic-literal finding, got: {findings:?}"
         );
+    }
+
+    #[test]
+    fn hollow_qualifier_phrasing_is_opt_in_but_reachable_by_name() {
+        assert!(
+            !default_checks()
+                .iter()
+                .any(|c| c.name == "hollow-qualifier-phrasing"
+                    || c.checker.as_deref() == Some("hollow-qualifier-phrasing")),
+            "hollow-qualifier-phrasing must stay opt-in"
+        );
+        let findings = crate::checker::run_checker_configured(
+            "hollow-qualifier-phrasing",
+            Path::new("doc.md"),
+            "# The primitive, generically\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]

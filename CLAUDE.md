@@ -12,7 +12,7 @@ architecture model, a `command` a project must supply) goes in
 remember. `comment-quality-<lang>` (`docs/comment-quality.md`) is wired in
 this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
-`duplicate-code-cross-file`, `file-complexity`, `inline-ignore` (reports
+`duplicate-code-cross-file`, `parameter-object` (`docs/parameter-object-false-positives.md`), `file-complexity`, `inline-ignore` (reports
 malformed `kibitzer:ignore` directives; the directives themselves are applied to
 every checker's findings, see `docs/suppressing-checks.md`), the Go-specific
 `go-blank-imports`/`go-ignored-error`/`go-error-context`, and the mechanical
@@ -27,6 +27,17 @@ same way — see `docs/plugins.md`.
 `testdata/comment-quality-corpus/` holds a hand-labeled how/why/ambiguous
 comment corpus for training/testing/tuning a future comment-quality
 classifier — see its README for provenance and known limitations.
+
+## Backtest every functional change
+
+Any change to what kibitzer does — a new or modified checker, a metric or counting
+semantics (e.g. `fan_in_out`), thresholds, parsing/model-building, or a change to which
+files or edits a check sees — needs a backtest before it lands, not just unit tests. Pure
+docs, comment, or test-only changes are exempt. Record what you ran and the before/after
+numbers in the PR or the relevant `docs/` page; a changed result you can't explain is a
+blocker. For a change to existing behavior, compare against the pre-change build
+(`scripts/fan-in-out-backtest.sh` is the model: baseline worktree vs. head, same corpus).
+The two tools below are the means; for a new checker the full procedure follows.
 
 ## Writing a new check
 

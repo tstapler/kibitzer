@@ -191,6 +191,7 @@ impl CommentQualityChecker {
             Language::Java => "comment-quality-java",
             Language::Kotlin => "comment-quality-kotlin",
             Language::Rust => "comment-quality-rust",
+            Language::Bash => "comment-quality-bash",
         }
     }
 }
@@ -227,8 +228,29 @@ impl Checker for CommentQualityChecker {
         // `///` lines are each their own node, verified via `to_sexp()` — is tracked as
         // one fence, not re-opened/closed per line. See `check_commented_out_code`.
         let mut in_fence = false;
-        for comment in &comments {
+        let mut in_pep723_block = false;
+        for (i, comment) in comments.iter().enumerate() {
             let text = comment.utf8_text(ctx.source.as_bytes()).unwrap_or("");
+            // PEP 723 inline script metadata is TOML (`key = value`), which reads as
+            // Python assignments; it is live data, not commentary or dead code.
+            if self.lang == Language::Python {
+                if in_pep723_block {
+                    if is_pep723_sentinel_close(text) {
+                        in_pep723_block = false;
+                    }
+                    continue;
+                }
+                // An opener with no closer anywhere after it is not a block; exempting it
+                // would silence every later comment in the file.
+                if is_pep723_sentinel_open(text)
+                    && comments[i + 1..].iter().any(|c| {
+                        is_pep723_sentinel_close(c.utf8_text(ctx.source.as_bytes()).unwrap_or(""))
+                    })
+                {
+                    in_pep723_block = true;
+                    continue;
+                }
+            }
             // The fix an agent adds for a finding must not itself produce one, so directive
             // lines are blanked; the comment's other lines are still judged.
             if is_directive_only_comment(text) {
@@ -236,21 +258,33 @@ impl Checker for CommentQualityChecker {
             }
             let text = &*without_directive_lines(text);
             check_verbose_phrases(*comment, text, &mut findings);
-            in_fence =
-                check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
+            if !skips_code_heuristics(self.lang) {
+                in_fence =
+                    check_commented_out_code(*comment, text, ctx.source, in_fence, &mut findings);
+            }
         }
 
-        let cfg = rules::lang_config(self.lang);
-        walk_declarations_for_proportionality(
-            tree.root_node(),
-            &cfg,
-            kinds,
-            ctx.source.as_bytes(),
-            &mut findings,
-        );
+        if !skips_code_heuristics(self.lang) {
+            let cfg = rules::lang_config(self.lang);
+            walk_declarations_for_proportionality(
+                tree.root_node(),
+                &cfg,
+                kinds,
+                ctx.source.as_bytes(),
+                &mut findings,
+            );
+        }
 
         Ok(findings)
     }
+}
+
+/// `commented-out-code` and `over-commented` are C-family-shaped; all 9 bash findings from
+/// those two rules in the backtest triage (docs/backtest-triage/bash-2026-10-18.md) were
+/// false positives (usage examples, `#key=value` metadata, why-comments). Only
+/// `verbose-comment` runs for bash until they are tuned for shell.
+fn skips_code_heuristics(lang: Language) -> bool {
+    lang == Language::Bash
 }
 
 fn collect_comments<'a>(node: Node<'a>, kinds: &[&str], out: &mut Vec<Node<'a>>) {
@@ -431,6 +465,22 @@ fn is_brace_closing_annotation(comment: Node, src: &str) -> bool {
         return false;
     };
     before.trim().trim_end_matches([';', ',']).trim_end() == "}"
+}
+
+/// Whether `text` opens a PEP 723 block (`# /// <type>`). The type must start with an
+/// alphanumeric so the closing `# ///` is never mistaken for an open.
+fn is_pep723_sentinel_open(text: &str) -> bool {
+    text.trim()
+        .strip_prefix('#')
+        .and_then(|rest| rest.trim_start().strip_prefix("///"))
+        .is_some_and(|rest| rest.trim_start().starts_with(|c: char| c.is_alphanumeric()))
+}
+
+/// Whether `text` closes a PEP 723 block (`# ///`), tolerating surrounding whitespace.
+fn is_pep723_sentinel_close(text: &str) -> bool {
+    text.trim()
+        .strip_prefix('#')
+        .is_some_and(|rest| rest.trim() == "///")
 }
 
 /// Strips the leading comment-marker noise (`//`, `///`, `//!`, `#`, `/*`, `*/`, a
@@ -834,6 +884,11 @@ fn leading_comment_nodes<'a>(decl: Node<'a>, comment_kinds: &[&str], src: &[u8])
             cursor = sibling;
             continue;
         }
+        // Walking backward, a PEP 723 closer is the first line of its block we meet; the
+        // block is metadata, not the declaration's doc comment.
+        if is_pep723_sentinel_close(text) {
+            break;
+        }
         if text
             .lines()
             .any(|line| looks_like_code(strip_comment_markers(line)))
@@ -975,6 +1030,27 @@ mod tests {
     }
 
     #[test]
+    fn bash_skips_code_heuristics_but_keeps_verbose_comment() {
+        // Four comment lines over a multi-line body: Rust flags this as over-commented (see
+        // `rust_flags_over_commented_function`), so only the bash skip can silence it.
+        let src = "# x=$(foo bar)\n# This seamlessly handles requests.\n# It takes a request.\n# It returns a reply.\nhandle() {\n  echo a\n  echo b\n}\n";
+        let findings = run(Language::Bash, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[verbose-comment]")),
+            "findings: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("[commented-out-code]")
+                    && !f.message.contains("[over-commented]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
     fn rust_flags_commented_out_code() {
         let src = "fn f() {\n    // x = do_something(1, 2);\n}\n";
         let findings = run(Language::Rust, src);
@@ -1050,6 +1126,59 @@ mod tests {
                 .any(|f| f.message.contains("[commented-out-code]")),
             "findings: {findings:?}"
         );
+    }
+
+    const PEP723_REPRO: &str = "#!/usr/bin/env python3\n# /// script\n# requires-python = \">=3.11\"\n# dependencies = [\n#   \"rich>=13.0.0\",\n#   \"typer>=0.9.0\",\n# ]\n# ///\n\ndef main():\n    pass\n";
+
+    #[test]
+    fn pep723_inline_script_metadata_block_is_not_flagged() {
+        let findings = run(Language::Python, PEP723_REPRO);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn pep723_block_with_other_type_and_trailing_whitespace_is_not_flagged() {
+        let src = "# /// my-tool\n# dependencies = [\n#   \"rich\",\n# ]\n# ///   \n# x = compute(1, 2)\ndef main():\n    pass\n";
+        let findings = run(Language::Python, src);
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert_eq!(findings[0].line, 6);
+    }
+
+    #[test]
+    fn real_dead_code_after_closed_pep723_block_is_still_flagged() {
+        let src = "# /// script\n# dependencies = [\"rich\"]\n# ///\n# x = compute(1, 2)\ndef main():\n    pass\n";
+        let findings = run(Language::Python, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn pep723_block_directly_above_a_function_is_not_counted_as_its_doc_comment() {
+        let src = "# /// script\n# requires-python = \">=3.11\"\n# dependencies = [\n#   \"rich\",\n# ]\n# ///\ndef main():\n    return 1 + 2\n";
+        let findings = run(Language::Python, src);
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn unclosed_pep723_opener_does_not_silence_later_comments() {
+        let src = "# /// script\n# note\nx = 1\n# y = foo(1)\n";
+        let findings = run(Language::Python, src);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("[commented-out-code]")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn pep723_sentinels_require_a_hash_prefix() {
+        assert!(!is_pep723_sentinel_open("// /// script"));
+        assert!(!is_pep723_sentinel_close("// ///"));
     }
 
     #[test]

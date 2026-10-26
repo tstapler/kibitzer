@@ -288,6 +288,16 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             name_finder: field_name,
             is_exported: rust_is_exported,
         },
+        // Architecture-model symbol extraction isn't implemented for shell scripts (they
+        // have no types, and no parameter lists for call-graph analysis) — empty kinds
+        // make a `.sh` file parse to zero symbols instead of being half-supported.
+        Language::Bash => LangSymbolConfig {
+            type_kinds: &[],
+            interface_kinds: &[],
+            function_kinds: &[],
+            name_finder: field_name,
+            is_exported: |_, _| false,
+        },
     }
 }
 
@@ -405,6 +415,9 @@ fn go_type_declaration_symbols(
             exported,
             parent: None,
             is_pure_delegation: false,
+            delegation_field: None,
+            params: vec![],
+            used_as_value: false,
         });
     }
 }
@@ -521,11 +534,23 @@ fn classify_node(
 
     let id = build_id(package_path, parent.as_deref(), &name);
 
-    let is_pure_delegation = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+    let delegating = if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
         && call_graph_supports(language)
-        && node
-            .child_by_field_name("body")
-            .is_some_and(is_pure_delegation_body);
+    {
+        node.child_by_field_name("body").and_then(delegating_call)
+    } else {
+        None
+    };
+    let is_pure_delegation = delegating.is_some();
+    let delegation_field = delegating
+        .filter(|_| symbol_kind == SymbolKind::Method)
+        .and_then(|call| delegation_field_from_call(node, call, language, source));
+
+    let params = if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method) {
+        extract_params(node, language, source)
+    } else {
+        Vec::new()
+    };
 
     Some(SymbolNode {
         id,
@@ -536,7 +561,84 @@ fn classify_node(
         exported,
         parent,
         is_pure_delegation,
+        delegation_field,
+        params,
+        used_as_value: false,
     })
+}
+
+/// True if `node` is, or contains, an anonymous function (closure/arrow).
+fn contains_anonymous_function(node: Node) -> bool {
+    if ANONYMOUS_FUNCTION_KINDS.contains(&node.kind()) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(contains_anonymous_function)
+}
+
+/// `(name, type_text)` pairs for a function/method's parameters, receiver excluded. Go
+/// and TypeScript/TSX only; every other language returns empty. A Go `a, b int` group
+/// yields one pair per name; an unnamed parameter yields `("", type)`.
+// SEAM(typed-node-kind-migration): TS/TSX parameter kinds are matched by raw string
+// since both grammars share the same spellings — see ADR-001.
+fn extract_params(node: Node, language: Language, source: &str) -> Vec<(String, String)> {
+    let Some(list) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = list.walk();
+    match language {
+        Language::Go => {
+            for decl in list.children(&mut cursor) {
+                let Some(ty) = decl.child_by_field_name("type") else {
+                    continue;
+                };
+                let mut ty_text = node_text(ty, source).to_string();
+                match decl.kind() {
+                    "parameter_declaration" => {}
+                    "variadic_parameter_declaration" => ty_text.insert_str(0, "..."),
+                    _ => continue,
+                }
+                let mut nc = decl.walk();
+                let names: Vec<_> = decl.children_by_field_name("name", &mut nc).collect();
+                if names.is_empty() {
+                    out.push((String::new(), ty_text));
+                } else {
+                    out.extend(
+                        names
+                            .into_iter()
+                            .map(|n| (node_text(n, source).to_string(), ty_text.clone())),
+                    );
+                }
+            }
+        }
+        Language::TypeScript | Language::Tsx => {
+            for param in list.children(&mut cursor) {
+                if !matches!(param.kind(), "required_parameter" | "optional_parameter") {
+                    continue;
+                }
+                let Some(pattern) = param.child_by_field_name("pattern") else {
+                    continue;
+                };
+                // `this` is a type-only pseudo-parameter, not a real argument.
+                if node_text(pattern, source) == "this" {
+                    continue;
+                }
+                let ty = param
+                    .child_by_field_name("type")
+                    .map(|t| {
+                        node_text(t, source)
+                            .trim_start_matches(':')
+                            .trim()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                out.push((node_text(pattern, source).to_string(), ty));
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 // SEAM(typed-node-kind-migration): raw `.kind()` comparisons against Go's
@@ -580,15 +682,18 @@ const CALL_EXPRESSION_KIND: &str = "call_expression";
 /// Fowler's *Inline Function* shape. Go wraps a `return`'s value(s) in an
 /// `expression_list` (so `return a(), b()` correctly doesn't match); TS/JS's
 /// `return_statement` holds the call directly.
-fn is_pure_delegation_body(body: Node) -> bool {
+fn delegating_call(body: Node) -> Option<Node> {
     let stmts = body_statements(body);
     let [stmt] = stmts.as_slice() else {
-        return false;
+        return None;
     };
+    // A closure holds its own logic rather than merely forwarding.
+    if contains_anonymous_function(*stmt) {
+        return None;
+    }
+    let is_call = |n: &Node| n.kind() == CALL_EXPRESSION_KIND;
     match stmt.kind() {
-        "expression_statement" => stmt
-            .named_child(0)
-            .is_some_and(|c| c.kind() == CALL_EXPRESSION_KIND),
+        "expression_statement" => stmt.named_child(0).filter(is_call),
         "return_statement" => {
             let mut cursor = stmt.walk();
             let values: Vec<Node> = stmt
@@ -596,18 +701,76 @@ fn is_pure_delegation_body(body: Node) -> bool {
                 .filter(|c| c.is_named())
                 .collect();
             match values.as_slice() {
-                [value] if value.kind() == CALL_EXPRESSION_KIND => true,
+                [value] if is_call(value) => Some(*value),
                 [value] if value.kind() == "expression_list" => {
                     let mut c2 = value.walk();
                     let exprs: Vec<Node> =
                         value.children(&mut c2).filter(|c| c.is_named()).collect();
-                    matches!(exprs.as_slice(), [expr] if expr.kind() == CALL_EXPRESSION_KIND)
+                    match exprs.as_slice() {
+                        [expr] if is_call(expr) => Some(*expr),
+                        _ => None,
+                    }
                 }
-                _ => false,
+                _ => None,
             }
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// The receiver field a pure-delegation method routes through: `s.inner.Foo()` (Go, where
+/// `s` is the method's receiver) or `this.inner.foo()` (TS/JS) gives `Some("inner")`.
+/// `None` for a bare/free call, a call chained off another call (`s.Get().Foo()`), a
+/// deeper chain (`s.a.b.Foo()`), or any language `call_graph_supports` excludes.
+///
+/// Non-goal (typed-node-kind-migration): the `.kind()` string comparisons below span the
+/// Go and TS/JS grammars at once, so no single `<Lang>Kind` enum covers them (ADR-001).
+fn delegation_field_from_call(
+    method: Node,
+    call: Node,
+    language: Language,
+    source: &str,
+) -> Option<String> {
+    let (access_kind, operand_field, member_field) = match language {
+        Language::Go => ("selector_expression", "operand", "field"),
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            ("member_expression", "object", "property")
+        }
+        _ => return None,
+    };
+    let callee = call.child_by_field_name("function")?;
+    if callee.kind() != access_kind {
+        return None;
+    }
+    let field_access = callee.child_by_field_name(operand_field)?;
+    if field_access.kind() != access_kind {
+        return None;
+    }
+    let base = field_access.child_by_field_name(operand_field)?;
+    let base_is_receiver = match language {
+        Language::Go => {
+            base.kind() == "identifier"
+                && go_receiver_name(method, source) == Some(node_text(base, source))
+        }
+        _ => base.kind() == "this",
+    };
+    if !base_is_receiver {
+        return None;
+    }
+    let field = field_access.child_by_field_name(member_field)?;
+    Some(node_text(field, source).to_string())
+}
+
+/// Name of a Go method's receiver parameter (`s` in `func (s *S) Foo()`); `None` when the
+/// receiver is unnamed or blank (`_`).
+fn go_receiver_name<'s>(method: Node, source: &'s str) -> Option<&'s str> {
+    let receiver = method.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let param = receiver
+        .children(&mut cursor)
+        .find(|c| GoKind::of(*c) == GoKind::ParameterDeclaration)?;
+    let name = node_text(param.child_by_field_name("name")?, source);
+    (name != "_").then_some(name)
 }
 
 fn walk(
@@ -654,6 +817,68 @@ pub fn extract_symbols_for_file(
         &mut symbols,
     );
     symbols
+}
+
+/// Bare identifiers in value positions, kept separate from invocation edges.
+pub(crate) fn function_value_names(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+) -> std::collections::HashSet<String> {
+    fn is_value(mut node: Node) -> bool {
+        while let Some(parent) = node.parent() {
+            let field_is_node = |field| parent.child_by_field_name(field) == Some(node);
+            // Value-position shapes span Go and JS/TS (typed-node-kind-migration non-goal).
+            match parent.kind() {
+                "parenthesized_expression" | "literal_element" => node = parent,
+                "as_expression" | "satisfies_expression" | "non_null_expression"
+                    if parent.named_child(0) == Some(node) =>
+                {
+                    node = parent
+                }
+                "index_expression" if field_is_node("operand") => node = parent,
+                "ternary_expression"
+                    if field_is_node("consequence") || field_is_node("alternative") =>
+                {
+                    node = parent
+                }
+                "member_expression" | "selector_expression"
+                    if field_is_node("property") || field_is_node("field") =>
+                {
+                    node = parent
+                }
+                "arguments" | "argument_list" | "return_statement" | "array" | "literal_value" => {
+                    return true;
+                }
+                "keyed_element" | "pair" | "variable_declarator" | "var_spec" | "const_spec" => {
+                    return field_is_node("value");
+                }
+                "assignment_expression" | "assignment_statement" | "short_var_declaration" => {
+                    return field_is_node("right");
+                }
+                "expression_list" => node = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+    fn visit(node: Node, source: &str, names: &mut std::collections::HashSet<String>) {
+        if (["identifier", "property_identifier", "field_identifier"].contains(&node.kind())
+            && is_value(node))
+            || node.kind() == "shorthand_property_identifier"
+        {
+            names.insert(node_text(node, source).to_string());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(child, source, names);
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    if call_graph_supports(language) {
+        visit(tree.root_node(), source, &mut names);
+    }
+    names
 }
 
 /// One call site found inside a function/method body: the id of the enclosing
@@ -710,12 +935,46 @@ struct CallWalkCtx<'a> {
     package_path: &'a str,
 }
 
+/// Anonymous function node kinds (Go `func_literal`, JS/TS arrows and function expressions).
+/// A call inside one of these with no named enclosing function — a test-framework
+/// `describe(() => { helper(); })` or ginkgo `var _ = Describe(func() { helper() })` at
+/// module level — is attributed to [`MODULE_LEVEL_CALLBACK`] instead of being dropped.
+const ANONYMOUS_FUNCTION_KINDS: &[&str] = &[
+    "func_literal",
+    "arrow_function",
+    "function_expression",
+    "function",
+    "generator_function",
+];
+
+/// Synthetic caller name prefix for a call in a module-level anonymous callback; the full id is
+/// `{package}::<module-level callback @{start_byte}>`, one per outermost callback. Each callback
+/// is a distinct caller (a helper used from five `it(...)` blocks has five callers), so it must
+/// not collapse into a single shared id, which would make a helper called from many callbacks
+/// look like it has exactly one caller.
+const MODULE_LEVEL_CALLBACK: &str = "<module-level callback";
+
 /// Recursive walk pairing each `call_expression` with its nearest *named* enclosing
 /// function/method — an anonymous callback (e.g. a JS arrow function with no `name`
 /// field) doesn't get its own caller context, so calls inside it attribute to whichever
 /// named declaration encloses it instead, matching `classify_node`'s existing "no
-/// resolvable name → no symbol" behavior for such nodes.
-fn walk_calls(node: Node, ctx: &CallWalkCtx, caller: Option<&str>, out: &mut Vec<RawCallSite>) {
+/// resolvable name → no symbol" behavior for such nodes. With no named declaration
+/// enclosing it either, a call inside an anonymous function takes the synthetic
+/// [`MODULE_LEVEL_CALLBACK`] caller; a bare package-level initializer (`var x = Bar()`) is
+/// still dropped, as it has no callback to attribute to. `callback` is the start byte of the
+/// outermost enclosing anonymous function, if any.
+fn walk_calls(
+    node: Node,
+    ctx: &CallWalkCtx,
+    caller: Option<&str>,
+    callback: Option<usize>,
+    out: &mut Vec<RawCallSite>,
+) {
+    let callback = callback.or_else(|| {
+        ANONYMOUS_FUNCTION_KINDS
+            .contains(&node.kind())
+            .then(|| node.start_byte())
+    });
     let mut current_caller = caller.map(str::to_string);
     // SEAM(typed-node-kind-migration): `function_kinds` is `LangSymbolConfig`'s seamed
     // `&'static [&'static str]` field, shared across all languages by this one function
@@ -730,12 +989,16 @@ fn walk_calls(node: Node, ctx: &CallWalkCtx, caller: Option<&str>, out: &mut Vec
     // JavaScript vocabulary reached from one function body (per `call_graph_supports`)
     // — see ADR-001. Surfaced during Story 4.1.1's completeness sweep, alongside the
     // already-seamed `function_kinds.contains` check just above.
+    let module_level_caller =
+        |start: usize| format!("{}::{MODULE_LEVEL_CALLBACK} @{start}>", ctx.package_path);
     if node.kind() == "call_expression"
-        && let Some(caller_id) = &current_caller
+        && let Some(caller_id) = current_caller
+            .clone()
+            .or_else(|| callback.map(module_level_caller))
         && let Some(callee_text) = callee_text_for(node, ctx.source)
     {
         out.push(RawCallSite {
-            caller_id: caller_id.clone(),
+            caller_id,
             callee_text,
             file: PathBuf::new(),
             line: node.start_position().row + 1,
@@ -744,7 +1007,7 @@ fn walk_calls(node: Node, ctx: &CallWalkCtx, caller: Option<&str>, out: &mut Vec
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_calls(child, ctx, current_caller.as_deref(), out);
+        walk_calls(child, ctx, current_caller.as_deref(), callback, out);
     }
 }
 
@@ -770,7 +1033,7 @@ pub fn extract_call_sites_for_file(
         package_path,
     };
     let mut sites = Vec::new();
-    walk_calls(tree.root_node(), &ctx, None, &mut sites);
+    walk_calls(tree.root_node(), &ctx, None, None, &mut sites);
     sites
 }
 
@@ -2070,6 +2333,55 @@ mod tests {
     }
 
     #[test]
+    fn ts_call_in_a_module_level_callback_gets_the_synthetic_caller() {
+        let sites = call_sites(
+            Language::TypeScript,
+            "describe('s', () => {\n  it('x', () => { helper(); });\n});\n",
+            "pkg",
+        );
+        let helper: Vec<_> = sites.iter().filter(|s| s.callee_text == "helper").collect();
+        assert_eq!(helper.len(), 1, "got: {sites:?}");
+        assert!(
+            helper[0]
+                .caller_id
+                .starts_with("pkg::<module-level callback @"),
+            "got: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn each_module_level_callback_is_a_distinct_caller() {
+        let sites = call_sites(
+            Language::TypeScript,
+            "describe('a', () => { helper(); });\ndescribe('b', () => { helper(); });\n",
+            "pkg",
+        );
+        let ids: std::collections::BTreeSet<_> = sites
+            .iter()
+            .filter(|s| s.callee_text == "helper")
+            .map(|s| s.caller_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2, "got: {sites:?}");
+    }
+
+    #[test]
+    fn go_call_in_a_package_level_func_literal_gets_the_synthetic_caller() {
+        let sites = call_sites(
+            Language::Go,
+            "package pkg\n\nvar _ = Describe(func() {\n\thelper()\n})\n",
+            "pkg",
+        );
+        let helper: Vec<_> = sites.iter().filter(|s| s.callee_text == "helper").collect();
+        assert_eq!(helper.len(), 1, "got: {sites:?}");
+        assert!(
+            helper[0]
+                .caller_id
+                .starts_with("pkg::<module-level callback @"),
+            "got: {sites:?}"
+        );
+    }
+
+    #[test]
     fn ts_bare_and_member_calls_both_attribute_to_enclosing_function() {
         let sites = call_sites(
             Language::TypeScript,
@@ -2684,6 +2996,72 @@ mod tests {
     // checker's own tests, so an AST-shape regression can be localized without also
     // touching caller-counting/export-filtering.
 
+    fn pairs(symbols: &[SymbolNode], name: &str) -> Vec<(String, String)> {
+        find_by_name(symbols, name).params.clone()
+    }
+
+    fn pair(n: &str, t: &str) -> (String, String) {
+        (n.to_string(), t.to_string())
+    }
+
+    #[test]
+    fn params_go_expands_shared_type_groups_and_excludes_the_receiver() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg
+
+type T struct{}
+
+func (t *T) Do(a, b string, n int, rest ...int) {}
+",
+            "pkg",
+        );
+        assert_eq!(
+            pairs(&symbols, "Do"),
+            vec![
+                pair("a", "string"),
+                pair("b", "string"),
+                pair("n", "int"),
+                pair("rest", "...int")
+            ]
+        );
+    }
+
+    #[test]
+    fn params_go_unnamed_parameter_has_an_empty_name() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg
+
+func f(int, string) {}
+",
+            "pkg",
+        );
+        assert_eq!(
+            pairs(&symbols, "f"),
+            vec![pair("", "int"), pair("", "string")]
+        );
+    }
+
+    #[test]
+    fn params_typescript_strips_the_annotation_colon() {
+        let symbols = extract(
+            Language::TypeScript,
+            "function f(a: string, b?: number, c) {}\n",
+            "pkg",
+        );
+        assert_eq!(
+            pairs(&symbols, "f"),
+            vec![pair("a", "string"), pair("b", "number"), pair("c", "")]
+        );
+    }
+
+    #[test]
+    fn params_empty_for_unsupported_languages() {
+        let symbols = extract(Language::Python, "def f(a, b):\n    pass\n", "pkg");
+        assert!(pairs(&symbols, "f").is_empty());
+    }
+
     #[test]
     fn is_pure_delegation_true_for_a_go_bare_call_body() {
         let symbols = extract(
@@ -2692,6 +3070,22 @@ mod tests {
             "pkg",
         );
         assert!(find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    #[test]
+    fn is_pure_delegation_false_when_the_call_wraps_a_closure() {
+        let go = extract(
+            Language::Go,
+            "package pkg\n\nfunc reg() {\n\tonce.Do(func() {\n\t\tx()\n\t})\n}\n",
+            "pkg",
+        );
+        assert!(!find_by_name(&go, "reg").is_pure_delegation);
+        let ts = extract(
+            Language::TypeScript,
+            "function reg() {\n  return list.map((x) => x + 1);\n}\n",
+            "pkg",
+        );
+        assert!(!find_by_name(&ts, "reg").is_pure_delegation);
     }
 
     #[test]
@@ -2772,5 +3166,159 @@ mod tests {
         // regardless of body shape, since there's no call-graph signal to pair it with.
         let symbols = extract(Language::Rust, "fn thin() {\n\thelper();\n}\n", "pkg");
         assert!(!find_by_name(&symbols, "thin").is_pure_delegation);
+    }
+
+    // --- `delegation_field` (remove-middle-man checker's input) ---
+
+    #[test]
+    fn delegation_field_set_for_a_go_field_delegation() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{ inner T }\ntype T struct{}\n\nfunc (s *S) Foo() int {\n\treturn s.inner.Foo()\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "Foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_go_direct_method_call() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{}\n\nfunc (s *S) Foo() {\n\ts.bar()\n}\n",
+            "pkg",
+        );
+        let foo = find_by_name(&symbols, "Foo");
+        assert!(foo.is_pure_delegation);
+        assert_eq!(foo.delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_go_call_chained_off_a_call() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{}\n\nfunc (s *S) Foo() {\n\ts.Get().Foo()\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "Foo").delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_go_package_level_selector() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{}\n\nfunc (s *S) Foo() {\n\tlog.Default.Println()\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "Foo").delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_typescript_field_delegation() {
+        let symbols = extract(
+            Language::TypeScript,
+            "class S {\n  foo(x: number) { return this.inner.foo(x); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_typescript_call_chained_off_a_call() {
+        let symbols = extract(
+            Language::TypeScript,
+            "class S {\n  foo() { return this.get().foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "foo").delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_javascript_field_delegation() {
+        let symbols = extract(
+            Language::JavaScript,
+            "class S {\n  foo() { this.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_tsx_field_delegation() {
+        let symbols = extract(
+            Language::Tsx,
+            "class S {\n  foo() { return this.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_a_typescript_non_this_receiver() {
+        let symbols = extract(
+            Language::TypeScript,
+            "class S {\n  foo() { return other.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        let foo = find_by_name(&symbols, "foo");
+        assert!(foo.is_pure_delegation, "precondition");
+        assert_eq!(foo.delegation_field, None);
+    }
+
+    #[test]
+    fn delegation_field_none_for_go_receivers_that_cannot_own_a_field() {
+        let cases = [
+            ("unnamed receiver", "func (S) Foo() { x.inner.Foo() }"),
+            ("blank receiver", "func (_ S) Foo() { x.inner.Foo() }"),
+            (
+                "base is not the receiver",
+                "func (s S) Foo() { other.inner.Foo() }",
+            ),
+            (
+                "chain deeper than one field",
+                "func (s S) Foo() { s.a.b.Foo() }",
+            ),
+        ];
+        for (label, method) in cases {
+            let src = format!("package pkg\n\ntype S struct{{}}\n\n{method}\n");
+            let symbols = extract(Language::Go, &src, "pkg");
+            let foo = find_by_name(&symbols, "Foo");
+            assert!(foo.is_pure_delegation, "{label}: precondition");
+            assert_eq!(foo.delegation_field, None, "{label}");
+        }
+    }
+
+    #[test]
+    fn delegation_field_set_for_a_go_value_receiver() {
+        let symbols = extract(
+            Language::Go,
+            "package pkg\n\ntype S struct{ inner T }\ntype T struct{}\n\nfunc (s S) Foo() { s.inner.Foo() }\n",
+            "pkg",
+        );
+        assert_eq!(
+            find_by_name(&symbols, "Foo").delegation_field.as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn delegation_field_none_for_rust_even_with_a_field_call() {
+        let symbols = extract(
+            Language::Rust,
+            "struct S { inner: T }\nimpl S {\n    fn foo(&self) { self.inner.foo(); }\n}\n",
+            "pkg",
+        );
+        assert_eq!(find_by_name(&symbols, "foo").delegation_field, None);
     }
 }
