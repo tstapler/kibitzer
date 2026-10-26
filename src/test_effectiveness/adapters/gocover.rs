@@ -133,6 +133,9 @@ fn test_id_from_file_name(path: &Path) -> Result<TestId, GoCoverError> {
     Ok(TestId::new(decode_package(pkg).ok_or_else(invalid)?, test))
 }
 
+/// Bounds per-line expansion so a hostile `1.1,4000000000.1` row cannot exhaust memory.
+const MAX_BLOCK_LINES: u32 = 100_000;
+
 /// Adds one line per covered line of each block to `lines`; `file -> line -> hits`. Blocks with count 0 are ignored.
 fn parse_profile(
     file: &Path,
@@ -174,6 +177,9 @@ fn parse_profile(
             .zip(line_of(end))
             .filter(|(a, b)| a <= b)
             .ok_or_else(|| bad(n, "block range is not `line.col,line.col`"))?;
+        if last - first > MAX_BLOCK_LINES {
+            return Err(bad(n, "block spans an implausible number of lines"));
+        }
         if count == 0 {
             continue;
         }
@@ -335,6 +341,15 @@ mod tests {
             .filter(|(_, p)| p.tests.contains(&ord))
             .map(|(u, _)| (u.file.clone(), u.line))
             .collect()
+    }
+
+    #[test]
+    fn parse_profile_should_Reject_When_BlockSpansImplausibleLineCount() {
+        let mut lines = BTreeMap::new();
+        let text = "mode: set\na.go:1.1,4000000000.1 1 1\n";
+        let err = parse_profile(Path::new("p.out"), text, &mut lines).unwrap_err();
+        assert!(matches!(err, GoCoverError::Malformed { line: 2, .. }));
+        assert!(lines.is_empty());
     }
 
     #[test]
