@@ -316,13 +316,13 @@ fn test_no_assertion_should_ReportZero_When_KnownFalseNegativeWeakOracle() {
         ("python", "weak_oracle_test.py", "test-no-assertion-python"),
         ("kotlin", "WeakOracleTest.kt", "test-no-assertion-kotlin"),
     ] {
-        let path = fixture_path(dir, file);
-        let source = std::fs::read_to_string(&path).unwrap();
+        let source = std::fs::read_to_string(fixture_path(dir, file)).unwrap();
         assert!(
             source.contains("known false negative: weak oracle"),
             "{file} header must label the gap"
         );
-        assert!(run_source(checker, &path, &source, None).is_empty());
+        // Bare name: a `testdata/` path is skipped as non-test code, which would pass vacuously.
+        assert!(run_source(checker, Path::new(file), &source, None).is_empty());
     }
 }
 

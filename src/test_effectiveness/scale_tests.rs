@@ -365,10 +365,15 @@ impl Format {
 /// `KIBITZER_SCALE_FORMATS=pit,stryker` narrows the ignored umbrella test to those formats.
 fn selected_formats() -> Vec<Format> {
     let wanted = std::env::var("KIBITZER_SCALE_FORMATS").unwrap_or_default();
-    ALL_FORMATS
+    let selected: Vec<Format> = ALL_FORMATS
         .into_iter()
         .filter(|f| wanted.is_empty() || wanted.split(',').any(|w| w == f.name()))
-        .collect()
+        .collect();
+    assert!(
+        !selected.is_empty(),
+        "KIBITZER_SCALE_FORMATS={wanted:?} matches no format"
+    );
+    selected
 }
 
 fn create(path: &Path) -> BufWriter<std::fs::File> {
