@@ -922,11 +922,23 @@ fn scope_line_verdicts(
         // Output doesn't follow the convention at all — can't scope it, leave untouched.
         return None;
     }
+    // An indented line right after an attributed one continues that finding's multi-line
+    // message, so it shares the headline's verdict instead of surviving it as an orphan.
+    let mut last_headline: Option<bool> = None;
     let keep: Vec<bool> = attributed
         .iter()
-        .map(|line_no| match line_no {
-            Some(n) => ranges.iter().any(|(start, end)| n >= start && n <= end),
-            None => true,
+        .zip(lines)
+        .map(|(line_no, line)| match line_no {
+            Some(n) => {
+                let kept = ranges.iter().any(|(start, end)| n >= start && n <= end);
+                last_headline = Some(kept);
+                kept
+            }
+            None if line.starts_with([' ', '\t']) => last_headline.unwrap_or(true),
+            None => {
+                last_headline = None;
+                true
+            }
         })
         .collect();
     // Any surviving non-empty line, attributed or not, is a failure.
@@ -1563,6 +1575,11 @@ fn run_checks_for_trigger_unbudgeted(
             run_ctx,
         )?);
     }
+    apply_test_quality_cap(
+        &mut results,
+        trigger,
+        crate::config::test_quality_hook_cap(),
+    );
     let extra = crate::inline_post_pass::run(crate::inline_post_pass::PostPassInput {
         checks,
         file_path,
@@ -1577,6 +1594,20 @@ fn run_checks_for_trigger_unbudgeted(
     });
     results.extend(extra);
     Ok(results)
+}
+
+/// Collapses test-quality findings beyond `cap` into one `+N more` line, in hook mode only
+/// (`kibitzer run` uses the `batch` trigger and passes no cap). A `None` cap never collapses.
+pub(crate) fn apply_test_quality_cap(
+    results: &mut [CheckResult],
+    trigger: &str,
+    cap: Option<usize>,
+) {
+    if let Some(n) = cap
+        && trigger != "batch"
+    {
+        crate::test_code::collapse_over_cap(results, n);
+    }
 }
 
 fn relativize(root: &Path, path: &Path) -> String {

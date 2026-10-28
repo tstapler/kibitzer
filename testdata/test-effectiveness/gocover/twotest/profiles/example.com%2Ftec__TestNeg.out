@@ -1,0 +1,6 @@
+mode: set
+example.com/tec/classify.go:4.29,5.11 1 1
+example.com/tec/classify.go:5.11,7.3 1 1
+example.com/tec/classify.go:8.2,8.12 1 0
+example.com/tec/classify.go:8.12,10.3 1 0
+example.com/tec/classify.go:11.2,11.14 1 0

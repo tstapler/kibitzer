@@ -99,6 +99,7 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("isp-fat-interface", OwnerMatch::Unowned),
     rule("remove-middle-man", OwnerMatch::Unowned),
     rule("unreferenced-private-symbol", OwnerMatch::Unowned),
+    rule("test-no-assertion", OwnerMatch::Prefix("test-no-assertion")),
     rule("go-type-switch-density", OwnerMatch::SameName),
     rule("go-encapsulate-collection", OwnerMatch::SameName),
     meta_rule("inline-ignore", OwnerMatch::SameName),

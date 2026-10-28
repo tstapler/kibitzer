@@ -1,0 +1,1 @@
+{"schemaVersion":"2","framework":{"name":"StrykerJS","version":"9.0.1"},"files":{"src/calc.js":{"language":"javascript","source":"","mutants":[{"id":"0","mutatorName":"ArithmeticOperator","replacement

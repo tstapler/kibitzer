@@ -1,0 +1,148 @@
+{"repo":"GoogleContainerTools/skaffold","file":"cmd/skaffold/app/cmd/flags_test.go","line":63,"tag":"no-panic-smoke","reason":"TestAddFlagsSmoke: AddFlags smoke over all commands, nothing checked"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/docker/debugger/debug_test.go","line":30,"tag":"no-panic-smoke","reason":"TestZeroValue: nil DebugManager methods, comment says no nil deref"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/docker/logger/log_test.go","line":29,"tag":"no-panic-smoke","reason":"TestDockerLoggerZeroValue: nil Logger methods, no nil deref"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/k8sjob/logger/log_test.go","line":25,"tag":"no-panic-smoke","reason":"TestK8sJobLoggerZeroValue: nil Logger methods"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/debugging/container_manager_test.go","line":151,"tag":"no-panic-smoke","reason":"TestContainerManagerZeroValue: nil ContainerManager methods"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/logger/log_test.go","line":96,"tag":"no-panic-smoke","reason":"TestLogAggregatorZeroValue: nil LogAggregator methods"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/portforward/forwarder_manager_test.go","line":75,"tag":"no-panic-smoke","reason":"TestForwarderManagerZeroValue: nil ForwarderManager methods"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":49,"tag":"false-positive","reason":"TestGetDeployments: testutil.Run closure asserts via t.CheckErrorAndDeepEqual (custom wrapper assertions)"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":233,"tag":"false-positive","reason":"TestGetDeployStatus: testutil.Run closure asserts via t.CheckError/CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":314,"tag":"false-positive","reason":"TestPrintSummaryStatus: testutil.Run closure asserts via t.CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":391,"tag":"false-positive","reason":"TestPrintStatus: testutil.Run closure asserts via t.CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":484,"tag":"false-positive","reason":"TestCounterCopy: testutil.Run closure asserts via t.CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":513,"tag":"false-positive","reason":"TestResourceMarkProcessed: testutil.Run closure asserts via t.CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/kubernetes/status/status_check_test.go","line":558,"tag":"false-positive","reason":"TestPollDeployment: testutil.Run closure asserts via t.CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/verify/docker/verify_test.go","line":77,"tag":"false-positive","reason":"Test_UseLocalImages: testutil.T CheckError/CheckDeepEqual"}
+{"repo":"GoogleContainerTools/skaffold","file":"pkg/skaffold/verify/docker/verify_test.go","line":154,"tag":"false-positive","reason":"TestGetContainerName: testutil.Run closure asserts via t.CheckDeepEqual"}
+{"repo":"IBM/sarama","file":"async_producer_race_test.go","line":9,"tag":"race-smoke","reason":"TestRetryHandlerHeadersRace: name and body: retryHandler headers race"}
+{"repo":"IBM/sarama","file":"balance_strategy_test.go","line":2098,"tag":"race-smoke","reason":"Test_stickyBalanceStrategy_Plan_data_race: data_race in name, 1000 goroutines call Plan"}
+{"repo":"IBM/sarama","file":"consumer_test.go","line":1747,"tag":"race-smoke","reason":"TestPartitionConsumerBrokerRace: BrokerRace; GOMAXPROCS(2) iterations"}
+{"repo":"argoproj/argo-rollouts","file":"analysis/controller_test.go","line":388,"tag":"lifecycle-smoke","reason":"TestRun: start and stop controller, comment says so"}
+{"repo":"argoproj/argo-rollouts","file":"experiments/controller_test.go","line":908,"tag":"lifecycle-smoke","reason":"TestRun: start and stop controller"}
+{"repo":"argoproj/argo-rollouts","file":"rollout/templateref_test.go","line":400,"tag":"no-panic-smoke","reason":"TestRequeueReferencedRollouts_InvalidMeta: nil args to updateRolloutsReferenceAnnotation, invalid meta"}
+{"repo":"argoproj/argo-rollouts","file":"rollout/trafficrouting/istio/controller_test.go","line":235,"tag":"lifecycle-smoke","reason":"TestRun: start and stop controller"}
+{"repo":"argoproj/argo-rollouts","file":"rollout/trafficrouting/traefik/traefik_test.go","line":50,"tag":"untagged","reason":"TestNewDynamicClient: constructor call, result ignored (coverage-only)"}
+{"repo":"argoproj/argo-rollouts","file":"service/service_test.go","line":240,"tag":"lifecycle-smoke","reason":"TestRun: start and stop controller"}
+{"repo":"argoproj/argo-rollouts","file":"utils/apisix/apisix_test.go","line":11,"tag":"untagged","reason":"TestNewDynamicClient: constructor call, result ignored (coverage-only)"}
+{"repo":"argoproj/argo-rollouts","file":"utils/controller/controller_test.go","line":440,"tag":"no-panic-smoke","reason":"TestWatchResourceHandleStop: WatchResource on a stopped watch returns; nothing asserted"}
+{"repo":"aws/aws-sdk-go-v2","file":"aws/ratelimit/token_bucket_test.go","line":93,"tag":"race-smoke","reason":"TestTokenBucketParallel: Parallel token bucket goroutines"}
+{"repo":"aws/aws-sdk-go-v2","file":"aws/retry/adaptive_token_bucket_test.go","line":93,"tag":"race-smoke","reason":"TestAdaptiveTokenBucketParallel: Parallel adaptive bucket goroutines"}
+{"repo":"aws/aws-sdk-go-v2","file":"aws/transport/http/timeout_read_closer_test.go","line":33,"tag":"untagged","reason":"TestTimeoutReadCloser: Read then t.Log(err) only"}
+{"repo":"aws/aws-sdk-go-v2","file":"aws/transport/http/timeout_read_closer_test.go","line":48,"tag":"untagged","reason":"TestTimeoutReadCloserSameDuration: Read then t.Log(err) only"}
+{"repo":"cortexproject/cortex","file":"pkg/chunk/cache/memcached_test.go","line":161,"tag":"lifecycle-smoke","reason":"TestMemcacheStop: helper testMemcachedStopping: Store, go Fetch, Stop; no asserts (helper read)"}
+{"repo":"cortexproject/cortex","file":"pkg/scheduler/fragment_table/fragment_table_test.go","line":107,"tag":"race-smoke","reason":"TestFragmentTable_ConcurrentAccess: ConcurrentAccess goroutines"}
+{"repo":"cortexproject/cortex","file":"pkg/scheduler/queue/user_queues_test.go","line":461,"tag":"race-smoke","reason":"TestQueueConcurrency: QueueConcurrency goroutines"}
+{"repo":"cortexproject/cortex","file":"pkg/util/timer/timer_test.go","line":8,"tag":"no-panic-smoke","reason":"TestStopAndDrainTimer_NilTimer: comment: should not panic on nil timer"}
+{"repo":"cortexproject/cortex","file":"pkg/util/worker_pool_test.go","line":13,"tag":"no-panic-smoke","reason":"TestNewWorkerPool_CreateMultiplesPoolsWithSameRegistry: two pools same registry, only defers Stop (duplicate registration must not panic)"}
+{"repo":"cortexproject/cortex","file":"pkg/util/worker_pool_test.go","line":59,"tag":"liveness-smoke","reason":"TestWorkerPool_ShouldFallbackWhenAllWorkersAreBusy: last job must run to end while workers busy (wg.Wait)"}
+{"repo":"derailed/k9s","file":"internal/model/table_test.go","line":65,"tag":"untagged","reason":"TestTableRmListener: RemoveListener call only"}
+{"repo":"googleapis/google-cloud-go","file":"bigtable/internal/transport/channel_primer_test.go","line":95,"tag":"compile-check","reason":"TestNoOpChannelPrimer_ImplementsChannelPrimer: var _ ChannelPrimer = NoOp..."}
+{"repo":"googleapis/google-cloud-go","file":"bigtable/internal/transport/direct_access_check_session_client_test.go","line":39,"tag":"compile-check","reason":"TestSessionClientDirectAccessChecker_ImplementsInterface: var _ DirectAccessChecker = nil ptr"}
+{"repo":"googleapis/google-cloud-go","file":"bigtable/internal/transport/diverter_test.go","line":94,"tag":"race-smoke","reason":"TestDiverterConcurrentAccess: ConcurrentAccess goroutines"}
+{"repo":"googleapis/google-cloud-go","file":"bigtable/internal/transport/session_test.go","line":369,"tag":"no-panic-smoke","reason":"TestSessionHooks_NilSafe: NilSafe hooks"}
+{"repo":"googleapis/google-cloud-go","file":"bigtable/internal/transport/session_tracer_test.go","line":226,"tag":"no-panic-smoke","reason":"TestSessionTracer_NilHistogramsAreNoOps: comment: early-return without panic"}
+{"repo":"googleapis/google-cloud-go","file":"firestore/query_test.go","line":1422,"tag":"no-panic-smoke","reason":"TestStop_Uninitialized: Stop on uninitialized iterator"}
+{"repo":"googleapis/google-cloud-go","file":"spanner/client_test.go","line":353,"tag":"no-panic-smoke","reason":"TestReadOnlyTransactionClose: comment: shouldn't panic"}
+{"repo":"googleapis/google-cloud-go","file":"spanner/endpoint_lifecycle_manager_test.go","line":318,"tag":"no-panic-smoke","reason":"TestEndpointLifecycleManager_ShutdownIsIdempotent: shutdown twice (idempotent)"}
+{"repo":"googleapis/google-cloud-go","file":"spanner/location_aware_client_test.go","line":1481,"tag":"untagged","reason":"TestLocationAwareSpannerClient_PassThroughRPCs: pass-through calls on mock, results ignored"}
+{"repo":"googleapis/google-cloud-go","file":"spanner/location_router_test.go","line":446,"tag":"no-panic-smoke","reason":"TestLocationRouter_NilSafety: NilSafety calls"}
+{"repo":"googleapis/google-cloud-go","file":"storage/reader_test.go","line":856,"tag":"no-panic-smoke","reason":"TestMRDRunCallbackNilGuard: comment: safely return without panicking"}
+{"repo":"grafana/k6","file":"lib/limiter_test.go","line":26,"tag":"liveness-smoke","reason":"TestSlotLimiterUnlimited: unlimited limiter Begin x3 must not block"}
+{"repo":"grafana/k6","file":"output/cloud/expv2/collect_test.go","line":263,"tag":"race-smoke","reason":"TestBucketQPushPopConcurrency: PushPopConcurrency goroutine (tail read)"}
+{"repo":"kubernetes/ingress-nginx","file":"internal/ingress/status/status_test.go","line":366,"tag":"untagged","reason":"TestCallback: buildStatusSync() call only"}
+{"repo":"kubevirt/kubevirt","file":"staging/src/kubevirt.io/api/apitesting/apitesting_suite_test.go","line":7,"tag":"empty-stub","reason":"TestApitesting: dummy empty body, comment says dummy file"}
+{"repo":"kyverno/kyverno","file":"api/kyverno/v1/match_resources_test.go","line":73,"tag":"no-panic-smoke","reason":"TestMatchResources_Validate_Empty_NoPanic: name NoPanic, t.Logf only"}
+{"repo":"kyverno/kyverno","file":"cmd/cli/kubectl-kyverno/output/color/color_test.go","line":7,"tag":"untagged","reason":"TestInit: Init(flag) calls only"}
+{"repo":"kyverno/kyverno","file":"ext/output/color/color_test.go","line":7,"tag":"untagged","reason":"TestInit: Init(flags) calls only"}
+{"repo":"kyverno/kyverno","file":"pkg/background/common/util_test.go","line":131,"tag":"compile-check","reason":"TestResourceSpecFromUnstructured_ReturnsResourceSpec: var _ ResourceSpec = result"}
+{"repo":"kyverno/kyverno","file":"pkg/background/gpol/dynamic_watcher_test.go","line":1458,"tag":"untagged","reason":"TestHandleAdd: handleAdd call, wantMsg unused"}
+{"repo":"kyverno/kyverno","file":"pkg/cli/loader/worker_test.go","line":171,"tag":"no-panic-smoke","reason":"TestWorkerPool_GracefulShutdown: comment: should not panic or deadlock"}
+{"repo":"kyverno/kyverno","file":"pkg/globalcontext/store/store_test.go","line":142,"tag":"race-smoke","reason":"TestStore_ConcurrentAccess: ConcurrentAccess, comment: passes if no race"}
+{"repo":"kyverno/kyverno","file":"pkg/image/verifiers/ivpol/cosign/opts_test.go","line":379,"tag":"untagged","reason":"TestInitTUFAndFetch_WithCustomMirror: t.Logf only"}
+{"repo":"kyverno/kyverno","file":"pkg/sigstoretuf/sigstoretuf_test.go","line":16,"tag":"race-smoke","reason":"TestConcurrentAccess: comment: absence of data races"}
+{"repo":"kyverno/kyverno","file":"pkg/version/version_test.go","line":79,"tag":"no-panic-smoke","reason":"TestPrintVersionInfo: comment: should not panic"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"connector/servicegraphconnector/connector_test.go","line":717,"tag":"no-panic-smoke","reason":"TestUpdateDurationMetrics: out-of-range latency indexes, nothing checked"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"extension/observer/ecsobserver/error_test.go","line":12,"tag":"untagged","reason":"TestSetInvalidError: comment: for coverage"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"internal/aws/cwlogs/pusher_test.go","line":296,"tag":"race-smoke","reason":"TestLogPusherConcurrentAddAndFlush: ConcurrentAddAndFlush"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"pkg/datadog/agentcomponents/zaplogger_test.go","line":17,"tag":"compile-check","reason":"TestZapLogger_Interface: var _ tracelog.Logger = &ZapLogger{}"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"pkg/stanza/operator/helper/ip_resolver_test.go","line":52,"tag":"no-panic-smoke","reason":"TestIPResolverWithMultipleStops: Stop twice"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"processor/tailsamplingprocessor/internal/sampling/util_test.go","line":20,"tag":"no-panic-smoke","reason":"TestSetAttrOnScopeSpans_Empty: empty traces input, nothing checked"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"receiver/nsxtreceiver/scraper_test.go","line":135,"tag":"no-panic-smoke","reason":"TestScraperRecordNoStat: nil stats, nothing checked"}
+{"repo":"open-telemetry/opentelemetry-collector-contrib","file":"receiver/nsxtreceiver/scraper_test.go","line":149,"tag":"no-panic-smoke","reason":"TestScraperRecordInterfaceNoStat: nil stats, nothing checked"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/core_test.go","line":392,"tag":"liveness-smoke","reason":"TestMembership_Wake_UnblocksSleep: Wake unblocks Sleep, <-done"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/core_test.go","line":407,"tag":"no-panic-smoke","reason":"TestMembership_Wake_IsIdempotent: comment: must not panic"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/core_test.go","line":418,"tag":"liveness-smoke","reason":"TestMembership_Sleep_ReturnsOnContextCancellation: Sleep returns on cancelled ctx"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/core_test.go","line":430,"tag":"liveness-smoke","reason":"TestMembership_WakeThenSleep_ReturnsImmediately: Sleep must not block"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/medium_test.go","line":334,"tag":"compile-check","reason":"TestQueueMedium_ImplementsMedium: var _ worker.Medium"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/medium_test.go","line":340,"tag":"compile-check","reason":"TestAccumulatorMedium_ImplementsMedium: var _ worker.Medium"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/medium_test.go","line":344,"tag":"compile-check","reason":"TestChannelMedium_ImplementsMedium: var _ worker.Medium"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/receiver_test.go","line":282,"tag":"compile-check","reason":"TestSeqReceiver_ImplementsReceiver: var _ Receiver = r"}
+{"repo":"openfga/openfga","file":"internal/listobjects/pipeline/internal/worker/util_test.go","line":22,"tag":"liveness-smoke","reason":"TestDrainSender_EmptySender: returns immediately"}
+{"repo":"quic-go/quic-go","file":"internal/wire/pool_test.go","line":9,"tag":"untagged","reason":"TestGetAndPutStreamFrames: get/put pool call only"}
+{"repo":"quic-go/quic-go","file":"internal/wire/pool_test.go","line":20,"tag":"no-panic-smoke","reason":"TestAcceptStreamFramesNotFromBuffer: comment: just checking it doesn't panic"}
+{"repo":"rancher/rancher","file":"pkg/auth/audit/middleware_test.go","line":432,"tag":"untagged","reason":"TestMiddlewareMemoryUsage: t.Logf WARNING only (tail read)"}
+{"repo":"rancher/rancher","file":"pkg/auth/providers/githubapp/github_data_test.go","line":467,"tag":"empty-stub","reason":"TestGitHubAppData_Errors: comments only"}
+{"repo":"rancher/rancher","file":"pkg/auth/providers/githubapp/githubapp_provider_test.go","line":49,"tag":"empty-stub","reason":"TestCustomizeSchema: comment: isn't currently tested"}
+{"repo":"rancher/rancher","file":"pkg/clustermanager/access_control_test.go","line":68,"tag":"race-smoke","reason":"TestAccessControlCanBeReadWhileTheControllersCreateIt: comment: race detector fails this test"}
+{"repo":"rancher/rancher","file":"pkg/ext/stores/kubeconfig/store_test.go","line":2594,"tag":"race-smoke","reason":"TestWatcherStop: concurrent Stop"}
+{"repo":"rancher/rancher","file":"tests/v2/integration/catalogv2/system_charts_version_test.go","line":124,"tag":"empty-stub","reason":"TestSystemChartsVersionSuite: suite.Run commented out"}
+{"repo":"redis/go-redis","file":"command_metadata_test.go","line":637,"tag":"race-smoke","reason":"TestCommandMetadataConcurrentRefreshAndStop: ConcurrentRefreshAndStop"}
+{"repo":"redis/go-redis","file":"extra/redisotel-native/metrics_definitions_test.go","line":41,"tag":"empty-stub","reason":"TestSemconvMetricTypes: subtests with comments only"}
+{"repo":"redis/go-redis","file":"extra/redisotel/metrics_test.go","line":62,"tag":"race-smoke","reason":"Test_poolStatsAttrs_race: _race in name, goroutines"}
+{"repo":"redis/go-redis","file":"hooks_current_race_test.go","line":23,"tag":"race-smoke","reason":"TestHooksMixinCurrentConcurrent: _race_test, concurrent"}
+{"repo":"redis/go-redis","file":"internal/otel/recorder_race_test.go","line":22,"tag":"race-smoke","reason":"TestRegisterPoolsRaceWithSetGlobalRecorder: Race in name"}
+{"repo":"redis/go-redis","file":"internal/pool/conn_onclose_race_test.go","line":22,"tag":"race-smoke","reason":"TestConnOnCloseRaceWithInitConn: Race in name"}
+{"repo":"redis/go-redis","file":"internal/pool/conn_state_alloc_test.go","line":27,"tag":"untagged","reason":"TestInlineSliceAllocations: AllocsPerRun then t.Logf only"}
+{"repo":"redis/go-redis","file":"internal/pool/try_dial_test.go","line":11,"tag":"false-positive","reason":"TestTryDial_AppliesDialTimeoutWhenSet: failure signalled indirectly: dialer returns error -> tryDial retries forever (hang/timeout), no t assertion"}
+{"repo":"redis/go-redis","file":"internal/pool/try_dial_test.go","line":30,"tag":"false-positive","reason":"TestTryDial_DoesNotApplyDialTimeoutWhenDisabled: failure signalled indirectly: dialer error -> tryDial retry loop"}
+{"repo":"redis/go-redis","file":"internal/pool/want_conn_test.go","line":737,"tag":"race-smoke","reason":"TestWantConnQueue_dropFrontDone_ConcurrentWithEnqueue: Concurrent in name; t.Logf (tail not read)"}
+{"repo":"redis/go-redis","file":"internal/pool/want_conn_test.go","line":787,"tag":"race-smoke","reason":"TestWantConnQueue_dropFrontDone_ConcurrentWithDequeue: Concurrent in name"}
+{"repo":"redis/go-redis","file":"internal/util_test.go","line":28,"tag":"false-positive","reason":"TestToLower: gomega Expect inside It()"}
+{"repo":"redis/go-redis","file":"internal/util_test.go","line":44,"tag":"false-positive","reason":"TestIsLower: gomega Expect inside It()"}
+{"repo":"redis/go-redis","file":"internal/util_test.go","line":57,"tag":"false-positive","reason":"TestGetAddr: gomega Expect inside It()"}
+{"repo":"redis/go-redis","file":"log_global_race_test.go","line":23,"tag":"race-smoke","reason":"TestSetLoggerLogLevelConcurrentWithReads: ConcurrentWithReads race"}
+{"repo":"redis/go-redis","file":"maintnotifications/cluster_state_callback_race_test.go","line":18,"tag":"race-smoke","reason":"TestManagerClusterStateReloadCallbackConcurrent: Concurrent callback"}
+{"repo":"redis/go-redis","file":"options_test.go","line":642,"tag":"race-smoke","reason":"TestOptionsCloneMaintNotificationsRace: Race in name"}
+{"repo":"redis/go-redis","file":"push/processor_unit_test.go","line":248,"tag":"race-smoke","reason":"TestProcessorConcurrentAccess: ConcurrentAccess"}
+{"repo":"redis/go-redis","file":"push/processor_unit_test.go","line":279,"tag":"compile-check","reason":"TestProcessorInterfaceCompliance: var _ NotificationProcessor"}
+{"repo":"redis/go-redis","file":"push/push_test.go","line":1605,"tag":"compile-check","reason":"TestInterfaceCompliance: var _ interfaces"}
+{"repo":"redis/go-redis","file":"ring_sharding_race_test.go","line":15,"tag":"race-smoke","reason":"TestRingShardingOnNewNodeConcurrent: Concurrent, comment about in-flight append"}
+{"repo":"siderolabs/talos","file":"cmd/talosctl/pkg/mgmt/helpers/helpers_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"internal/app/machined/pkg/system/runner/runner_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"internal/pkg/containers/containers_test.go","line":11,"tag":"empty-stub","reason":"TestEmpty: comment: replace with real test"}
+{"repo":"siderolabs/talos","file":"internal/pkg/dashboard/components/tables_test.go","line":15,"tag":"no-panic-smoke","reason":"TestUpdate: comment: without the check it panics"}
+{"repo":"siderolabs/talos","file":"internal/pkg/encryption/encryption_test.go","line":11,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"internal/pkg/mount/switchroot/switchroot_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"pkg/grpc/factory/factory_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"pkg/grpc/gen/gen_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"pkg/grpc/middleware/log/annotations_test.go","line":95,"tag":"no-panic-smoke","reason":"TestAnnotateNoMiddleware: comment: no-op, not a panic"}
+{"repo":"siderolabs/talos","file":"pkg/machinery/config/internal/cis/cis_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"pkg/provision/access/access_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"pkg/provision/providers/docker/docker_test.go","line":9,"tag":"empty-stub","reason":"TestEmpty: empty body, coverage placeholder"}
+{"repo":"siderolabs/talos","file":"tools/docgen/main_test.go","line":14,"tag":"untagged","reason":"TestProcessFile: processFiles call, outputs never read"}
+{"repo":"sirupsen/logrus","file":"entry_test.go","line":459,"tag":"race-smoke","reason":"TestEntryLoggerMutationRace: Race in name; helper runEntryLoggerRace asserts nothing (helper read)"}
+{"repo":"sirupsen/logrus","file":"hook_test.go","line":215,"tag":"race-smoke","reason":"TestAddHookRace2: Race in name"}
+{"repo":"sirupsen/logrus","file":"logrus_test.go","line":609,"tag":"no-panic-smoke","reason":"TestLevelString: String() on unknown level, result discarded"}
+{"repo":"sirupsen/logrus","file":"logrus_test.go","line":615,"tag":"race-smoke","reason":"TestGetSetLevelRace: Race in name"}
+{"repo":"sirupsen/logrus","file":"logrus_test.go","line":631,"tag":"race-smoke","reason":"TestLoggingRace: Race in name"}
+{"repo":"sirupsen/logrus","file":"logrus_test.go","line":647,"tag":"race-smoke","reason":"TestLoggingRaceWithHooksOnEntry: Race in name"}
+{"repo":"sirupsen/logrus","file":"logrus_test.go","line":814,"tag":"untagged","reason":"TestReportCallerOnTextFormatter: logging calls only"}
+{"repo":"tidwall/gjson","file":"gjson_test.go","line":350,"tag":"no-panic-smoke","reason":"TestIssue38: comment: should not fail"}
+{"repo":"tidwall/gjson","file":"gjson_test.go","line":657,"tag":"no-panic-smoke","reason":"TestUnescape: edge-case unescape calls, nothing checked"}
+{"repo":"tidwall/gjson","file":"gjson_test.go","line":1110,"tag":"no-panic-smoke","reason":"TestValidRandom: random payload fuzz-ish loop, nothing checked"}
+{"repo":"tidwall/gjson","file":"gjson_test.go","line":2830,"tag":"no-panic-smoke","reason":"TestPathRev: comment: must not panic"}
+{"repo":"uber-go/fx","file":"fxevent/event_test.go","line":30,"tag":"untagged","reason":"TestForCoverage: TestForCoverage"}
+{"repo":"urfave/cli","file":"flag_bool_with_inverse_test.go","line":601,"tag":"compile-check","reason":"TestBoolWithInverseFlag_SatisfiesRequiredFlagInterface: var f RequiredFlag = &X{} interface satisfaction"}
+{"repo":"urfave/cli","file":"flag_bool_with_inverse_test.go","line":607,"tag":"compile-check","reason":"TestBoolWithInverseFlag_SatisfiesVisibleFlagInterface: interface satisfaction"}
+{"repo":"urfave/cli","file":"flag_test.go","line":3703,"tag":"compile-check","reason":"TestGenericFlag_SatisfiesFlagInterface: interface satisfaction"}
+{"repo":"urfave/cli","file":"flag_test.go","line":3729,"tag":"compile-check","reason":"TestGenericFlag_SatisfiesFmtStringerInterface: interface satisfaction"}
+{"repo":"urfave/cli","file":"flag_test.go","line":3735,"tag":"compile-check","reason":"TestGenericFlag_SatisfiesRequiredFlagInterface: interface satisfaction"}
+{"repo":"urfave/cli","file":"flag_test.go","line":3741,"tag":"compile-check","reason":"TestGenericFlag_SatisfiesVisibleFlagInterface: interface satisfaction"}
+{"repo":"urfave/cli","file":"flag_test.go","line":3747,"tag":"compile-check","reason":"TestGenericFlag_SatisfiesDocFlagInterface: interface satisfaction"}
+{"repo":"vmware/govmomi","file":"govc/main_test.go","line":15,"tag":"no-panic-smoke","reason":"TestMain: flag registration for all commands; flag redefinition panics"}
+{"repo":"vmware/govmomi","file":"simulator/authorization_manager_test.go","line":14,"tag":"no-panic-smoke","reason":"TestAuthorizationManager: comment: 2nd pass panics w/o copying"}
+{"repo":"vmware/govmomi","file":"task/wait_test.go","line":17,"tag":"untagged","reason":"TestCallbackFn: t.Logf only"}
+{"repo":"vmware/govmomi","file":"toolbox/power_test.go","line":12,"tag":"untagged","reason":"TestPowerCommandHandler: comment: cover nil Handler paths"}
+{"repo":"vmware/govmomi","file":"vim25/mo/type_info_test.go","line":14,"tag":"untagged","reason":"TestLoadAll: newTypeInfo loop only"}
+{"repo":"vmware/govmomi","file":"vim25/mo/type_info_test.go","line":20,"tag":"no-panic-smoke","reason":"TestApplyPropertyChange: nil/empty ref change values, nothing checked"}
+{"repo":"vmware/govmomi","file":"vim25/xml/marshal_test.go","line":2390,"tag":"race-smoke","reason":"TestRace9796: Race9796 in name, concurrent Marshal"}

@@ -1,0 +1,1 @@
+{"schema_version":1,"tool":"pit","tool_version":"1.15.0","commit":"298cc15","attribution":"isolated","tests_total":240,"mutants_total":1930,"mutants_run":1930,"sampled_fraction":1.0,"budget_seconds":null,"budget_exhausted":false,"partial":false}

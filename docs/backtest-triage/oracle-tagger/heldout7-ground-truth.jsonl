@@ -1,0 +1,143 @@
+{"repo":"argoproj/argo-workflows","file":"cmd/argoexec/commands/supervisor_test.go","line":72,"tag":"no-panic-smoke","reason":"TestStatusMarker_BestEffortOnUnwritable: calls writeFailureStatusAt on unwritable path; comment says must not panic"}
+{"repo":"argoproj/argo-workflows","file":"util/deprecation/deprecation_test.go","line":12,"tag":"no-panic-smoke","reason":"TestUninitalized: Record on uninitialized metrics; no panic"}
+{"repo":"argoproj/argo-workflows","file":"workflow/controller/controller_test.go","line":751,"tag":"no-panic-smoke","reason":"TestWorkflowController_archivedWorkflowGarbageCollector: runs garbage collector once, nothing asserted"}
+{"repo":"argoproj/argo-workflows","file":"workflow/controller/controller_test.go","line":1100,"tag":"no-panic-smoke","reason":"TestReleaseAllWorkflowLocks: three t.Run calls of releaseAllWorkflowLocks with nil/other objects"}
+{"repo":"aws/amazon-ecs-agent","file":"agent/dockerclient/dockerapi/docker_events_buffer_test.go","line":28,"tag":"liveness-smoke","reason":"TestProduceConsume: producer/consumer 10000 events through buffer; completes only if nothing blocks"}
+{"repo":"aws/amazon-ecs-agent","file":"agent/engine/execcmd/manager_init_task_windows_test.go","line":28,"tag":"empty-stub","reason":"TestInitializeContainer: empty function body (Windows stub)"}
+{"repo":"aws/amazon-ecs-agent","file":"agent/engine/task_manager_test.go","line":958,"tag":"liveness-smoke","reason":"TestWaitForContainerTransitionsForNonTerminalTask: waitForTransition must return after two events"}
+{"repo":"aws/amazon-ecs-agent","file":"agent/engine/task_manager_test.go","line":1004,"tag":"liveness-smoke","reason":"TestWaitForContainerTransitionsForTerminalTask: waitForTransition must not block on second event (comment)"}
+{"repo":"aws/amazon-ecs-agent","file":"agent/engine/task_manager_test.go","line":2075,"tag":"liveness-smoke","reason":"TestWaitForResourceTransition: waitForTransition returns after resource event"}
+{"repo":"aws/amazon-ecs-agent","file":"ecs-agent/netlib/platform/iptables_linux_test.go","line":63,"tag":"untagged","reason":"TestModifyNetfilterEntry: table of iptables actions; errors only t.Logf'd"}
+{"repo":"aws/amazon-ecs-agent","file":"ecs-agent/netlib/platform/iptables_linux_test.go","line":151,"tag":"untagged","reason":"TestEnableSysctlSetting: error only t.Logf'd"}
+{"repo":"aws/amazon-ecs-agent","file":"ecs-agent/netlib/platform/iptables_linux_test.go","line":257,"tag":"untagged","reason":"TestSetupIPv6NAT: error only t.Logf'd"}
+{"repo":"aws/amazon-ecs-agent","file":"ecs-agent/netlib/platform/iptables_linux_test.go","line":286,"tag":"untagged","reason":"TestSetupIPv4NAT: error only t.Logf'd"}
+{"repo":"aws/amazon-ecs-agent","file":"ecs-agent/netlib/platform/iptables_linux_test.go","line":296,"tag":"untagged","reason":"TestSetupNAT: error only t.Logf'd"}
+{"repo":"aws/amazon-ecs-agent","file":"ecs-agent/netlib/platform/managed_linux_test.go","line":1120,"tag":"untagged","reason":"TestAddDaemonBridgeNATRule: error only t.Logf'd"}
+{"repo":"cert-manager/cert-manager","file":"pkg/controller/clusterissuers/sync_test.go","line":42,"tag":"empty-stub","reason":"TestSync: empty function body"}
+{"repo":"cert-manager/cert-manager","file":"pkg/controller/issuers/sync_test.go","line":43,"tag":"empty-stub","reason":"TestSync: empty function body"}
+{"repo":"cloudflare/cloudflared","file":"datagramsession/session_test.go","line":185,"tag":"race-smoke","reason":"TestMarkActiveNotBlocking: 50 goroutines call markActive, WaitGroup; -race oracle"}
+{"repo":"cloudflare/cloudflared","file":"management/logger_test.go","line":13,"tag":"no-panic-smoke","reason":"TestLoggerWrite_NoSessions: logger write with no sessions"}
+{"repo":"cloudflare/cloudflared","file":"management/service_test.go","line":62,"tag":"liveness-smoke","reason":"TestReadEventsLoop_ContextCancelled: readEvents must return when ctx cancelled"}
+{"repo":"cloudflare/cloudflared","file":"signal/safe_signal_test.go","line":7,"tag":"no-panic-smoke","reason":"TestMultiNotifyDoesntCrash: double Notify; comment says reaching here is the pass condition"}
+{"repo":"cosmos/cosmos-sdk","file":"crypto/hd/hdpath_test.go","line":284,"tag":"no-panic-smoke","reason":"TestDerivePrivateKeyForPathDoNotCrash: fuzz-found paths must not crash; results discarded"}
+{"repo":"cosmos/cosmos-sdk","file":"internal/blockstm/txnrunner_test.go","line":502,"tag":"compile-check","reason":"TestTxRunnerInterface: var _ sdk.TxRunner = NewSTMRunner(...) interface assertion only"}
+{"repo":"cosmos/cosmos-sdk","file":"store/cachekv/store_test.go","line":436,"tag":"liveness-smoke","reason":"TestIteratorDeadlock: iterator deadlock regression; blocked forever on regression"}
+{"repo":"cosmos/cosmos-sdk","file":"store/listenkv/store_test.go","line":273,"tag":"no-panic-smoke","reason":"TestListenKVStoreCacheWrap: CacheWrap result discarded"}
+{"repo":"cosmos/cosmos-sdk","file":"store/rootmulti/store_test.go","line":26,"tag":"untagged","reason":"TestStoreType: mounts a store; construction only"}
+{"repo":"cosmos/cosmos-sdk","file":"x/auth/types/account_test.go","line":194,"tag":"no-panic-smoke","reason":"TestModuleAccountValidateNilBaseAccount: Validate on nil base account, result discarded"}
+{"repo":"ethereum/go-ethereum","file":"accounts/abi/bind/v2/base_test.go","line":587,"tag":"no-panic-smoke","reason":"TestCrashers: TestCrashers: abi.JSON results discarded"}
+{"repo":"ethereum/go-ethereum","file":"core/state/snapshot/disklayer_test.go","line":524,"tag":"empty-stub","reason":"TestDiskMidAccountPartialMerge: TODO comment only"}
+{"repo":"ethereum/go-ethereum","file":"core/state/state_test.go","line":187,"tag":"no-panic-smoke","reason":"TestSnapshotEmpty: RevertToSnapshot of empty snapshot"}
+{"repo":"ethereum/go-ethereum","file":"core/txpool/blobpool/conversion_test.go","line":62,"tag":"no-panic-smoke","reason":"TestConversionQueueDoubleClose: double close; comment should not panic"}
+{"repo":"ethereum/go-ethereum","file":"core/txpool/legacypool/list_test.go","line":58,"tag":"no-panic-smoke","reason":"TestListAddVeryExpensive: overflow gas price Add; results discarded, only t.Logf"}
+{"repo":"ethereum/go-ethereum","file":"crypto/crypto_test.go","line":288,"tag":"untagged","reason":"TestPythonIntegration: signs messages, only t.Logf"}
+{"repo":"ethereum/go-ethereum","file":"eth/catalyst/api_test.go","line":396,"tag":"empty-stub","reason":"TestEth2DeepReorg: whole body commented out (TODO broken)"}
+{"repo":"ethereum/go-ethereum","file":"event/event_test.go","line":28,"tag":"no-panic-smoke","reason":"TestSubCloseUnsub: comment: point is not to panic"}
+{"repo":"ethereum/go-ethereum","file":"event/feedof_test.go","line":116,"tag":"liveness-smoke","reason":"TestFeedOfSubscribeBlockedPost: 2000 sends vs subscribe, deadlock regression, loop on ch1 receives"}
+{"repo":"ethereum/go-ethereum","file":"event/feedof_test.go","line":149,"tag":"liveness-smoke","reason":"TestFeedOfUnsubscribeBlockedPost: Unsubscribe while Sends blocked; wg.Wait is oracle"}
+{"repo":"ethereum/go-ethereum","file":"event/feedof_test.go","line":186,"tag":"liveness-smoke","reason":"TestFeedOfUnsubscribeSentChan: Unsubscribe while Send in flight; waits on channels"}
+{"repo":"ethereum/go-ethereum","file":"event/feed_test.go","line":172,"tag":"liveness-smoke","reason":"TestFeedSubscribeBlockedPost: 2000 sends vs subscribe, deadlock regression"}
+{"repo":"ethereum/go-ethereum","file":"event/feed_test.go","line":205,"tag":"liveness-smoke","reason":"TestFeedUnsubscribeBlockedPost: Unsubscribe while Sends blocked; wg.Wait is oracle"}
+{"repo":"ethereum/go-ethereum","file":"event/feed_test.go","line":242,"tag":"liveness-smoke","reason":"TestFeedUnsubscribeSentChan: Unsubscribe while Send in flight; waits on channels"}
+{"repo":"ethereum/go-ethereum","file":"event/subscription_test.go","line":158,"tag":"liveness-smoke","reason":"TestResubscribeWithCompletedSubscription: resubscribe after completed subscription; must not hang"}
+{"repo":"ethereum/go-ethereum","file":"internal/tablewriter/database_tablewriter_test.go","line":25,"tag":"untagged","reason":"TestTableWriterTinyGo: renders table; only t.Logf"}
+{"repo":"ethereum/go-ethereum","file":"metrics/metrics_test.go","line":10,"tag":"untagged","reason":"TestReadRuntimeValues: reads runtime stats; only t.Logf"}
+{"repo":"ethereum/go-ethereum","file":"p2p/enode/nodedb_test.go","line":465,"tag":"no-panic-smoke","reason":"TestDBExpireV5: UpdateFindFailsV5 then expireNodes, nothing asserted"}
+{"repo":"ethereum/go-ethereum","file":"p2p/message_test.go","line":81,"tag":"race-smoke","reason":"TestMsgPipeConcurrentClose: 10 concurrent Close goroutines, no wait"}
+{"repo":"ethereum/go-ethereum","file":"p2p/tracker/tracker_test.go","line":30,"tag":"no-panic-smoke","reason":"TestCleanAfterStop: clean after stop; comment doesn't panic"}
+{"repo":"ethereum/go-ethereum","file":"rlp/encode_test.go","line":490,"tag":"race-smoke","reason":"TestEncodeToReaderReturnToPool: 5 goroutines x1000 EncodeToReader (pool reuse), results discarded"}
+{"repo":"ethereum/go-ethereum","file":"trie/trie_test.go","line":333,"tag":"no-panic-smoke","reason":"TestLargeValue: large value Update then Hash discarded"}
+{"repo":"ethereum/go-ethereum","file":"trie/trie_test.go","line":1206,"tag":"no-panic-smoke","reason":"TestDecodeNode: 5M random decodeNode calls, results discarded"}
+{"repo":"go-delve/delve","file":"_fixtures/buildtest/main_test.go","line":12,"tag":"untagged","reason":"TestCurrentDirectory: only t.Logf of working directory"}
+{"repo":"go-delve/delve","file":"pkg/terminal/command_test.go","line":232,"tag":"no-panic-smoke","reason":"TestIssue354: printStack on empty frames (issue 354 crash)"}
+{"repo":"golang-migrate/migrate","file":"database/redshift/redshift_test.go","line":287,"tag":"empty-stub","reason":"TestWithInstance: empty function body"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":7,"tag":"empty-stub","reason":"TestNewMigrations: TODO comment only"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":11,"tag":"empty-stub","reason":"TestAppend: TODO comment only"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":62,"tag":"empty-stub","reason":"TestBuildIndex: TODO comment only"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":66,"tag":"empty-stub","reason":"TestFirst: TODO comment only"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":70,"tag":"empty-stub","reason":"TestPrev: TODO comment only"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":74,"tag":"empty-stub","reason":"TestUp: TODO comment only"}
+{"repo":"golang-migrate/migrate","file":"source/migration_test.go","line":78,"tag":"empty-stub","reason":"TestDown: TODO comment only"}
+{"repo":"jaegertracing/jaeger","file":"cmd/anonymizer/app/anonymizer/anonymizer_test.go","line":95,"tag":"no-panic-smoke","reason":"TestAnonymizer_SaveMapping: SaveMapping results discarded"}
+{"repo":"jaegertracing/jaeger","file":"cmd/jaeger/internal/extension/jaegerquery/internal/jaegerai/aihealth/checker_test.go","line":73,"tag":"liveness-smoke","reason":"TestChecker_StopWithoutStartIsNoOp: Stop without Start; comment must not block or panic"}
+{"repo":"jaegertracing/jaeger","file":"cmd/remote-storage/app/service_test.go","line":23,"tag":"untagged","reason":"TestAddFlags: AddFlags coverage; construction only"}
+{"repo":"jaegertracing/jaeger","file":"empty_test.go","line":12,"tag":"empty-stub","reason":"TestDummy: intentional dummy placeholder test (empty body)"}
+{"repo":"jaegertracing/jaeger","file":"internal/cache/lru_test.go","line":198,"tag":"race-smoke","reason":"TestLRUCacheConcurrentAccess: 20 goroutines x1000 Get with WaitGroup.Go"}
+{"repo":"jaegertracing/jaeger","file":"internal/converter/empty_test.go","line":12,"tag":"empty-stub","reason":"TestDummy: intentional dummy placeholder test (empty body)"}
+{"repo":"jaegertracing/jaeger","file":"internal/converter/thrift/empty_test.go","line":12,"tag":"empty-stub","reason":"TestDummy: intentional dummy placeholder test (empty body)"}
+{"repo":"jaegertracing/jaeger","file":"internal/metrics/metrics_test.go","line":109,"tag":"untagged","reason":"TestNullMetrics: comment: just for cover"}
+{"repo":"jaegertracing/jaeger","file":"internal/telemetry/settings_test.go","line":49,"tag":"no-panic-smoke","reason":"TestReportStatus_NilHost: ReportStatus with nil host; comment should not panic"}
+{"repo":"jaegertracing/jaeger","file":"internal/testutils/logger_test.go","line":41,"tag":"race-smoke","reason":"TestRaceCondition: concurrent Info vs Lines/String on logger buffer"}
+{"repo":"kubernetes-sigs/cluster-api","file":"bootstrap/kubeadm/webhooks/conversion/conversion_test.go","line":44,"tag":"false-positive","reason":"TestFuzzyConversion: assertions live in conversionutil.SpokeConverterFuzzTestFunc returned closure (gomega.NewWithT(t)); verified in util/conversion/conversion.go:298-310"}
+{"repo":"kubernetes-sigs/cluster-api","file":"internal/topology/upgrade/test/t2/v1beta1/conversion_test.go","line":37,"tag":"false-positive","reason":"TestFuzzyConversion: assertions live in conversionutil.FuzzTestFunc returned closure (gomega.NewWithT(t)); util/conversion/conversion.go:195-203"}
+{"repo":"kubernetes-sigs/cluster-api","file":"test/infrastructure/docker/api/v1beta1/conversion_test.go","line":37,"tag":"false-positive","reason":"TestFuzzyConversion: same FuzzTestFunc helper"}
+{"repo":"mattermost/mattermost","file":"server/cmd/mattermost/main_test.go","line":17,"tag":"no-panic-smoke","reason":"TestRunMain: calls main(); nothing asserted"}
+{"repo":"mattermost/mattermost","file":"server/public/model/authorize_test.go","line":12,"tag":"no-panic-smoke","reason":"TestAuthPreSave: PreSave/IsExpired results discarded"}
+{"repo":"mattermost/mattermost","file":"server/public/model/channel_test.go","line":327,"tag":"no-panic-smoke","reason":"TestChannelPreSave: PreSave only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/channel_test.go","line":332,"tag":"no-panic-smoke","reason":"TestChannelPreUpdate: PreUpdate only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/command_test.go","line":134,"tag":"no-panic-smoke","reason":"TestCommandPreSave: PreSave only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/command_test.go","line":139,"tag":"no-panic-smoke","reason":"TestCommandPreUpdate: PreUpdate only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/incoming_webhook_test.go","line":70,"tag":"no-panic-smoke","reason":"TestIncomingWebhookPreSave: PreSave only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/incoming_webhook_test.go","line":75,"tag":"no-panic-smoke","reason":"TestIncomingWebhookPreUpdate: PreUpdate only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/oauth_test.go","line":44,"tag":"no-panic-smoke","reason":"TestOAuthAppPreUpdate: PreUpdate only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/outgoing_webhook_test.go","line":121,"tag":"no-panic-smoke","reason":"TestOutgoingWebhookPreSave: PreSave only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/outgoing_webhook_test.go","line":126,"tag":"no-panic-smoke","reason":"TestOutgoingWebhookPreUpdate: PreUpdate only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/post_test.go","line":893,"tag":"race-smoke","reason":"TestPostPropsDataRace: 7 goroutines on Post props; data-race test"}
+{"repo":"mattermost/mattermost","file":"server/public/model/team_test.go","line":53,"tag":"no-panic-smoke","reason":"TestTeamPreSave: PreSave and Etag only"}
+{"repo":"mattermost/mattermost","file":"server/public/model/team_test.go","line":59,"tag":"no-panic-smoke","reason":"TestTeamPreUpdate: PreUpdate only"}
+{"repo":"mattermost/mattermost","file":"server/public/pluginapi/experimental/bot/poster/default_poster_test.go","line":22,"tag":"compile-check","reason":"TestInterface: NewPoster accepts plugin API client; interface-satisfaction check"}
+{"repo":"mattermost/mattermost","file":"server/public/pluginapi/logrus_test.go","line":90,"tag":"race-smoke","reason":"TestConfigureLogrusConcurrentWithLogging: 4 loggers + 1 ConfigureLogrus concurrently, WaitGroup.Go"}
+{"repo":"open-policy-agent/opa","file":"v1/ast/policy_logical_test.go","line":329,"tag":"no-panic-smoke","reason":"TestExpr_NewExprAcceptsLogicalAndOr: comment: must not panic"}
+{"repo":"pocketbase/pocketbase","file":"core/base_test.go","line":661,"tag":"liveness-smoke","reason":"TestBaseAppTriggerOnTerminate: trigger OnTerminate thrice; comment ensure it doesn't deadlock"}
+{"repo":"projectcalico/calico","file":"apiserver/pkg/apiserver/scheme_test.go","line":22,"tag":"empty-stub","reason":"TestRoundTripTypes: assertions commented out, TODO"}
+{"repo":"projectcalico/calico","file":"felix/cmd/calico-bpf/commands/nat_test.go","line":27,"tag":"untagged","reason":"TestNATDump: dump prints via fmt.Printf"}
+{"repo":"projectcalico/calico","file":"lib/std/intervals/set_test.go","line":97,"tag":"no-panic-smoke","reason":"TestCoalescedEarlyBreak: early break out of iterator"}
+{"repo":"projectcalico/calico","file":"node/pkg/cni/token_watch_internal_test.go","line":714,"tag":"no-panic-smoke","reason":"TestTokenRefresher_StopIsIdempotent: Stop idempotence; comment must not panic"}
+{"repo":"sigstore/cosign","file":"pkg/cosign/env/env_test.go","line":23,"tag":"no-panic-smoke","reason":"TestMustRegisterEnv: comment: should NOT panic"}
+{"repo":"thanos-io/thanos","file":"internal/cortex/chunk/cache/memcached_test.go","line":163,"tag":"lifecycle-smoke","reason":"TestMemcacheStop: Store, Fetch, Stop of memcache; no assertions"}
+{"repo":"thanos-io/thanos","file":"pkg/metadata/proxy_test.go","line":52,"tag":"race-smoke","reason":"TestProxyDataRace: TestProxyDataRace: 100 endpoints, result discarded"}
+{"repo":"thanos-io/thanos","file":"pkg/receive/expandedpostingscache/cache_test.go","line":172,"tag":"race-smoke","reason":"TestLockRaceExpireSeries: 10x 2000 goroutines ExpireSeries vs getSeed"}
+{"repo":"thanos-io/thanos","file":"pkg/receive/handler_test.go","line":2372,"tag":"race-smoke","reason":"TestPeerGroupResetRace: 4 goroutines x1000 on peerGroup"}
+{"repo":"thanos-io/thanos","file":"pkg/rules/proxy_test.go","line":257,"tag":"race-smoke","reason":"TestProxyDataRace: TestProxyDataRace: result discarded"}
+{"repo":"thanos-io/thanos","file":"pkg/store/labelpb/label_zlabel_test.go","line":333,"tag":"discarded-result","reason":"TestSortZLabelSets: sort.Sort then reflect.DeepEqual(expectedResult, list) with result dropped (label_zlabel_test.go:474)"}
+{"repo":"thanos-io/thanos","file":"pkg/targets/proxy_test.go","line":52,"tag":"race-smoke","reason":"TestProxyDataRace: TestProxyDataRace: result discarded"}
+{"repo":"thanos-io/thanos","file":"test/e2e/rule_test.go","line":919,"tag":"empty-stub","reason":"TestRule_CanPersistWALData: TODO comment only"}
+{"repo":"vitessio/vitess","file":"go/event/syslogger/syslogger_test.go","line":124,"tag":"no-panic-smoke","reason":"TestWriteError: dispatch with failing writer; nothing asserted"}
+{"repo":"vitessio/vitess","file":"go/exit/exit_test.go","line":92,"tag":"no-panic-smoke","reason":"TestRecoverNil: defer Recover() on nil"}
+{"repo":"vitessio/vitess","file":"go/mysql/json/json_path_test.go","line":68,"tag":"no-panic-smoke","reason":"Test1: ParseBytes results discarded"}
+{"repo":"vitessio/vitess","file":"go/sqltypes/type_test.go","line":382,"tag":"untagged","reason":"TestPrintTypeChecks: only t.Logf of matches"}
+{"repo":"vitessio/vitess","file":"go/stats/export_test.go","line":108,"tag":"no-panic-smoke","reason":"TestDropVariable: comment: should not panic"}
+{"repo":"vitessio/vitess","file":"go/stats/prometheusbackend/collectors_test.go","line":35,"tag":"untagged","reason":"TestCollector: Counts() result discarded; coverage"}
+{"repo":"vitessio/vitess","file":"go/test/endtoend/vtgate/queries/random/random_expr_test.go","line":27,"tag":"no-panic-smoke","reason":"TestRandomExprWithTables: 100 random expression generations, results discarded"}
+{"repo":"vitessio/vitess","file":"go/timer/rate_limiter_test.go","line":112,"tag":"no-panic-smoke","reason":"TestRateLimiterUninitialized: Stop on uninitialized limiter"}
+{"repo":"vitessio/vitess","file":"go/trace/trace_test.go","line":34,"tag":"no-panic-smoke","reason":"TestFakeSpan: comment: safe to call all methods"}
+{"repo":"vitessio/vitess","file":"go/vt/vterrors/errors_test.go","line":254,"tag":"no-panic-smoke","reason":"TestErrorEquality: comment: mustn't panic"}
+{"repo":"vitessio/vitess","file":"go/vt/vtgate/engine/opcode/constants_test.go","line":30,"tag":"no-panic-smoke","reason":"TestCheckAllAggrOpCodes: comment: never reach the panic"}
+{"repo":"vitessio/vitess","file":"go/vt/vtgate/engine/opcode/constants_test.go","line":165,"tag":"no-panic-smoke","reason":"TestCheckAllWindowOpCodes: comment: never reach the panic"}
+{"repo":"vitessio/vitess","file":"go/vt/vtgate/executorcontext/safe_session_test.go","line":247,"tag":"race-smoke","reason":"TestPrepareDataConcurrentAccess: 100 iterations x3 goroutines; comment: fails under race detector"}
+{"repo":"vitessio/vitess","file":"go/vt/vtgate/grpcvtgateservice/no_test.go","line":35,"tag":"empty-stub","reason":"TestNothing: empty function body (TestNothing)"}
+{"repo":"vitessio/vitess","file":"go/vt/vtgate/vschema_manager_test.go","line":359,"tag":"no-panic-smoke","reason":"TestKeyspaceRoutingRules: comment: doesn't cause a panic"}
+{"repo":"vitessio/vitess","file":"go/vt/vtgate/vtgateconn/vtgateconn_test.go","line":26,"tag":"no-panic-smoke","reason":"TestRegisterDialer: RegisterDialer twice, nothing asserted"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/health_streamer_test.go","line":586,"tag":"liveness-smoke","reason":"TestDeadlockBwCloseAndReload: Close/Open vs reload in parallel; comment: reproduces the deadlock"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/messager/engine_test.go","line":164,"tag":"liveness-smoke","reason":"TestDeadlockBwCloseAndSchemaChange: Close/Open vs schema change in parallel; comment: reproduces the deadlock"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/messager/message_manager_test.go","line":161,"tag":"lifecycle-smoke","reason":"TestMessageManagerState: Open/Close twice with idempotence; no assertions"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/messager/message_manager_test.go","line":371,"tag":"liveness-smoke","reason":"TestMessageManagerFieldSendError: comment: should not hang; waits on done"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/tabletserver_test.go","line":1874,"tag":"no-panic-smoke","reason":"TestHandleExecUnknownError: deferred panic handler around panic"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":412,"tag":"false-positive","reason":"TestSetAndEnum: TestSpec.Run asserts via require.NoError(ts.t, ...) (helper_event_test.go:393-432); TestSpec{t: t}"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":454,"tag":"false-positive","reason":"TestCellValuePadding: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":490,"tag":"false-positive","reason":"TestColumnCollationHandling: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":554,"tag":"false-positive","reason":"TestSetForeignKeyCheck: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":578,"tag":"false-positive","reason":"TestStmtComment: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1336,"tag":"false-positive","reason":"TestFilteredVarBinary: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1381,"tag":"false-positive","reason":"TestPartialFilteredInt: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1423,"tag":"false-positive","reason":"TestFilteredInt: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1469,"tag":"false-positive","reason":"TestSavepoint: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1495,"tag":"false-positive","reason":"TestSavepointWithFilter: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1694,"tag":"false-positive","reason":"TestRegexp: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":1901,"tag":"false-positive","reason":"TestSelectFilter: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":2136,"tag":"false-positive","reason":"TestBuffering: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":2437,"tag":"false-positive","reason":"TestJSON: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":2798,"tag":"false-positive","reason":"TestGeneratedColumns: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":2880,"tag":"false-positive","reason":"TestFilteredInOperator: TestSpec{t: t}.Run()"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":2910,"tag":"false-positive","reason":"TestFilteredBetweenOperator: TestSpec{t: t}.Run() inside t.Run closure per case"}
+{"repo":"vitessio/vitess","file":"go/vt/vttablet/tabletserver/vstreamer/vstreamer_test.go","line":3031,"tag":"false-positive","reason":"TestFilteredIsNullOperator: TestSpec{t: t}.Run() inside t.Run closure per case"}
