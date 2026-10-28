@@ -174,6 +174,13 @@ filters apply on top of the base threshold of 3:
   (numeric literals only; the string `"100"` is not exempt). Values such as `60`, `11.0`
   or `86400` still fire. Known cost: a repeated `10 * time.Minute` is no longer flagged.
 
+Corpus result (12 repo/language runs over `docs/backtest-repos.md` clones, whole tree): 122,482
+findings before, 32,293 after (-74%). A hand-labeled sample (`docs/backtest-triage/*/replace-magic-literal.jsonl`)
+judged 33 of 35 removed findings and 28 of 36 remaining findings to be false positives, so the
+post-change false-positive rate is still roughly 78% (n=36, wide interval). Most remaining noise is
+test-like code `is_test_file` does not recognize (`test/e2e/`, in-crate `#[cfg(test)]`), fixtures and
+generated files without a header marker.
+
 Set these per check in `.kibitzer/inspect.json`, on the `syntax-rules-<lang>` check's `options`
 (`options` applies to every rule of that checker; only `replace-magic-literal` reads these):
 
