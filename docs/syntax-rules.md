@@ -33,7 +33,7 @@ kinds each language's `lang_config()` entry checks against differ:
 | `long-parameter-list`  | style      | advisory          | > 5 identifiers        | Function/method parameter list names more identifiers than this. |
 | `flag-argument`        | design     | advisory          | n/a                    | A boolean-typed parameter is branched on directly (an `if`/ternary condition, or an operand of one) inside the function body — Fowler's *Remove Flag Argument*. A parameter only ever forwarded to another call is not flagged. Requires a statically-known boolean type, so it's a no-op on plain JavaScript and on untyped Python parameters. |
 | `unreachable-code`     | dead-code  | advisory          | n/a                    | A statement follows an unconditional `return`/`break`/`continue`/panic-call in the same `{ ... }` block — Fowler's *Remove Dead Code*. Only the first dead statement in a block is flagged (everything after it is dead by construction). Doesn't descend into `switch`/`match`/`when` case bodies. Go's `panic(...)` and Rust's `panic!`/`unreachable!`/`todo!`/`unimplemented!` count as diverging calls; other languages have no such built-in and are return/break/continue-only. Kotlin is return-only — `tree-sitter-kotlin-ng` 1.1.0 has no dedicated node kind for a bare `break`/`continue` (it parses as a plain identifier). |
-| `replace-magic-literal` | duplication | advisory        | >= 3 occurrences       | A non-trivial numeric or string literal (not `0`, `1`, `-1`, `""`, or an empty collection literal) repeats at least this many times in one file with no bound named constant — Fowler's *Replace Magic Literal*. Excludes a literal that's the direct initializer of a `const`/`final`/`val`-style binding (Python: `SCREAMING_SNAKE_CASE`) referenced elsewhere by name; a `let`/non-const binding does not qualify. Bumped from AC2's literal `2` to `3` per a corpus backtest against a pre-committed 40% false-positive bar — see `project_plans/replace-magic-literal/decisions/ADR-001-magic-literal-exclusion-and-threshold-strategy.md`. |
+| `replace-magic-literal` | duplication | advisory        | >= 3 occurrences (see [false-positive reductions](#replace-magic-literal-false-positive-reductions)) | A non-trivial numeric or string literal (not `0`, `1`, `-1`, `""`, or an empty collection literal) repeats at least this many times in one file with no bound named constant — Fowler's *Replace Magic Literal*. Excludes a literal that's the direct initializer of a `const`/`final`/`val`-style binding (Python: `SCREAMING_SNAKE_CASE`) referenced elsewhere by name; a `let`/non-const binding does not qualify. Bumped from AC2's literal `2` to `3` per a corpus backtest against a pre-committed 40% false-positive bar — see `project_plans/replace-magic-literal/decisions/ADR-001-magic-literal-exclusion-and-threshold-strategy.md`. |
 | `extract-variable`     | readability | advisory          | nesting depth >= 5 | An `if`/ternary condition, or a `return`'s value, nests binary/logical operators and function calls this deep — Fowler's *Extract Variable* (née Introduce Explaining Variable). The metric is depth, not node count: a flat same-operator `&&`/`||` run and a receiver call chain (`a.b().c().d()`) each count as one level however long, while a call argument or a mixed `&&`/`||` operand adds a level. `user.isActive() && user.hasPermission(p)` (depth 2) is deliberately far under this. Rust tuple-struct/enum-variant constructors (`Some(x)`, `Err(E::A(x))`, an UpperCamelCase callee) are not counted; in other languages an uppercase callee is an exported function and is. The threshold came from a 2026-10-12 corpus backtest: depth 4 fired ~2,000 times on ordinary two-level conditions, depth 5 ~220 times on genuinely nested ones. Closure bodies and struct/map/array literals inside the expression are not counted. A `return` whose entire value is itself an if/ternary expression (Kotlin/Rust's `return if ... else ...`, TS/JS/Java's `return cond ? a : b`) is flagged once, at the nested if/ternary, not twice. |
 
 Per-language node kinds (`src/rules.rs`'s `lang_config()`), verified against
@@ -156,8 +156,33 @@ name be referenced at least once beyond its own declaration — same-file,
 non-scope-resolved (a same-named binding shadowed in a different function scope is
 an accepted false negative; see ADR-001).
 
-Thresholds are fixed constants in `src/rules.rs` for now; per-rule
-configurability is a natural follow-up, not required for the initial catalog.
+Thresholds are fixed constants in `src/checkers/rules.rs`, except the
+`replace-magic-literal` options below.
+
+### `replace-magic-literal` false-positive reductions
+
+Backed by a hand-labeled sample of 70 of 2,399 real findings (63 false positives): 64% were in
+test files, 70% were identifier-like strings, and the numerics were mostly small ints. These
+filters apply on top of the base threshold of 3:
+
+- **Test files** (`checkers::is_test_file`: `*_test.go`, `test_*.py`, `*.test.ts`, `tests/`
+  directories, etc.) need >= 10 occurrences.
+- **Identifier-like strings** (`^[\w\-./:#]{1,40}$` on the unquoted value: test ids, dict/log
+  keys, paths) need >= 6 occurrences in the file. The planned ">= 3 files" arm is not
+  implemented: a checker sees one file at a time.
+- **Numeric allowlist** adds `2`-`10`, `16`, `100`, `1000` and `2026` to `0`/`1`/`-1`
+  (numeric literals only; the string `"100"` is not exempt). Values such as `60`, `11.0`
+  or `86400` still fire. Known cost: a repeated `10 * time.Minute` is no longer flagged.
+
+Set these per check in `.kibitzer/inspect.json`, on the `syntax-rules-<lang>` check's `options`
+(`options` applies to every rule of that checker; only `replace-magic-literal` reads these):
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `min_occurrences` | `3` | Base repetition threshold (must be >= 2). |
+| `skip_tests` | `true` | Require >= 10 occurrences in test files; `false` uses `min_occurrences` there. |
+| `skip_identifier_strings` | `true` | Require >= 6 occurrences for identifier-like strings; `false` uses `min_occurrences`. |
+
 `replace-magic-literal` is the rule most likely to hit table-driven-test/fixture
 false positives (the corpus backtest above found this dominates its false-positive
 set) — see `docs/suppressing-checks.md`'s "Exclude one file or directory" section for

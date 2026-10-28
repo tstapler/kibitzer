@@ -39,6 +39,23 @@ const MAGIC_LITERAL_MIN_OCCURRENCES: usize = 3;
 /// in the allow-list anyway as defense-in-depth for any future grammar/version where it
 /// might be.
 const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
+/// Extra values `replace-magic-literal` allow-lists for *numeric* literal kinds only (a
+/// string `"100"` is not exempt): small ints (loop bounds, arities, test fixtures), the
+/// hex/byte radix, round powers of ten, and the current year. A hand-labeled sample of
+/// 2,399 real findings (63 of 70 false positives) found small ints dominating the numeric
+/// noise; non-trivial values such as `60` or `0.75rem` stay flagged.
+const MAGIC_LITERAL_NUMERIC_ALLOWLIST: &[&str] = &[
+    "2", "3", "4", "5", "6", "7", "8", "9", "10", "16", "100", "1000", "2026",
+];
+/// A literal in a test file (`checkers::is_test_file`) needs this many occurrences — 64% of
+/// the sampled findings were in tests, where repeated fixture values are idiomatic.
+const MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES: usize = 10;
+/// An identifier-like string (`is_identifier_like`) needs this many occurrences in a file:
+/// ids, dict/log keys and paths are overwhelmingly self-describing. The matching
+/// ">= 3 files" arm is not implemented — the checker sees one file at a time.
+const MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES: usize = 6;
+/// Longest string `is_identifier_like` treats as an identifier.
+const IDENTIFIER_LIKE_MAX_LEN: usize = 40;
 /// An `if`/`return`/ternary expression whose operator/call nesting depth reaches this is flagged.
 const EXTRACT_VARIABLE_NESTING_THRESHOLD: usize = 5;
 
@@ -1390,14 +1407,64 @@ fn rust_lang_config() -> LangRuleConfig {
     }
 }
 
+/// Per-check `options` for `syntax-rules-<lang>`; only `replace-magic-literal` reads them.
+/// Absent fields keep their defaults; unknown fields are rejected at config-load time.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyntaxRulesOptions {
+    min_occurrences: Option<usize>,
+    skip_tests: Option<bool>,
+    skip_identifier_strings: Option<bool>,
+}
+
 pub struct SyntaxRulesChecker {
     lang: Language,
+    /// Base repetition threshold for `replace-magic-literal`.
+    min_occurrences: usize,
+    /// Require `MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES` in test files.
+    skip_tests: bool,
+    /// Require `MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES` for identifier-like strings.
+    skip_identifier_strings: bool,
 }
 
 impl SyntaxRulesChecker {
     pub fn new(lang: Language) -> Self {
-        Self { lang }
+        Self {
+            lang,
+            min_occurrences: MAGIC_LITERAL_MIN_OCCURRENCES,
+            skip_tests: true,
+            skip_identifier_strings: true,
+        }
     }
+
+    fn literal_filter<'a>(
+        &self,
+        file: &Path,
+        excluded: &'a HashSet<usize>,
+        slog_keys: &'a HashSet<usize>,
+    ) -> LiteralFilter<'a> {
+        let in_test = self.skip_tests && super::is_test_file(file);
+        let test_min = if in_test {
+            MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES
+        } else {
+            0
+        };
+        LiteralFilter {
+            excluded,
+            slog_keys,
+            min_occurrences: self.min_occurrences.max(test_min),
+            skip_identifier_strings: self.skip_identifier_strings,
+        }
+    }
+}
+
+/// Per-file inputs `build_literal_finding` filters one literal value's occurrences with.
+struct LiteralFilter<'a> {
+    excluded: &'a HashSet<usize>,
+    slog_keys: &'a HashSet<usize>,
+    /// Threshold after the test-file adjustment.
+    min_occurrences: usize,
+    skip_identifier_strings: bool,
 }
 
 impl Checker for SyntaxRulesChecker {
@@ -1417,7 +1484,22 @@ impl Checker for SyntaxRulesChecker {
         lang_config(self.lang).file_globs
     }
 
-    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+    fn configure(&self, options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
+        let opts: SyntaxRulesOptions = serde_json::from_value(options.clone())?;
+        if opts.min_occurrences.is_some_and(|n| n < 2) {
+            anyhow::bail!("`min_occurrences` must be >= 2 (a literal \"repeats\" at least twice)");
+        }
+        Ok(Some(Box::new(SyntaxRulesChecker {
+            lang: self.lang,
+            min_occurrences: opts.min_occurrences.unwrap_or(self.min_occurrences),
+            skip_tests: opts.skip_tests.unwrap_or(self.skip_tests),
+            skip_identifier_strings: opts
+                .skip_identifier_strings
+                .unwrap_or(self.skip_identifier_strings),
+        })))
+    }
+
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
         let tree = ctx
             .tree
             .context("syntax-rules checker requires a parsed tree")?;
@@ -1437,7 +1519,8 @@ impl Checker for SyntaxRulesChecker {
             let mut collector = LiteralCollector::default();
             walk_literals(tree.root_node(), &cfg, src, &mut collector);
             let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
-            emit_literal_findings(&collector, &cfg, &excluded, &mut findings);
+            let filter = self.literal_filter(file, &excluded, &collector.slog_key_ids);
+            emit_literal_findings(&collector, &cfg, &filter, &mut findings);
         }
         Ok(findings)
     }
@@ -1624,8 +1707,19 @@ fn strip_quote_delimiter(s: &str) -> Option<&str> {
     None
 }
 
-fn is_allowlisted_literal(raw: &str, kind: &str) -> bool {
-    MAGIC_LITERAL_ALLOWLIST.contains(&normalize_literal_value(raw, kind))
+fn is_allowlisted_literal(raw: &str, kind: &str, cfg: &LangRuleConfig) -> bool {
+    let value = normalize_literal_value(raw, kind);
+    MAGIC_LITERAL_ALLOWLIST.contains(&value)
+        || (cfg.numeric_literal_kinds.contains(&kind)
+            && MAGIC_LITERAL_NUMERIC_ALLOWLIST.contains(&value))
+}
+
+/// Matches `^[\w\-./:#]{1,40}$` on the unquoted value: test ids, dict/log keys, paths.
+fn is_identifier_like(value: &str) -> bool {
+    (1..=IDENTIFIER_LIKE_MAX_LEN).contains(&value.chars().count())
+        && value
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '#'))
 }
 
 /// Emit-pass for `replace-magic-literal`: applies the allow-list and the excluded-node-
@@ -1635,7 +1729,7 @@ fn is_allowlisted_literal(raw: &str, kind: &str) -> bool {
 fn emit_literal_findings(
     collector: &LiteralCollector,
     cfg: &LangRuleConfig,
-    excluded: &HashSet<usize>,
+    filter: &LiteralFilter,
     findings: &mut Vec<Finding>,
 ) {
     // `collector.occurrences` is a `HashMap`, whose iteration order is randomized per
@@ -1645,34 +1739,41 @@ fn emit_literal_findings(
     let mut new_findings: Vec<Finding> = collector
         .occurrences
         .iter()
-        .filter_map(|(text, occurrences)| {
-            build_literal_finding(text, occurrences, cfg, excluded, &collector.slog_key_ids)
-        })
+        .filter_map(|(text, occurrences)| build_literal_finding(text, occurrences, cfg, filter))
         .collect();
     new_findings.sort_by_key(|f| f.line);
     findings.extend(new_findings);
 }
 
 /// Applies the allow-list and the excluded-node-id set to one literal value's
-/// occurrences, returning a `Finding` if >= `MAGIC_LITERAL_MIN_OCCURRENCES` remain —
+/// occurrences, returning a `Finding` if >= `filter.min_occurrences` (raised for identifier-like
+/// strings) remain —
 /// anchored at the first remaining occurrence's line. Split out of
 /// `emit_literal_findings` so the loop stays a filter/collect, not a 40+-line body.
 fn build_literal_finding(
     text: &str,
     occurrences: &[LiteralOccurrence],
     cfg: &LangRuleConfig,
-    excluded: &HashSet<usize>,
-    slog_keys: &HashSet<usize>,
+    filter: &LiteralFilter,
 ) -> Option<Finding> {
     let first = occurrences.first()?;
-    if is_allowlisted_literal(text, first.kind) {
+    if is_allowlisted_literal(text, first.kind, cfg) {
         return None;
+    }
+    let mut min_occurrences = filter.min_occurrences;
+    if filter.skip_identifier_strings
+        && !cfg.numeric_literal_kinds.contains(&first.kind)
+        && is_identifier_like(normalize_literal_value(text, first.kind))
+    {
+        min_occurrences = min_occurrences.max(MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES);
     }
     let mut remaining: Vec<&LiteralOccurrence> = occurrences
         .iter()
-        .filter(|occ| !excluded.contains(&occ.node.id()) && !slog_keys.contains(&occ.node.id()))
+        .filter(|occ| {
+            !filter.excluded.contains(&occ.node.id()) && !filter.slog_keys.contains(&occ.node.id())
+        })
         .collect();
-    if remaining.len() < MAGIC_LITERAL_MIN_OCCURRENCES {
+    if remaining.len() < min_occurrences {
         return None;
     }
     remaining.sort_by_key(|occ| occ.node.start_position().row);
@@ -1686,7 +1787,7 @@ fn build_literal_finding(
         .iter()
         .map(|occ| (occ.node.start_position().row + 1).to_string())
         .collect();
-    // `MAGIC_LITERAL_MIN_OCCURRENCES` is >= 2, so `other_lines` always has >= 1 entry —
+    // `configure` rejects `min_occurrences` < 2, so `other_lines` always has >= 1 entry —
     // pluralize "line" instead of hardcoding the singular.
     let line_word = if other_lines.len() == 1 {
         "line"
@@ -2612,9 +2713,198 @@ mod tests {
         let findings = magic_literal_findings(
             Language::Go,
             tree_sitter_go::LANGUAGE.into(),
-            "package main\nfunc f() {\n\ta := 2\n\tb := 2\n\tc := 2\n}\n",
+            "package main\nfunc f() {\n\ta := 11\n\tb := 11\n\tc := 11\n}\n",
         );
         assert_eq!(findings.len(), 1);
+    }
+
+    /// Like `magic_literal_findings` but for an explicit file path and checker instance, so
+    /// the test-file and `configure` option arms are reachable.
+    fn magic_literal_findings_with(checker: &dyn Checker, path: &str, src: &str) -> Vec<Finding> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("loading grammar");
+        let tree = parser.parse(src, None).expect("parsing source");
+        let ctx = CheckContext {
+            source: src,
+            tree: Some(&tree),
+        };
+        checker
+            .check(Path::new(path), &ctx)
+            .expect("check() should not error")
+            .into_iter()
+            .filter(|f| f.message.contains("[replace-magic-literal]"))
+            .collect()
+    }
+
+    /// `n` Go statements each assigning the literal `lit`.
+    fn go_repeated(lit: &str, n: usize) -> String {
+        let body: String = (0..n).map(|i| format!("\tv{i} := {lit}\n")).collect();
+        format!("package main\nfunc f() {{\n{body}}}\n")
+    }
+
+    fn configured(options: serde_json::Value) -> Box<dyn Checker> {
+        SyntaxRulesChecker::new(Language::Go)
+            .configure(&options)
+            .unwrap()
+            .expect("syntax-rules is configurable")
+    }
+
+    fn default_go_findings(path: &str, src: &str) -> Vec<Finding> {
+        magic_literal_findings_with(&SyntaxRulesChecker::new(Language::Go), path, src)
+    }
+
+    #[test]
+    fn allows_replace_magic_literal_numeric_allowlist_extension() {
+        for lit in [
+            "2", "3", "4", "5", "6", "7", "8", "9", "10", "16", "100", "1000", "2026",
+        ] {
+            assert!(
+                default_go_findings("a.go", &go_repeated(lit, 4)).is_empty(),
+                "{lit} should be allow-listed"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_non_trivial_numerics_despite_allowlist_extension() {
+        // `60` is the truncation-width true positive from the hand-labeled sample.
+        for lit in ["60", "11.0", "86400"] {
+            assert_eq!(
+                default_go_findings("a.go", &go_repeated(lit, 3)).len(),
+                1,
+                "{lit} should still fire"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_duration_multiplier_outside_numeric_allowlist() {
+        // `30*time.Second` repeated stays flagged; `10*time.Minute` (a labeled true positive)
+        // is lost to the allow-listed `10` — the accepted cost of that allowlist entry.
+        let src = "package main\nfunc f() {\n\ta := 30 * time.Second\n\tb := 30 * time.Second\n\tc := 30 * time.Second\n}\n";
+        assert_eq!(default_go_findings("a.go", src).len(), 1);
+    }
+
+    #[test]
+    fn numeric_allowlist_extension_does_not_exempt_the_same_digits_as_a_string() {
+        let src = go_repeated("\"100\"", 3);
+        assert_eq!(
+            default_go_findings("a.go", &src).len(),
+            0,
+            "identifier-like"
+        );
+        let opts = configured(serde_json::json!({"skip_identifier_strings": false}));
+        assert_eq!(magic_literal_findings_with(&*opts, "a.go", &src).len(), 1);
+    }
+
+    #[test]
+    fn allows_replace_magic_literal_in_test_file_below_ten_occurrences() {
+        let src = go_repeated("86400", 9);
+        assert!(default_go_findings("pkg/foo_test.go", &src).is_empty());
+        assert_eq!(default_go_findings("pkg/foo.go", &src).len(), 1);
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_in_test_file_at_ten_occurrences() {
+        let src = go_repeated("86400", 10);
+        assert_eq!(default_go_findings("pkg/foo_test.go", &src).len(), 1);
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_glob_string_repeated_in_test_file() {
+        // `"**/*.go"` x14 is a true positive: not identifier-like (`*`), and >= 10 in a test.
+        let src = go_repeated("\"**/*.go\"", 14);
+        assert_eq!(default_go_findings("pkg/foo_test.go", &src).len(), 1);
+        let three = go_repeated("\"**/*.go\"", 3);
+        assert_eq!(default_go_findings("pkg/foo.go", &three).len(), 1);
+    }
+
+    #[test]
+    fn skip_tests_false_restores_base_threshold_in_test_files() {
+        let opts = configured(serde_json::json!({"skip_tests": false}));
+        let src = go_repeated("86400", 3);
+        assert_eq!(
+            magic_literal_findings_with(&*opts, "foo_test.go", &src).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn allows_replace_magic_literal_identifier_string_below_six_occurrences() {
+        for lit in ["\"user_id\"", "\"a-b.c/d:e#f\"", "\"/var/log/app.log\""] {
+            assert!(
+                default_go_findings("a.go", &go_repeated(lit, 5)).is_empty(),
+                "{lit} x5 should be suppressed"
+            );
+            assert_eq!(
+                default_go_findings("a.go", &go_repeated(lit, 6)).len(),
+                1,
+                "{lit} x6 should fire"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_replace_magic_literal_non_identifier_strings_at_base_threshold() {
+        for lit in [
+            "\"hello world\"",
+            "\"**/*.go\"",
+            "\"a_string_that_is_longer_than_forty_characters_x\"",
+        ] {
+            assert_eq!(
+                default_go_findings("a.go", &go_repeated(lit, 3)).len(),
+                1,
+                "{lit} should fire at 3"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_identifier_strings_false_restores_base_threshold() {
+        let opts = configured(serde_json::json!({"skip_identifier_strings": false}));
+        let src = go_repeated("\"user_id\"", 3);
+        assert_eq!(magic_literal_findings_with(&*opts, "a.go", &src).len(), 1);
+    }
+
+    #[test]
+    fn identifier_like_matches_the_documented_charset_and_length() {
+        assert!(is_identifier_like("a"));
+        assert!(is_identifier_like(&"a".repeat(40)));
+        assert!(!is_identifier_like(&"a".repeat(41)));
+        assert!(!is_identifier_like(""));
+        assert!(!is_identifier_like("has space"));
+        assert!(!is_identifier_like("glob*"));
+    }
+
+    #[test]
+    fn min_occurrences_option_raises_and_lowers_the_base_threshold() {
+        let two = go_repeated("86400", 2);
+        let lowered = configured(serde_json::json!({"min_occurrences": 2}));
+        assert_eq!(
+            magic_literal_findings_with(&*lowered, "a.go", &two).len(),
+            1
+        );
+        let raised = configured(serde_json::json!({"min_occurrences": 5}));
+        let four = go_repeated("86400", 4);
+        assert!(magic_literal_findings_with(&*raised, "a.go", &four).is_empty());
+    }
+
+    #[test]
+    fn configure_rejects_unknown_key_and_invalid_min_occurrences() {
+        let checker = SyntaxRulesChecker::new(Language::Go);
+        assert!(checker.configure(&serde_json::json!({"typo": 1})).is_err());
+        assert!(
+            checker
+                .configure(&serde_json::json!({"min_occurrences": 1}))
+                .is_err()
+        );
+        assert!(
+            checker
+                .configure(&serde_json::json!({"min_occurrences": "x"}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -3473,7 +3763,7 @@ mod tests {
     #[test]
     fn bash_flags_repeated_plain_string_and_mixed_expansion_string() {
         assert_eq!(
-            bash_magic_literal_findings("a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n"),
+            bash_magic_literal_findings("a=\"linux box\"\nb=\"linux box\"\nc=\"linux box\"\n"),
             1
         );
         assert_eq!(
@@ -3484,7 +3774,7 @@ mod tests {
 
     #[test]
     fn bash_exempts_literals_in_a_file_with_a_parse_error() {
-        let clean = "a=\"linux\"\nb=\"linux\"\nc=\"linux\"\n";
+        let clean = "a=\"linux box\"\nb=\"linux box\"\nc=\"linux box\"\n";
         assert_eq!(bash_magic_literal_findings(clean), 1);
         let broken = format!("{clean}if then fi )\n");
         let tree = crate::checker::GrammarCache::new()
@@ -3515,7 +3805,7 @@ mod tests {
 
     #[test]
     fn bash_still_flags_repeated_number_in_arithmetic() {
-        let src = "a=$((x*7))\nb=$((y*7))\nc=$((z*7))\n";
+        let src = "a=$((x*13))\nb=$((y*13))\nc=$((z*13))\n";
         assert_eq!(bash_magic_literal_findings(src), 1);
     }
 
@@ -4730,12 +5020,12 @@ func f(a, b, c error) {
     fn still_flags_genuine_repeated_string_outside_slog_key_position() {
         // AC6: "pending" repeated 3 times as a plain return value → fires
         let src = r#"package main
-func f() string { return "pending" }
-func g() string { return "pending" }
-func h() string { return "pending" }
+func f() string { return "in progress" }
+func g() string { return "in progress" }
+func h() string { return "in progress" }
 "#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
-        assert!(!findings.is_empty(), "expected a finding for 'pending'");
+        assert!(!findings.is_empty(), "expected a finding for 'in progress'");
     }
 
     #[test]
@@ -4744,9 +5034,9 @@ func h() string { return "pending" }
         let src = r#"package main
 import "log/slog"
 func f() {
-    slog.Warn("check1", "status", "active")
-    slog.Warn("check2", "status", "active")
-    slog.Warn("check3", "status", "active")
+    slog.Warn("check1", "status", "very active")
+    slog.Warn("check2", "status", "very active")
+    slog.Warn("check3", "status", "very active")
 }"#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
         assert!(
@@ -4766,9 +5056,9 @@ import (
     "log/slog"
 )
 func f(ctx context.Context, a, b, c string) {
-    slog.WarnContext(ctx, "msg1", "file", a)
-    slog.WarnContext(ctx, "msg2", "file", b)
-    slog.WarnContext(ctx, "msg3", "file", c)
+    slog.WarnContext(ctx, "msg1", "file name", a)
+    slog.WarnContext(ctx, "msg2", "file name", b)
+    slog.WarnContext(ctx, "msg3", "file name", c)
 }"#;
         let findings = magic_literal_findings(Language::Go, tree_sitter_go::LANGUAGE.into(), src);
         assert!(
