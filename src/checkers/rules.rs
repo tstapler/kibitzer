@@ -55,9 +55,10 @@ const MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES: usize = 10;
 /// ">= 3 files" arm is not implemented — the checker sees one file at a time.
 const MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES: usize = 6;
 /// With `scope_aware`, a literal whose uses all sit in ONE function needs this many: reuse
-/// within a single function is weak evidence of a missing shared constant. A GUESS until
-/// backtested (see docs/syntax-rules.md).
-const MAGIC_LITERAL_LOCAL_MIN_OCCURRENCES: usize = 6;
+/// within a single function is weak evidence of a missing shared constant. Chosen from a
+/// corpus backtest where locality barely beats random removal at any value (4 had the best
+/// false-positive-to-true-positive ratio); see docs/syntax-rules.md.
+const MAGIC_LITERAL_LOCAL_MIN_OCCURRENCES: usize = 4;
 /// Longest string `is_identifier_like` treats as an identifier.
 const IDENTIFIER_LIKE_MAX_LEN: usize = 40;
 /// An `if`/`return`/ternary expression whose operator/call nesting depth reaches this is flagged.
@@ -3045,6 +3046,23 @@ mod tests {
         let findings = magic_literal_findings_with(&*scope_aware(6), "a.go", &src);
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("6 times in 1 function(s)"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn scope_aware_should_UseDefaultLocalThreshold_When_OnlyEnabled() {
+        let on = configured(serde_json::json!({"scope_aware": true}));
+        let three = go_in_functions("86400", &[3]);
+        let four = go_in_functions("86400", &[4]);
+        assert!(magic_literal_findings_with(&*on, "a.go", &three).is_empty());
+        assert_eq!(magic_literal_findings_with(&*on, "a.go", &four).len(), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn scope_aware_should_BeOff_When_NotConfigured() {
+        let three = go_in_functions("86400", &[3]);
+        assert_eq!(default_go_findings("a.go", &three).len(), 1);
     }
 
     #[test]
