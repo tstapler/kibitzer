@@ -221,6 +221,19 @@ Set these per check in `.kibitzer/inspect.json`, on the `syntax-rules-<lang>` ch
 | `skip_tests` | `true` | Require >= 10 occurrences for numerics (and strings, when `skip_test_strings` is off) in test files; `false` uses `min_occurrences` there. |
 | `skip_test_strings` | `true` | Ignore string literals in test files and Rust `cfg(test)` items entirely; `false` applies the `skip_tests` rule to them. |
 | `skip_identifier_strings` | `true` | Require >= 6 occurrences for identifier-like strings; `false` uses `min_occurrences`. |
+| `scope_aware` | `false` | When every use of a literal sits in ONE function, require `min_occurrences_local` instead of `min_occurrences`. Uses at module level (top-level tables) or spread over several functions keep `min_occurrences`. Test-file and identifier-string floors still apply via `max`, so locality only ever raises a threshold. The finding message gains "in N function(s)". Closures/lambdas count toward their enclosing function. |
+| `min_occurrences_local` | `4` | Threshold when `scope_aware` and all uses are in one function (must be >= 2; never lowers below `min_occurrences`). |
+
+**`scope_aware` is off by default.** A hand-labeled backtest found locality is barely better than
+random removal: over the corpus clones (12 repo/language runs, 32,291 findings) only 3.6% to 7.7%
+of findings are single-function with 3 to 7 uses (local = 4 to 8). On a stratified sample of 60 of
+those, 22% were true positives (a named constant would plausibly help), against 23% of 30 findings
+that locality keeps. Estimated false positives removed vs true positives lost: local 4: 3.9% / 2.6%;
+5: 5.4% / 5.1%; 6: 6.4% / 5.4%; 8: 7.8% / 7.5%. That does not beat the earlier "all uses within
+40 lines" experiment (26 of 63 false positives removed, 2 of 7 true positives lost). Samples are
+small and hand-labeled by one reviewer; see `docs/backtest-triage/*/replace-magic-literal.jsonl`
+(notes tagged `scope-aware sample`). The intra-file `ScopeMap` (`src/scope.rs`) is shared
+infrastructure other per-file checks can reuse.
 
 `replace-magic-literal` is the rule most likely to hit table-driven-test/fixture
 false positives (the corpus backtest above found this dominates its false-positive
