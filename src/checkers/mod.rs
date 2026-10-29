@@ -40,6 +40,14 @@ pub mod test_no_assertion;
 /// cases — already the Parameterize-Function shape, so flagging them back is backwards.
 /// See `docs/duplicate-code-fuzzy.md`.
 pub(crate) fn is_test_file(file: &std::path::Path) -> bool {
+    // Judge only the part below the working directory: a checkout under `~/test/` or
+    // `/tmp/spec/` must not make every file in it a test file.
+    let relative = std::env::current_dir().ok().and_then(|cwd| {
+        file.strip_prefix(cwd)
+            .ok()
+            .map(std::path::Path::to_path_buf)
+    });
+    let file = relative.as_deref().unwrap_or(file);
     // Rust integration tests and JS/TS test suites both conventionally live in a `tests/`
     // or `__tests__/` directory rather than following a filename suffix (e.g.
     // `crates/cli/tests/browser_session.rs`, confirmed as a real backtest hit before this
@@ -103,6 +111,16 @@ mod tests {
             assert!(is_test_file(Path::new(p)), "{p}");
         }
         assert!(!is_test_file(Path::new("pkg/contest/a.go")));
+        assert!(!is_test_file(Path::new("pkg/contesting/a.go")));
+        assert!(!is_test_file(Path::new("src/latest/a.go")));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn is_test_file_should_IgnoreCwdAncestors_When_PathIsAbsoluteUnderCwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(!is_test_file(&cwd.join("src/a.go")));
+        assert!(is_test_file(&cwd.join("test/a.go")));
     }
 
     #[test]

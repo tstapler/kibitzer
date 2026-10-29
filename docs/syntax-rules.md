@@ -188,7 +188,8 @@ exclusions. Each is a tree-sitter node check, not a line regex:
   file, or inside a Rust item (or file, via `#![cfg(test)]`) carrying `#[cfg(test)]`. Numerics in
   tests keep the >= 10 rule above, since dropping them lost 5 of 13 labeled true positives.
   `is_test_file` now also matches singular `test/`, `spec/` and `testing/` directories,
-  `*TestBase.java`/`.kt`, `*_tests.py` and `*.integrationTest.ts(x)`. Other users of
+  `*TestBase.java`/`.kt`, `*_tests.py` and `*.integrationTest.ts(x)`. Paths under the working
+  directory are judged relative to it, so a checkout under `~/test/` is not all test code. Other users of
   `is_test_file`: `duplicate-code-fuzzy`, `go-package-focus`, `middle-man`.
 - **Attributes and annotations**: a literal inside `#[..]`/`#![..]`, a Java/Kotlin `@Annotation(..)`,
   a Python/TS `@decorator(..)`, or a Go struct tag.
@@ -202,7 +203,7 @@ exclusions. Each is a tree-sitter node check, not a line regex:
 - **Generated files** are detected from the `Code generated ... DO NOT EDIT.` marker within the
   first 60 lines (was 20), which covers protobuf headers behind a license block. This also
   affects `file-size`, `complexity`, `duplicate-code*`, `go-error-context`,
-  `go-encapsulate-collection`, `go-type-switch-density`, `go-table-driven-test` and hotspots.
+  `go-encapsulate-collection`, `go-type-switch-density`, `go-table-driven-test`, `test-no-assertion`, hotspots and the architecture file-complexity sum.
 
 Measured on the 80 labeled findings: 28 of 41 design-set false positives and 20 of 26 held-out ones
 are gone; 2 of 9 design true positives are lost (both from the broader test-file detection), 0 of 4
