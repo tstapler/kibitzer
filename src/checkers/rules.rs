@@ -5,11 +5,11 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::checkers::file_size;
 use crate::config::Severity;
 use crate::node_kind::{
     BashKind, GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind,
 };
+use crate::scope::{ScopeMap, Spread};
 
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
@@ -54,6 +54,10 @@ const MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES: usize = 10;
 /// ids, dict/log keys and paths are overwhelmingly self-describing. The matching
 /// ">= 3 files" arm is not implemented — the checker sees one file at a time.
 const MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES: usize = 6;
+/// With `scope_aware`, a literal whose uses all sit in ONE function needs this many: reuse
+/// within a single function is weak evidence of a missing shared constant. A GUESS until
+/// backtested (see docs/syntax-rules.md).
+const MAGIC_LITERAL_LOCAL_MIN_OCCURRENCES: usize = 6;
 /// Longest string `is_identifier_like` treats as an identifier.
 const IDENTIFIER_LIKE_MAX_LEN: usize = 40;
 /// An `if`/`return`/ternary expression whose operator/call nesting depth reaches this is flagged.
@@ -1415,6 +1419,8 @@ struct SyntaxRulesOptions {
     min_occurrences: Option<usize>,
     skip_tests: Option<bool>,
     skip_identifier_strings: Option<bool>,
+    scope_aware: Option<bool>,
+    min_occurrences_local: Option<usize>,
 }
 
 pub struct SyntaxRulesChecker {
@@ -1425,6 +1431,31 @@ pub struct SyntaxRulesChecker {
     skip_tests: bool,
     /// Require `MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES` for identifier-like strings.
     skip_identifier_strings: bool,
+    /// Require `min_occurrences_local` when every use sits in one function.
+    scope_aware: bool,
+    min_occurrences_local: usize,
+}
+
+/// Which repetition threshold applies given where a literal's uses sit.
+pub(crate) struct SpreadPolicy {
+    pub scope_aware: bool,
+    /// Threshold when all uses are confined to one function.
+    pub local: usize,
+    /// Threshold when uses span several functions (the plain `min_occurrences`).
+    pub multi_fn: usize,
+}
+
+/// Locality only ever raises the threshold: `bumps` (test-file, identifier-string) are
+/// floors applied with `max`, and `local` never undercuts `multi_fn`. Top-level uses
+/// (`module_level > 0`) are never "local": a table at module scope isn't one function's habit.
+pub(crate) fn effective_threshold(spread: &Spread, policy: &SpreadPolicy, bumps: usize) -> usize {
+    let one_function = spread.distinct_scopes == 1 && spread.module_level == 0;
+    let base = if policy.scope_aware && one_function {
+        policy.local.max(policy.multi_fn)
+    } else {
+        policy.multi_fn
+    };
+    base.max(bumps)
 }
 
 impl SyntaxRulesChecker {
@@ -1434,25 +1465,32 @@ impl SyntaxRulesChecker {
             min_occurrences: MAGIC_LITERAL_MIN_OCCURRENCES,
             skip_tests: true,
             skip_identifier_strings: true,
+            scope_aware: false,
+            min_occurrences_local: MAGIC_LITERAL_LOCAL_MIN_OCCURRENCES,
         }
     }
 
     fn literal_filter<'a>(
         &self,
-        file: &Path,
+        scopes: &'a ScopeMap,
         excluded: &'a HashSet<usize>,
         slog_keys: &'a HashSet<usize>,
     ) -> LiteralFilter<'a> {
-        let in_test = self.skip_tests && super::is_test_file(file);
-        let test_min = if in_test {
-            MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES
-        } else {
-            0
-        };
+        let in_test = self.skip_tests && scopes.file.test;
         LiteralFilter {
             excluded,
             slog_keys,
-            min_occurrences: self.min_occurrences.max(test_min),
+            test_bump: if in_test {
+                MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES
+            } else {
+                0
+            },
+            policy: SpreadPolicy {
+                scope_aware: self.scope_aware,
+                local: self.min_occurrences_local,
+                multi_fn: self.min_occurrences,
+            },
+            scopes,
             skip_identifier_strings: self.skip_identifier_strings,
         }
     }
@@ -1462,8 +1500,10 @@ impl SyntaxRulesChecker {
 struct LiteralFilter<'a> {
     excluded: &'a HashSet<usize>,
     slog_keys: &'a HashSet<usize>,
-    /// Threshold after the test-file adjustment.
-    min_occurrences: usize,
+    /// Floor from the test-file adjustment (0 outside test files).
+    test_bump: usize,
+    policy: SpreadPolicy,
+    scopes: &'a ScopeMap,
     skip_identifier_strings: bool,
 }
 
@@ -1489,6 +1529,9 @@ impl Checker for SyntaxRulesChecker {
         if opts.min_occurrences.is_some_and(|n| n < 2) {
             anyhow::bail!("`min_occurrences` must be >= 2 (a literal \"repeats\" at least twice)");
         }
+        if opts.min_occurrences_local.is_some_and(|n| n < 2) {
+            anyhow::bail!("`min_occurrences_local` must be >= 2");
+        }
         Ok(Some(Box::new(SyntaxRulesChecker {
             lang: self.lang,
             min_occurrences: opts.min_occurrences.unwrap_or(self.min_occurrences),
@@ -1496,6 +1539,10 @@ impl Checker for SyntaxRulesChecker {
             skip_identifier_strings: opts
                 .skip_identifier_strings
                 .unwrap_or(self.skip_identifier_strings),
+            scope_aware: opts.scope_aware.unwrap_or(self.scope_aware),
+            min_occurrences_local: opts
+                .min_occurrences_local
+                .unwrap_or(self.min_occurrences_local),
         })))
     }
 
@@ -1514,12 +1561,13 @@ impl Checker for SyntaxRulesChecker {
         // confirmed for `extract-variable` by a `kubernetes/kubernetes` corpus backtest,
         // where `zz_generated.*.go`/`generated.pb.go` dominated the raw finding count).
         // Scoped to just these 2 passes; the other 5 rules are untouched.
-        if !file_size::is_generated(ctx.source) {
+        let scopes = ScopeMap::build(self.lang, tree, file, ctx.source);
+        if !scopes.file.generated {
             walk_dense_expressions(tree.root_node(), &cfg, src, &mut findings);
             let mut collector = LiteralCollector::default();
             walk_literals(tree.root_node(), &cfg, src, &mut collector);
             let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
-            let filter = self.literal_filter(file, &excluded, &collector.slog_key_ids);
+            let filter = self.literal_filter(&scopes, &excluded, &collector.slog_key_ids);
             emit_literal_findings(&collector, &cfg, &filter, &mut findings);
         }
         Ok(findings)
@@ -1760,12 +1808,12 @@ fn build_literal_finding(
     if is_allowlisted_literal(text, first.kind, cfg) {
         return None;
     }
-    let mut min_occurrences = filter.min_occurrences;
+    let mut bumps = filter.test_bump;
     if filter.skip_identifier_strings
         && !cfg.numeric_literal_kinds.contains(&first.kind)
         && is_identifier_like(normalize_literal_value(text, first.kind))
     {
-        min_occurrences = min_occurrences.max(MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES);
+        bumps = bumps.max(MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES);
     }
     let mut remaining: Vec<&LiteralOccurrence> = occurrences
         .iter()
@@ -1773,7 +1821,17 @@ fn build_literal_finding(
             !filter.excluded.contains(&occ.node.id()) && !filter.slog_keys.contains(&occ.node.id())
         })
         .collect();
-    if remaining.len() < min_occurrences {
+    // The lowest threshold any spread can yield; skips the scope lookup for clear misses.
+    if remaining.len() < filter.policy.multi_fn.max(bumps) {
+        return None;
+    }
+    let spread = filter.policy.scope_aware.then(|| {
+        let bytes: Vec<usize> = remaining.iter().map(|occ| occ.node.start_byte()).collect();
+        filter.scopes.spread(&bytes)
+    });
+    if let Some(spread) = &spread
+        && remaining.len() < effective_threshold(spread, &filter.policy, bumps)
+    {
         return None;
     }
     remaining.sort_by_key(|occ| occ.node.start_position().row);
@@ -1794,10 +1852,18 @@ fn build_literal_finding(
     } else {
         "lines"
     };
+    let where_ = spread.map_or_else(String::new, |s| {
+        let functions = s.distinct_scopes - usize::from(s.module_level > 0);
+        match (functions, s.module_level > 0) {
+            (0, _) => " at module level".to_string(),
+            (n, true) => format!(" in {n} function(s) and at module level"),
+            (n, false) => format!(" in {n} function(s)"),
+        }
+    });
     Some(Finding {
         line,
         message: format!(
-            "[replace-magic-literal] {label} literal {text} appears {} times (also {line_word} {}) — consider extracting a named constant",
+            "[replace-magic-literal] {label} literal {text} appears {} times{where_} (also {line_word} {}) — consider extracting a named constant",
             remaining.len(),
             other_lines.join(", ")
         ),
@@ -2889,6 +2955,178 @@ mod tests {
         let raised = configured(serde_json::json!({"min_occurrences": 5}));
         let four = go_repeated("86400", 4);
         assert!(magic_literal_findings_with(&*raised, "a.go", &four).is_empty());
+    }
+
+    fn scope_aware(local: usize) -> Box<dyn Checker> {
+        configured(serde_json::json!({"scope_aware": true, "min_occurrences_local": local}))
+    }
+
+    /// One Go function per entry of `per_function`, each using `lit` that many times.
+    fn go_in_functions(lit: &str, per_function: &[usize]) -> String {
+        let mut src = String::from("package main\n");
+        for (f, n) in per_function.iter().enumerate() {
+            src.push_str(&format!("func f{f}() {{\n"));
+            for i in 0..*n {
+                src.push_str(&format!("\tv{i} := {lit}\n"));
+            }
+            src.push_str("}\n");
+        }
+        src
+    }
+
+    fn spread_of(distinct_scopes: usize, module_level: usize) -> Spread {
+        Spread {
+            total: 9,
+            distinct_scopes,
+            module_level,
+            span_lines: 9,
+            files: 1,
+        }
+    }
+
+    fn policy(scope_aware: bool) -> SpreadPolicy {
+        SpreadPolicy {
+            scope_aware,
+            local: 6,
+            multi_fn: 3,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn effective_threshold_should_UseLocalBump_When_AllInOneFunction() {
+        assert_eq!(effective_threshold(&spread_of(1, 0), &policy(true), 0), 6);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn effective_threshold_should_UseBase_When_SpreadAcrossFunctions() {
+        assert_eq!(effective_threshold(&spread_of(3, 0), &policy(true), 0), 3);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn effective_threshold_should_UseBase_When_ScopeAwareIsOff() {
+        assert_eq!(effective_threshold(&spread_of(1, 0), &policy(false), 0), 3);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn effective_threshold_should_UseBase_When_UsesAreAtModuleLevel() {
+        assert_eq!(effective_threshold(&spread_of(1, 9), &policy(true), 0), 3);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn effective_threshold_should_NeverLowerBelowBump_When_LocalIsSmaller() {
+        let small_local = SpreadPolicy {
+            scope_aware: true,
+            local: 2,
+            multi_fn: 3,
+        };
+        assert_eq!(effective_threshold(&spread_of(1, 0), &small_local, 0), 3);
+        assert_eq!(effective_threshold(&spread_of(1, 0), &small_local, 10), 10);
+        assert_eq!(effective_threshold(&spread_of(3, 0), &policy(true), 10), 10);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_literal_finding_should_NotFire_When_FourUsesInOneFunction() {
+        let src = go_in_functions("86400", &[4]);
+        assert!(magic_literal_findings_with(&*scope_aware(6), "a.go", &src).is_empty());
+        // control: today's behavior without the option
+        assert_eq!(default_go_findings("a.go", &src).len(), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_literal_finding_should_Fire_When_SixUsesInOneFunction() {
+        let src = go_in_functions("86400", &[6]);
+        let findings = magic_literal_findings_with(&*scope_aware(6), "a.go", &src);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("6 times in 1 function(s)"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_literal_finding_should_StillFire_When_ThreeUsesInThreeFunctions() {
+        let src = go_in_functions("86400", &[1, 1, 1]);
+        let findings = magic_literal_findings_with(&*scope_aware(6), "a.go", &src);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("3 times in 3 function(s)"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_literal_finding_should_StillFire_When_ThreeTopLevelUses() {
+        let src = "package main\nvar a = 86400\nvar b = 86400\nvar c = 86400\n";
+        let findings = magic_literal_findings_with(&*scope_aware(6), "a.go", src);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("at module level"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_literal_finding_should_StillFire_When_TwoInOneFunctionPlusOneAtModuleLevel() {
+        let src = "package main\nvar a = 86400\nfunc f() {\n\tb := 86400\n\tc := 86400\n}\n";
+        let findings = magic_literal_findings_with(&*scope_aware(6), "a.go", src);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .message
+                .contains("1 function(s) and at module level")
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn identifier_bump_should_NotBeLoweredBy_LocalPolicy() {
+        // 5 uses over 2 functions: past multi_fn (3), under the identifier floor (6)
+        let src = go_in_functions("\"user_id\"", &[3, 2]);
+        let opts = configured(serde_json::json!({"scope_aware": true, "min_occurrences_local": 2}));
+        assert!(magic_literal_findings_with(&*opts, "a.go", &src).is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_file_bump_should_NotBeLoweredBy_LocalPolicy() {
+        let src = go_in_functions("86400", &[2, 2, 2]);
+        assert!(magic_literal_findings_with(&*scope_aware(6), "a_test.go", &src).is_empty());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn configure_should_Reject_When_LocalThresholdBelowTwo() {
+        let checker = SyntaxRulesChecker::new(Language::Go);
+        assert!(
+            checker
+                .configure(&serde_json::json!({"min_occurrences_local": 1}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_literal_finding_should_AttributeClosureUsesToEnclosingFunction_When_Rust() {
+        // 3 uses split between a fn body and its closure = ONE function, below local (6)
+        let src = "fn f() {\n let a = 86400;\n let g = || 86400;\n let b = 86400;\n}\n";
+        let checker = SyntaxRulesChecker::new(Language::Rust)
+            .configure(&serde_json::json!({"scope_aware": true}))
+            .unwrap()
+            .unwrap();
+        let tree = crate::checker::GrammarCache::new()
+            .parse(Language::Rust, src)
+            .unwrap();
+        let ctx = CheckContext {
+            source: src,
+            tree: Some(&tree),
+        };
+        let findings = checker.check(Path::new("a.rs"), &ctx).unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("[replace-magic-literal]"))
+        );
     }
 
     #[test]
