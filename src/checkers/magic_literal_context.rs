@@ -60,11 +60,13 @@ pub(super) fn structural_exclusions(
 ) -> HashSet<usize> {
     let mut excluded = HashSet::new();
     let mut file_is_cfg_test: Option<bool> = None;
+    // Row verdict per container id: recounting siblings per element is O(n^2) on a big array.
+    let mut row_verdicts: HashMap<usize, bool> = HashMap::new();
     for occ in occurrences.values().flatten() {
         let node = occ.node;
         let numeric = numeric_kinds.contains(&occ.kind);
         let skip = in_attribute(node)
-            || (numeric && in_numeric_data_row(node, numeric_kinds))
+            || (numeric && in_numeric_data_row(node, numeric_kinds, &mut row_verdicts))
             || (!numeric
                 && test_strings.is_some_and(|in_test_file| {
                     in_test_file
@@ -104,7 +106,11 @@ fn numeric_core<'a>(node: Node<'a>, numeric_kinds: &[&str]) -> Option<Node<'a>> 
     numeric_kinds.contains(&cur.kind()).then_some(cur)
 }
 
-fn in_numeric_data_row(node: Node, numeric_kinds: &[&str]) -> bool {
+fn in_numeric_data_row(
+    node: Node,
+    numeric_kinds: &[&str],
+    verdicts: &mut HashMap<usize, bool>,
+) -> bool {
     let mut element = node;
     let mut parent = node.parent();
     while let Some(p) = parent
@@ -119,12 +125,15 @@ fn in_numeric_data_row(node: Node, numeric_kinds: &[&str]) -> bool {
     if !DATA_ROW_CONTAINERS.contains(&container.kind()) || element.id() == container.id() {
         return false;
     }
-    let mut cursor = container.walk();
-    let numeric_siblings = container
-        .named_children(&mut cursor)
-        .filter(|c| numeric_core(*c, numeric_kinds).is_some())
-        .count();
-    numeric_siblings >= DATA_ROW_MIN_ELEMENTS
+    *verdicts.entry(container.id()).or_insert_with(|| {
+        let mut cursor = container.walk();
+        container
+            .named_children(&mut cursor)
+            .filter(|c| numeric_core(*c, numeric_kinds).is_some())
+            .take(DATA_ROW_MIN_ELEMENTS)
+            .count()
+            >= DATA_ROW_MIN_ELEMENTS
+    })
 }
 
 fn is_cfg_test_attribute(node: Node, src: &[u8]) -> bool {
@@ -299,6 +308,41 @@ mod tests {
     }
 
     #[test]
+    fn strings_should_StillFlag_When_CfgAttributeIsNotPlainCfgTest() {
+        let body = repeated(Language::Rust, STR, 3);
+        for attr in [
+            "#[cfg(not(test))]",
+            "#[cfg_attr(test, derive(Debug))]",
+            "#[cfg(feature = \"test\")]",
+            "#[cfg(all(test, unix))]",
+        ] {
+            let src = format!("{attr}\nmod t {{\n{body}}}\n");
+            assert_eq!(count(Language::Rust, "src/a.rs", &src), 1, "{attr}");
+        }
+    }
+
+    #[test]
+    fn annotation_numbers_should_BeSkipped_But_BodyNumbersFlagged_When_Timeout60() {
+        let m = |n: &str| format!("@Timeout(60) void {n}() {{ int x = 60; }}\n");
+        let java = format!("class A {{\n{}{}{}}}\n", m("a"), m("b"), m("c"));
+        // 3 annotation 60s are skipped; the 3 body 60s remain one grouped finding.
+        assert_eq!(count(Language::Java, "A.java", &java), 1);
+        let bare = "class A {\n@Timeout(60) void a() {}\n@Timeout(60) void b() {}\n@Timeout(60) void c() {}\n}\n";
+        assert_eq!(count(Language::Java, "A.java", bare), 0);
+    }
+
+    #[test]
+    fn numeric_rows_should_NotBeQuadratic_When_ArrayHasTwentyThousandElements() {
+        let nums = (0..20_000)
+            .map(|i| (i + 50).to_string())
+            .collect::<Vec<_>>();
+        let src = format!("const T = [{}];\n", nums.join(","));
+        let start = std::time::Instant::now();
+        assert_eq!(count(Language::TypeScript, "a.ts", &src), 0);
+        assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    }
+
+    #[test]
     fn strings_should_StillFlag_When_ProdCodeFollowsRustCfgTestModule() {
         let prod = repeated(Language::Rust, STR, 3);
         let src = format!("#[cfg(test)]\nmod t {{ fn x() {{ let a = 1; }} }}\n{prod}");
@@ -381,6 +425,9 @@ mod tests {
         assert_eq!(normalize_numeric("2.0"), "2");
         assert_eq!(normalize_numeric("2.50"), "2.50");
         assert_eq!(normalize_numeric("0.0"), "0");
+        for keep in ["0x1", "0b1", "0xFFd", "1e0", "1.05"] {
+            assert_eq!(normalize_numeric(keep), keep, "{keep}");
+        }
     }
 
     /// One row of `per_row` numbers inside `open`/`close`.
