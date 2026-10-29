@@ -22,6 +22,7 @@ pub mod java_error_context;
 pub mod java_ignored_error;
 pub mod java_lost_exception_cause;
 pub mod java_swallowed_interrupt;
+mod magic_literal_context;
 pub mod markdown_link_integrity;
 pub mod paragraph_breaks;
 pub mod primitive_obsession;

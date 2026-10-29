@@ -6,6 +6,7 @@ use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::checkers::file_size;
+use crate::checkers::magic_literal_context::{normalize_numeric, structural_exclusions};
 use crate::config::Severity;
 use crate::node_kind::{
     BashKind, GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind,
@@ -1414,6 +1415,7 @@ fn rust_lang_config() -> LangRuleConfig {
 struct SyntaxRulesOptions {
     min_occurrences: Option<usize>,
     skip_tests: Option<bool>,
+    skip_test_strings: Option<bool>,
     skip_identifier_strings: Option<bool>,
 }
 
@@ -1423,6 +1425,8 @@ pub struct SyntaxRulesChecker {
     min_occurrences: usize,
     /// Require `MAGIC_LITERAL_TEST_FILE_MIN_OCCURRENCES` in test files.
     skip_tests: bool,
+    /// Ignore string literals in test files and Rust `cfg(test)` items entirely.
+    skip_test_strings: bool,
     /// Require `MAGIC_LITERAL_IDENTIFIER_MIN_OCCURRENCES` for identifier-like strings.
     skip_identifier_strings: bool,
 }
@@ -1433,6 +1437,7 @@ impl SyntaxRulesChecker {
             lang,
             min_occurrences: MAGIC_LITERAL_MIN_OCCURRENCES,
             skip_tests: true,
+            skip_test_strings: true,
             skip_identifier_strings: true,
         }
     }
@@ -1493,6 +1498,7 @@ impl Checker for SyntaxRulesChecker {
             lang: self.lang,
             min_occurrences: opts.min_occurrences.unwrap_or(self.min_occurrences),
             skip_tests: opts.skip_tests.unwrap_or(self.skip_tests),
+            skip_test_strings: opts.skip_test_strings.unwrap_or(self.skip_test_strings),
             skip_identifier_strings: opts
                 .skip_identifier_strings
                 .unwrap_or(self.skip_identifier_strings),
@@ -1518,7 +1524,13 @@ impl Checker for SyntaxRulesChecker {
             walk_dense_expressions(tree.root_node(), &cfg, src, &mut findings);
             let mut collector = LiteralCollector::default();
             walk_literals(tree.root_node(), &cfg, src, &mut collector);
-            let excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
+            let mut excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
+            excluded.extend(structural_exclusions(
+                &collector.occurrences,
+                cfg.numeric_literal_kinds,
+                src,
+                self.skip_test_strings.then(|| super::is_test_file(file)),
+            ));
             let filter = self.literal_filter(file, &excluded, &collector.slog_key_ids);
             emit_literal_findings(&collector, &cfg, &filter, &mut findings);
         }
@@ -1709,9 +1721,13 @@ fn strip_quote_delimiter(s: &str) -> Option<&str> {
 
 fn is_allowlisted_literal(raw: &str, kind: &str, cfg: &LangRuleConfig) -> bool {
     let value = normalize_literal_value(raw, kind);
-    MAGIC_LITERAL_ALLOWLIST.contains(&value)
-        || (cfg.numeric_literal_kinds.contains(&kind)
-            && MAGIC_LITERAL_NUMERIC_ALLOWLIST.contains(&value))
+    if cfg.numeric_literal_kinds.contains(&kind) {
+        let number = normalize_numeric(value);
+        return MAGIC_LITERAL_ALLOWLIST.contains(&number.as_str())
+            || MAGIC_LITERAL_NUMERIC_ALLOWLIST.contains(&number.as_str());
+    }
+    // A one-character string (`","`, `"x"`) is a delimiter or label, not a magic value.
+    MAGIC_LITERAL_ALLOWLIST.contains(&value) || value.chars().count() == 1
 }
 
 /// Matches `^[\w\-./:#]{1,40}$` on the unquoted value: test ids, dict/log keys, paths.
@@ -2813,10 +2829,15 @@ mod tests {
     }
 
     #[test]
-    fn flags_replace_magic_literal_glob_string_repeated_in_test_file() {
-        // `"**/*.go"` x14 is a true positive: not identifier-like (`*`), and >= 10 in a test.
+    fn flags_replace_magic_literal_glob_string_repeated_in_test_file_when_test_strings_kept() {
+        // `"**/*.go"` x14 is not identifier-like (`*`) and clears the test-file threshold;
+        // strings in tests are skipped by default, so this needs `skip_test_strings: false`.
         let src = go_repeated("\"**/*.go\"", 14);
-        assert_eq!(default_go_findings("pkg/foo_test.go", &src).len(), 1);
+        let opts = configured(serde_json::json!({"skip_test_strings": false}));
+        assert_eq!(
+            magic_literal_findings_with(&*opts, "pkg/foo_test.go", &src).len(),
+            1
+        );
         let three = go_repeated("\"**/*.go\"", 3);
         assert_eq!(default_go_findings("pkg/foo.go", &three).len(), 1);
     }
