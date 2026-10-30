@@ -181,14 +181,59 @@ post-change false-positive rate is still roughly 78% (n=36, wide interval). Most
 test-like code `is_test_file` does not recognize (`test/e2e/`, in-crate `#[cfg(test)]`), fixtures and
 generated files without a header marker.
 
+A second round, backed by 80 fresh hand-labeled findings (50 design, 30 held-out), adds node-context
+exclusions. Each is a tree-sitter node check, not a line regex:
+
+- **Strings in test code are skipped entirely** (not just raised to 10): a string in a detected test
+  file, or inside a Rust item (or file, via `#![cfg(test)]`) carrying `#[cfg(test)]`. Numerics in
+  tests keep the >= 10 rule above, since dropping them lost 5 of 13 labeled true positives.
+  `is_test_file` now also matches singular `test/`, `spec/` and `testing/` directories,
+  `*TestBase.java`/`.kt`, `*_tests.py` and `*.integrationTest.ts(x)`. Paths under the working
+  directory are judged relative to it, so a checkout under `~/test/` is not all test code. Other users of
+  `is_test_file`: `duplicate-code-fuzzy`, `go-package-focus`, `middle-man`.
+- **Attributes and annotations**: a literal inside `#[..]`/`#![..]`, a Java/Kotlin `@Annotation(..)`,
+  a Python/TS `@decorator(..)`, or a Go struct tag.
+- **Type-suffixed or float spellings of allowlisted numbers**: digit separators, a type suffix
+  (`u8`, `f32`, `L`, `f`) and a trailing `.0` are stripped before the allowlist, so `0u8`, `1f`,
+  `1.0` and `1_u32` are treated as `0`/`1`. Radix-prefixed literals are left alone.
+- **Numeric data-table rows**: a number in an array/tuple/list/composite literal that has
+  >= 4 numeric elements (unary minus included). A 3-number row, or numbers passed as call
+  arguments, still fire.
+- **Single-character strings** (`","`, `'x'`).
+- **Generated files** are detected from the `Code generated ... DO NOT EDIT.` marker within the
+  first 60 lines (was 20), which covers protobuf headers behind a license block. This also
+  affects `file-size`, `complexity`, `duplicate-code*`, `go-error-context`,
+  `go-encapsulate-collection`, `go-type-switch-density`, `go-table-driven-test`, `test-no-assertion`, hotspots and the architecture file-complexity sum.
+
+Measured on the 80 labeled findings: 28 of 41 design-set false positives and 20 of 26 held-out ones
+are gone; 2 of 9 design true positives are lost (both from the broader test-file detection), 0 of 4
+held-out. Corpus (25 repo/language runs, whole tree): 51,200 findings before, 17,213 after.
+
+Deliberately not excluded (each cost labeled true positives): map-key strings, message-like
+strings, and `1024`-style unit math.
+
 Set these per check in `.kibitzer/inspect.json`, on the `syntax-rules-<lang>` check's `options`
 (`options` applies to every rule of that checker; only `replace-magic-literal` reads these):
 
 | Option | Default | Effect |
 |--------|---------|--------|
 | `min_occurrences` | `3` | Base repetition threshold (must be >= 2). |
-| `skip_tests` | `true` | Require >= 10 occurrences in test files; `false` uses `min_occurrences` there. |
+| `skip_tests` | `true` | Require >= 10 occurrences for numerics (and strings, when `skip_test_strings` is off) in test files; `false` uses `min_occurrences` there. |
+| `skip_test_strings` | `true` | Ignore string literals in test files and Rust `cfg(test)` items entirely; `false` applies the `skip_tests` rule to them. |
 | `skip_identifier_strings` | `true` | Require >= 6 occurrences for identifier-like strings; `false` uses `min_occurrences`. |
+| `scope_aware` | `false` | When every use of a literal sits in ONE function, require `min_occurrences_local` instead of `min_occurrences`. Uses at module level (top-level tables) or spread over several functions keep `min_occurrences`. Test-file and identifier-string floors still apply via `max`, so locality only ever raises a threshold. The finding message gains "in N function(s)". Closures/lambdas count toward their enclosing function. |
+| `min_occurrences_local` | `4` | Threshold when `scope_aware` and all uses are in one function (must be >= 2; never lowers below `min_occurrences`). |
+
+**`scope_aware` is off by default.** A hand-labeled backtest found locality is barely better than
+random removal: over the corpus clones (12 repo/language runs, 32,291 findings) only 3.6% to 7.7%
+of findings are single-function with 3 to 7 uses (local = 4 to 8). On a stratified sample of 60 of
+those, 22% were true positives (a named constant would plausibly help), against 23% of 30 findings
+that locality keeps. Estimated false positives removed vs true positives lost: local 4: 3.9% / 2.6%;
+5: 5.4% / 5.1%; 6: 6.4% / 5.4%; 8: 7.8% / 7.5%. That does not beat the earlier "all uses within
+40 lines" experiment (26 of 63 false positives removed, 2 of 7 true positives lost). Samples are
+small and hand-labeled by one reviewer; see `docs/backtest-triage/*/replace-magic-literal.jsonl`
+(notes tagged `scope-aware sample`). The intra-file `ScopeMap` (`src/scope.rs`) is shared
+infrastructure other per-file checks can reuse.
 
 `replace-magic-literal` is the rule most likely to hit table-driven-test/fixture
 false positives (the corpus backtest above found this dominates its false-positive

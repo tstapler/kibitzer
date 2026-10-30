@@ -47,6 +47,7 @@ mod root_cause_clusters;
 mod run;
 mod run_context;
 mod schema;
+mod scope;
 mod single_call_site_delegation;
 mod status;
 mod symbol_extract;
@@ -331,7 +332,8 @@ enum CheckCommand {
     /// Code session transcripts, to validate it against real historical edits before
     /// shipping it. See docs/backtesting.md.
     Backtest {
-        /// Checker name from `checker::registry()`, or "all" to run every checker.
+        /// Checker name from `checker::registry()`, a `syntax-rules` rule id (e.g.
+        /// `replace-magic-literal`), or "all" to run every checker.
         name: String,
         /// Directory of `<session>/*.jsonl` transcripts (default: `~/.claude/projects`).
         #[arg(long)]
@@ -557,16 +559,19 @@ fn main() -> Result<ExitCode> {
                     .context("no transcripts directory given and $HOME is unset")?;
                 let transcripts = backtest::discover_transcripts(&dir)
                     .with_context(|| format!("discovering transcripts under {}", dir.display()))?;
-                let checker_names: Vec<String> = if name == "all" {
-                    Vec::new()
-                } else {
-                    vec![name]
-                };
+                let target = backtest::resolve_target(&name)?;
                 let cache_path = backtest::default_cache_path();
                 let mut cache = backtest::BacktestCache::load(&cache_path);
-                let report =
-                    backtest::run_backtest(&transcripts, &checker_names, only_new, &mut cache)?;
+                let mut report = backtest::run_backtest(
+                    &transcripts,
+                    &target.checker_names,
+                    only_new,
+                    &mut cache,
+                )?;
                 cache.save(&cache_path)?;
+                if let Some(rule_id) = &target.rule_id {
+                    backtest::retain_rule(&mut report.findings, rule_id);
+                }
                 println!(
                     "[kibitzer] scanned {} transcript(s), checked {} snapshot(s), {} edit(s) unreconstructable",
                     report.stats.transcripts_scanned,

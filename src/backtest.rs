@@ -17,6 +17,54 @@ use crate::architecture_checks::ArchModelChecker;
 use crate::checker::{Finding, GrammarCache};
 use crate::glob::matches_scope;
 
+/// What `kibitzer check backtest <name>` should run: the checkers to replay and, when
+/// `name` was a `syntax-rules` rule id rather than a checker, the rule to filter to.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BacktestTarget {
+    /// Empty means every registered checker.
+    pub checker_names: Vec<String>,
+    pub rule_id: Option<String>,
+}
+
+/// Resolves a CLI backtest name: `all`, a registered checker, or a rule id from
+/// `checkers::rules::CATALOG` (e.g. `replace-magic-literal`), which is not a checker of
+/// its own and so is replayed through every `syntax-rules-<lang>` checker.
+pub fn resolve_target(name: &str) -> Result<BacktestTarget> {
+    if name == "all" {
+        return Ok(BacktestTarget {
+            checker_names: Vec::new(),
+            rule_id: None,
+        });
+    }
+    if crate::checker::lookup(name).is_some() {
+        return Ok(BacktestTarget {
+            checker_names: vec![name.to_string()],
+            rule_id: None,
+        });
+    }
+    if crate::checkers::rules::CATALOG.iter().any(|r| r.id == name) {
+        let checker_names = crate::checker::registry()
+            .iter()
+            .map(|c| c.name())
+            .filter(|n| n.starts_with("syntax-rules-"))
+            .map(str::to_string)
+            .collect();
+        return Ok(BacktestTarget {
+            checker_names,
+            rule_id: Some(name.to_string()),
+        });
+    }
+    Err(anyhow::anyhow!(
+        "no checker or syntax rule named '{name}' — run `kibitzer check list` for checkers"
+    ))
+}
+
+/// Keeps only findings tagged `[rule_id]`, the prefix every `syntax-rules` finding carries.
+pub fn retain_rule(findings: &mut Vec<BacktestFinding>, rule_id: &str) {
+    let tag = format!("[{rule_id}]");
+    findings.retain(|f| f.message.starts_with(&tag));
+}
+
 /// A file mutation reconstructed from a transcript's Edit/Write/MultiEdit tool_use
 /// events — the content kibitzer's live hook would have seen right after that tool
 /// ran, reconstructed without touching disk (the real historical content is long
@@ -1101,5 +1149,58 @@ mod tests {
         .err()
         .expect("unknown checker must error");
         assert!(err.to_string().contains("no checker named"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn resolve_target_should_FanOutToSyntaxRulesCheckers_When_NameIsARuleId() {
+        let target = resolve_target("replace-magic-literal").unwrap();
+        assert_eq!(target.rule_id.as_deref(), Some("replace-magic-literal"));
+        assert!(!target.checker_names.is_empty());
+        assert!(
+            target
+                .checker_names
+                .iter()
+                .all(|n| n.starts_with("syntax-rules-"))
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn resolve_target_should_PassThroughRegisteredCheckerAndAll() {
+        let checker = resolve_target("duplicate-code").unwrap();
+        assert_eq!(checker.checker_names, vec!["duplicate-code".to_string()]);
+        assert_eq!(checker.rule_id, None);
+        let all = resolve_target("all").unwrap();
+        assert!(all.checker_names.is_empty());
+        assert_eq!(all.rule_id, None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn resolve_target_should_Error_When_NameIsNeitherCheckerNorRule() {
+        let err = resolve_target("does-not-exist").unwrap_err();
+        assert!(err.to_string().contains("no checker or syntax rule named"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn retain_rule_should_KeepOnlyFindingsTaggedWithTheRule() {
+        let finding = |message: &str| BacktestFinding {
+            transcript: PathBuf::from("t.jsonl"),
+            file_path: PathBuf::from("a.go"),
+            seq: 0,
+            checker: "syntax-rules-go".to_string(),
+            line: 1,
+            message: message.to_string(),
+            pre_existing: false,
+        };
+        let mut findings = vec![
+            finding("[replace-magic-literal] numeric literal 7 appears 3 times"),
+            finding("[flag-argument] parameter `b` is branched on"),
+        ];
+        retain_rule(&mut findings, "replace-magic-literal");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.starts_with("[replace-magic-literal]"));
     }
 }
