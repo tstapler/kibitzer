@@ -15,3 +15,7 @@ tap = "tstapler/homebrew-tap"
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+
+# macos-14 images are retired 2026-11-02 (runner-images#13518)
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
