@@ -219,9 +219,9 @@ Set these per check in `.kibitzer/inspect.json`, on the `syntax-rules-<lang>` ch
 |--------|---------|--------|
 | `min_occurrences` | `3` | Base repetition threshold (must be >= 2). |
 | `skip_tests` | `true` | Require >= 10 occurrences for numerics (and strings, when `skip_test_strings` is off) in test files; `false` uses `min_occurrences` there. |
-| `skip_test_strings` | `true` | Ignore string literals in test files and Rust `cfg(test)` items entirely; `false` applies the `skip_tests` rule to them. |
+| `skip_test_strings` | `true` | Ignore string literals in test files and Rust `cfg(test)` items entirely, independently of `skip_tests`: `skip_tests: false` alone does not re-enable test-file strings. `false` applies the `skip_tests` rule to them. |
 | `skip_identifier_strings` | `true` | Require >= 6 occurrences for identifier-like strings; `false` uses `min_occurrences`. |
-| `scope_aware` | `false` | When every use of a literal sits in ONE function, require `min_occurrences_local` instead of `min_occurrences`. Uses at module level (top-level tables) or spread over several functions keep `min_occurrences`. Test-file and identifier-string floors still apply via `max`, so locality only ever raises a threshold. The finding message gains "in N function(s)". Closures/lambdas count toward their enclosing function. |
+| `scope_aware` | `false` | When every use of a literal sits in ONE function, require `min_occurrences_local` instead of `min_occurrences`. Uses at module level (top-level tables) or spread over several functions keep `min_occurrences`. Test-file and identifier-string floors still apply via `max`, so locality only ever raises a threshold. The finding message gains "in N function(s)". Rust/Go/Python closures count toward their enclosing function; TS/JS arrow and function expressions, Java lambdas and Kotlin anonymous functions are their own scope. |
 | `min_occurrences_local` | `4` | Threshold when `scope_aware` and all uses are in one function (must be >= 2; never lowers below `min_occurrences`). |
 
 **`scope_aware` is off by default.** A hand-labeled backtest found locality is barely better than

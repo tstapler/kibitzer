@@ -10,7 +10,7 @@ use crate::config::Severity;
 use crate::node_kind::{
     BashKind, GoKind, JavaKind, KotlinKind, PythonKind, RustKind, TypeScriptKind,
 };
-use crate::scope::{ScopeMap, Spread};
+use crate::scope::{FileKind, ScopeMap, Spread};
 
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
@@ -1478,11 +1478,12 @@ impl SyntaxRulesChecker {
 
     fn literal_filter<'a>(
         &self,
-        scopes: &'a ScopeMap,
+        file: FileKind,
+        scopes: Option<&'a ScopeMap>,
         excluded: &'a HashSet<usize>,
         slog_keys: &'a HashSet<usize>,
     ) -> LiteralFilter<'a> {
-        let in_test = self.skip_tests && scopes.file.test;
+        let in_test = self.skip_tests && file.test;
         LiteralFilter {
             excluded,
             slog_keys,
@@ -1509,7 +1510,8 @@ struct LiteralFilter<'a> {
     /// Floor from the test-file adjustment (0 outside test files).
     test_bump: usize,
     policy: SpreadPolicy,
-    scopes: &'a ScopeMap,
+    /// Built only when `policy.scope_aware`; the default path never walks for scopes.
+    scopes: Option<&'a ScopeMap>,
     skip_identifier_strings: bool,
 }
 
@@ -1568,21 +1570,25 @@ impl Checker for SyntaxRulesChecker {
         // confirmed for `extract-variable` by a `kubernetes/kubernetes` corpus backtest,
         // where `zz_generated.*.go`/`generated.pb.go` dominated the raw finding count).
         // Scoped to just these 2 passes; the other 5 rules are untouched.
-        let scopes = ScopeMap::build(self.lang, tree, file, ctx.source);
-        if !scopes.file.generated {
-            walk_dense_expressions(tree.root_node(), &cfg, src, &mut findings);
-            let mut collector = LiteralCollector::default();
-            walk_literals(tree.root_node(), &cfg, src, &mut collector);
-            let mut excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
-            excluded.extend(structural_exclusions(
-                &collector.occurrences,
-                cfg.numeric_literal_kinds,
-                src,
-                self.skip_test_strings.then_some(scopes.file.test),
-            ));
-            let filter = self.literal_filter(&scopes, &excluded, &collector.slog_key_ids);
-            emit_literal_findings(&collector, &cfg, &filter, &mut findings);
+        let kind = FileKind::classify(file, ctx.source);
+        if kind.generated {
+            return Ok(findings);
         }
+        walk_dense_expressions(tree.root_node(), &cfg, src, &mut findings);
+        let mut collector = LiteralCollector::default();
+        walk_literals(tree.root_node(), &cfg, src, &mut collector);
+        let mut excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
+        excluded.extend(structural_exclusions(
+            &collector.occurrences,
+            cfg.numeric_literal_kinds,
+            src,
+            self.skip_test_strings.then_some(kind.test),
+        ));
+        let scopes = self
+            .scope_aware
+            .then(|| ScopeMap::build(self.lang, tree, ctx.source));
+        let filter = self.literal_filter(kind, scopes.as_ref(), &excluded, &collector.slog_key_ids);
+        emit_literal_findings(&collector, &cfg, &filter, &mut findings);
         Ok(findings)
     }
 }
@@ -1842,9 +1848,9 @@ fn build_literal_finding(
     if remaining.len() < filter.policy.multi_fn.max(bumps) {
         return None;
     }
-    let spread = filter.policy.scope_aware.then(|| {
+    let spread = filter.scopes.map(|scopes| {
         let bytes: Vec<usize> = remaining.iter().map(|occ| occ.node.start_byte()).collect();
-        filter.scopes.spread(&bytes)
+        scopes.spread(&bytes)
     });
     if let Some(spread) = &spread
         && remaining.len() < effective_threshold(spread, &filter.policy, bumps)
@@ -2910,6 +2916,23 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
+    fn test_file_strings_should_StaySkipped_When_OnlySkipTestsIsFalse() {
+        let src = go_repeated("\"**/*.go\"", 14);
+        let no_bump = configured(serde_json::json!({"skip_tests": false}));
+        assert!(magic_literal_findings_with(&*no_bump, "pkg/foo_test.go", &src).is_empty());
+        // `skip_test_strings: false` alone re-enables them, at the test-file floor (10).
+        let kept = configured(serde_json::json!({"skip_test_strings": false}));
+        let nine = go_repeated("\"**/*.go\"", 9);
+        assert!(magic_literal_findings_with(&*kept, "pkg/foo_test.go", &nine).is_empty());
+        let ten = go_repeated("\"**/*.go\"", 10);
+        assert_eq!(
+            magic_literal_findings_with(&*kept, "pkg/foo_test.go", &ten).len(),
+            1
+        );
+    }
+
+    #[test]
     fn skip_tests_false_restores_base_threshold_in_test_files() {
         let opts = configured(serde_json::json!({"skip_tests": false}));
         let src = go_repeated("86400", 3);
@@ -3120,17 +3143,27 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn identifier_bump_should_NotBeLoweredBy_LocalPolicy() {
-        // 5 uses over 2 functions: past multi_fn (3), under the identifier floor (6)
-        let src = go_in_functions("\"user_id\"", &[3, 2]);
+        // ONE function, so the local branch applies: 5 uses clear local (2) and multi_fn (3)
+        // but stay under the identifier floor (6); 6 uses clear it.
         let opts = configured(serde_json::json!({"scope_aware": true, "min_occurrences_local": 2}));
-        assert!(magic_literal_findings_with(&*opts, "a.go", &src).is_empty());
+        let five = go_in_functions("\"user_id\"", &[5]);
+        assert!(magic_literal_findings_with(&*opts, "a.go", &five).is_empty());
+        let six = go_in_functions("\"user_id\"", &[6]);
+        assert_eq!(magic_literal_findings_with(&*opts, "a.go", &six).len(), 1);
     }
 
     #[test]
     #[allow(non_snake_case)]
     fn test_file_bump_should_NotBeLoweredBy_LocalPolicy() {
-        let src = go_in_functions("86400", &[2, 2, 2]);
-        assert!(magic_literal_findings_with(&*scope_aware(6), "a_test.go", &src).is_empty());
+        // ONE function in a test file: 9 uses clear local (6) but not the test floor (10).
+        let opts = scope_aware(6);
+        let nine = go_in_functions("86400", &[9]);
+        assert!(magic_literal_findings_with(&*opts, "a_test.go", &nine).is_empty());
+        let ten = go_in_functions("86400", &[10]);
+        assert_eq!(
+            magic_literal_findings_with(&*opts, "a_test.go", &ten).len(),
+            1
+        );
     }
 
     #[test]
