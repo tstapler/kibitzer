@@ -67,7 +67,6 @@ pub(crate) struct ScopeMap {
     scopes: Vec<Scope>,
     /// Byte offset of the start of each line, for offset-to-line lookups.
     line_starts: Vec<usize>,
-    pub file: FileKind,
 }
 
 /// Node kinds that open a class-like scope. Functions come from the shared
@@ -92,7 +91,8 @@ fn class_kinds(lang: Language) -> &'static [&'static str] {
 }
 
 impl ScopeMap {
-    pub fn build(lang: Language, tree: &Tree, path: &Path, src: &str) -> Self {
+    /// Walks the whole tree; callers that only need [`FileKind`] should classify directly.
+    pub fn build(lang: Language, tree: &Tree, src: &str) -> Self {
         let root = tree.root_node();
         let function_kinds = lang_config(lang).function_kinds;
         let mut map = Self {
@@ -107,7 +107,6 @@ impl ScopeMap {
             line_starts: std::iter::once(0)
                 .chain(src.match_indices('\n').map(|(i, _)| i + 1))
                 .collect(),
-            file: FileKind::classify(path, src),
         };
         map.collect(root, 0, function_kinds, class_kinds(lang));
         map
@@ -197,9 +196,9 @@ mod tests {
     use super::*;
     use crate::checker::GrammarCache;
 
-    fn map_for(lang: Language, path: &str, src: &str) -> ScopeMap {
+    fn map_for(lang: Language, src: &str) -> ScopeMap {
         let tree = GrammarCache::new().parse(lang, src).unwrap();
-        ScopeMap::build(lang, &tree, Path::new(path), src)
+        ScopeMap::build(lang, &tree, src)
     }
 
     fn offset_of(src: &str, needle: &str) -> usize {
@@ -215,7 +214,7 @@ mod tests {
     fn scope_map_enclosing_should_ReturnInnermostFunction_When_ClosureNested() {
         let src =
             "fn outer() {\n    let a = 111;\n    let f = || { 222 };\n}\nfn other() { 333 }\n";
-        let map = map_for(Language::Rust, "a.rs", src);
+        let map = map_for(Language::Rust, src);
         let outer = fn_scope(&map, src, "111").unwrap();
         // closure_expression is not a function kind, so it belongs to `outer`
         assert_eq!(fn_scope(&map, src, "222"), Some(outer));
@@ -226,7 +225,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn scope_map_enclosing_should_ReturnInnermostFunction_When_FunctionNestedInFunction() {
         let src = "function outer() {\n  const a = 111;\n  function inner() { return 222; }\n  return 444;\n}\n";
-        let map = map_for(Language::TypeScript, "a.ts", src);
+        let map = map_for(Language::TypeScript, src);
         let outer = fn_scope(&map, src, "111").unwrap();
         let inner = fn_scope(&map, src, "222").unwrap();
         assert_ne!(inner, outer);
@@ -239,7 +238,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn scope_map_should_TreatArrowFunctionAsFunction_When_LangIsTypeScript() {
         let src = "const top = 111;\nconst f = () => { return 222; };\n";
-        let map = map_for(Language::TypeScript, "a.ts", src);
+        let map = map_for(Language::TypeScript, src);
         assert_eq!(fn_scope(&map, src, "111"), None);
         let arrow = fn_scope(&map, src, "222").unwrap();
         assert_eq!(map.scope(arrow).kind, ScopeKind::Function);
@@ -249,7 +248,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn scope_map_should_DeriveFunctionScopes_When_LangIsGo() {
         let src = "package m\nvar top = 111\nfunc a() int { return 222 }\nfunc (r T) b() int { return 333 }\n";
-        let map = map_for(Language::Go, "a.go", src);
+        let map = map_for(Language::Go, src);
         assert_eq!(fn_scope(&map, src, "111"), None);
         let a = fn_scope(&map, src, "222").unwrap();
         let b = fn_scope(&map, src, "333").unwrap();
@@ -260,7 +259,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn scope_map_should_DeriveFunctionAndClassScopes_When_LangIsPython() {
         let src = "class C:\n    attr = 111\n    def m(self):\n        return 222\nTOP = 333\n";
-        let map = map_for(Language::Python, "a.py", src);
+        let map = map_for(Language::Python, src);
         assert_eq!(fn_scope(&map, src, "111"), None);
         let class = map.enclosing(offset_of(src, "111"), ScopeKind::Class);
         assert!(class.is_some());
@@ -273,7 +272,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn scope_map_enclosing_should_ResolveModule_When_OutsideEveryFunction() {
         let src = "package m\nvar top = 111\n";
-        let map = map_for(Language::Go, "a.go", src);
+        let map = map_for(Language::Go, src);
         assert_eq!(
             map.enclosing(offset_of(src, "111"), ScopeKind::Module),
             Some(0)
@@ -284,7 +283,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn spread_should_CountTopLevelUsesAsOneScope_When_AllOutsideFunctions() {
         let src = "package m\nvar a = 111\nvar b = 111\nvar c = 111\n";
-        let map = map_for(Language::Go, "a.go", src);
+        let map = map_for(Language::Go, src);
         let bytes: Vec<usize> = src.match_indices("111").map(|(i, _)| i).collect();
         let s = map.spread(&bytes);
         assert_eq!(
@@ -298,7 +297,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn spread_should_CountFunctionsAndModule_When_Mixed() {
         let src = "package m\nvar t = 111\nfunc a() { _ = 111 }\nfunc b() { _ = 111; _ = 111 }\n";
-        let map = map_for(Language::Go, "a.go", src);
+        let map = map_for(Language::Go, src);
         let bytes: Vec<usize> = src.match_indices("111").map(|(i, _)| i).collect();
         let s = map.spread(&bytes);
         assert_eq!((s.total, s.distinct_scopes, s.module_level), (4, 3, 1));
@@ -307,10 +306,10 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn file_kind_should_ClassifyTestAndGenerated() {
-        let tree_src = "// Code generated by x. DO NOT EDIT.\npackage m\n";
-        let map = map_for(Language::Go, "a_test.go", tree_src);
-        assert!(map.file.test && map.file.generated);
-        let map = map_for(Language::Go, "a.go", "package m\n");
-        assert!(!map.file.test && !map.file.generated);
+        let generated = "// Code generated by x. DO NOT EDIT.\npackage m\n";
+        let kind = FileKind::classify(Path::new("a_test.go"), generated);
+        assert!(kind.test && kind.generated);
+        let kind = FileKind::classify(Path::new("a.go"), "package m\n");
+        assert!(!kind.test && !kind.generated);
     }
 }
