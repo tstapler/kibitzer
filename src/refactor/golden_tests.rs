@@ -53,6 +53,9 @@ fn checksums(root: &Path) -> BTreeMap<String, String> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let e = e.unwrap();
+            if e.file_type().unwrap().is_symlink() {
+                continue;
+            }
             if e.file_type().unwrap().is_dir() {
                 walk(root, &e.path(), out);
             } else {
@@ -256,12 +259,19 @@ fn every_operation_covers_the_required_shapes() {
     }
 }
 
+/// Re-plans the fixture (not the blessed plan.json), so the assertion tests the code.
 fn blocker_codes(case: &str) -> Vec<String> {
-    let p: MovePlan = serde_json::from_str(
-        &std::fs::read_to_string(data_root().join(case).join("plan.json")).unwrap(),
-    )
-    .unwrap();
-    p.blockers.into_iter().map(|b| b.code).collect()
+    let dir = data_root().join(case);
+    let op: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("op.json")).unwrap()).unwrap();
+    let root = input_copy(op["input"].as_str().unwrap());
+    let codes = run_plan(&root, &op)
+        .blockers
+        .into_iter()
+        .map(|b| b.code)
+        .collect();
+    let _ = std::fs::remove_dir_all(&root);
+    codes
 }
 
 #[test]
@@ -697,4 +707,161 @@ fn rename_blocks_when_testdata_would_be_stranded_but_partial_moves_only_warn() {
     assert!(rename.blockers.iter().any(|b| b.code == "non_go_assets"));
     let mv = plan_move_files(&root, &["lib/util.go".into()], "example.com/m/util", None).unwrap();
     assert!(mv.blockers.is_empty() && mv.warnings.iter().any(|w| w.contains("testdata")));
+}
+
+fn scratch(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+    let d = temp_dir(tag);
+    std::fs::write(d.join("go.mod"), "module example.com/m\n\ngo 1.21\n").unwrap();
+    for (path, body) in files {
+        let full = d.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    d
+}
+
+fn move_codes(root: &Path, src: &str, dest: &str) -> Vec<String> {
+    let before = checksums(root);
+    let plan = plan_move_files(root, &[src.into()], dest, None).unwrap();
+    assert_eq!(checksums(root), before, "planning must not touch the tree");
+    plan.blockers.into_iter().map(|b| b.code).collect()
+}
+
+#[test]
+fn boundary_crossing_declarations_are_blocked_with_specific_codes() {
+    // Receiver type and its method end up in different packages.
+    let r = scratch(
+        "method-split",
+        &[
+            ("lib/a.go", "package lib\n\ntype T struct{}\n"),
+            ("lib/b.go", "package lib\n\nfunc (T) M() {}\n"),
+        ],
+    );
+    assert!(
+        move_codes(&r, "lib/a.go", "example.com/m/other").contains(&"method_split".to_string())
+    );
+
+    // A moved name used as a composite-literal key: field or value?
+    let r = scratch(
+        "ambiguous",
+        &[
+            ("lib/a.go", "package lib\n\nfunc Moved() int { return 1 }\n"),
+            (
+                "lib/b.go",
+                "package lib\n\ntype S struct{ Moved int }\n\nvar V = S{Moved: 1}\n",
+            ),
+        ],
+    );
+    assert!(
+        move_codes(&r, "lib/a.go", "example.com/m/other")
+            .contains(&"ambiguous_reference".to_string())
+    );
+
+    // Moved code depends on an unexported name that stays behind.
+    let r = scratch(
+        "unexported",
+        &[
+            (
+                "lib/a.go",
+                "package lib\n\nfunc Moved() int { return helper() }\n",
+            ),
+            (
+                "lib/b.go",
+                "package lib\n\nfunc helper() int { return 1 }\n\nfunc Other() int { return helper() }\n",
+            ),
+        ],
+    );
+    assert!(
+        move_codes(&r, "lib/a.go", "example.com/m/other")
+            .contains(&"unexported_dependency".to_string())
+    );
+
+    // The destination already has a file with that name.
+    let r = scratch(
+        "dest-exists",
+        &[
+            ("lib/a.go", "package lib\n\nfunc Moved() int { return 1 }\n"),
+            ("lib/keep.go", "package lib\n"),
+            ("util/a.go", "package util\n\nfunc Other() {}\n"),
+        ],
+    );
+    assert!(
+        move_codes(&r, "lib/a.go", "example.com/m/util").contains(&"dest_file_exists".to_string())
+    );
+}
+
+#[test]
+fn import_alias_joins_the_last_two_path_elements() {
+    assert_eq!(
+        super::ops::import_alias_for_test("example.com/m/sub/lib"),
+        "sublib"
+    );
+    assert_eq!(
+        super::ops::import_alias_for_test("example.com/m/a-b/v2"),
+        "abv2"
+    );
+}
+
+#[test]
+fn plans_may_only_touch_expected_files_and_never_through_symlinks() {
+    let root = input_copy("base");
+    let mut plan = base_move_plan(&root);
+    plan.steps[0].transform.new_path = Some(".github/workflows/x.yml".into());
+    assert!(
+        apply(&plan, &root, &ApplyOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("may not touch")
+            || apply(&plan, &root, &ApplyOptions::default())
+                .unwrap_err()
+                .to_string()
+                .contains("not a file this operation may touch")
+    );
+
+    // A non-policy plan cannot carry policy steps (and so cannot skip verification).
+    let mut plan = base_move_plan(&root);
+    plan.steps[0].kind = PlanStepKind::PolicyUpdate;
+    assert!(
+        apply(&plan, &root, &ApplyOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("does not belong")
+    );
+
+    #[cfg(unix)]
+    {
+        let outside = temp_dir("outside");
+        std::os::unix::fs::symlink(&outside, root.join("esc")).unwrap();
+        let mut plan = base_move_plan(&root);
+        plan.steps[0].transform.new_path = Some("esc/dropped.go".into());
+        let before = checksums(&root);
+        assert!(
+            apply(&plan, &root, &ApplyOptions::default())
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+        assert!(!outside.join("dropped.go").exists());
+        assert_eq!(checksums(&root), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn moves_keep_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = input_copy("base");
+    std::fs::set_permissions(
+        root.join("lib/util.go"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let plan = base_move_plan(&root);
+    apply(&plan, &root, &ApplyOptions::default()).unwrap();
+    let mode = std::fs::metadata(root.join("util/util.go"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }

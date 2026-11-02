@@ -20,6 +20,8 @@ pub struct Workspace {
     /// Directories with `testdata/` or other non-Go files a directory move would strand.
     pub asset_dirs: BTreeSet<String>,
     imports_memo: std::cell::RefCell<HashMap<String, Vec<String>>>,
+    /// dir -> files, rebuilt lazily after any edit so graph walks don't rescan every path.
+    dir_index: std::cell::RefCell<Option<HashMap<String, Vec<String>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +67,14 @@ impl Workspace {
         let module = text
             .lines()
             .find_map(|l| l.trim().strip_prefix("module "))
-            .map(|m| m.trim().trim_matches('"').to_string())
+            .map(|m| {
+                m.split("//")
+                    .next()
+                    .unwrap_or(m)
+                    .trim()
+                    .trim_matches('"')
+                    .to_string()
+            })
             .filter(|m| !m.is_empty());
         let Some(module) = module else {
             bail!("{} has no `module` directive", gomod.display())
@@ -78,6 +87,7 @@ impl Workspace {
             native_dirs: BTreeSet::new(),
             asset_dirs: BTreeSet::new(),
             imports_memo: Default::default(),
+            dir_index: Default::default(),
         };
         ws.walk(root, "")?;
         Ok(ws)
@@ -135,11 +145,13 @@ impl Workspace {
 
     pub fn set(&mut self, path: &str, content: String) {
         self.imports_memo.borrow_mut().clear();
+        *self.dir_index.borrow_mut() = None;
         self.edits.insert(path.to_string(), Some(content));
     }
 
     pub fn remove(&mut self, path: &str) {
         self.imports_memo.borrow_mut().clear();
+        *self.dir_index.borrow_mut() = None;
         self.edits.insert(path.to_string(), None);
     }
 
@@ -189,10 +201,18 @@ impl Workspace {
     }
 
     pub fn files_in_dir(&self, dir: &str) -> Vec<String> {
-        self.paths()
-            .into_iter()
-            .filter(|p| dir_of(p) == dir)
-            .collect()
+        if self.dir_index.borrow().is_none() {
+            let mut idx: HashMap<String, Vec<String>> = HashMap::new();
+            for p in self.paths() {
+                idx.entry(dir_of(&p).to_string()).or_default().push(p);
+            }
+            *self.dir_index.borrow_mut() = Some(idx);
+        }
+        self.dir_index
+            .borrow()
+            .as_ref()
+            .and_then(|i| i.get(dir).cloned())
+            .unwrap_or_default()
     }
 
     pub fn pkg_info(&self, dir: &str) -> Option<PkgInfo> {

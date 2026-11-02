@@ -173,3 +173,50 @@ pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
         simulation_result: source.simulation_result.clone(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(from: &str, to: &str) -> PathMapping {
+        PathMapping {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn remap_respects_path_boundaries_and_glob_prefixes() {
+        let m = map("lib", "core");
+        let maps = [&m];
+        assert_eq!(remap("lib", &maps).as_deref(), Some("core"));
+        assert_eq!(remap("lib/**", &maps).as_deref(), Some("core/**"));
+        assert_eq!(remap("./lib/x", &maps).as_deref(), Some("./core/x"));
+        assert_eq!(remap("**/lib/**", &maps).as_deref(), Some("**/core/**"));
+        assert_eq!(
+            remap("libx/a", &maps),
+            None,
+            "sibling prefix must not match"
+        );
+        assert_eq!(remap("other/lib", &maps), None);
+    }
+
+    #[test]
+    fn longest_mapping_wins() {
+        let (a, b) = (map("lib/sub", "x"), map("lib", "core"));
+        assert_eq!(remap("lib/sub/f.go", &[&a, &b]).as_deref(), Some("x/f.go"));
+    }
+
+    #[test]
+    fn import_replacement_honors_word_boundaries() {
+        let m = map("example.com/m/lib", "example.com/m/core");
+        let out = replace_import_paths(
+            "a: example.com/m/lib\nb: example.com/m/lib-extra\nc: \"example.com/m/lib\"\n",
+            &[&m],
+        );
+        assert_eq!(
+            out,
+            "a: example.com/m/core\nb: example.com/m/lib-extra\nc: \"example.com/m/core\"\n"
+        );
+    }
+}

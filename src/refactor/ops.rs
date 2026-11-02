@@ -1151,3 +1151,8 @@ pub fn split_pkg(ws: &mut Workspace, f: &mut Findings, pkg_import: &str, cluster
         }
     }
 }
+
+#[cfg(test)]
+pub(super) fn import_alias_for_test(import: &str) -> String {
+    import_alias_for(import)
+}

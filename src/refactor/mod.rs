@@ -40,7 +40,8 @@ pub struct CommonArgs {
     /// Root of the Go module (must contain go.mod).
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Write the changes (default: print the plan and change nothing).
+    /// Write the changes (default: print the plan and change nothing). Runs `go build/vet/test`
+    /// in the repo afterwards, which executes its test code: only use on repos you trust.
     #[arg(long)]
     apply: bool,
     /// Write the plan JSON here instead of stdout.

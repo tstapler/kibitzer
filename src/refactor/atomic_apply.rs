@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 
 use super::plan::sha256_hex;
-use super::types::{ApplyResult, ApplyStatus, MovePlan, PlanStep};
+use super::types::{ApplyResult, ApplyStatus, MovePlan, OperationKind, PlanStep, PlanStepKind};
 use super::verify::run_verify;
 
 #[derive(Default)]
@@ -82,6 +82,7 @@ fn classify(root: &Path, s: &PlanStep) -> StepState {
 struct Journal {
     root: PathBuf,
     snapshot: BTreeMap<String, Option<Vec<u8>>>,
+    perms: BTreeMap<String, std::fs::Permissions>,
     created_dirs: Vec<PathBuf>,
     tmp_files: Vec<PathBuf>,
 }
@@ -89,6 +90,7 @@ struct Journal {
 impl Journal {
     fn new(root: &Path, plan: &MovePlan) -> Result<Self> {
         let mut snapshot = BTreeMap::new();
+        let mut perms = BTreeMap::new();
         for s in &plan.steps {
             for p in [&s.transform.old_path, &s.transform.new_path]
                 .into_iter()
@@ -101,6 +103,9 @@ impl Journal {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                         Err(e) => bail!("cannot snapshot {p}: {e}"),
                     };
+                    if let Ok(m) = std::fs::metadata(&full) {
+                        perms.insert(p.clone(), m.permissions());
+                    }
                     snapshot.insert(p.clone(), bytes);
                 }
             }
@@ -108,6 +113,7 @@ impl Journal {
         Ok(Self {
             root: root.to_path_buf(),
             snapshot,
+            perms,
             created_dirs: vec![],
             tmp_files: vec![],
         })
@@ -132,16 +138,35 @@ impl Journal {
         Ok(())
     }
 
-    fn write_atomic(&mut self, rel: &str, content: &[u8]) -> std::io::Result<()> {
+    /// Write via an exclusively created temp file (never follows a pre-planted symlink),
+    /// carrying over the permissions of `mode_from` so a move keeps a file's mode.
+    fn write_atomic(
+        &mut self,
+        rel: &str,
+        content: &[u8],
+        mode_from: Option<&str>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
         let full = self.root.join(rel);
         self.ensure_parent(&full)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
         let tmp = full.with_file_name(format!(
-            ".{}.kibitzer-tmp.{}",
+            ".{}.kibitzer-tmp.{}.{nanos}",
             super::workspace::base_of(rel),
             std::process::id()
         ));
         self.tmp_files.push(tmp.clone());
-        std::fs::write(&tmp, content)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(content)?;
+        drop(file);
+        if let Some(perms) = mode_from.and_then(|m| self.perms.get(m)) {
+            std::fs::set_permissions(&tmp, perms.clone())?;
+        }
         std::fs::rename(&tmp, &full)
     }
 
@@ -161,6 +186,8 @@ impl Journal {
                         .and_then(|()| std::fs::write(&full, bytes));
                     if let Err(e) = r {
                         errors.push(format!("restore {rel}: {e}"));
+                    } else if let Some(perms) = self.perms.get(rel) {
+                        let _ = std::fs::set_permissions(&full, perms.clone());
                     }
                 }
                 None => {
@@ -193,10 +220,28 @@ fn prune_empty_dirs(root: &Path, plan: &MovePlan) {
     }
 }
 
-/// Plans are data a reviewer may have edited: keep every path inside the repo and every
-/// package argument a plain relative package path (never a `go` flag).
-fn validate_plan(plan: &MovePlan) -> Result<()> {
+const POLICY_FILES: &[&str] = &[
+    ".kibitzer/inspect.json",
+    ".golangci.yml",
+    ".golangci.yaml",
+    ".go-arch-lint.yml",
+    ".depguard.yml",
+];
+
+/// Plans are data a reviewer may have edited, so a plan may only touch what the tool itself
+/// would produce: `.go` files for move operations, known policy files for `sync_policy`;
+/// never a path outside the repo or one that crosses a symlink; and package arguments must
+/// be plain relative package paths (never a `go` flag).
+fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
+    let policy = plan.operation == OperationKind::SyncPolicy;
     for s in &plan.steps {
+        if policy != (s.kind == PlanStepKind::PolicyUpdate) {
+            bail!(
+                "plan step kind {:?} does not belong to a {:?} plan; refusing to apply",
+                s.kind,
+                plan.operation
+            );
+        }
         for p in [&s.transform.old_path, &s.transform.new_path]
             .into_iter()
             .flatten()
@@ -209,6 +254,25 @@ fn validate_plan(plan: &MovePlan) -> Result<()> {
             if escapes || p.is_empty() {
                 bail!("plan path `{p}` is absolute or leaves the repository; refusing to apply");
             }
+            let allowed = if policy {
+                POLICY_FILES.contains(&p.as_str())
+            } else {
+                p.ends_with(".go") && !p.split('/').any(|c| c.starts_with('.'))
+            };
+            if !allowed {
+                bail!("plan path `{p}` is not a file this operation may touch; refusing to apply");
+            }
+            let mut cur = root.to_path_buf();
+            for comp in path.components() {
+                cur.push(comp);
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        bail!("plan path `{p}` crosses a symlink; refusing to apply")
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
         }
     }
     for pkg in &plan.affected_packages {
@@ -220,7 +284,7 @@ fn validate_plan(plan: &MovePlan) -> Result<()> {
 }
 
 pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyResult> {
-    validate_plan(plan)?;
+    validate_plan(plan, root)?;
     if !plan.blockers.is_empty() {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
         bail!(
@@ -305,7 +369,11 @@ fn write_steps(journal: &mut Journal, plan: &MovePlan, opts: &ApplyOptions) -> R
         let t = &s.transform;
         if let (Some(new), Some(content)) = (&t.new_path, &t.new_content) {
             journal
-                .write_atomic(new, content.as_bytes())
+                .write_atomic(
+                    new,
+                    content.as_bytes(),
+                    t.old_path.as_deref().or(Some(new.as_str())),
+                )
                 .map_err(|e| anyhow::anyhow!("writing {new}: {e}"))?;
         }
         if let Some(old) = &t.old_path

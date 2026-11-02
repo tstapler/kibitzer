@@ -33,9 +33,11 @@ this partition does not exist yet, so the file format is defined here.
 * Paths in a plan are repo-relative; each step carries the new content and the SHA-256
   of the content it replaces. A plan is the exact bytes that will be written. Rewritten
   files are `gofmt`ed at plan time only when the original was already gofmt-clean, so a
-  pre-existing formatting problem is not folded into the diff. Plan paths must stay inside
-  the repo and `affected_packages` must be relative package paths; anything else is
-  rejected before any write.
+  pre-existing formatting problem is not folded into the diff. A plan may only touch `.go` files
+  (move operations) or the known policy files (`sync_policy`), must not leave the repo or
+  cross a symlink, may not mix step kinds, and its `affected_packages` must be relative
+  package paths; anything else is rejected before any write. Temp files are created
+  exclusively and file permissions are carried over on moves and restored on rollback.
 * **Idempotence.** Before writing, every step is classified against disk: all steps
   already at their target state → `already_applied` (no-op); some → error `plan is
   partially applied … nothing was modified`; any source changed since planning → error
@@ -62,9 +64,18 @@ this partition does not exist yet, so the file format is defined here.
 
 Limits of the guarantee: there is no signal handling (a kill during `go test` leaves the
 written, unverified tree, and the next `apply` of the plan reports it as partially
-applied); file modes and symlinks are not preserved across the temp-file rename; and
-verification has no baseline or timeout, so a pre-existing `go vet`/`go test` failure
+applied); verification has no baseline or timeout, so a pre-existing `go vet`/`go test` failure
 rolls every move back.
+
+## Trust model
+
+Planning (no `--apply`) only reads files and runs `gofmt`. **`--apply` runs `go build`,
+`go vet` and `go test` in the target repo, which executes that repo's own test and `init`
+code** (and `go` may fetch a toolchain named by `go.mod`), as does a `--post-apply`
+command. Only apply to repositories you trust, and only apply plans you have reviewed;
+`apply --plan` re-validates the plan's paths but a reviewed-and-edited plan can still add
+or rewrite Go source. Verification output (stdout/stderr, unbounded) is embedded verbatim in
+the result JSON, so treat saved results as you would test logs.
 
 ## Why tree-sitter in Rust (and not `gopls`)
 
