@@ -26,6 +26,24 @@ pub struct ArchFinding {
     /// precedent as `CheckResult.command`, `src/check.rs:26-32`).
     #[serde(default)]
     pub severity_override: Option<Severity>,
+    /// Mechanical refactor that could resolve this finding, so an agent can follow up
+    /// with the named MCP call. Advisory only — never affects severity or suppression.
+    /// `#[serde(default)]` keeps pre-existing cached/serialized findings deserializable.
+    #[serde(default)]
+    pub operation: Option<AvailableOperation>,
+}
+
+/// A refactor operation attached to an [`ArchFinding`] (docs/refactor-tools.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableOperation {
+    /// Stable identifier, e.g. `split_package`.
+    pub name: String,
+    /// The MCP call that plans this operation.
+    pub mcp_call: String,
+    pub feasible: bool,
+    /// Why the operation is not feasible; empty when `feasible`.
+    #[serde(default)]
+    pub blocker: String,
 }
 
 pub trait ArchitectureChecker {
@@ -79,7 +97,7 @@ impl ArchitectureChecker for ImportCycleChecker {
         &self,
         graph: &ImportGraph,
         _config: &ArchitectureConfig,
-        _model: Option<&crate::arch_model::ArchModel>,
+        model: Option<&crate::arch_model::ArchModel>,
     ) -> Vec<ArchFinding> {
         let cycles = find_cycles(graph);
         cycles
@@ -96,10 +114,30 @@ impl ArchitectureChecker for ImportCycleChecker {
                     line: edge.map(|e| e.line),
                     message: format!("[import-cycle] import cycle: {}", path.join(" -> ")),
                     severity_override: None,
+                    operation: model.and_then(|m| cycle_operation(m, &cycle)),
                 }
             })
             .collect()
     }
+}
+
+/// `split_package` hint for the first cycle member that has a clean partition, with the
+/// simulated feasibility; `None` when the model has nothing to propose.
+fn cycle_operation(model: &crate::arch_model::ArchModel, cycle: &[String]) -> Option<AvailableOperation> {
+    cycle.iter().find_map(|package| {
+        let partition = crate::refactor::auto_partition(model, package)?;
+        let sim = crate::refactor::simulate_split(model, package, &partition);
+        Some(AvailableOperation {
+            name: "split_package".into(),
+            mcp_call: crate::refactor::plan_call(package, &partition),
+            feasible: sim.feasible && sim.violations_resolved > 0,
+            blocker: if sim.feasible && sim.violations_resolved == 0 {
+                "simulated split does not resolve the cycle".into()
+            } else {
+                sim.blocker
+            },
+        })
+    })
 }
 
 /// Returns the index into `config.layers` of the layer `node`'s path belongs to, by
@@ -156,6 +194,7 @@ impl ArchitectureChecker for LayeringChecker {
                             config.layers[to_layer]
                         ),
                         severity_override: None,
+                        operation: None,
                     })
                 } else {
                     None
@@ -210,6 +249,7 @@ fn fan_out_findings(
                          — consider splitting its responsibilities"
                     ),
                     severity_override: None,
+                    operation: None,
                 })
             } else {
                 None
@@ -238,6 +278,7 @@ fn fan_in_findings(
                          (over {MAX_FAN_IN}) — changes to it have a wide blast radius"
                     ),
                     severity_override: None,
+                    operation: None,
                 })
             } else {
                 None
@@ -318,6 +359,7 @@ impl ArchitectureChecker for PackageSizeChecker {
                      {MAX_PACKAGE_LINES}) — consider splitting it into sub-packages"
                 ),
                 severity_override: None,
+                operation: None,
             })
             .collect()
     }
@@ -401,6 +443,7 @@ pub(crate) fn zero_match_advisory<T>(
             describe(&declared[0])
         ),
         severity_override: Some(Severity::Advisory),
+        operation: None,
     })
 }
 
@@ -450,6 +493,7 @@ impl ArchitectureChecker for ComponentDependencyChecker {
                     line: Some(edge.line),
                     message,
                     severity_override: None,
+                    operation: None,
                 })
             })
             .collect();
@@ -650,6 +694,7 @@ fn instability_finding(
                 pkg.path
             ),
             severity_override: None,
+            operation: None,
         });
     }
     if instability >= UNSTABLE_MIN && abstractness >= ABSTRACT_MIN {
@@ -663,6 +708,7 @@ fn instability_finding(
                 pkg.path
             ),
             severity_override: None,
+            operation: None,
         });
     }
     None
@@ -730,6 +776,7 @@ fn dip_finding(
              vary; consider depending on an interface instead"
         ),
         severity_override: None,
+        operation: None,
     })
 }
 
@@ -967,6 +1014,7 @@ fn lcom_findings_for_package(
                     evaluated.len()
                 ),
                 severity_override: None,
+                operation: None,
             })
         })
         .collect()
@@ -2352,3 +2400,34 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod operation_field_tests {
+    use super::*;
+
+    #[test]
+    fn operation_round_trips_through_serde_json() {
+        let f = ArchFinding {
+            file: None,
+            line: Some(3),
+            message: "m".into(),
+            severity_override: None,
+            operation: Some(AvailableOperation {
+                name: "split_package".into(),
+                mcp_call: "plan_refactor({})".into(),
+                feasible: false,
+                blocker: "why".into(),
+            }),
+        };
+        let back: ArchFinding = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn old_json_without_operation_deserializes() {
+        let f: ArchFinding =
+            serde_json::from_str(r#"{"file":null,"line":null,"message":"m","severity_override":null}"#).unwrap();
+        assert_eq!(f.operation, None);
+    }
+}
+

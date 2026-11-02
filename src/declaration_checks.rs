@@ -84,6 +84,7 @@ impl DeclarationChecker for ContentChecker {
                         rule.allowed_kinds.join(", ")
                     ),
                     severity_override: None,
+                    operation: None,
                 })
             })
             .collect();
@@ -150,6 +151,7 @@ impl DeclarationChecker for NamingChecker {
                         decl.name, rule.pattern
                     ),
                     severity_override: None,
+                    operation: None,
                 })
             })
             .collect();
@@ -175,6 +177,7 @@ impl DeclarationChecker for NamingChecker {
                     rule.component, rule.kind, rule.pattern
                 ),
                 severity_override: Some(Severity::Advisory),
+                operation: None,
             })
         }));
 

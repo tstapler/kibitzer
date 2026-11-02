@@ -210,6 +210,7 @@ fn build_findings(
                     usages.len()
                 ),
                 severity_override: None,
+                operation: None,
             })
         })
         .collect()
