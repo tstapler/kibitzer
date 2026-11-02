@@ -103,7 +103,7 @@ pub fn build_plan(
             .as_ref()
             .and_then(|o| ws.original(o))
             .or(orig.as_deref());
-        if super::go_syntax::parse(&content).is_none_or(|t| t.root_node().has_error()) {
+        if crate::go_syntax::parse(&content).is_none_or(|t| t.root_node().has_error()) {
             f.blockers.push(
                 BlockingDiagnostic::new("syntax_error", "file does not parse as Go (before or after the rewrite); refusing to plan around it")
                     .at(&path, None),

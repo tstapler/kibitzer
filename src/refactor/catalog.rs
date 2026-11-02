@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use super::feasibility::{self, Resolved};
 use super::{
     AvailableOperation, Edit, OperationKind, RefactorOperation, RefactorPlan, TouchedFile,
-    go_syntax,
 };
 use crate::arch_model::ArchModel;
+use crate::go_syntax::{self, ImportName};
 
 fn is_test_file(path: &Path) -> bool {
     path.file_name()
@@ -34,7 +34,7 @@ pub fn list_operations_for_package(model: &ArchModel, package: &str) -> Vec<Avai
     let has_cgo = sources
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
-        .any(|src| go_syntax::imports_c(&src));
+        .any(|src| go_syntax::imports_cgo(&src));
     if sources.len() < 2 || has_cgo {
         return Vec::new();
     }
@@ -205,9 +205,15 @@ fn import_edits(
 ) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
     for file in feasibility::importer_files(model, op, r).into_keys() {
-        let sites = go_syntax::find_imports(&read_file(&file)?, &op.source_package);
-        let Some(site) = sites.first() else { continue };
-        let alias = (old_name != new_name && !site.has_alias && !old_name.is_empty())
+        let src = read_file(&file)?;
+        let Some(site) = go_syntax::imports(&src)
+            .into_iter()
+            .find(|i| i.path == op.source_package)
+        else {
+            continue;
+        };
+        let has_alias = site.name != ImportName::Implicit;
+        let alias = (old_name != new_name && !has_alias && !old_name.is_empty())
             .then(|| old_name.to_string());
         edits.push(Edit::ReplaceImportPath {
             file,

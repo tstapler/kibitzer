@@ -171,6 +171,33 @@ pub fn rewrite_import_path(src: &str, old: &str, new: &str) -> String {
     apply_edits(src, edits)
 }
 
+/// Swap every import of `old` for `new`; `alias` is added to specs that carry no name so existing
+/// `pkg.Sym` selectors stay valid when the package name changes. `None` when no spec matches, so a
+/// caller never reports a no-op as a rewrite.
+pub fn rewrite_import_path_aliased(
+    src: &str,
+    old: &str,
+    new: &str,
+    alias: Option<&str>,
+) -> Option<String> {
+    let edits: Vec<Edit> = imports(src)
+        .into_iter()
+        .filter(|i| i.path == old)
+        .map(|i| {
+            let prefix = match (alias, &i.name) {
+                (Some(a), ImportName::Implicit) => format!("{a} "),
+                _ => String::new(),
+            };
+            Edit {
+                start: i.path_start,
+                end: i.path_end,
+                text: format!("{prefix}\"{new}\""),
+            }
+        })
+        .collect();
+    (!edits.is_empty()).then(|| apply_edits(src, edits))
+}
+
 /// Delete the import spec(s) for `path`.
 pub fn remove_import(src: &str, path: &str) -> String {
     let mut edits = vec![];
@@ -880,5 +907,59 @@ mod tests {
         assert_eq!(lits[0].0, "x/y.T");
         assert_eq!(path_keyed_use(src).unwrap().1, "gob.Register");
         assert!(path_keyed_use("package a\n\nfunc f() {}\n").is_none());
+    }
+
+    #[test]
+    fn exact_import_match_ignores_prefixes_and_comments() {
+        let src = "package a\n\n// \"foo/bar\"\nimport (\n\t\"foo/bar/baz\"\n\tx \"foo/bar\"\n)\n";
+        let hits: Vec<_> = imports(src)
+            .into_iter()
+            .filter(|i| i.path == "foo/bar")
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, ImportName::Alias("x".into()));
+    }
+
+    #[test]
+    fn aliased_rewrite_leaves_prefix_paths_alone_and_reports_no_match() {
+        let src = "package a\n\nimport (\n\t\"foo/bar/baz\"\n\t\"foo/bar\"\n)\n";
+        let out = rewrite_import_path_aliased(src, "foo/bar", "x/y", Some("bar")).unwrap();
+        assert_eq!(
+            out,
+            "package a\n\nimport (\n\t\"foo/bar/baz\"\n\tbar \"x/y\"\n)\n"
+        );
+        assert_eq!(rewrite_import_path_aliased(src, "foo/ba", "x", None), None);
+    }
+
+    #[test]
+    fn aliased_rewrite_keeps_an_existing_name() {
+        let src = "package a\n\nimport b \"foo/bar\"\n";
+        let out = rewrite_import_path_aliased(src, "foo/bar", "x/y", Some("bar")).unwrap();
+        assert_eq!(out, "package a\n\nimport b \"x/y\"\n");
+    }
+
+    #[test]
+    fn cgo_and_package_clause_reads() {
+        assert!(imports_cgo(
+            "package a\n\n/*\n#include <x.h>\n*/\nimport \"C\"\n"
+        ));
+        assert!(!imports_cgo("package a\n\nimport \"fmt\"\n"));
+        assert_eq!(
+            package_name("package foo_test\n").as_deref(),
+            Some("foo_test")
+        );
+    }
+
+    #[test]
+    fn build_constraint_only_counts_before_the_package_clause() {
+        assert!(has_build_constraint(
+            "a.go",
+            "//go:build linux\n\npackage a\n"
+        ));
+        assert!(!has_build_constraint(
+            "a.go",
+            "package a\n\n// +build linux\n"
+        ));
+        assert!(has_build_constraint("a_linux.go", "package a\n"));
     }
 }

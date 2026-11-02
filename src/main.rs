@@ -25,6 +25,7 @@ mod go_build_cost;
 mod go_call_resolution;
 mod go_package_focus;
 mod go_refactor;
+mod go_syntax;
 mod god_class;
 mod hook;
 mod hook_footer;

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use super::go_syntax;
+use crate::go_syntax;
 
 pub struct Workspace {
     pub module: String,

@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use super::go_syntax::{self as gs, DeclKind, Edit};
 use super::types::{BlockingDiagnostic, PathMapping};
 use super::workspace::{
     PkgInfo, Workspace, base_of, derive_pkg_name, dir_of, internal_ok, is_test_file, join,
 };
+use crate::go_syntax::{self as gs, DeclKind, Edit};
 
 #[derive(Default)]
 pub struct Findings {

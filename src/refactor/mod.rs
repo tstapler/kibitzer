@@ -7,7 +7,6 @@
 pub mod apply;
 pub mod catalog;
 pub mod feasibility;
-mod go_syntax;
 
 use std::path::PathBuf;
 

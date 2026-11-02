@@ -13,7 +13,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Edit, RefactorPlan, go_syntax};
+use super::{Edit, RefactorPlan};
+use crate::go_syntax;
 
 /// Serializes apply and recovery in this process so one apply never rolls back another's live
 /// WAL. Two separate server processes on one repo are not covered.
@@ -425,7 +426,9 @@ fn compute_outputs(plan: &RefactorPlan) -> Result<Vec<Output>> {
         match edit {
             Edit::ReplacePackageDecl { file, new_name, .. } => {
                 let body = bodies.get_mut(file).context("unrecorded file")?;
-                *body = go_syntax::replace_package_name(body, new_name)
+                // The plan carries the final name; the shared rewriter re-appends an existing `_test`.
+                let base = new_name.strip_suffix("_test").unwrap_or(new_name);
+                *body = go_syntax::rewrite_package_clause(body, base)
                     .with_context(|| format!("no package clause in {}", file.display()))?;
             }
             Edit::ReplaceImportPath {
@@ -435,10 +438,13 @@ fn compute_outputs(plan: &RefactorPlan) -> Result<Vec<Output>> {
                 alias,
             } => {
                 let body = bodies.get_mut(file).context("unrecorded file")?;
-                *body = go_syntax::replace_import_path(body, old_path, new_path, alias.as_deref())
-                    .with_context(|| {
-                        format!("import {old_path} not found in {}", file.display())
-                    })?;
+                *body = go_syntax::rewrite_import_path_aliased(
+                    body,
+                    old_path,
+                    new_path,
+                    alias.as_deref(),
+                )
+                .with_context(|| format!("import {old_path} not found in {}", file.display()))?;
             }
             Edit::MoveFile { from, to } => {
                 if to.exists() {

@@ -2,7 +2,6 @@
 //! Design: docs/go-pkg-move-ops.md.
 
 mod atomic_apply;
-mod go_syntax;
 mod ops;
 mod plan;
 mod policy;
