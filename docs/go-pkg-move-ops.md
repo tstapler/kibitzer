@@ -185,6 +185,25 @@ Exported-surface changes are listed in `surface_changes` (`old.Path.Name -> new.
 * A trailing comment on the line of the previous declaration is not treated as the next
   declaration's doc comment.
 
+## Known follow-ups (found in the sdd:6-verify review)
+
+* **Two move engines coexist.** `src/go_refactor/` (this CLI, five operations, journal-based
+  applier) and `src/refactor/` (#159, MCP, WAL-based applier, build/vet allowlist only) were
+  developed in parallel and share no code or plan schema. Duplicated: plan hash helper
+  (`sha256_hex` in three files), Go package/import parsing (`go_refactor/go_syntax.rs`, 884
+  lines, is a superset of `refactor/go_syntax.rs`, 198 lines, and the two
+  `has_build_constraint` functions disagree on filename suffixes and block comments), and
+  `go.mod` module-line parsing. The safer shared core is a separate change; until then
+  `go_refactor` runs `go test` and an optional `--post-apply` shell command (see Trust model),
+  which #159 does not.
+* `ops.rs::partial_move` is ~500 lines and only golden-tested; splitting it per operation is
+  a mechanical follow-up.
+* `write_atomic` does not `fsync` before `rename`, so it is atomic against failure and panic
+  (a `Drop` guard restores the tree) but not against power loss. Files written by a
+  `--post-apply` hook or by `go` itself are not rolled back. A rollback that itself fails
+  exits 4 (a clean rollback exits 3).
+* `verify.rs` runs commands without a timeout.
+
 ## Out of v1
 
 Semantic refactorings, signature changes, interface extraction, cross-module moves,

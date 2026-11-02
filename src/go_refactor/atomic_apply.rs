@@ -33,6 +33,14 @@ fn read(root: &Path, rel: &str) -> Option<Vec<u8>> {
 
 fn classify(root: &Path, s: &PlanStep) -> StepState {
     let t = &s.transform;
+    // `read` maps every error to "absent"; an unreadable file must not look like a missing one.
+    for p in [&t.old_path, &t.new_path].into_iter().flatten() {
+        if let Err(e) = std::fs::read(root.join(p))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return StepState::Conflict(format!("{p} is not readable: {e}"));
+        }
+    }
     let want = t.new_content.as_deref().map(str::as_bytes);
     let old_matches = |p: &str| match (read(root, p), &t.old_sha256) {
         (Some(b), Some(h)) => &sha256_hex(&b) == h,
@@ -85,6 +93,16 @@ struct Journal {
     perms: BTreeMap<String, std::fs::Permissions>,
     created_dirs: Vec<PathBuf>,
     tmp_files: Vec<PathBuf>,
+    /// While set, dropping the journal restores the tree (covers a panic mid-apply).
+    armed: bool,
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.restore();
+        }
+    }
 }
 
 impl Journal {
@@ -116,6 +134,7 @@ impl Journal {
             perms,
             created_dirs: vec![],
             tmp_files: vec![],
+            armed: true,
         })
     }
 
@@ -172,6 +191,7 @@ impl Journal {
 
     /// Put every snapshotted path back. Errors are collected, never short-circuited.
     fn restore(&mut self) -> Vec<String> {
+        self.armed = false;
         let mut errors = vec![];
         for tmp in self.tmp_files.drain(..) {
             let _ = std::fs::remove_file(tmp);
@@ -270,7 +290,8 @@ fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
                         bail!("plan path `{p}` crosses a symlink; refusing to apply")
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => bail!("plan path `{p}` cannot be inspected: {e}; refusing to apply"),
                 }
             }
         }
@@ -354,6 +375,7 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
             });
         }
     }
+    journal.armed = false;
     prune_empty_dirs(root, plan);
     Ok(ApplyResult {
         status: ApplyStatus::Applied,
@@ -393,6 +415,72 @@ fn write_steps(journal: &mut Journal, plan: &MovePlan, opts: &ApplyOptions) -> R
 mod tests {
     use super::*;
     use crate::go_refactor::types::{FileTransform, OperationKind, PlanStepKind};
+
+    fn one_step_plan(old: &str, new: &str) -> MovePlan {
+        MovePlan {
+            operation: OperationKind::MoveFiles,
+            repo_root: ".".into(),
+            module: "m".into(),
+            from: vec![],
+            to: vec![],
+            steps: vec![PlanStep {
+                kind: PlanStepKind::MoveFile,
+                transform: FileTransform {
+                    old_path: Some(old.into()),
+                    old_sha256: None,
+                    new_path: Some(new.into()),
+                    new_content: Some("package z\n".into()),
+                },
+                reason: String::new(),
+            }],
+            blockers: vec![],
+            warnings: vec![],
+            surface_changes: vec![],
+            path_map: vec![],
+            affected_packages: vec![],
+            simulation_result: None,
+        }
+    }
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("kibitzer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn unreadable_file_is_a_conflict_not_a_missing_file() {
+        let root = scratch_root("unreadable");
+        // A directory where a file is expected fails to read with a non-NotFound error, on any user.
+        std::fs::create_dir_all(root.join("a.go")).unwrap();
+        let plan = one_step_plan("a.go", "b.go");
+        assert!(matches!(
+            classify(&root, &plan.steps[0]),
+            StepState::Conflict(m) if m.contains("not readable")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropping_an_armed_journal_restores_the_tree() {
+        let root = scratch_root("drop-guard");
+        std::fs::write(root.join("a.go"), "package a\n").unwrap();
+        let plan = one_step_plan("a.go", "b.go");
+        {
+            let journal = Journal::new(&root, &plan).unwrap();
+            // Simulate a half-finished apply, then unwind without an explicit restore.
+            std::fs::write(root.join("b.go"), "package z\n").unwrap();
+            std::fs::remove_file(root.join("a.go")).unwrap();
+            drop(journal);
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.go")).unwrap(),
+            "package a\n"
+        );
+        assert!(!root.join("b.go").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn restore_recreates_missing_parent_directories() {

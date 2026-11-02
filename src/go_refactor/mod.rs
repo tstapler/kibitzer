@@ -340,7 +340,10 @@ pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
         common.affected_only,
     )?;
     emit(&result, &common.out)?;
-    Ok(if result.status == ApplyStatus::RolledBack {
+    Ok(if !result.restore_errors.is_empty() {
+        // A rollback that itself failed leaves the tree dirty: distinguish it from a clean one.
+        ExitCode::from(4)
+    } else if result.status == ApplyStatus::RolledBack {
         ExitCode::from(3)
     } else {
         ExitCode::SUCCESS
