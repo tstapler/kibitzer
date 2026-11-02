@@ -128,11 +128,11 @@ fn cycle_operation(
     cycle: &[String],
 ) -> Option<AvailableOperation> {
     cycle.iter().find_map(|package| {
-        let partition = crate::refactor::auto_partition(model, package)?;
-        let sim = crate::refactor::simulate_split(model, package, &partition);
+        let partition = crate::refactor_split::auto_partition(model, package)?;
+        let sim = crate::refactor_split::simulate_split(model, package, &partition);
         Some(AvailableOperation {
             name: "split_package".into(),
-            mcp_call: crate::refactor::plan_call(package, &partition),
+            mcp_call: crate::refactor_split::plan_call(package, &partition),
             feasible: sim.feasible && sim.violations_resolved > 0,
             blocker: if sim.feasible && sim.violations_resolved == 0 {
                 "simulated split does not resolve the cycle".into()
@@ -2417,7 +2417,7 @@ mod operation_field_tests {
             severity_override: None,
             operation: Some(AvailableOperation {
                 name: "split_package".into(),
-                mcp_call: "plan_refactor({})".into(),
+                mcp_call: "plan_split_refactor({})".into(),
                 feasible: false,
                 blocker: "why".into(),
             }),

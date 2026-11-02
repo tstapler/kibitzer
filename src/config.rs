@@ -442,7 +442,7 @@ pub struct Config {
     /// `checks` in the first place. See docs/suppressing-checks.md.
     #[serde(default)]
     pub disabled: Vec<String>,
-    /// Per-repo opt-in for the refactor write tools (`apply_refactor`, `verify_refactor`,
+    /// Per-repo opt-in for the refactor write tools (`apply_split_refactor`, `verify_refactor`,
     /// `revert_refactor`). Off unless the repo's own `.kibitzer/inspect.json` sets it.
     #[serde(default)]
     pub allow_write_tools: bool,

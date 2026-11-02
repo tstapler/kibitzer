@@ -1485,7 +1485,7 @@ impl KibitzerServer {
         description = "Rank mechanical refactors worth considering (currently split_package for \
                         packages in an import cycle) — read-only. JSON ({suggestions, abstained, \
                         truncated}); each suggestion carries evidence, feasibility from a \
-                        what-if simulation, blockers, and the plan_refactor call. Abstains, with \
+                        what-if simulation, blockers, and the plan_split_refactor call. Abstains, with \
                         a reason, rather than recommending on thin evidence."
     )]
     async fn suggest_refactors(&self, req: Parameters<SuggestRefactorsRequest>) -> String {
@@ -1498,9 +1498,9 @@ impl KibitzerServer {
             Ok(m) => m,
             Err(e) => return json_error(e),
         };
-        let (suggestions, abstained) = crate::refactor::suggest(&model, &req.scope);
-        let (suggestions, t1) = crate::refactor::cap_list(suggestions);
-        let (abstained, t2) = crate::refactor::cap_list(abstained);
+        let (suggestions, abstained) = crate::refactor_split::suggest(&model, &req.scope);
+        let (suggestions, t1) = crate::refactor_split::cap_list(suggestions);
+        let (abstained, t2) = crate::refactor_split::cap_list(abstained);
         serde_json::json!({"suggestions": suggestions, "abstained": abstained, "truncated": t1 || t2})
             .to_string()
     }
@@ -1521,7 +1521,7 @@ impl KibitzerServer {
             Ok(m) => m,
             Err(e) => return json_error(e),
         };
-        let result = crate::refactor::simulate_split(&model, &req.package, &req.partition);
+        let result = crate::refactor_split::simulate_split(&model, &req.package, &req.partition);
         serde_json::to_string(&result).unwrap_or_else(|e| json_error(e.to_string()))
     }
 
@@ -1532,7 +1532,7 @@ impl KibitzerServer {
                         staleness_token (HEAD), edits (capped), importers_touched, \
                         exported_surface_changes, verification_steps and touched_paths."
     )]
-    async fn plan_refactor(&self, req: Parameters<PlanRefactorRequest>) -> String {
+    async fn plan_split_refactor(&self, req: Parameters<PlanRefactorRequest>) -> String {
         let req = req.0;
         if req.operation != "split_package" {
             return refactor_error_json(
@@ -1553,26 +1553,27 @@ impl KibitzerServer {
             Err(e) => return json_error(e),
         };
         let planned = tokio::task::spawn_blocking(move || {
-            crate::refactor::plan_split(&model, &repo_root, &args.package, &args.partition)
+            crate::refactor_split::plan_split(&model, &repo_root, &args.package, &args.partition)
         })
         .await;
         match planned {
-            Ok(Ok(plan)) => crate::refactor::plan_response(&plan).to_string(),
+            Ok(Ok(plan)) => crate::refactor_split::plan_response(&plan).to_string(),
             Ok(Err(e)) => refactor_error_json(e.code, e.message),
             Err(e) => json_error(format!("refactor task failed: {e}")),
         }
     }
 
     #[tool(
-        description = "Apply a plan from plan_refactor atomically and run its verification \
+        description = "Apply a plan from plan_split_refactor atomically and run its verification \
                         (auto-rolls back if verification fails); changes are staged, not \
                         committed. Requires allow_write_tools: true in the repo's \
                         .kibitzer/inspect.json. Refuses unknown/stale plans, dirty trees and \
                         paths locked by another session's plan."
     )]
-    async fn apply_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
+    async fn apply_split_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
         self.write_tool(req.0, |repo, id| {
-            crate::refactor::apply(repo, id).map(|o| serde_json::to_value(o).unwrap_or_default())
+            crate::refactor_split::apply(repo, id)
+                .map(|o| serde_json::to_value(o).unwrap_or_default())
         })
         .await
     }
@@ -1583,7 +1584,8 @@ impl KibitzerServer {
     )]
     async fn verify_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
         self.write_tool(req.0, |repo, id| {
-            crate::refactor::verify(repo, id).map(|v| serde_json::to_value(v).unwrap_or_default())
+            crate::refactor_split::verify(repo, id)
+                .map(|v| serde_json::to_value(v).unwrap_or_default())
         })
         .await
     }
@@ -1595,7 +1597,7 @@ impl KibitzerServer {
     )]
     async fn revert_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
         self.write_tool(req.0, |repo, id| {
-            crate::refactor::revert(repo, id)
+            crate::refactor_split::revert(repo, id)
                 .map(|files| serde_json::json!({"reverted": true, "files": files}))
         })
         .await
@@ -1621,7 +1623,7 @@ struct SimulateSplitRequest {
     path: String,
     /// Package key as shown by list_architecture_symbols (e.g. a Go import path).
     package: String,
-    partition: Vec<crate::refactor::PartitionGroup>,
+    partition: Vec<crate::refactor_split::PartitionGroup>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1637,7 +1639,7 @@ struct PlanRefactorRequest {
 #[derive(Deserialize)]
 struct SplitArgs {
     package: String,
-    partition: Vec<crate::refactor::PartitionGroup>,
+    partition: Vec<crate::refactor_split::PartitionGroup>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1652,7 +1654,7 @@ impl KibitzerServer {
     /// (not a global config) can enable them.
     async fn write_tool<F>(&self, req: PlanIdRequest, f: F) -> String
     where
-        F: FnOnce(&Path, &str) -> Result<serde_json::Value, crate::refactor::RefactorError>
+        F: FnOnce(&Path, &str) -> Result<serde_json::Value, crate::refactor_split::RefactorError>
             + Send
             + 'static,
     {
@@ -3931,7 +3933,7 @@ mod tests {
         let repo = parent.join("child");
         std::fs::create_dir_all(&repo).unwrap();
         let out = KibitzerServer::new()
-            .apply_refactor(Parameters(PlanIdRequest {
+            .apply_split_refactor(Parameters(PlanIdRequest {
                 path: repo.display().to_string(),
                 plan_id: "abc123".into(),
             }))
@@ -3994,7 +3996,7 @@ mod tests {
         );
         assert_eq!(sug["suggestions"][0]["package"], "fixture/a", "{sug}");
 
-        let partition = vec![crate::refactor::PartitionGroup {
+        let partition = vec![crate::refactor_split::PartitionGroup {
             name: "ypart".into(),
             symbols: vec!["Y".into()],
         }];
@@ -4011,7 +4013,7 @@ mod tests {
 
         let unsupported = json(
             server
-                .plan_refactor(Parameters(PlanRefactorRequest {
+                .plan_split_refactor(Parameters(PlanRefactorRequest {
                     path: path.clone(),
                     operation: "nope".into(),
                     args: serde_json::json!({}),
@@ -4021,7 +4023,7 @@ mod tests {
         assert_eq!(unsupported["code"], "unsupported");
         let bad_args = json(
             server
-                .plan_refactor(Parameters(PlanRefactorRequest {
+                .plan_split_refactor(Parameters(PlanRefactorRequest {
                     path: path.clone(),
                     operation: "split_package".into(),
                     args: serde_json::json!({"package": 1}),
@@ -4032,7 +4034,7 @@ mod tests {
 
         let plan = json(
             server
-                .plan_refactor(Parameters(PlanRefactorRequest {
+                .plan_split_refactor(Parameters(PlanRefactorRequest {
                     path: path.clone(),
                     operation: "split_package".into(),
                     args: serde_json::json!({"package": "fixture/a", "partition": partition}),
@@ -4046,7 +4048,7 @@ mod tests {
             path: path.clone(),
             plan_id: id.clone(),
         };
-        let applied = json(server.apply_refactor(Parameters(req())).await);
+        let applied = json(server.apply_split_refactor(Parameters(req())).await);
         assert_eq!(applied["applied"], true, "{applied}");
         assert!(dir.join("a/ypart").exists());
         let verified = json(server.verify_refactor(Parameters(req())).await);
@@ -4065,7 +4067,7 @@ mod tests {
         std::fs::write(dir.join("keep.txt"), "x").unwrap();
         let server = KibitzerServer::new();
         let out = server
-            .apply_refactor(Parameters(PlanIdRequest {
+            .apply_split_refactor(Parameters(PlanIdRequest {
                 path: dir.display().to_string(),
                 plan_id: "abc123".into(),
             }))

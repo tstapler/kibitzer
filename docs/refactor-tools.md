@@ -11,7 +11,7 @@ the shape `{"error": "<message>", "code": "<code>"}`. Listed collections are cap
 
 ## Opt-in for write tools
 
-`apply_refactor`, `verify_refactor` and `revert_refactor` return `opt_in_required` and
+`apply_split_refactor`, `verify_refactor` and `revert_refactor` return `opt_in_required` and
 change nothing unless `.kibitzer/inspect.json` contains:
 
 ```json
@@ -39,7 +39,7 @@ Response:
       "evidence": {"cycles_resolved": 1, "importers_affected": 3},
       "feasible": true,
       "blockers": [],
-      "mcp_call": "plan_refactor(operation=\"split_package\", args={...})"
+      "mcp_call": "plan_split_refactor(operation=\"split_package\", args={...})"
     }
   ],
   "abstained": [
@@ -71,7 +71,7 @@ Response:
 }
 ```
 
-### `plan_refactor`
+### `plan_split_refactor`
 
 Request: `{"path": "/repo", "operation": "split_package", "args": {"package": "...", "partition": [...]}}`.
 Never writes to the working tree; the plan is persisted under the worktree's git dir
@@ -100,9 +100,9 @@ Response:
 
 ## Write tools
 
-All three take `{"path": "/repo", "plan_id": "<id from plan_refactor>"}`.
+All three take `{"path": "/repo", "plan_id": "<id from plan_split_refactor>"}`.
 
-### `apply_refactor`
+### `apply_split_refactor`
 
 Applies the plan atomically, stages (does not commit) the changes, then runs the plan's
 verification steps. If verification fails the tree is rolled back.
@@ -115,7 +115,7 @@ Refusals (no file is changed):
 |---|---|
 | `opt_in_required` | `allow_write_tools` is not `true` |
 | `unknown_plan` | no such plan id |
-| `stale_plan` | HEAD moved since `plan_refactor` (`staleness_token` mismatch) |
+| `stale_plan` | HEAD moved since `plan_split_refactor` (`staleness_token` mismatch) |
 | `dirty_tree` | uncommitted changes in the working tree |
 | `lock_conflict` | another session's plan holds a lock on an overlapping path |
 | `not_applicable` | the plan was already applied or reverted |
@@ -143,7 +143,7 @@ still uncommitted and unmodified since apply. Response:
 Architecture findings gain an optional `operation` field:
 
 ```json
-{"name": "split_package", "mcp_call": "plan_refactor(...)", "feasible": true, "blocker": ""}
+{"name": "split_package", "mcp_call": "plan_split_refactor(...)", "feasible": true, "blocker": ""}
 ```
 
 It is advisory only: it does not change severity or suppression, and findings serialized

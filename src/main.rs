@@ -46,6 +46,7 @@ mod node_kind;
 mod parameter_object;
 mod plugin;
 mod refactor;
+mod refactor_split;
 mod root_cause_clusters;
 mod run;
 mod run_context;
