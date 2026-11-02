@@ -38,6 +38,7 @@ mod jaccard;
 mod lsp;
 mod markdown_text;
 mod mcp;
+mod mcp_http;
 mod mermaid;
 mod middle_man;
 mod node_kind;
@@ -91,8 +92,18 @@ enum Command {
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
-    /// Run kibitzer as an MCP server over stdio.
-    Mcp,
+    /// Run kibitzer as an MCP server over stdio, or over streamable HTTP with `--http`.
+    Mcp {
+        /// Serve MCP over streamable HTTP at this address (e.g. 127.0.0.1:8787; port 0
+        /// picks a free one) on the `/mcp` path, instead of over stdio. There is no
+        /// authentication.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<std::net::SocketAddr>,
+        /// Allow `--http` to bind a non-loopback address. Anyone who can reach it can
+        /// run every MCP tool, including reading any file path this user can read.
+        #[arg(long, requires = "http")]
+        allow_remote: bool,
+    },
     /// Run kibitzer as an LSP server over stdio, publishing check results as diagnostics.
     Lsp,
     /// Manage the background daemon that caches check results across invocations.
@@ -432,9 +443,12 @@ fn main() -> Result<ExitCode> {
             deny_blocking_suppression,
         ),
         Command::Hook => hook::run_hook(),
-        Command::Mcp => {
+        Command::Mcp { http, allow_remote } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(mcp::run_mcp_server())?;
+            match http {
+                Some(addr) => rt.block_on(mcp_http::run_mcp_http_server(addr, allow_remote))?,
+                None => rt.block_on(mcp::run_mcp_server())?,
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Lsp => {

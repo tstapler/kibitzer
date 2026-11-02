@@ -35,6 +35,7 @@ kibitzer run [dir] --trigger batch   # batch mode: check every file under dir
 kibitzer install [--global] [--dry-run]  # wire the PostToolUse hook into settings.json
 kibitzer hook                        # Claude Code PostToolUse hook, reads event off stdin
 kibitzer mcp                         # serve as an MCP server over stdio
+kibitzer mcp --http 127.0.0.1:8787   # serve MCP over streamable HTTP at /mcp (see below)
 kibitzer lsp                         # serve as an LSP server over stdio (diagnostics) (see docs/lsp.md)
 kibitzer daemon start|stop|status    # background daemon that caches check results
 kibitzer check native primitive-obsession <file>   # run a single built-in check directly
@@ -52,6 +53,34 @@ kibitzer schema [--out <file>]       # emit .kibitzer/inspect.json's JSON Schema
 New to kibitzer? See `docs/getting-started.md` for a walkthrough of wiring
 it into a repo end to end. See `docs/checking-invocations.md` for how
 checks are wired up.
+
+### MCP over HTTP
+
+By default each MCP client spawns its own `kibitzer mcp` over stdio. To
+serve many clients from one long-lived process instead, run it over
+streamable HTTP and register the URL:
+
+```bash
+kibitzer mcp --http 127.0.0.1:8787
+claude mcp add --transport http kibitzer http://127.0.0.1:8787/mcp
+```
+
+- The endpoint has **no authentication**. Any client that can reach it can
+  run every tool, and tools read whatever absolute paths they're given.
+- It binds loopback only: a non-loopback address is refused unless you also
+  pass `--allow-remote`. While bound to loopback, requests whose `Host` or
+  `Origin` isn't loopback get `403` (DNS-rebinding protection). With
+  `--allow-remote` on a non-loopback address that check is off.
+- Each MCP session gets its own server instance, so sessions don't share an
+  architecture-model cache. A session idle for 2 hours is closed; the
+  client must re-initialize.
+- Ctrl-C or `SIGTERM` stops it, waiting up to 5 seconds for open streams.
+- Unlike stdio mode, the server's working directory doesn't follow each
+  client's project. The one cwd-sensitive behavior is test-file detection:
+  it ignores `test/`, `spec/`, … components only in the part of a path above
+  the server's cwd. A repo checked out under such a directory (say
+  `~/test/myrepo`) has every file treated as a test file unless the server
+  was started from inside that directory.
 
 ### `inspect.json` schema
 
