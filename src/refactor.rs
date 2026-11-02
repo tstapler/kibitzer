@@ -57,9 +57,31 @@ fn graph_of(model: &ArchModel) -> ImportGraph {
 }
 
 const GO_KEYWORDS: &[&str] = &[
-    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for", "func",
-    "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select", "struct",
-    "switch", "type", "var",
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
 ];
 
 /// Group names become a directory, a Go package clause and an import alias.
@@ -88,7 +110,10 @@ fn assign_groups(
             return Err(format!("group name '{}' is empty or duplicated", g.name));
         }
         if !valid_go_ident(&g.name) {
-            return Err(format!("group name '{}' must match [a-z_][a-z0-9_]* and not be a Go keyword", g.name));
+            return Err(format!(
+                "group name '{}' must match [a-z_][a-z0-9_]* and not be a Go keyword",
+                g.name
+            ));
         }
         if g.symbols.is_empty() {
             return Err(format!("group '{}' has no symbols", g.name));
@@ -97,7 +122,11 @@ fn assign_groups(
             if by_name.insert(s.as_str(), i).is_some() {
                 return Err(format!("symbol '{s}' appears in more than one group"));
             }
-            if !pkg.symbols.iter().any(|sym| &sym.name == s && sym.parent.is_none()) {
+            if !pkg
+                .symbols
+                .iter()
+                .any(|sym| &sym.name == s && sym.parent.is_none())
+            {
                 return Err(format!("symbol '{s}' not found in package '{package}'"));
             }
         }
@@ -107,7 +136,10 @@ fn assign_groups(
         .iter()
         .map(|sym| {
             let owner = sym.parent.as_deref().unwrap_or(&sym.name);
-            (sym.id.clone(), by_name.get(owner).copied().unwrap_or(partition.len()))
+            (
+                sym.id.clone(),
+                by_name.get(owner).copied().unwrap_or(partition.len()),
+            )
         })
         .collect())
 }
@@ -149,7 +181,12 @@ pub fn simulate_split(
         .map(|&i| group_key(package, partition, i))
         .collect();
     let mut after = ImportGraph::default();
-    after.nodes = before.nodes.iter().filter(|n| *n != package).cloned().collect();
+    after.nodes = before
+        .nodes
+        .iter()
+        .filter(|n| *n != package)
+        .cloned()
+        .collect();
     after.nodes.extend(all_keys.iter().cloned());
 
     let mut importers = BTreeSet::new();
@@ -164,7 +201,11 @@ pub fn simulate_split(
                 .filter_map(|c| owner.get(&c.to))
                 .map(|&i| group_key(package, partition, i))
                 .collect();
-            let targets = if reached.is_empty() { &all_keys } else { &reached };
+            let targets = if reached.is_empty() {
+                &all_keys
+            } else {
+                &reached
+            };
             for t in targets {
                 let mut edge = e.clone();
                 edge.to = t.clone();
@@ -179,7 +220,11 @@ pub fn simulate_split(
                 .filter_map(|c| owner.get(&c.from))
                 .map(|&i| group_key(package, partition, i))
                 .collect();
-            let sources = if sources.is_empty() { &all_keys } else { &sources };
+            let sources = if sources.is_empty() {
+                &all_keys
+            } else {
+                &sources
+            };
             for k in sources {
                 let mut edge = e.clone();
                 edge.from = k.clone();
@@ -190,15 +235,15 @@ pub fn simulate_split(
         }
     }
     for c in model.call_edges.iter().filter(|c| c.resolved) {
-        if let (Some(&a), Some(&b)) = (owner.get(&c.from), owner.get(&c.to)) {
-            if a != b {
-                after.edges.push(crate::import_graph::ImportEdge {
-                    from: group_key(package, partition, a),
-                    to: group_key(package, partition, b),
-                    file: c.file.clone(),
-                    line: c.line,
-                });
-            }
+        if let (Some(&a), Some(&b)) = (owner.get(&c.from), owner.get(&c.to))
+            && a != b
+        {
+            after.edges.push(crate::import_graph::ImportEdge {
+                from: group_key(package, partition, a),
+                to: group_key(package, partition, b),
+                file: c.file.clone(),
+                line: c.line,
+            });
         }
     }
     let after_cycles = find_cycles(&after).len();
@@ -223,8 +268,11 @@ pub fn simulate_split(
 /// calls between their symbols). `None` when the package has fewer than two components.
 pub fn auto_partition(model: &ArchModel, package: &str) -> Option<Vec<PartitionGroup>> {
     let pkg = model.packages.get(package)?;
-    let file_of: BTreeMap<&str, &Path> =
-        pkg.symbols.iter().map(|s| (s.id.as_str(), s.file.as_path())).collect();
+    let file_of: BTreeMap<&str, &Path> = pkg
+        .symbols
+        .iter()
+        .map(|s| (s.id.as_str(), s.file.as_path()))
+        .collect();
     let files: Vec<&Path> = pkg
         .symbols
         .iter()
@@ -242,11 +290,11 @@ pub fn auto_partition(model: &ArchModel, package: &str) -> Option<Vec<PartitionG
     }
     let idx = |f: &Path| files.iter().position(|x| *x == f);
     for c in model.call_edges.iter().filter(|c| c.resolved) {
-        if let (Some(a), Some(b)) = (file_of.get(c.from.as_str()), file_of.get(c.to.as_str())) {
-            if let (Some(i), Some(j)) = (idx(a), idx(b)) {
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                parent[ri] = rj;
-            }
+        if let (Some(a), Some(b)) = (file_of.get(c.from.as_str()), file_of.get(c.to.as_str()))
+            && let (Some(i), Some(j)) = (idx(a), idx(b))
+        {
+            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            parent[ri] = rj;
         }
     }
     let mut comps: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -267,7 +315,13 @@ pub fn auto_partition(model: &ArchModel, package: &str) -> Option<Vec<PartitionG
                 .map(|s| s.name.clone())
                 .collect();
             symbols.sort();
-            (members[0], PartitionGroup { name: String::new(), symbols })
+            (
+                members[0],
+                PartitionGroup {
+                    name: String::new(),
+                    symbols,
+                },
+            )
         })
         .filter(|(_, g)| !g.symbols.is_empty())
         .collect();
@@ -276,7 +330,8 @@ pub fn auto_partition(model: &ArchModel, package: &str) -> Option<Vec<PartitionG
         return None;
     }
     // The largest component stays in the original package so its importers keep working.
-    let keep = (0..groups.len()).max_by_key(|&i| (groups[i].1.symbols.len(), std::cmp::Reverse(i)))?;
+    let keep =
+        (0..groups.len()).max_by_key(|&i| (groups[i].1.symbols.len(), std::cmp::Reverse(i)))?;
     groups.remove(keep);
     Some(
         groups
@@ -326,9 +381,15 @@ pub fn plan_call(package: &str, partition: &[PartitionGroup]) -> String {
 /// without a clean partition or a simulated improvement is reported in `abstained`.
 pub fn suggest(model: &ArchModel, scope: &[String]) -> (Vec<Suggestion>, Vec<Abstention>) {
     let in_scope = |p: &str| scope.is_empty() || scope.iter().any(|s| p.starts_with(s.as_str()));
-    let cyclic: BTreeSet<String> = find_cycles(&graph_of(model)).into_iter().flatten().collect();
+    let cyclic: BTreeSet<String> = find_cycles(&graph_of(model))
+        .into_iter()
+        .flatten()
+        .collect();
     let (mut out, mut abstained) = (vec![], vec![]);
-    for package in cyclic.iter().filter(|p| model.packages.contains_key(*p) && in_scope(p)) {
+    for package in cyclic
+        .iter()
+        .filter(|p| model.packages.contains_key(*p) && in_scope(p))
+    {
         let abstain = |reason: String| Abstention {
             operation: "split_package".into(),
             package: package.clone(),
@@ -355,10 +416,14 @@ pub fn suggest(model: &ArchModel, scope: &[String]) -> (Vec<Suggestion>, Vec<Abs
                 partition,
             });
         } else if !sim.feasible {
-            abstained.push(abstain(format!("simulated split is not feasible: {}", sim.blocker)));
+            abstained.push(abstain(format!(
+                "simulated split is not feasible: {}",
+                sim.blocker
+            )));
         } else {
             abstained.push(abstain(
-                "simulated split does not resolve any import cycle; evidence too thin to recommend".into(),
+                "simulated split does not resolve any import cycle; evidence too thin to recommend"
+                    .into(),
             ));
         }
     }
@@ -366,7 +431,11 @@ pub fn suggest(model: &ArchModel, scope: &[String]) -> (Vec<Suggestion>, Vec<Abs
         b.evidence
             .cycles_resolved
             .cmp(&a.evidence.cycles_resolved)
-            .then(a.evidence.importers_affected.cmp(&b.evidence.importers_affected))
+            .then(
+                a.evidence
+                    .importers_affected
+                    .cmp(&b.evidence.importers_affected),
+            )
             .then(a.package.cmp(&b.package))
     });
     (out, abstained)
@@ -421,19 +490,29 @@ pub struct RefactorError {
 }
 
 fn err<T>(code: &'static str, message: impl Into<String>) -> Result<T, RefactorError> {
-    Err(RefactorError { code, message: message.into() })
+    Err(RefactorError {
+        code,
+        message: message.into(),
+    })
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, RefactorError> {
     let mut cmd = crate::git_cmd::git_command(repo);
     cmd.args(args);
     let Some(out) = crate::git_cmd::bounded_output(cmd, GIT_TIMEOUT) else {
-        return err("git_failed", format!("git {} timed out or could not start", args.join(" ")));
+        return err(
+            "git_failed",
+            format!("git {} timed out or could not start", args.join(" ")),
+        );
     };
     if !out.status.success() {
         return err(
             "git_failed",
-            format!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()),
+            format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -454,7 +533,11 @@ fn new_plan_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let seed = format!("{nanos}:{}:{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let seed = format!(
+        "{nanos}:{}:{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     hex(&Sha256::digest(seed.as_bytes()))[..16].to_string()
 }
 
@@ -465,8 +548,14 @@ fn hex(bytes: &[u8]) -> String {
 /// Rejects absolute paths and `..`: every edit must stay inside the repo root.
 fn safe_rel(rel: &str) -> Result<(), RefactorError> {
     let p = Path::new(rel);
-    if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
-        return err("path_outside_repo", format!("edit path '{rel}' is outside the repository root"));
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return err(
+            "path_outside_repo",
+            format!("edit path '{rel}' is outside the repository root"),
+        );
     }
     Ok(())
 }
@@ -480,9 +569,15 @@ fn plan_path(repo: &Path, id: &str) -> Result<PathBuf, RefactorError> {
 
 fn save_plan(repo: &Path, plan: &RefactorPlan) -> Result<(), RefactorError> {
     let path = plan_path(repo, &plan.plan_id)?;
-    let io = |e: std::io::Error| RefactorError { code: "io", message: e.to_string() };
+    let io = |e: std::io::Error| RefactorError {
+        code: "io",
+        message: e.to_string(),
+    };
     std::fs::create_dir_all(path.parent().unwrap()).map_err(io)?;
-    let json = serde_json::to_string(plan).map_err(|e| RefactorError { code: "io", message: e.to_string() })?;
+    let json = serde_json::to_string(plan).map_err(|e| RefactorError {
+        code: "io",
+        message: e.to_string(),
+    })?;
     std::fs::write(path, json).map_err(io)
 }
 
@@ -492,7 +587,10 @@ pub fn load_plan(repo: &Path, id: &str) -> Result<RefactorPlan, RefactorError> {
         Ok(r) => r,
         Err(_) => return err("unknown_plan", format!("unknown plan_id '{id}'")),
     };
-    serde_json::from_str(&raw).map_err(|e| RefactorError { code: "io", message: format!("corrupt plan: {e}") })
+    serde_json::from_str(&raw).map_err(|e| RefactorError {
+        code: "io",
+        message: format!("corrupt plan: {e}"),
+    })
 }
 
 /// Builds and persists a `split_package` plan. Never touches the working tree.
@@ -508,19 +606,29 @@ pub fn plan_split(
     }
     let pkg = &model.packages[package];
     let rel = |f: &Path| -> String {
-        f.strip_prefix(repo).unwrap_or(f).to_string_lossy().to_string()
+        f.strip_prefix(repo)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .to_string()
     };
     let mut edits = vec![];
     let mut surface = vec![];
     for g in partition {
         let mut files = BTreeSet::new();
-        for s in pkg.symbols.iter().filter(|s| g.symbols.iter().any(|x| x == s.parent.as_deref().unwrap_or(&s.name))) {
+        for s in pkg.symbols.iter().filter(|s| {
+            g.symbols
+                .iter()
+                .any(|x| x == s.parent.as_deref().unwrap_or(&s.name))
+        }) {
             files.insert(rel(&s.file));
         }
         for file in &files {
             safe_rel(file)?;
             if !file.ends_with(".go") {
-                return err("unsupported", "split_package currently supports Go packages only");
+                return err(
+                    "unsupported",
+                    "split_package currently supports Go packages only",
+                );
             }
             let other: Vec<&str> = pkg
                 .symbols
@@ -532,14 +640,23 @@ pub fn plan_split(
             if let Some(o) = other.first() {
                 return err(
                     "file_straddles_groups",
-                    format!("{file} also defines '{o}', which is outside group '{}'; file-level moves need whole files in one group", g.name),
+                    format!(
+                        "{file} also defines '{o}', which is outside group '{}'; file-level moves need whole files in one group",
+                        g.name
+                    ),
                 );
             }
             let src = repo.join(file);
-            let original = std::fs::read_to_string(&src)
-                .map_err(|e| RefactorError { code: "io", message: format!("reading {file}: {e}") })?;
+            let original = std::fs::read_to_string(&src).map_err(|e| RefactorError {
+                code: "io",
+                message: format!("reading {file}: {e}"),
+            })?;
             let p = Path::new(file);
-            let dest = p.parent().unwrap_or(Path::new("")).join(&g.name).join(p.file_name().unwrap());
+            let dest = p
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join(&g.name)
+                .join(p.file_name().unwrap());
             let dest_s = dest.to_string_lossy().to_string();
             if repo.join(&dest).exists() {
                 return err("dest_exists", format!("{dest_s} already exists"));
@@ -559,7 +676,10 @@ pub fn plan_split(
                 original: Some(original),
             });
         }
-        surface.push(format!("symbols {:?} move to package {package}/{}", g.symbols, g.name));
+        surface.push(format!(
+            "symbols {:?} move to package {package}/{}",
+            g.symbols, g.name
+        ));
     }
     edits.extend(importer_edits(model, repo, package, partition)?);
     let verification_steps = if repo.join("go.mod").is_file() {
@@ -596,20 +716,39 @@ fn importer_edits(
 ) -> Result<Vec<PlannedEdit>, RefactorError> {
     let mut out = vec![];
     for (file, aliases) in &model.file_import_aliases {
-        let Some(alias) = aliases.iter().find(|(_, v)| v.as_str() == package).map(|(k, _)| k) else {
+        let Some(alias) = aliases
+            .iter()
+            .find(|(_, v)| v.as_str() == package)
+            .map(|(k, _)| k)
+        else {
             continue;
         };
-        let rel_file = file.strip_prefix(repo).unwrap_or(file).to_string_lossy().to_string();
+        let rel_file = file
+            .strip_prefix(repo)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .to_string();
         safe_rel(&rel_file)?;
-        let Ok(original) = std::fs::read_to_string(repo.join(&rel_file)) else { continue };
+        let Ok(original) = std::fs::read_to_string(repo.join(&rel_file)) else {
+            continue;
+        };
         let mut text = original.clone();
         let mut new_imports = vec![];
         for g in partition {
             for sym in &g.symbols {
-                let re = regex::Regex::new(&format!(r"\b{}\.{}\b", regex::escape(alias), regex::escape(sym)))
-                    .map_err(|e| RefactorError { code: "io", message: e.to_string() })?;
+                let re = regex::Regex::new(&format!(
+                    r"\b{}\.{}\b",
+                    regex::escape(alias),
+                    regex::escape(sym)
+                ))
+                .map_err(|e| RefactorError {
+                    code: "io",
+                    message: e.to_string(),
+                })?;
                 if re.is_match(&text) {
-                    text = re.replace_all(&text, format!("{}.{sym}", g.name).as_str()).to_string();
+                    text = re
+                        .replace_all(&text, format!("{}.{sym}", g.name).as_str())
+                        .to_string();
                     let imp = format!("\t{} \"{package}/{}\"", g.name, g.name);
                     if !new_imports.contains(&imp) {
                         new_imports.push(imp);
@@ -620,7 +759,9 @@ fn importer_edits(
         if new_imports.is_empty() {
             continue;
         }
-        let still_used = regex::Regex::new(&format!(r"\b{}\.", regex::escape(alias))).unwrap().is_match(&text);
+        let still_used = regex::Regex::new(&format!(r"\b{}\.", regex::escape(alias)))
+            .unwrap()
+            .is_match(&text);
         text = add_go_imports(&text, package, &new_imports, !still_used);
         out.push(PlannedEdit {
             file: rel_file.clone(),
@@ -682,7 +823,9 @@ fn rewrite_go_package(src: &str, name: &str) -> String {
 // ---- locks: one file per touched path, owned by a plan, valid while HEAD is unchanged ----
 
 fn lock_file(repo: &Path, rel: &str) -> Result<PathBuf, RefactorError> {
-    Ok(state_dir(repo)?.join("locks").join(&hex(&Sha256::digest(rel.as_bytes()))[..32]))
+    Ok(state_dir(repo)?
+        .join("locks")
+        .join(&hex(&Sha256::digest(rel.as_bytes()))[..32]))
 }
 
 fn acquire_locks(repo: &Path, plan: &RefactorPlan) -> Result<(), RefactorError> {
@@ -690,11 +833,18 @@ fn acquire_locks(repo: &Path, plan: &RefactorPlan) -> Result<(), RefactorError> 
     let res = (|| {
         for rel in &plan.touched_paths {
             let lf = lock_file(repo, rel)?;
-            std::fs::create_dir_all(lf.parent().unwrap())
-                .map_err(|e| RefactorError { code: "io", message: e.to_string() })?;
-            let body = serde_json::json!({"plan_id": plan.plan_id, "head": plan.staleness_token}).to_string();
+            std::fs::create_dir_all(lf.parent().unwrap()).map_err(|e| RefactorError {
+                code: "io",
+                message: e.to_string(),
+            })?;
+            let body = serde_json::json!({"plan_id": plan.plan_id, "head": plan.staleness_token})
+                .to_string();
             for attempt in 0..2 {
-                match std::fs::OpenOptions::new().write(true).create_new(true).open(&lf) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lf)
+                {
                     Ok(mut f) => {
                         use std::io::Write;
                         let _ = f.write_all(body.as_bytes());
@@ -708,7 +858,9 @@ fn acquire_locks(repo: &Path, plan: &RefactorPlan) -> Result<(), RefactorError> 
                             .unwrap_or_default();
                         let owner = cur["plan_id"].as_str().unwrap_or("");
                         // An unreadable lock body counts as live: never steal on a guess.
-                        let live = cur["head"].as_str().map_or(true, |h| h == plan.staleness_token);
+                        let live = cur["head"]
+                            .as_str()
+                            .is_none_or(|h| h == plan.staleness_token);
                         if live || attempt == 1 {
                             return err(
                                 "lock_conflict",
@@ -757,36 +909,66 @@ pub struct Verification {
 
 fn truncate_at_boundary(s: &mut String, max: usize) {
     if s.len() > max {
-        let end = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        let end = (0..=max)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0);
         s.truncate(end);
     }
 }
 
 pub fn run_verification(repo: &Path, plan: &RefactorPlan) -> Verification {
     if plan.verification_steps.is_empty() {
-        return Verification { passed: true, skipped: true, output: "no verification steps for this repo".into() };
+        return Verification {
+            passed: true,
+            skipped: true,
+            output: "no verification steps for this repo".into(),
+        };
     }
     let mut output = String::new();
     for step in &plan.verification_steps {
         let tool = step.split_whitespace().next().unwrap_or("");
         if Command::new(tool).arg("version").output().is_err() {
             output.push_str(&format!("skipped '{step}': '{tool}' not on PATH\n"));
-            return Verification { passed: true, skipped: true, output };
+            return Verification {
+                passed: true,
+                skipped: true,
+                output,
+            };
         }
-        match Command::new("sh").arg("-c").arg(step).current_dir(repo).output() {
+        match Command::new("sh")
+            .arg("-c")
+            .arg(step)
+            .current_dir(repo)
+            .output()
+        {
             Ok(o) => {
                 output.push_str(&String::from_utf8_lossy(&o.stdout));
                 output.push_str(&String::from_utf8_lossy(&o.stderr));
                 if !o.status.success() {
                     truncate_at_boundary(&mut output, 4000);
-                    return Verification { passed: false, skipped: false, output };
+                    return Verification {
+                        passed: false,
+                        skipped: false,
+                        output,
+                    };
                 }
             }
-            Err(e) => return Verification { passed: false, skipped: false, output: e.to_string() },
+            Err(e) => {
+                return Verification {
+                    passed: false,
+                    skipped: false,
+                    output: e.to_string(),
+                };
+            }
         }
     }
     truncate_at_boundary(&mut output, 4000);
-    Verification { passed: true, skipped: false, output }
+    Verification {
+        passed: true,
+        skipped: false,
+        output,
+    }
 }
 
 fn paths_refs(plan: &RefactorPlan) -> Vec<&str> {
@@ -824,7 +1006,10 @@ pub struct ApplyOutcome {
 pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
     let mut plan = load_plan(repo, id)?;
     if plan.status != PlanStatus::Planned {
-        return err("not_applicable", format!("plan '{id}' is {:?}, not planned", plan.status));
+        return err(
+            "not_applicable",
+            format!("plan '{id}' is {:?}, not planned", plan.status),
+        );
     }
     for e in &plan.edits {
         safe_rel(&e.file)?;
@@ -839,7 +1024,10 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
         Ok(s) if s.trim().is_empty() => {}
         Ok(_) => {
             release_locks(repo, &plan);
-            return err("dirty_tree", "working tree has uncommitted changes; commit or stash first");
+            return err(
+                "dirty_tree",
+                "working tree has uncommitted changes; commit or stash first",
+            );
         }
         Err(e) => {
             release_locks(repo, &plan);
@@ -887,13 +1075,21 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
         return Err(e);
     }
     let diff_summary = git(repo, &["diff", "--cached", "--stat"]).unwrap_or_default();
-    Ok(ApplyOutcome { applied: true, rolled_back: false, diff_summary, verification })
+    Ok(ApplyOutcome {
+        applied: true,
+        rolled_back: false,
+        diff_summary,
+        verification,
+    })
 }
 
 pub fn verify(repo: &Path, id: &str) -> Result<Verification, RefactorError> {
     let plan = load_plan(repo, id)?;
     if plan.status != PlanStatus::Applied {
-        return err("not_applicable", format!("plan '{id}' is {:?}, not applied", plan.status));
+        return err(
+            "not_applicable",
+            format!("plan '{id}' is {:?}, not applied", plan.status),
+        );
     }
     Ok(run_verification(repo, &plan))
 }
@@ -901,16 +1097,29 @@ pub fn verify(repo: &Path, id: &str) -> Result<Verification, RefactorError> {
 pub fn revert(repo: &Path, id: &str) -> Result<Vec<String>, RefactorError> {
     let mut plan = load_plan(repo, id)?;
     if plan.status != PlanStatus::Applied {
-        return err("not_applicable", format!("plan '{id}' is {:?}, not applied", plan.status));
+        return err(
+            "not_applicable",
+            format!("plan '{id}' is {:?}, not applied", plan.status),
+        );
     }
     if head(repo)? != plan.staleness_token {
-        return err("already_committed", "HEAD moved since apply; revert with git instead");
+        return err(
+            "already_committed",
+            "HEAD moved since apply; revert with git instead",
+        );
     }
     for e in &plan.edits {
         let cur = std::fs::read_to_string(repo.join(&e.file)).ok();
-        let expected = if e.kind == "write" { e.content.clone() } else { None };
+        let expected = if e.kind == "write" {
+            e.content.clone()
+        } else {
+            None
+        };
         if cur != expected {
-            return err("modified_since_apply", format!("{} was modified after apply; not reverting", e.file));
+            return err(
+                "modified_since_apply",
+                format!("{} was modified after apply; not reverting", e.file),
+            );
         }
     }
     restore_originals(repo, &plan);

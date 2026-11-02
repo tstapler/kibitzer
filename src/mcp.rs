@@ -1379,7 +1379,10 @@ impl KibitzerServer {
     async fn plan_refactor(&self, req: Parameters<PlanRefactorRequest>) -> String {
         let req = req.0;
         if req.operation != "split_package" {
-            return refactor_error_json("unsupported", format!("unknown operation '{}'", req.operation));
+            return refactor_error_json(
+                "unsupported",
+                format!("unknown operation '{}'", req.operation),
+            );
         }
         let args: SplitArgs = match serde_json::from_value(req.args) {
             Ok(a) => a,
@@ -1436,7 +1439,8 @@ impl KibitzerServer {
     )]
     async fn revert_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
         self.write_tool(req.0, |repo, id| {
-            crate::refactor::revert(repo, id).map(|files| serde_json::json!({"reverted": true, "files": files}))
+            crate::refactor::revert(repo, id)
+                .map(|files| serde_json::json!({"reverted": true, "files": files}))
         })
         .await
     }
@@ -1508,7 +1512,8 @@ impl KibitzerServer {
                 // The config must sit at the requested path's own repo root, not an ancestor's.
                 Ok(Some((c, dir))) => {
                     c.allow_write_tools
-                        && std::fs::canonicalize(&dir).ok() == std::fs::canonicalize(find_repo_root(&start)).ok()
+                        && std::fs::canonicalize(&dir).ok()
+                            == std::fs::canonicalize(find_repo_root(&start)).ok()
                 }
                 _ => false,
             })
@@ -3690,7 +3695,11 @@ mod tests {
     async fn parent_directory_opt_in_does_not_enable_write_tools() {
         let parent = tmp_dir("refactor-optin-parent");
         std::fs::create_dir_all(parent.join(".kibitzer")).unwrap();
-        std::fs::write(parent.join(".kibitzer/inspect.json"), r#"{"allow_write_tools": true}"#).unwrap();
+        std::fs::write(
+            parent.join(".kibitzer/inspect.json"),
+            r#"{"allow_write_tools": true}"#,
+        )
+        .unwrap();
         let repo = parent.join("child");
         std::fs::create_dir_all(&repo).unwrap();
         let out = KibitzerServer::new()
@@ -3720,6 +3729,10 @@ mod tests {
         assert_eq!(v["code"], "opt_in_required", "{out}");
         assert!(v["error"].as_str().unwrap().contains("allow_write_tools"));
         assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "x");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no files created");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no files created"
+        );
     }
 }

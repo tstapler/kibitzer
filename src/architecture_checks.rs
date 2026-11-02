@@ -123,7 +123,10 @@ impl ArchitectureChecker for ImportCycleChecker {
 
 /// `split_package` hint for the first cycle member that has a clean partition, with the
 /// simulated feasibility; `None` when the model has nothing to propose.
-fn cycle_operation(model: &crate::arch_model::ArchModel, cycle: &[String]) -> Option<AvailableOperation> {
+fn cycle_operation(
+    model: &crate::arch_model::ArchModel,
+    cycle: &[String],
+) -> Option<AvailableOperation> {
     cycle.iter().find_map(|package| {
         let partition = crate::refactor::auto_partition(model, package)?;
         let sim = crate::refactor::simulate_split(model, package, &partition);
@@ -2425,9 +2428,10 @@ mod operation_field_tests {
 
     #[test]
     fn old_json_without_operation_deserializes() {
-        let f: ArchFinding =
-            serde_json::from_str(r#"{"file":null,"line":null,"message":"m","severity_override":null}"#).unwrap();
+        let f: ArchFinding = serde_json::from_str(
+            r#"{"file":null,"line":null,"message":"m","severity_override":null}"#,
+        )
+        .unwrap();
         assert_eq!(f.operation, None);
     }
 }
-
