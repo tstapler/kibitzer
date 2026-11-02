@@ -97,6 +97,8 @@ enum Command {
     /// Run kibitzer as an MCP server over stdio; or as one shared server on a Unix socket
     /// (`--socket`) that stdio clients reach through `--connect`.
     Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
         /// Serve MCP (streamable HTTP at /mcp) on this Unix socket, owner-only, instead of
         /// stdio. Defaults to $XDG_RUNTIME_DIR/kibitzer/mcp.sock.
         #[arg(long, value_name = "PATH", num_args = 0..=1, conflicts_with = "connect")]
@@ -379,6 +381,12 @@ enum FalsePositivesAction {
 }
 
 #[derive(Subcommand)]
+enum McpAction {
+    /// Print the name of every tool the MCP server exposes, one per line.
+    List,
+}
+
+#[derive(Subcommand)]
 enum DaemonAction {
     /// Run the daemon in the foreground (background it yourself: `&`, systemd, launchd).
     Start,
@@ -445,7 +453,18 @@ fn main() -> Result<ExitCode> {
             deny_blocking_suppression,
         ),
         Command::Hook => hook::run_hook(),
-        Command::Mcp { socket, connect } => {
+        Command::Mcp {
+            action: Some(McpAction::List),
+            ..
+        } => {
+            for name in mcp::tool_names() {
+                println!("{name}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Mcp {
+            socket, connect, ..
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
             let path_or_default = mcp_socket::socket_path_or_default;
             match (socket, connect) {

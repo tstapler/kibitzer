@@ -63,6 +63,75 @@ fn collect_spec(spec: Node, source: &str, wanted: &str, out: &mut Vec<ImportSite
     });
 }
 
+/// Rewrites the identifier in the `package` clause. `None` when there is no clause.
+pub fn replace_package_name(source: &str, new_name: &str) -> Option<String> {
+    let tree = parse(source)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let clause = root
+        .children(&mut cursor)
+        .find(|n| n.kind() == "package_clause")?;
+    let mut inner = clause.walk();
+    let ident = clause
+        .children(&mut inner)
+        .find(|n| n.kind() == "package_identifier")?;
+    let mut out = source.to_string();
+    out.replace_range(ident.byte_range(), new_name);
+    Some(out)
+}
+
+/// Swaps every import spec whose path equals `old` for `new`, adding `alias` to specs that
+/// have none. `None` when no spec matches, so a caller never reports a no-op as a rewrite.
+pub fn replace_import_path(
+    source: &str,
+    old: &str,
+    new: &str,
+    alias: Option<&str>,
+) -> Option<String> {
+    let tree = parse(source)?;
+    let mut specs = Vec::new();
+    collect_specs(tree.root_node(), &mut specs);
+    // Back to front so earlier byte offsets stay valid while splicing.
+    let mut sites: Vec<(usize, usize, bool)> = specs
+        .iter()
+        .filter_map(|spec| {
+            let path = spec.child_by_field_name("path")?;
+            let text = &source[path.byte_range()];
+            (text.trim_matches(|c| c == '"' || c == '`') == old).then(|| {
+                (
+                    path.start_byte(),
+                    path.end_byte(),
+                    spec.child_by_field_name("name").is_some(),
+                )
+            })
+        })
+        .collect();
+    if sites.is_empty() {
+        return None;
+    }
+    sites.sort_unstable();
+    let mut out = source.to_string();
+    for (start, end, has_alias) in sites.into_iter().rev() {
+        let prefix = match alias {
+            Some(a) if !has_alias => format!("{a} "),
+            _ => String::new(),
+        };
+        out.replace_range(start..end, &format!("{prefix}\"{new}\""));
+    }
+    Some(out)
+}
+
+fn collect_specs<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    if node.kind() == "import_spec" {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_specs(child, out);
+    }
+}
+
 /// True when the file declares `import "C"` (cgo).
 pub fn imports_c(source: &str) -> bool {
     !find_imports(source, "C").is_empty()
@@ -100,6 +169,17 @@ mod tests {
         let src = "package a\n\n// \"foo/bar\"\nimport (\n\t\"foo/bar/baz\"\n\tx \"foo/bar\"\n)\n";
         let sites = find_imports(src, "foo/bar");
         assert_eq!(sites, vec![ImportSite { has_alias: true }]);
+    }
+
+    #[test]
+    fn replace_import_path_should_LeavePrefixPathAlone_When_RewritingExactPath() {
+        let src = "package a\n\nimport (\n\t\"foo/bar/baz\"\n\t\"foo/bar\"\n)\n";
+        let out = replace_import_path(src, "foo/bar", "x/y", Some("bar")).unwrap();
+        assert_eq!(
+            out,
+            "package a\n\nimport (\n\t\"foo/bar/baz\"\n\tbar \"x/y\"\n)\n"
+        );
+        assert_eq!(replace_import_path(src, "foo/ba", "x", None), None);
     }
 
     #[test]

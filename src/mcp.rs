@@ -184,6 +184,14 @@ struct RefactorOperationRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct ApplyRefactorRequest {
+    /// Any path inside the repo to apply to (the repo root or a subdirectory).
+    path: String,
+    /// A plan exactly as returned by `plan_refactor`.
+    plan: crate::refactor::RefactorPlan,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct CallTraversalRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
     path: String,
@@ -1203,7 +1211,7 @@ impl KibitzerServer {
         description = "Plan a MoveFiles/ExtractPackage operation for Go: returns a JSON \
                         RefactorPlan (ordered edits, verification commands, content hashes of \
                         every touched file). Errors when the operation is infeasible. Writes \
-                        nothing; there is no apply tool yet."
+                        nothing; pass the plan to apply_refactor to carry it out."
     )]
     async fn plan_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
         let req = req.0;
@@ -1215,6 +1223,34 @@ impl KibitzerServer {
             Ok(plan) => serde_json::to_string(&plan)
                 .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
             Err(e) => json_error(format!("{e:#}")),
+        }
+    }
+
+    #[tool(
+        description = "Apply a RefactorPlan from plan_refactor atomically: a stale plan (any \
+                        touched file changed since planning) is rejected before any write; after \
+                        the writes `go build ./...` and `go vet ./...` run and a failure rolls \
+                        everything back, returning the command output as the error."
+    )]
+    async fn apply_refactor(&self, req: Parameters<ApplyRefactorRequest>) -> String {
+        let req = req.0;
+        let repo_root = match Self::resolve_repo_root(&PathBuf::from(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        let applied = tokio::task::spawn_blocking(move || {
+            crate::refactor::apply::apply_plan(
+                &repo_root,
+                &req.plan,
+                &crate::refactor::apply::RealIo,
+            )
+        })
+        .await;
+        match applied {
+            Ok(Ok(result)) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
+            Ok(Err(e)) => json_error(format!("{e:#}")),
+            Err(e) => json_error(format!("apply task failed: {e}")),
         }
     }
 
@@ -1535,7 +1571,35 @@ impl ServerHandler for KibitzerServer {
     }
 }
 
+/// Names of every tool the server exposes, for `kibitzer mcp list`.
+pub fn tool_names() -> Vec<String> {
+    let mut names: Vec<String> = KibitzerServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Rolls back an apply a previous process died in the middle of, for the repo at the working
+/// directory. Best-effort: a server must still start when this fails, so errors are logged.
+pub fn recover_orphaned_refactors() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(root) = KibitzerServer::resolve_repo_root(&cwd) else {
+        return;
+    };
+    match crate::refactor::apply::recover(&root) {
+        Ok(Some(id)) => eprintln!("kibitzer: rolled back interrupted refactor {id}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("kibitzer: could not recover interrupted refactor: {e:#}"),
+    }
+}
+
 pub async fn run_mcp_server() -> Result<()> {
+    recover_orphaned_refactors();
     let server = KibitzerServer::new()
         .serve(rmcp::transport::stdio())
         .await?;
@@ -3264,13 +3328,10 @@ mod tests {
             "list_refactor_operations",
             "simulate_refactor",
             "plan_refactor",
+            "apply_refactor",
         ] {
             assert!(tools.iter().any(|t| t.name == name), "{name} is registered");
         }
-        assert!(
-            !tools.iter().any(|t| t.name == "apply_refactor"),
-            "no apply path ships in this milestone"
-        );
     }
 
     #[test]

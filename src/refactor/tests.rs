@@ -349,3 +349,175 @@ fn check_should_Block_When_TargetPackageFileImportsSource() {
         "got: {report:?}"
     );
 }
+
+mod apply_tests {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    use super::*;
+    use crate::refactor::RefactorPlan;
+    use crate::refactor::apply::{ApplyIo, RealIo, apply_plan, recover};
+
+    /// Fails the Nth rename and/or every verification command, otherwise behaves like the real thing.
+    struct FakeIo {
+        fail_rename_at: Option<usize>,
+        fail_verify: bool,
+        renames: Cell<usize>,
+    }
+
+    impl FakeIo {
+        fn new(fail_rename_at: Option<usize>, fail_verify: bool) -> Self {
+            Self {
+                fail_rename_at,
+                fail_verify,
+                renames: Cell::new(0),
+            }
+        }
+    }
+
+    impl ApplyIo for FakeIo {
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            let n = self.renames.get();
+            self.renames.set(n + 1);
+            if self.fail_rename_at == Some(n) {
+                return Err(std::io::Error::other("injected rename failure"));
+            }
+            std::fs::rename(from, to)
+        }
+
+        fn run(&self, cmd: &str, _dir: &Path) -> (bool, String) {
+            if self.fail_verify {
+                (false, format!("{cmd}: ./b.go:3: injected build error"))
+            } else {
+                (true, String::new())
+            }
+        }
+    }
+
+    fn plan_for(
+        label: &str,
+        files: &[(&str, &str)],
+        o: &RefactorOperation,
+    ) -> (PathBuf, RefactorPlan) {
+        let (dir, model) = fixture(label, files);
+        let plan = plan_move_files(&model, o).unwrap();
+        (dir, plan)
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    #[test]
+    fn apply_should_MoveFileAndRewriteImporter_When_SingleFileMove() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-single", &files, &op("a", "b", &["a/a1.go"]));
+        let result = apply_plan(&dir, &plan, &RealIo).unwrap();
+        assert_eq!(result.verification.len(), 2, "go build and go vet both ran");
+        assert!(!dir.join("a/a1.go").exists());
+        assert_eq!(read(&dir, "b/a1.go"), "package b\n\nfunc A1() {}\n");
+        assert!(read(&dir, "user1/user1.go").contains("a \"example.com/app/b\""));
+        assert_eq!(read(&dir, "user2/user2.go"), USER2, "untouched importer");
+        assert!(
+            !dir.join(".kibitzer/plans/.wal").exists(),
+            "WAL removed on success"
+        );
+    }
+
+    #[test]
+    fn apply_should_RenameTestPackages_When_WholePackageMoveWithTestFiles() {
+        let mut files = base_files();
+        files.push(("a/ext_test.go", "package a_test\n\nfunc ExtHelper() {}\n"));
+        let (dir, plan) = plan_for("apply-multi", &files, &op("a", "b", &[]));
+        apply_plan(&dir, &plan, &RealIo).unwrap();
+        for gone in ["a/a1.go", "a/a2.go", "a/a_test.go", "a/ext_test.go"] {
+            assert!(!dir.join(gone).exists(), "{gone}");
+        }
+        assert!(read(&dir, "b/a_test.go").starts_with("package b\n"));
+        assert!(read(&dir, "b/ext_test.go").starts_with("package b_test\n"));
+        assert!(read(&dir, "user1/user1.go").contains("\"example.com/app/b\""));
+        assert!(read(&dir, "user2/user2.go").contains("\"example.com/app/b\""));
+    }
+
+    #[test]
+    fn apply_should_RejectBeforeAnyWrite_When_TouchedFileChangedSincePlanning() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-stale", &files, &op("a", "b", &["a/a1.go"]));
+        std::fs::write(dir.join("user1/user1.go"), format!("{USER1}// edited\n")).unwrap();
+        let err = apply_plan(&dir, &plan, &RealIo).unwrap_err();
+        assert!(format!("{err:#}").contains("stale plan"), "got: {err:#}");
+        assert!(dir.join("a/a1.go").exists());
+        assert!(!dir.join("b").exists());
+        assert!(
+            !dir.join(".kibitzer/plans/.wal").exists(),
+            "rejected before the WAL"
+        );
+    }
+
+    #[test]
+    fn apply_should_RestoreTree_When_BuildFails() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-build-fail", &files, &op("a", "b", &["a/a1.go"]));
+        let err = apply_plan(&dir, &plan, &FakeIo::new(None, true)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("injected build error"),
+            "output is the error"
+        );
+        assert_tree_unchanged(&dir, &files);
+        assert!(!dir.join("b").exists(), "created directory removed");
+        assert!(!dir.join(".kibitzer/plans/.wal").exists());
+    }
+
+    #[test]
+    fn apply_should_RestoreTree_When_RenameFailsMidLoop() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-rename-fail", &files, &op("a", "b", &["a/a1.go"]));
+        let err = apply_plan(&dir, &plan, &FakeIo::new(Some(1), false)).unwrap_err();
+        assert!(format!("{err:#}").contains("injected rename failure"));
+        assert_tree_unchanged(&dir, &files);
+        assert!(!dir.join("b").exists());
+    }
+
+    #[test]
+    fn recover_should_RollBackPartialApply_When_WalIsOrphaned() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-orphan", &files, &op("a", "b", &["a/a1.go"]));
+        // Simulate a kill after the first rename: the process dies without cleanup.
+        let wal_dir = dir.join(".kibitzer/plans");
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            struct Crash;
+            impl ApplyIo for Crash {
+                fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+                    std::fs::rename(from, to)?;
+                    panic!("simulated crash");
+                }
+                fn run(&self, _: &str, _: &Path) -> (bool, String) {
+                    (true, String::new())
+                }
+            }
+            let _ = apply_plan(&dir, &plan, &Crash);
+        }));
+        assert!(crashed.is_err());
+        assert!(wal_dir.join(".wal").exists(), "WAL survives the crash");
+        assert!(dir.join("b/a1.go").exists(), "tree is partially applied");
+
+        assert!(recover(&dir).unwrap().is_some());
+        assert_tree_unchanged(&dir, &files);
+        assert!(!dir.join("b").exists());
+        assert!(!wal_dir.join(".wal").exists());
+        assert_eq!(recover(&dir).unwrap(), None, "idempotent");
+    }
+
+    #[test]
+    fn apply_should_Reject_When_PlanWasTamperedWith() {
+        let files = base_files();
+        let (dir, mut plan) = plan_for("apply-tamper", &files, &op("a", "b", &["a/a1.go"]));
+        plan.verification_cmds.push("rm -rf /".into());
+        let err = apply_plan(&dir, &plan, &RealIo).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("plan id does not match"),
+            "got: {err:#}"
+        );
+        assert_tree_unchanged(&dir, &files);
+    }
+}

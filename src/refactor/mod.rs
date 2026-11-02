@@ -1,10 +1,10 @@
-//! Mechanical, behavior-preserving refactoring engine (read-only milestone).
+//! Mechanical, behavior-preserving refactoring engine.
 //!
-//! Stage 1: [`feasibility::check`] decides whether an operation is possible without
-//! writing anything. Stage 2 (partial): [`catalog::plan_move_files`] turns a feasible
-//! operation into a serializable [`RefactorPlan`]. No apply path exists in this
-//! milestone, so nothing in this module writes to the tree.
+//! [`feasibility::check`] decides whether an operation is possible without writing anything;
+//! [`catalog::plan_move_files`] turns a feasible one into a serializable [`RefactorPlan`];
+//! [`apply::apply_plan`] is the only code here that writes, atomically and with a WAL.
 
+pub mod apply;
 pub mod catalog;
 pub mod feasibility;
 mod go_syntax;
@@ -71,7 +71,7 @@ pub enum BlockingReason {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "warning", rename_all = "snake_case")]
 pub enum Warning {
     /// Build constraints are not evaluated by the model; verify on every target platform.
@@ -92,7 +92,7 @@ pub struct FeasibilityReport {
     pub importers_affected: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "edit", rename_all = "snake_case")]
 pub enum Edit {
     MoveFile {
@@ -114,7 +114,7 @@ pub enum Edit {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TouchedFile {
     pub path: PathBuf,
     /// Hex SHA-256 of the file's bytes at planning time; a later apply compares it to
@@ -122,7 +122,7 @@ pub struct TouchedFile {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RefactorPlan {
     pub id: String,
     pub operation: RefactorOperation,
