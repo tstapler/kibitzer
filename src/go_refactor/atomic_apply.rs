@@ -392,7 +392,7 @@ fn write_steps(journal: &mut Journal, plan: &MovePlan, opts: &ApplyOptions) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::refactor::types::{FileTransform, OperationKind, PlanStepKind};
+    use crate::go_refactor::types::{FileTransform, OperationKind, PlanStepKind};
 
     #[test]
     fn restore_recreates_missing_parent_directories() {
