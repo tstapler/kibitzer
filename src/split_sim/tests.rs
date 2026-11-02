@@ -223,6 +223,36 @@ fn abstains_with_a_reason_on_bad_input() {
 }
 
 #[test]
+fn abstains_without_reading_files_outside_the_root() {
+    let m = model(&fixture_dir("legal-split"), true);
+    let reads = std::cell::RefCell::new(Vec::<String>::new());
+    let read = |p: &str| {
+        reads.borrow_mut().push(p.to_string());
+        None
+    };
+    for escape in ["../secret.go", "/etc/passwd", "sub/../../x.go"] {
+        let parts = [spec("P1", &["a.go", escape]), spec("P2", &["b.go"])];
+        let r = run_with_sources(&m, PKG, &parts, &SplitSimOpts::default(), &read);
+        assert!(r.abstained.is_some(), "{escape} should abstain");
+    }
+    assert!(
+        reads.borrow().is_empty(),
+        "read called with {:?}",
+        reads.borrow()
+    );
+}
+
+#[test]
+fn abstains_on_oversized_partition_input() {
+    let m = model(&fixture_dir("legal-split"), true);
+    let many: Vec<PartitionSpec> = (0..=MAX_PARTS)
+        .map(|i| spec(&format!("P{i}"), &["a.go"]))
+        .collect();
+    let r = run(&m, PKG, &many, &SplitSimOpts::default());
+    assert!(r.abstained.unwrap().contains("exceeds"));
+}
+
+#[test]
 fn output_is_deterministic_and_matches_committed_snapshots() {
     let cases: Vec<(&str, Vec<PartitionSpec>)> = vec![
         ("legal-split", ab()),

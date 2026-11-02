@@ -203,6 +203,11 @@ fn resolve_file(pkg_files: &BTreeSet<String>, spec: &str, pkg_dir: &str) -> Opti
         .find(|c| pkg_files.contains(c))
 }
 
+const MAX_PARTS: usize = 64;
+const MAX_PARTITION_FILES: usize = 10_000;
+const MAX_NAME_LEN: usize = 512;
+const MAX_SOURCE_BYTES: u64 = 4 << 20;
+
 struct Assignment {
     file_part: BTreeMap<String, String>,
     warnings: Vec<Blocker>,
@@ -232,6 +237,14 @@ fn assign(
     if names.len() != specs.len() || names.contains("") {
         return Err("part names must be non-empty and distinct".into());
     }
+    if specs.len() > MAX_PARTS
+        || specs.iter().map(|s| s.files.len()).sum::<usize>() > MAX_PARTITION_FILES
+        || specs
+            .iter()
+            .any(|s| s.name.len() > MAX_NAME_LEN || s.files.iter().any(|f| f.len() > MAX_NAME_LEN))
+    {
+        return Err("partition input exceeds the supported size".into());
+    }
     if let Some(empty) = specs.iter().find(|s| s.files.is_empty()) {
         return Err(format!("part {} has no files", empty.name));
     }
@@ -250,7 +263,7 @@ fn assign(
     for spec in specs {
         for raw in &spec.files {
             let Some(file) = resolve_file(&pkg_files, raw, &pkg_dir) else {
-                warnings.push(generated_or_unknown(model, raw, &spec.name, read)?);
+                warnings.push(generated_or_unknown(raw, &spec.name, &pkg_dir, read)?);
                 continue;
             };
             if let Some(prev) = file_part.insert(file.clone(), spec.name.clone()) {
@@ -284,9 +297,9 @@ fn assign(
 /// A partition file absent from the model is acceptable only if it is a generated file
 /// (which the model deliberately skips); anything else is a typo or a foreign file.
 fn generated_or_unknown(
-    model: &ArchModel,
     raw: &str,
     part: &str,
+    pkg_dir: &str,
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Blocker, String> {
     let path = raw.strip_prefix("./").unwrap_or(raw);
@@ -299,21 +312,12 @@ fn generated_or_unknown(
                 | std::path::Component::Prefix(_)
         )
     });
-    let on_disk = if escapes_root { None } else { read(path) }.or_else(|| {
-        if escapes_root {
-            return None;
-        }
-        model
-            .packages
-            .values()
-            .flat_map(|p| &p.files)
-            .next()
-            .and_then(|f| {
-                norm(&model.repo_root, f)
-                    .rsplit_once('/')
-                    .and_then(|(d, _)| read(&format!("{d}/{path}")))
-            })
-    });
+    if escapes_root {
+        return Err(format!(
+            "{raw} is not in package files and could not be read"
+        ));
+    }
+    let on_disk = read(path).or_else(|| read(&format!("{pkg_dir}/{path}")));
     match on_disk {
         Some(src) if looks_generated(&src) => Ok(Blocker {
             kind: "generated_file_in_partition".into(),
@@ -354,8 +358,22 @@ pub fn run(
 ) -> SplitSimResult {
     let root = model.repo_root.clone();
     run_with_sources(model, package, specs, opts, &|rel| {
-        std::fs::read_to_string(root.join(rel)).ok()
+        read_regular_in_root(&root, rel)
     })
+}
+
+/// Reads `rel` only if it is a regular file of bounded size that still resolves inside `root`
+/// after symlinks, so partition names can't probe or exhaust memory via links or devices.
+fn read_regular_in_root(root: &std::path::Path, rel: &str) -> Option<String> {
+    let full = root.join(rel).canonicalize().ok()?;
+    if !full.starts_with(root.canonicalize().ok()?) {
+        return None;
+    }
+    let meta = std::fs::metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(full).ok()
 }
 
 pub fn run_with_sources(
