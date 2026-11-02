@@ -3713,6 +3713,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refactor_tools_end_to_end_over_the_server() {
+        use std::process::Command;
+        let dir = tmp_dir("refactor-e2e");
+        let w = |p: &str, c: &str| {
+            let f = dir.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, c).unwrap();
+        };
+        w("go.mod", "module fixture\n\ngo 1.21\n");
+        w(
+            "a/x.go",
+            "package a\n\nimport \"fixture/b\"\n\nfunc X() int { return b.B() }\n",
+        );
+        w("a/y.go", "package a\n\nfunc Y() int { return 1 }\n");
+        w(
+            "b/b.go",
+            "package b\n\nimport \"fixture/a\"\n\nfunc B() int { return a.Y() }\n",
+        );
+        w(".kibitzer/inspect.json", r#"{"allow_write_tools": true}"#);
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "init"],
+        ] {
+            let st = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(&args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let path = dir.display().to_string();
+        let server = KibitzerServer::new();
+        let json = |out: String| -> serde_json::Value { serde_json::from_str(&out).unwrap() };
+
+        let sug = json(
+            server
+                .suggest_refactors(Parameters(SuggestRefactorsRequest {
+                    path: path.clone(),
+                    scope: vec![],
+                }))
+                .await,
+        );
+        assert_eq!(sug["suggestions"][0]["package"], "fixture/a", "{sug}");
+
+        let partition = vec![crate::refactor::PartitionGroup {
+            name: "ypart".into(),
+            symbols: vec!["Y".into()],
+        }];
+        let sim = json(
+            server
+                .simulate_split(Parameters(SimulateSplitRequest {
+                    path: path.clone(),
+                    package: "fixture/a".into(),
+                    partition: partition.clone(),
+                }))
+                .await,
+        );
+        assert_eq!(sim["feasible"], true, "{sim}");
+
+        let unsupported = json(
+            server
+                .plan_refactor(Parameters(PlanRefactorRequest {
+                    path: path.clone(),
+                    operation: "nope".into(),
+                    args: serde_json::json!({}),
+                }))
+                .await,
+        );
+        assert_eq!(unsupported["code"], "unsupported");
+        let bad_args = json(
+            server
+                .plan_refactor(Parameters(PlanRefactorRequest {
+                    path: path.clone(),
+                    operation: "split_package".into(),
+                    args: serde_json::json!({"package": 1}),
+                }))
+                .await,
+        );
+        assert_eq!(bad_args["code"], "bad_args");
+
+        let plan = json(
+            server
+                .plan_refactor(Parameters(PlanRefactorRequest {
+                    path: path.clone(),
+                    operation: "split_package".into(),
+                    args: serde_json::json!({"package": "fixture/a", "partition": partition}),
+                }))
+                .await,
+        );
+        let id = plan["plan_id"].as_str().unwrap().to_string();
+        assert!(!dir.join("a/ypart").exists(), "plan must not write");
+
+        let req = || PlanIdRequest {
+            path: path.clone(),
+            plan_id: id.clone(),
+        };
+        let applied = json(server.apply_refactor(Parameters(req())).await);
+        assert_eq!(applied["applied"], true, "{applied}");
+        assert!(dir.join("a/ypart").exists());
+        let verified = json(server.verify_refactor(Parameters(req())).await);
+        assert!(verified.get("passed").is_some(), "{verified}");
+        let reverted = json(server.revert_refactor(Parameters(req())).await);
+        assert_eq!(reverted["reverted"], true, "{reverted}");
+        assert!(!dir.join("a/ypart").exists(), "revert restores the tree");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn write_tools_are_inert_without_opt_in() {
         let dir = tmp_dir("refactor-optin");
         std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
