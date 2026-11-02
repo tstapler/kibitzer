@@ -1,0 +1,57 @@
+=== .kibitzer/inspect.json ===
+{
+  "checks": [
+    {
+      "name": "file-complexity",
+      "scope": [
+        "lib/**",
+        "app/**"
+      ]
+    }
+  ],
+  "architecture": {
+    "components": [
+      {
+        "name": "lib",
+        "paths": [
+          "lib"
+        ]
+      },
+      {
+        "name": "util-tests",
+        "paths": [
+          "lib/util_test.go"
+        ]
+      }
+    ]
+  }
+}
+
+=== go.mod ===
+module example.com/m
+
+go 1.21
+
+=== hashing/lib.go ===
+package hashing
+
+import (
+	"fmt"
+	"strings"
+)
+
+const seed = 7
+
+// Hash mixes s with the package seed.
+func Hash(s string) string {
+	return fmt.Sprint(mix(strings.ToLower(s)))
+}
+
+func mix(s string) int { return len(s) * seed }
+
+=== lib/lib.go ===
+package lib
+
+// Other stays in lib.
+func Other() int { return 1 }
+

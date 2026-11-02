@@ -535,3 +535,62 @@ fn simulation_blocker_is_embedded_and_refuses_apply() {
     );
     apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
 }
+
+#[test]
+fn rename_handles_tags_generated_and_init_but_blocks_cgo_native_and_embed() {
+    let codes =
+        |p: &MovePlan| -> Vec<String> { p.blockers.iter().map(|b| b.code.clone()).collect() };
+    let rename = |root: &Path| {
+        plan_rename_pkg(root, "example.com/m/lib", "example.com/m/core", None, None).unwrap()
+    };
+
+    // cgo.go in the package: blocked.
+    let root = input_copy("hazards");
+    assert_eq!(codes(&rename(&root)), vec!["cgo"]);
+
+    // Without cgo: build-tagged, generated and init() files all move intact.
+    std::fs::remove_file(root.join("lib/cgo.go")).unwrap();
+    let plan = rename(&root);
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("lib/gen.go") && w.contains("generated"))
+    );
+    let tagged = plan
+        .steps
+        .iter()
+        .find(|s| s.transform.new_path.as_deref() == Some("core/tagged.go"))
+        .unwrap();
+    assert!(
+        tagged
+            .transform
+            .new_content
+            .as_ref()
+            .unwrap()
+            .starts_with("//go:build linux\n\npackage core")
+    );
+    let reg = plan
+        .steps
+        .iter()
+        .find(|s| s.transform.new_path.as_deref() == Some("core/reg.go"))
+        .unwrap();
+    assert!(
+        reg.transform
+            .new_content
+            .as_ref()
+            .unwrap()
+            .contains("func init()")
+    );
+
+    // Native sources and go:embed block even a whole-package rename.
+    std::fs::write(root.join("lib/x.c"), "int x;\n").unwrap();
+    assert_eq!(codes(&rename(&root)), vec!["native_sources"]);
+    std::fs::remove_file(root.join("lib/x.c")).unwrap();
+    std::fs::write(
+        root.join("lib/emb.go"),
+        "package lib\n\nimport _ \"embed\"\n\n//go:embed emb.txt\nvar Emb string\n",
+    )
+    .unwrap();
+    assert_eq!(codes(&rename(&root)), vec!["go_embed"]);
+}

@@ -195,6 +195,34 @@ pub fn remove_import(src: &str, path: &str) -> String {
             });
         }
     }
+    drop_empty_import_decls(&apply_edits(src, edits))
+}
+
+/// `import ()` left behind by removing the last spec is valid Go but noise; delete it.
+fn drop_empty_import_decls(src: &str) -> String {
+    let Some(tree) = parse(src) else {
+        return src.to_string();
+    };
+    let mut edits = vec![];
+    for d in children(tree.root_node())
+        .into_iter()
+        .filter(|n| n.kind() == "import_declaration")
+    {
+        let mut has_spec = false;
+        walk(d, &mut |n| has_spec |= n.kind() == "import_spec");
+        if !has_spec {
+            let end = if src[d.end_byte()..].starts_with("\n\n") {
+                d.end_byte() + 2
+            } else {
+                d.end_byte()
+            };
+            edits.push(Edit {
+                start: d.start_byte(),
+                end,
+                text: String::new(),
+            });
+        }
+    }
     apply_edits(src, edits)
 }
 
