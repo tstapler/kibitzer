@@ -87,6 +87,7 @@ pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .with_context(|| format!("socket path {} has no parent directory", path.display()))?;
+    check_path_fits(path)?;
     ensure_socket_dir(parent)
         .map_err(|why| anyhow::anyhow!("refusing socket directory {}: {why}", parent.display()))?;
 
@@ -101,7 +102,7 @@ pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket> {
     }
 
     remove_stale_socket(path)?;
-    let listener = bind_via_private_staging(parent, path)?;
+    let listener = bind_owner_only(parent, path)?;
     listener.set_nonblocking(true)?;
     Ok(BoundSocket {
         listener: UnixListener::from_std(listener)?,
@@ -131,19 +132,59 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     }
 }
 
-/// Binds inside a fresh 0700 directory and chmods before the rename, so the socket is never
-/// reachable by others even if `parent` is merely not-writable (e.g. 0755).
+/// Longest socket path `bind` accepts: `sun_path` (108 bytes on Linux, 104 on macOS and the
+/// BSDs) less its terminating NUL.
+const MAX_SOCKET_PATH: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
+
+fn check_path_fits(path: &Path) -> Result<()> {
+    let len = path.as_os_str().len();
+    if len > MAX_SOCKET_PATH {
+        bail!(
+            "socket path {} is {len} bytes, over the {MAX_SOCKET_PATH}-byte limit for Unix \
+             sockets; pass a shorter path",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Binds `path` so it's only ever reachable by this user. In a private (0700) `parent`
+/// nobody else can reach it anyway, so it's bound in place; otherwise (e.g. 0755) it's
+/// bound in a fresh 0700 staging directory and chmodded before being renamed into place.
+fn bind_owner_only(parent: &Path, path: &Path) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::MetadataExt;
+    let parent_mode = std::fs::metadata(parent)
+        .with_context(|| format!("checking {}", parent.display()))?
+        .mode();
+    if parent_mode & 0o077 == 0 {
+        let listener = std::os::unix::net::UnixListener::bind(path)
+            .with_context(|| format!("binding {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
+        return Ok(listener);
+    }
+    bind_via_private_staging(parent, path)
+}
+
 fn bind_via_private_staging(
     parent: &Path,
     path: &Path,
 ) -> Result<std::os::unix::net::UnixListener> {
-    let staging = parent.join(format!(".mcp-bind-{}", std::process::id()));
+    // Short names, since the staged path must fit the same length limit as the final one.
+    let staging = parent.join(format!(".k{}", std::process::id()));
+    let staged = staging.join("s");
+    if staged.as_os_str().len() > MAX_SOCKET_PATH {
+        bail!(
+            "socket path {} is too long to stage safely in {}, which others can read; use a \
+             0700 directory or a shorter path",
+            path.display(),
+            parent.display()
+        );
+    }
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::DirBuilder::new()
         .mode(OWNER_ONLY_DIR)
         .create(&staging)
         .with_context(|| format!("creating {}", staging.display()))?;
-    let staged = staging.join("s");
     let bound = std::os::unix::net::UnixListener::bind(&staged)
         .and_then(|l| {
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
@@ -388,7 +429,7 @@ pub(crate) mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name())
-            .filter(|n| n.to_string_lossy().starts_with(".mcp-bind"))
+            .filter(|n| n.to_string_lossy().starts_with(".k"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         drop(bound);
@@ -431,6 +472,51 @@ pub(crate) mod tests {
         let err = bind_socket(&path).err().unwrap();
         assert!(err.to_string().contains("not a socket"), "{err}");
         assert!(path.exists(), "a non-socket file is never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_should_StageOwnerOnlySocket_When_DirIsReadableByOthers() {
+        let dir = unique_temp_dir("mcpsock-0755");
+        let run = dir.join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = run.join("mcp.sock");
+        let bound = bind_socket(&path).unwrap();
+        assert_eq!(mode(&path), OWNER_ONLY_FILE);
+        assert_eq!(
+            mode(&run),
+            0o755,
+            "a directory we didn't make is left alone"
+        );
+        let leftovers = std::fs::read_dir(&run).unwrap().count();
+        assert_eq!(leftovers, 2, "only the socket and its lock remain");
+        drop(bound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dir/<padding>/s.sock`, exactly `len` bytes long.
+    fn path_of_len(dir: &Path, len: usize) -> PathBuf {
+        let base = dir.as_os_str().len() + "/".len() + "/s.sock".len();
+        let path = dir.join("p".repeat(len - base)).join("s.sock");
+        assert_eq!(path.as_os_str().len(), len);
+        path
+    }
+
+    #[tokio::test]
+    async fn bind_socket_should_BindPathAtTheLimit_And_RefuseLongerWithClearError() {
+        let dir = PathBuf::from(format!("/tmp/kbz-len-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let at_limit = path_of_len(&dir, MAX_SOCKET_PATH);
+        let bound = bind_socket(&at_limit).unwrap();
+        assert_eq!(mode(&at_limit), OWNER_ONLY_FILE);
+        drop(bound);
+        let near = path_of_len(&dir, 100);
+        drop(bind_socket(&near).unwrap());
+        let too_long = path_of_len(&dir, MAX_SOCKET_PATH + 1);
+        let err = bind_socket(&too_long).err().unwrap();
+        assert!(err.to_string().contains("byte limit"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

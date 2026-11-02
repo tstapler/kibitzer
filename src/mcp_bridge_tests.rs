@@ -23,6 +23,57 @@ fn ours(socket: &Path) -> ServerAddr {
     ServerAddr {
         socket: socket.to_path_buf(),
         uid: current_uid(),
+        timeouts: Timeouts::default(),
+    }
+}
+
+const SHORT: Duration = Duration::from_millis(200);
+
+/// `ours`, with every wait bounded at `SHORT`.
+fn impatient(socket: &Path) -> ServerAddr {
+    ServerAddr {
+        timeouts: Timeouts {
+            connect: SHORT,
+            headers: SHORT,
+            idle: SHORT,
+            close: SHORT,
+        },
+        ..ours(socket)
+    }
+}
+
+/// A server whose kernel accepts connections but which never answers (a stopped process).
+/// With `sse_headers`, it sends SSE response headers once a request arrives, then goes silent.
+fn wedged_server(dir: &Path, sse_headers: bool) -> PathBuf {
+    let path = dir.join("wedged.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            if sse_headers {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                          transfer-encoding: chunked\r\n\r\n",
+                    )
+                    .await;
+            }
+            held.push(stream);
+        }
+    });
+    path
+}
+
+async fn wait_until_no_sessions(server: &TestServer) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !server.sessions.sessions.read().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session never left the server's map"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -124,8 +175,8 @@ async fn bridge_should_RefuseServer_When_PeerUidIsNotTheExpectedOne() {
     let dir = unique_temp_dir("mcpbr-uid");
     let server = TestServer::start(&dir, LONG_IDLE, current_uid()).await;
     let mut client = Client::start(ServerAddr {
-        socket: server.path.clone(),
         uid: current_uid() + 1,
+        ..ours(&server.path)
     });
     client.send(&initialize_message(5).to_string()).await;
     let reply = client.recv().await;
@@ -147,8 +198,7 @@ async fn bridge_should_Reinitialize_When_ServerDroppedIdleSession() {
     let server = TestServer::start(&dir, Duration::from_millis(200), current_uid()).await;
     let mut client = Client::start(ours(&server.path));
     client.handshake().await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(server.sessions.sessions.read().await.is_empty());
+    wait_until_no_sessions(&server).await;
     let names = client.tool_names(2).await;
     assert!(names.iter().any(|n| n == "run_checks"), "{names:?}");
     client.finish().await.unwrap();
@@ -190,31 +240,100 @@ async fn bridge_should_AnswerParseError_And_StillCloseSession_When_InputIsInvali
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A reader whose first read fails, standing in for a broken stdin.
-struct BrokenInput;
+/// A stdin that delivers `first`, then fails.
+struct BreaksAfter {
+    first: Option<Vec<u8>>,
+}
 
-impl tokio::io::AsyncRead for BrokenInput {
+impl tokio::io::AsyncRead for BreaksAfter {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         _: &mut std::task::Context<'_>,
-        _: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Err(std::io::Error::other("stdin broke")))
+        std::task::Poll::Ready(match self.first.take() {
+            Some(bytes) => {
+                buf.put_slice(&bytes);
+                Ok(())
+            }
+            None => Err(std::io::Error::other("stdin broke")),
+        })
     }
 }
 
 #[tokio::test]
-async fn bridge_should_ReturnError_But_StillClose_When_InputFails() {
+async fn bridge_should_ReturnError_But_StillCloseSession_When_InputFails() {
     let dir = unique_temp_dir("mcpbr-broken");
-    let output = tokio::io::sink();
-    let err = bridge(
-        ours(&dir.join("nothing.sock")),
-        BufReader::new(BrokenInput),
-        output,
-    )
-    .await
-    .unwrap_err();
+    let server = TestServer::start(&dir, LONG_IDLE, current_uid()).await;
+    let mut init = initialize_message(1).to_string().into_bytes();
+    init.push(b'\n');
+    let input = BufReader::new(BreaksAfter { first: Some(init) });
+    let err = bridge(ours(&server.path), input, tokio::io::sink())
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("stdin broke"), "{err}");
+    // The session the initialize opened was DELETEd on the way out.
+    assert!(server.sessions.sessions.read().await.is_empty());
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn bridge_should_AnswerError_And_StillExit_When_ServerNeverReplies() {
+    let dir = unique_temp_dir("mcpbr-wedged");
+    let wedged = wedged_server(&dir, false);
+    let started = tokio::time::Instant::now();
+    let mut client = Client::start(impatient(&wedged));
+    client.send(&initialize_message(1).to_string()).await;
+    let reply = client.recv().await;
+    assert_eq!(reply["id"], 1);
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("timed out"), "{reply}");
+    tokio::time::timeout(Duration::from_secs(5), client.finish())
+        .await
+        .expect("bridge exits despite the wedged server")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn bridge_should_AnswerError_When_SseStreamGoesSilent() {
+    let dir = unique_temp_dir("mcpbr-silent");
+    let silent = wedged_server(&dir, true);
+    let mut client = Client::start(impatient(&silent));
+    client
+        .send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+        .await;
+    let reply = client.recv().await;
+    assert_eq!(reply["id"], 2);
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("sent nothing"), "{reply}");
+    client.finish().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn close_should_GiveUp_When_ServerNeverAnswersDelete() {
+    let dir = unique_temp_dir("mcpbr-close");
+    let session = Session::new(impatient(&wedged_server(&dir, false)));
+    session.state.lock().await.id = Some("stuck".to_string());
+    tokio::time::timeout(Duration::from_secs(5), session.close())
+        .await
+        .expect("close is bounded");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn bridge_should_AnswerInvalidRequest_When_GivenBatch() {
+    let dir = unique_temp_dir("mcpbr-batch");
+    let mut client = Client::start(ours(&dir.join("nothing.sock")));
+    client
+        .send(r#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#)
+        .await;
+    let reply = client.recv().await;
+    assert_eq!(reply["error"]["code"], INVALID_REQUEST, "{reply}");
+    client.finish().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -242,7 +361,11 @@ async fn bridge_should_ReportServerError_When_RequestRejected() {
 
 async fn relay(body: &'static [u8], id: Option<&Value>, max: usize) -> Result<Vec<Value>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let result = relay_sse(Full::new(Bytes::from_static(body)), id, &tx, max).await;
+    let limits = SseLimits {
+        max_bytes: max,
+        idle: Duration::from_secs(5),
+    };
+    let result = relay_sse(Full::new(Bytes::from_static(body)), id, &tx, limits).await;
     drop(tx);
     let mut got = Vec::new();
     while let Some(v) = rx.recv().await {

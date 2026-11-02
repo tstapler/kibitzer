@@ -72,7 +72,11 @@ Code's HTTP transport takes a URL and can't reach a Unix socket. That's what
 `--connect` is for: a stdio MCP server that forwards each message to the
 socket and loads no checks itself. When the server has dropped the
 bridge's session (idle for 2 hours, or restarted), the bridge opens a new
-one on its own.
+one on its own. If the server stops responding (stopped or wedged), the
+bridge doesn't hang: each request returns a JSON-RPC error after a timeout
+(5s to connect, 60s for response headers, 60s with no data on a reply
+stream; the server pings every 15s), and the bridge's exit waits at most
+3s for the session close.
 
 - **Who can connect:** only processes running as your user. The socket is
   `0600`, it sits in a directory only you can write (created `0700`), and

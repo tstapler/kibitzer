@@ -4,11 +4,12 @@
 //! per message, SSE replies) over the Unix socket.
 //!
 //! Limits: no standalone GET stream, so server-initiated messages outside a request's own
-//! reply stream are not relayed (kibitzer sends none); batches are passed through as-is,
-//! which rmcp 0.2 answers with 501.
+//! reply stream are not relayed (kibitzer sends none); batches, which rmcp 0.2 doesn't
+//! support, get a JSON-RPC error.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -28,6 +29,7 @@ use crate::mcp_socket::MCP_PATH;
 const SESSION_HEADER: &str = "mcp-session-id";
 const ACCEPT: &str = "application/json, text/event-stream";
 const PARSE_ERROR: i64 = -32700;
+const INVALID_REQUEST: i64 = -32600;
 const INTERNAL_ERROR: i64 = -32603;
 
 /// Largest single SSE event or error body accepted from the server.
@@ -39,12 +41,52 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct ServerAddr {
     pub socket: PathBuf,
     pub uid: u32,
+    pub timeouts: Timeouts,
+}
+
+/// Bounds on waiting for the server, so a stopped or wedged one (whose kernel still accepts
+/// connections) can't hang a request, or the bridge's exit, forever.
+#[derive(Clone, Copy)]
+pub(crate) struct Timeouts {
+    /// Connecting plus the HTTP handshake.
+    pub connect: Duration,
+    /// Response headers. rmcp sends them before running the tool (the reply streams as SSE),
+    /// so this needn't cover a slow tool call.
+    pub headers: Duration,
+    /// Silence between body frames. rmcp pings SSE streams every 15s while a tool runs, so
+    /// 60s of nothing means the server is gone; no total cap, since tool calls can be long.
+    pub idle: Duration,
+    /// The session DELETE on exit.
+    pub close: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            headers: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            close: Duration::from_secs(3),
+        }
+    }
+}
+
+/// Runs `fut`, failing with "<what> timed out after <limit>" if it takes longer.
+async fn bounded<T>(
+    limit: Duration,
+    what: &str,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} timed out after {limit:?}"))?
 }
 
 pub async fn run_mcp_bridge(socket: PathBuf) -> Result<()> {
     let server = ServerAddr {
         socket,
         uid: current_uid(),
+        timeouts: Timeouts::default(),
     };
     bridge(
         server,
@@ -93,6 +135,15 @@ async fn relay_input<R: AsyncBufRead + Unpin>(
             continue;
         }
         let message: Value = match serde_json::from_str(&line) {
+            Ok(Value::Array(_)) => {
+                // rmcp 0.2 answers batches with 501 and no JSON-RPC reply; say so instead.
+                let _ = tx.send(rpc_error(
+                    Value::Null,
+                    INVALID_REQUEST,
+                    "batch requests are not supported",
+                ));
+                continue;
+            }
             Ok(m) => m,
             Err(e) => {
                 let _ = tx.send(rpc_error(
@@ -197,11 +248,19 @@ impl Session {
         }
         let status = response.status();
         if !status.is_success() {
-            let body = Limited::new(response.into_body(), MAX_MESSAGE_BYTES)
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("reading {status} reply: {e}"))?
-                .to_bytes();
+            let collect = async {
+                Limited::new(response.into_body(), MAX_MESSAGE_BYTES)
+                    .collect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("reading {status} reply: {e}"))
+            };
+            let body = bounded(
+                self.server.timeouts.idle,
+                "reading the error reply",
+                collect,
+            )
+            .await?
+            .to_bytes();
             bail!(
                 "server answered {status}: {}",
                 String::from_utf8_lossy(&body)
@@ -212,7 +271,7 @@ impl Session {
                 response.into_body(),
                 request_id(message),
                 out,
-                MAX_MESSAGE_BYTES,
+                SseLimits::new(self.server.timeouts),
             )
             .await?;
         } else if let Some(id) = request_id(message) {
@@ -255,7 +314,11 @@ impl Session {
             .header(SESSION_HEADER, session_id)
             .body(Full::new(Bytes::new()));
         if let Ok(request) = request {
-            let _ = send(&self.server, request).await;
+            let delete = send(&self.server, request);
+            if let Err(e) = bounded(self.server.timeouts.close, "closing the session", delete).await
+            {
+                eprintln!("[kibitzer] mcp bridge: {e:#}");
+            }
         }
     }
 }
@@ -278,7 +341,7 @@ async fn open_session(server: &ServerAddr, initialize: &Value) -> Result<(String
         response.into_body(),
         request_id(initialize),
         &tx,
-        MAX_MESSAGE_BYTES,
+        SseLimits::new(server.timeouts),
     )
     .await?;
     let reply = rx.recv().await.context("initialize got no reply")?;
@@ -331,38 +394,78 @@ async fn connect(server: &ServerAddr) -> Result<UnixStream> {
     Ok(stream)
 }
 
-/// One HTTP/1.1 exchange on a fresh connection to the server.
+/// One HTTP/1.1 exchange on a fresh connection to the server, up to the response headers.
 async fn send(server: &ServerAddr, request: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
-    let stream = connect(server).await?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .context("HTTP handshake")?;
+    let open = async {
+        let stream = connect(server).await?;
+        hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .context("HTTP handshake")
+    };
+    let (mut sender, connection) = bounded(
+        server.timeouts.connect,
+        "connecting to the MCP server",
+        open,
+    )
+    .await?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    sender
-        .send_request(request)
-        .await
-        .context("sending request to the MCP server")
+    let response = async {
+        sender
+            .send_request(request)
+            .await
+            .context("sending request to the MCP server")
+    };
+    bounded(
+        server.timeouts.headers,
+        "waiting for the MCP server to answer",
+        response,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct SseLimits {
+    /// Largest single event.
+    max_bytes: usize,
+    /// Longest silence between frames.
+    idle: Duration,
+}
+
+impl SseLimits {
+    fn new(timeouts: Timeouts) -> Self {
+        Self {
+            max_bytes: MAX_MESSAGE_BYTES,
+            idle: timeouts.idle,
+        }
+    }
 }
 
 /// Forwards each SSE event's JSON payload until the reply to `request_id` (the stream may be
-/// held open by keep-alives after it). A stream that ends first, or an event over `max`
-/// bytes, is an error.
+/// held open by keep-alives after it). A stream that ends first, an event over the byte
+/// limit, or silence past the idle limit is an error.
 async fn relay_sse<B>(
     mut body: B,
     request_id: Option<&Value>,
     out: &mpsc::UnboundedSender<Value>,
-    max: usize,
+    limits: SseLimits,
 ) -> Result<()>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    let max = limits.max_bytes;
     let mut buffer: Vec<u8> = Vec::new();
     // Bytes already searched for an event end, so each frame only scans what's new.
     let mut scanned = 0;
-    while let Some(frame) = body.frame().await {
+    loop {
+        let next = tokio::time::timeout(limits.idle, body.frame())
+            .await
+            .map_err(|_| anyhow::anyhow!("MCP server sent nothing for {:?}", limits.idle))?;
+        let Some(frame) = next else {
+            break;
+        };
         let Ok(data) = frame?.into_data() else {
             continue;
         };
