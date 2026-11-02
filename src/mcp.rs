@@ -168,6 +168,22 @@ struct GetArchitectureNodeRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct ListRefactorOperationsRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// Module-qualified Go package path to list operations for.
+    package: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct RefactorOperationRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// The operation to simulate or plan.
+    operation: crate::refactor::RefactorOperation,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct CallTraversalRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
     path: String,
@@ -1136,6 +1152,70 @@ impl KibitzerServer {
         };
         serde_json::to_string(&response)
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    /// Shared prologue for the refactor tools: resolve the repo root and load the model.
+    async fn refactor_model(&self, path: &str) -> Result<Arc<ArchModel>, String> {
+        let repo_root = Self::resolve_repo_root(&PathBuf::from(path)).map_err(json_error)?;
+        // Private symbols are needed: refactors move unexported code too.
+        self.load_model_off_stack(repo_root, true)
+            .await
+            .map_err(json_error)
+    }
+
+    #[tool(
+        description = "List mechanical refactoring operations (MoveFiles, ExtractPackage) \
+                        available for a Go package — returns a JSON array, `[]` when none is \
+                        supported. Read-only."
+    )]
+    async fn list_refactor_operations(
+        &self,
+        req: Parameters<ListRefactorOperationsRequest>,
+    ) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let ops = crate::refactor::catalog::list_operations_for_package(&model, &req.package);
+        serde_json::to_string(&ops)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Simulate a refactoring operation and report feasibility as JSON \
+                        ({feasible, blocking, warnings, touched_files, importers_affected}) — \
+                        import cycles, internal/ violations and cgo block; build-tagged and \
+                        generated files warn. Writes nothing."
+    )]
+    async fn simulate_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let report = crate::refactor::feasibility::check(&model, &req.operation);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Plan a MoveFiles/ExtractPackage operation for Go: returns a JSON \
+                        RefactorPlan (ordered edits, verification commands, content hashes of \
+                        every touched file). Errors when the operation is infeasible. Writes \
+                        nothing; there is no apply tool yet."
+    )]
+    async fn plan_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        match crate::refactor::catalog::plan_move_files(&model, &req.operation) {
+            Ok(plan) => serde_json::to_string(&plan)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
+            Err(e) => json_error(format!("{e:#}")),
+        }
     }
 
     #[tool(
@@ -3173,6 +3253,23 @@ mod tests {
         assert_eq!(
             render_run_checks_report(&[ok], Path::new("x.go")),
             "all checks passed"
+        );
+    }
+
+    #[test]
+    fn refactor_tools_are_registered() {
+        let router = KibitzerServer::tool_router();
+        let tools = router.list_all();
+        for name in [
+            "list_refactor_operations",
+            "simulate_refactor",
+            "plan_refactor",
+        ] {
+            assert!(tools.iter().any(|t| t.name == name), "{name} is registered");
+        }
+        assert!(
+            !tools.iter().any(|t| t.name == "apply_refactor"),
+            "no apply path ships in this milestone"
         );
     }
 
