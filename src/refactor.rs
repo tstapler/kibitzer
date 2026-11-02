@@ -180,13 +180,15 @@ pub fn simulate_split(
         .values()
         .map(|&i| group_key(package, partition, i))
         .collect();
-    let mut after = ImportGraph::default();
-    after.nodes = before
-        .nodes
-        .iter()
-        .filter(|n| *n != package)
-        .cloned()
-        .collect();
+    let mut after = ImportGraph {
+        nodes: before
+            .nodes
+            .iter()
+            .filter(|n| *n != package)
+            .cloned()
+            .collect(),
+        ..ImportGraph::default()
+    };
     after.nodes.extend(all_keys.iter().cloned());
 
     let mut importers = BTreeSet::new();
