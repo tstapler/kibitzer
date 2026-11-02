@@ -80,20 +80,28 @@ fn target_dir(model: &ArchModel, op: &RefactorOperation, r: &Resolved) -> Result
     let first = r.moved.iter().next().context("no files to move")?;
     let (module, root) = go_module(model, first.parent().unwrap_or(first))
         .context("no go.mod found above the source package")?;
-    let rel = op
+    let rest = op
         .target_package
         .strip_prefix(&module)
-        .with_context(|| format!("target {} is outside module {module}", op.target_package))?
-        .trim_start_matches('/');
+        .filter(|r| r.is_empty() || r.starts_with('/'))
+        .with_context(|| format!("target {} is outside module {module}", op.target_package))?;
+    let rel = rest.trim_start_matches('/');
+    if rel.split('/').any(|seg| seg == ".." || seg == ".") || rest.contains("//") {
+        bail!("target {} has an invalid path segment", op.target_package);
+    }
     Ok(root.join(rel))
 }
 
 fn target_package_name(op: &RefactorOperation, dir: &Path) -> String {
     let existing = std::fs::read_dir(dir).ok().and_then(|entries| {
-        entries
+        let mut files: Vec<PathBuf> = entries
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "go") && !is_test_file(p))
+            .collect();
+        files.sort();
+        files
+            .into_iter()
             .find_map(|p| go_syntax::package_name(&std::fs::read_to_string(p).ok()?))
     });
     existing.unwrap_or_else(|| {

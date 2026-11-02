@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::{Edit, RefactorPlan, go_syntax};
 
+/// Serializes apply and recovery in this process so one apply never rolls back another's live
+/// WAL. Two separate server processes on one repo are not covered.
+static APPLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const PLANS_DIR: &str = ".kibitzer/plans";
 const WAL_FILE: &str = ".wal";
 const BACKUP_DIR: &str = ".wal-backup";
@@ -101,6 +104,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Rolls back an apply a crashed process left half-done. Returns the interrupted plan id, or
 /// `None` when no WAL exists. Safe to call at every startup and before every apply.
 pub fn recover(root: &Path) -> Result<Option<String>> {
+    let _guard = APPLY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    recover_locked(root)
+}
+
+fn recover_locked(root: &Path) -> Result<Option<String>> {
     let path = wal_path(root);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -142,8 +152,10 @@ fn rollback(root: &Path, wal: &Wal) -> Result<()> {
         // Non-empty or already gone: either way there is nothing of ours left to remove.
         let _ = std::fs::remove_dir(dir);
     }
-    let _ = std::fs::remove_dir_all(plans_dir(root).join(BACKUP_DIR));
+    // The WAL is the commit point: drop it before the backups so a crash in between never leaves
+    // a WAL whose backups are gone.
     ignore_missing(std::fs::remove_file(wal_path(root)))?;
+    let _ = std::fs::remove_dir_all(plans_dir(root).join(BACKUP_DIR));
     Ok(())
 }
 
@@ -190,10 +202,52 @@ fn check_plan(root: &Path, plan: &RefactorPlan) -> Result<()> {
             }
         }
     }
-    if let Some(p) = paths.iter().find(|p| !p.starts_with(root)) {
+    for edit in &plan.edits {
+        match edit {
+            Edit::ReplacePackageDecl { new_name, .. } if !is_go_ident(new_name) => {
+                bail!("`{new_name}` is not a valid Go package name");
+            }
+            Edit::ReplaceImportPath { new_path, .. } if !is_safe_import_path(new_path) => {
+                bail!("`{new_path}` is not a valid import path");
+            }
+            _ => {}
+        }
+    }
+    paths.extend(plan.touched.iter().map(|t| t.path.as_path()));
+    if let Some(p) = paths.iter().find(|p| !is_inside(root, p)) {
         bail!("{} is outside the repository", p.display());
     }
     Ok(())
+}
+
+fn is_go_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn is_safe_import_path(s: &str) -> bool {
+    !s.is_empty()
+        && !s
+            .chars()
+            .any(|c| c == '"' || c == '`' || c == '\\' || c.is_whitespace() || c.is_control())
+}
+
+/// True when `p` is under `root` without `..` hops or a symlink that leaves the tree. Checks
+/// the deepest existing ancestor, since the destination may not exist yet.
+pub(super) fn is_inside(root: &Path, p: &Path) -> bool {
+    use std::path::Component;
+    if !p.starts_with(root) || p.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let (Ok(canon_root), Some(existing)) =
+        (root.canonicalize(), p.ancestors().find(|a| a.exists()))
+    else {
+        return false;
+    };
+    existing
+        .canonicalize()
+        .is_ok_and(|c| c.starts_with(canon_root))
 }
 
 fn edit_sources(edit: &Edit) -> Vec<&Path> {
@@ -259,14 +313,18 @@ fn compute_outputs(plan: &RefactorPlan) -> Result<Vec<Output>> {
     if unique.len() != dests.len() {
         bail!("two files would be written to the same destination");
     }
-    Ok(dests
-        .into_iter()
-        .map(|(original, dest)| Output {
-            body: bodies.remove(&original).unwrap_or_default(),
+    let mut outputs = Vec::new();
+    for (original, dest) in dests {
+        let body = bodies
+            .remove(&original)
+            .with_context(|| format!("no body for {}", original.display()))?;
+        outputs.push(Output {
             original,
             dest,
-        })
-        .collect())
+            body,
+        });
+    }
+    Ok(outputs)
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -310,7 +368,10 @@ fn go_module_dir(root: &Path, start: &Path) -> PathBuf {
 /// Applies `plan` under `root`. Errors leave the tree as it was: a stale or invalid plan is
 /// rejected before any write, and a failed write or failed build/vet is rolled back.
 pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<ApplyResult> {
-    recover(root)?;
+    let _guard = APPLY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    recover_locked(root)?;
     check_plan(root, plan)?;
     check_not_stale(plan)?;
     let outputs = compute_outputs(plan)?;
@@ -323,7 +384,7 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
         Ok(v) => v,
         Err(e) => return Err(failed(root, &wal, e)),
     };
-    rollback_cleanup(root)?;
+    commit_cleanup(root)?;
     Ok(ApplyResult {
         plan_id: plan.id.clone(),
         files_written: outputs.into_iter().map(|o| o.dest).collect(),
@@ -393,6 +454,9 @@ fn write_and_swap(wal: &Wal, outputs: &[Output], io: &dyn ApplyIo) -> Result<()>
         }
         write_synced(&e.temp, o.body.as_bytes())
             .with_context(|| format!("writing {}", e.temp.display()))?;
+        if let Ok(meta) = std::fs::metadata(&e.original) {
+            std::fs::set_permissions(&e.temp, meta.permissions())?;
+        }
     }
     for e in &wal.entries {
         io.rename(&e.temp, &e.dest)
@@ -417,7 +481,8 @@ fn failed(root: &Path, wal: &Wal, cause: anyhow::Error) -> anyhow::Error {
     }
 }
 
-fn rollback_cleanup(root: &Path) -> Result<()> {
+fn commit_cleanup(root: &Path) -> Result<()> {
+    ignore_missing(std::fs::remove_file(wal_path(root)))?;
     let _ = std::fs::remove_dir_all(plans_dir(root).join(BACKUP_DIR));
-    ignore_missing(std::fs::remove_file(wal_path(root)))
+    Ok(())
 }

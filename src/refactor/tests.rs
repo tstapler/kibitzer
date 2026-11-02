@@ -520,4 +520,24 @@ mod apply_tests {
         );
         assert_tree_unchanged(&dir, &files);
     }
+
+    #[test]
+    fn is_inside_should_Reject_When_PathEscapesRootByDotDotOrSymlink() {
+        let root = std::env::temp_dir().join(format!("kib-inside-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("kib-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(super::super::apply::is_inside(&root, &root.join("a/b.go")));
+        assert!(!super::super::apply::is_inside(
+            &root,
+            &root.join("../../etc/x")
+        ));
+        assert!(!super::super::apply::is_inside(
+            &root,
+            &root.join("link/x.go")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 }
