@@ -1,0 +1,120 @@
+{
+  "package": "ex.com/ss/lib",
+  "abstained": null,
+  "feasible": true,
+  "parts": {
+    "P1": [
+      "lib/a.go"
+    ],
+    "P2": [
+      "lib/b.go"
+    ]
+  },
+  "cycles": [],
+  "exported_surface_delta": {
+    "must_export": [
+      {
+        "symbol": "ex.com/ss/lib::helper",
+        "kind": "function",
+        "defined_in": "P2",
+        "referenced_from": [
+          "P1"
+        ],
+        "sites": [
+          "lib/a.go:3"
+        ]
+      }
+    ],
+    "already_exported": [],
+    "part_local_unexported": []
+  },
+  "callers_to_rewrite": [
+    {
+      "symbol": "ex.com/ss/lib::Alpha",
+      "defined_in": "P1",
+      "external_packages": [
+        "ex.com/ss/app1"
+      ],
+      "referencing_parts": [],
+      "production_count": 1,
+      "test_count": 0,
+      "production_sites": [
+        "app1/app1.go:5"
+      ],
+      "test_sites": []
+    },
+    {
+      "symbol": "ex.com/ss/lib::Beta",
+      "defined_in": "P2",
+      "external_packages": [
+        "ex.com/ss/app2"
+      ],
+      "referencing_parts": [],
+      "production_count": 1,
+      "test_count": 0,
+      "production_sites": [
+        "app2/app2.go:5"
+      ],
+      "test_sites": []
+    },
+    {
+      "symbol": "ex.com/ss/lib::helper",
+      "defined_in": "P2",
+      "external_packages": [],
+      "referencing_parts": [
+        "ex.com/ss/lib#P1"
+      ],
+      "production_count": 1,
+      "test_count": 0,
+      "production_sites": [
+        "lib/a.go:3"
+      ],
+      "test_sites": []
+    }
+  ],
+  "blockers": [],
+  "reverse_dep_impact": {
+    "before": {
+      "node": "ex.com/ss/lib",
+      "direct": 2,
+      "transitive": 3,
+      "transitive_packages": [
+        "ex.com/ss/app1",
+        "ex.com/ss/app2",
+        "ex.com/ss/top"
+      ]
+    },
+    "after": [
+      {
+        "node": "ex.com/ss/lib#P1",
+        "direct": 1,
+        "transitive": 2,
+        "transitive_packages": [
+          "ex.com/ss/app1",
+          "ex.com/ss/top"
+        ]
+      },
+      {
+        "node": "ex.com/ss/lib#P2",
+        "direct": 2,
+        "transitive": 4,
+        "transitive_packages": [
+          "ex.com/ss/app1",
+          "ex.com/ss/app2",
+          "ex.com/ss/lib#P1",
+          "ex.com/ss/top"
+        ]
+      }
+    ]
+  },
+  "coverage": {
+    "private_symbols_skipped": 0,
+    "generated_files_skipped": 0,
+    "unresolved_call_sites_in_package": 0,
+    "notes": [
+      "Shared-state detection is syntactic (unexported fields accessed across parts, package-level locks); sharing through parameters, interface fields or unexported types is not detected.",
+      "Package-level var/const uses are found by identifier match, not name resolution; a shadowing local is miscounted.",
+      "Every part is assumed to become a new package path; importers are attributed to the parts whose symbols they call, and importers with no attributable use are assumed to need every part."
+    ]
+  }
+}

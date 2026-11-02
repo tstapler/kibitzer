@@ -1,0 +1,93 @@
+{
+  "package": "ex.com/ss/lib",
+  "abstained": null,
+  "feasible": false,
+  "parts": {
+    "P1": [
+      "lib/a.go"
+    ],
+    "P2": [
+      "lib/b.go"
+    ]
+  },
+  "cycles": [],
+  "exported_surface_delta": {
+    "must_export": [],
+    "already_exported": [
+      {
+        "symbol": "ex.com/ss/lib::Register",
+        "kind": "function",
+        "defined_in": "P1",
+        "referenced_from": [
+          "P2"
+        ],
+        "sites": [
+          "lib/b.go:3"
+        ]
+      }
+    ],
+    "part_local_unexported": [
+      "ex.com/ss/lib::init"
+    ]
+  },
+  "callers_to_rewrite": [
+    {
+      "symbol": "ex.com/ss/lib::Register",
+      "defined_in": "P1",
+      "external_packages": [],
+      "referencing_parts": [
+        "ex.com/ss/lib#P2"
+      ],
+      "production_count": 1,
+      "test_count": 0,
+      "production_sites": [
+        "lib/b.go:3"
+      ],
+      "test_sites": []
+    }
+  ],
+  "blockers": [
+    {
+      "kind": "init_function",
+      "severity": "hard",
+      "file": "lib/b.go",
+      "line": 3,
+      "part": "P2",
+      "detail": "init() runs at package load; ordering relative to other init() functions and package-level initialisation across the new packages is not analysed — human review required"
+    }
+  ],
+  "reverse_dep_impact": {
+    "before": {
+      "node": "ex.com/ss/lib",
+      "direct": 0,
+      "transitive": 0,
+      "transitive_packages": []
+    },
+    "after": [
+      {
+        "node": "ex.com/ss/lib#P1",
+        "direct": 1,
+        "transitive": 1,
+        "transitive_packages": [
+          "ex.com/ss/lib#P2"
+        ]
+      },
+      {
+        "node": "ex.com/ss/lib#P2",
+        "direct": 0,
+        "transitive": 0,
+        "transitive_packages": []
+      }
+    ]
+  },
+  "coverage": {
+    "private_symbols_skipped": 0,
+    "generated_files_skipped": 0,
+    "unresolved_call_sites_in_package": 0,
+    "notes": [
+      "Shared-state detection is syntactic (unexported fields accessed across parts, package-level locks); sharing through parameters, interface fields or unexported types is not detected.",
+      "Package-level var/const uses are found by identifier match, not name resolution; a shadowing local is miscounted.",
+      "Every part is assumed to become a new package path; importers are attributed to the parts whose symbols they call, and importers with no attributable use are assumed to need every part."
+    ]
+  }
+}
