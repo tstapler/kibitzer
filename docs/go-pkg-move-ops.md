@@ -105,7 +105,11 @@ planning is read-only and fast (a rename plan over `kubernetes/kubernetes`, 17,8
 files, takes ~0.3 s), and plans compose (split = repeated move over one overlay).
 
 **Cost of the choice.** Rewrites are syntactic, not type-resolved, which the item's
-implementation notes asked to avoid. What replaces resolution:
+implementation notes asked to avoid. Dynamic references are therefore handled by
+*detect-and-block* for the shapes listed in the matrix (path/name string literals and the
+path-keyed registries), and by `go build/vet/test` + rollback for anything else; a
+resolved-reference engine (`go/packages` helper) is the follow-up that would close the
+remaining gap. What replaces resolution:
 
 * Qualifier rewrites touch only `pkg.Member` selectors/qualified types whose `pkg` is the
   file's actual import name for that package and whose member is one of the moved
@@ -132,7 +136,10 @@ implementation notes asked to avoid. What replaces resolution:
 | Generated *importer* that needs a path rewrite | Rewritten in place + warning | Rewritten in place + warning | importer loop |
 | `init()` in moved code (registration) | Handled — `init` moves with its package, blank imports are rewritten | **Blocked** `init_registration` — importers that only side-effect-import the old package would stop registering | `file_hazards` |
 | Dot import of the source package | Path rewritten | **Blocked** `dot_import` | importer loop |
-| Import-path strings in reflection/plugins/config the tool cannot see | Not detected (no resolved references); `go test` is the backstop | Not detected | — |
+| String literal spelling the moved package's import path (`plugin.Open`, registries, config keys) | **Blocked** `import_path_string` | n/a (path unchanged) | `string_references` |
+| String literal `"pkg.Name"` / `"<import path>.Name"` naming a moved symbol | n/a | **Blocked** `import_path_string` | `string_references` |
+| Registries/reflection keyed by package path or name in moved code (`gob.Register[Name]`, `proto.RegisterType/RegisterFile`, `plugin.Open/Lookup`, `runtime.Caller[s]/FuncForPC`, any `.PkgPath`) | **Blocked** `path_keyed_registration` | **Blocked** `path_keyed_registration` | `file_hazards` |
+| Any other run-time name construction (`fmt.Sprintf("%s.%s", …)`, struct tags, build-time codegen reading paths) | Not detectable syntactically; `go test` is the backstop | Not detectable | — |
 | Nested packages under the source dir | **Blocked** `has_subpackages` | n/a | `rename_pkg` |
 | `testdata/` or other non-Go files (not `*.md`/`OWNERS`/dotfiles) in the source dir | **Blocked** `non_go_assets` — they are not moved | Warning | `dir_hazards` |
 | Moving into a package with the same name as the source | n/a | Handled — importers import the destination under a distinct alias (`m/sub/lib` → `sublib`) | importer loop |

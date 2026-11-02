@@ -1,0 +1,45 @@
+{
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/util"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util.go",
+        "old_sha256": "3c9bfae8b69d53596cafe5a43c87f7de8e9e928f7574c84ada5e83e5e9290624",
+        "new_path": "util/util.go",
+        "new_content": "package util\n\n// Util is looked up by name at run time (see app).\nfunc Util() string { return \"u\" }\n"
+      },
+      "reason": "moved from lib/util.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "import_path_string",
+      "message": "string literal \"lib.Util\" names a moved symbol; it would go stale (reflection/registry reference)",
+      "file": "app/app.go",
+      "line": 6
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Util -> example.com/m/util.Util (now `util.Util`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "util/util.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./util"
+  ]
+}

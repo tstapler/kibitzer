@@ -678,6 +678,68 @@ pub fn imports_cgo(src: &str) -> bool {
     imports(src).iter().any(|i| i.path == "C")
 }
 
+/// Interpreted/raw string literal contents outside import specs, with their lines.
+pub fn string_literals(src: &str) -> Vec<(String, usize)> {
+    let Some(tree) = parse(src) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    walk(tree.root_node(), &mut |n| {
+        if matches!(
+            n.kind(),
+            "interpreted_string_literal" | "raw_string_literal"
+        ) {
+            let in_import = std::iter::successors(n.parent(), |p| p.parent())
+                .any(|p| p.kind() == "import_spec");
+            if !in_import {
+                out.push((unquote(text(n, src)), n.start_position().row + 1));
+            }
+        }
+    });
+    out
+}
+
+/// Calls/selectors whose behavior is keyed by a type's or function's package path or
+/// name at run time, so relocating the code silently changes what they see.
+pub const PATH_KEYED_SELECTORS: &[(&str, &str)] = &[
+    ("gob", "Register"),
+    ("gob", "RegisterName"),
+    ("proto", "RegisterType"),
+    ("proto", "RegisterFile"),
+    ("plugin", "Open"),
+    ("plugin", "Lookup"),
+    ("runtime", "FuncForPC"),
+    ("runtime", "Callers"),
+    ("runtime", "Caller"),
+    ("reflect", "PkgPath"),
+];
+
+/// Line of the first path-keyed registration/reflection use, with a label.
+pub fn path_keyed_use(src: &str) -> Option<(usize, String)> {
+    let tree = parse(src)?;
+    let mut hit = None;
+    walk(tree.root_node(), &mut |n| {
+        if hit.is_some() || n.kind() != "selector_expression" {
+            return;
+        }
+        let (Some(op), Some(field)) = (
+            n.child_by_field_name("operand"),
+            n.child_by_field_name("field"),
+        ) else {
+            return;
+        };
+        let (o, f) = (text(op, src), text(field, src));
+        let known = PATH_KEYED_SELECTORS
+            .iter()
+            .any(|(po, pf)| *po == o && *pf == f);
+        // `t.PkgPath()` on any reflect.Type value
+        if known || f == "PkgPath" {
+            hit = Some((n.start_position().row + 1, format!("{o}.{f}")));
+        }
+    });
+    hit
+}
+
 pub fn uses_go_embed(src: &str) -> bool {
     src.lines().any(|l| l.starts_with("//go:embed"))
 }
@@ -808,5 +870,15 @@ mod tests {
             reliable_import_name(&spec("github.com/json-iterator/go"), None),
             None
         );
+    }
+
+    #[test]
+    fn dynamic_reference_helpers() {
+        let src = "package a\n\nimport \"x/y\"\n\nfunc f() { gob.Register(1); _ = \"x/y.T\"; _ = t.PkgPath() }\n";
+        let lits = string_literals(src);
+        assert_eq!(lits.len(), 1);
+        assert_eq!(lits[0].0, "x/y.T");
+        assert_eq!(path_keyed_use(src).unwrap().1, "gob.Register");
+        assert!(path_keyed_use("package a\n\nfunc f() {}\n").is_none());
     }
 }

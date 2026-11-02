@@ -56,6 +56,15 @@ fn known_name_fn(ws: &Workspace) -> impl Fn(&str) -> Option<String> + '_ {
 
 /// Hazards that make a file unsafe to move: generated code, cgo, embeds, build tags, `init`.
 fn file_hazards(f: &mut Findings, path: &str, src: &str, partial: bool) {
+    if let Some((line, what)) = gs::path_keyed_use(src) {
+        f.block(
+            BlockingDiagnostic::new(
+                "path_keyed_registration",
+                format!("`{what}` depends on the package path/name at run time; the move would change what it observes"),
+            )
+            .at(path, Some(line)),
+        );
+    }
     if gs::imports_cgo(src) {
         f.block(
             BlockingDiagnostic::new(
@@ -93,6 +102,64 @@ fn file_hazards(f: &mut Findings, path: &str, src: &str, partial: bool) {
         }
         if gs::has_init_func(src) {
             f.block(BlockingDiagnostic::new("init_registration", "file declares init(); moving it changes which importers trigger the registration").at(path, None));
+        }
+    }
+}
+
+/// String literals that spell the moved package's import path (`plugin.Open`, config
+/// keys, registries) or `pkg.Name` for a moved name cannot be rewritten safely.
+fn string_references(
+    ws: &Workspace,
+    f: &mut Findings,
+    import: &str,
+    names: Option<(&str, &HashSet<String>)>,
+) {
+    for file in ws.files_containing(import) {
+        let Some(src) = ws.get(&file) else { continue };
+        for (lit, line) in gs::string_literals(src) {
+            let boundary = |rest: &str| rest.is_empty() || rest.starts_with(['/', '.']);
+            let path_hit = lit.strip_prefix(import).is_some_and(boundary);
+            let name_hit = names.is_some_and(|(_, moved)| {
+                lit.strip_prefix(import)
+                    .and_then(|r| r.strip_prefix('.'))
+                    .is_some_and(|n| moved.contains(n))
+            });
+            if (names.is_none() && path_hit) || name_hit {
+                f.block(
+                    BlockingDiagnostic::new(
+                        "import_path_string",
+                        format!("string literal \"{lit}\" names the package or a moved symbol; it would go stale (reflection/plugin/config reference)"),
+                    )
+                    .at(&file, Some(line)),
+                );
+            }
+        }
+    }
+    if let Some((pkg_name, moved)) = names {
+        // `"lib.Util"`-style qualified-name strings in the source package's importers.
+        for file in ws.paths() {
+            let Some(src) = ws.get(&file) else { continue };
+            if !moved
+                .iter()
+                .any(|n| src.contains(&format!("\"{pkg_name}.{n}\"")))
+            {
+                continue;
+            }
+            for (lit, line) in gs::string_literals(src) {
+                if lit
+                    .strip_prefix(pkg_name)
+                    .and_then(|r| r.strip_prefix('.'))
+                    .is_some_and(|n| moved.contains(n))
+                {
+                    f.block(
+                        BlockingDiagnostic::new(
+                            "import_path_string",
+                            format!("string literal \"{lit}\" names a moved symbol; it would go stale (reflection/registry reference)"),
+                        )
+                        .at(&file, Some(line)),
+                    );
+                }
+            }
         }
     }
 }
@@ -649,6 +716,7 @@ pub fn partial_move(
             }
         }
     }
+    string_references(ws, f, &a_import, Some((&a_name, &moved_names)));
     check_cycles(ws, f, &[&a_import, dest_import]);
     surface(f, &a_import, dest_import, &b_name, &moved_units);
 }
@@ -887,6 +955,7 @@ pub fn rename_pkg(
         ));
     }
     dir_hazards(ws, f, &from_dir, true);
+    string_references(ws, f, from_import, None);
     let new_name = match name_override {
         Some(n) => n.to_string(),
         None if a.name == derive_pkg_name(from_import) => derive_pkg_name(to_import),

@@ -306,6 +306,16 @@ fn negative_fixtures_report_the_expected_blocker() {
         ("move-files/hazard-cgo", "cgo"),
         ("move-files/hazard-generated", "generated_file"),
         ("move-files/hazard-init-registration", "init_registration"),
+        ("move-files/hazard-symbol-name-string", "import_path_string"),
+        (
+            "move-files/hazard-path-keyed-registration",
+            "path_keyed_registration",
+        ),
+        ("rename-pkg/hazard-dynamic-reference", "import_path_string"),
+        (
+            "rename-pkg/hazard-dynamic-reference",
+            "path_keyed_registration",
+        ),
     ] {
         assert!(blocker_codes(case).contains(&code.to_string()), "{case}");
     }
