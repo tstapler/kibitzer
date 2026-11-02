@@ -202,16 +202,24 @@ requires Go 1.27.0; the system Go is 1.26.4). Each repo was run with
 |---|---|---|---|---|
 | `kubernetes/kubernetes` (`0ba07e08`) | yes | `rename-pkg` `pkg/util/slice` → `pkg/util/sliceutil` (6 importers + 2 moved files, 8 steps) | `go build` of the 6 affected packages: exit 0 | `go build`, `go vet`, `go test -count=1` of the 6 packages: exit 0, 0, 0 (`persistentvolume` tests ok in 22.4 s); diff 14 insertions / 240 deletions (the deletions are the moved files); second apply: `already_applied` |
 | `kubernetes/kubernetes` | yes | `extract-decls` `CopyStrings,SortStrings` from `pkg/util/slice` → new `pkg/util/stringsutil` | `go build ./pkg/util/slice`: exit 0 | build/vet/test of `slice` + `stringsutil`: exit 0, 0, 0 |
-| `apache/cassandra` (`c103032`) | no | `rename-pkg` | n/a (no Go) | refused: `Error: no go.mod at apache/cassandra (a Go module root is required)`, exit 1 |
-| `servo/servo` (`7821ec2dd`) | no | `rename-pkg` | n/a | refused, same message |
-| `BurntSushi/ripgrep` (`3fce3b5`) | no | `rename-pkg` | n/a | refused, same message |
-| `denoland/deno` (`60e01b1d`) | no | `rename-pkg` | n/a | refused, same message |
-| `microsoft/vscode` (`7a332eb7`) | no | `rename-pkg` | n/a | refused, same message (4 stray `.go` files, no `go.mod`) |
+| `apache/cassandra` (`c103032`) | no — probe | `move-files` `lib/util.go`+`util_test.go` → new `util` pkg in a synthetic probe module (see below), 8,725 files in repo | `go build ./zz_kibitzer_probe/...`: exit 0 | `applied`; build/vet/test of affected pkgs: exit 0, 0, 0; plan 0.03 s |
+| `servo/servo` (`7821ec2dd`) | no — probe | same probe move, 195,563 files in repo | exit 0 | `applied`; 0, 0, 0; plan 0.20 s |
+| `BurntSushi/ripgrep` (`3fce3b5`) | no — probe | same, 237 files | exit 0 | `applied`; 0, 0, 0; plan 0.02 s |
+| `denoland/deno` (`60e01b1d`) | no — probe | same, 14,830 files | exit 0 | `applied`; 0, 0, 0; plan 0.05 s |
+| `microsoft/vscode` (`7a332eb7`) | no — probe | same, 18,647 files | exit 0 | `applied`; 0, 0, 0; plan 0.06 s |
 
-**Honest limit:** only `kubernetes/kubernetes` is a Go module. The other five contain no
-`go.mod`, so `go build ./...` is not applicable there and the only observable outcome is
-the refusal above. This is a statement about the corpus, not evidence about those repos'
-code.
+**Honest limit:** only `kubernetes/kubernetes` is a Go module, so it is the only row that
+moves the repo's own code. `cassandra`, `servo`, `ripgrep`, `deno` and `vscode` have no
+`go.mod` (run against them as-is, the tool refuses: `Error: no go.mod at <repo> (a Go
+module root is required)`, exit 1). For those five the "probe" rows add a throwaway
+`git worktree` of the repo at the listed HEAD, a `go.mod` (`module example.com/probe`) at
+its root, and the `_inputs/base` fixture (`lib/`, `app/` with tests) copied to
+`zz_kibitzer_probe/`; the move is `move-files` of `lib/util.go` + `lib/util_test.go`, applied
+with `--affected-only` verification (`GOWORK=off GOFLAGS=-mod=mod`). That shows the tool
+loads, plans, and applies correctly when embedded in a very large non-Go tree (the
+`go build` outcomes are those of the probe packages, not of the host project's Java/Rust/TS
+code), and the worktrees were removed afterwards. It is not evidence about those repos'
+own code.
 
 Scale/noise run on `kubernetes/kubernetes` (plan only, nothing applied): 60 package
 directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-pkg` to
