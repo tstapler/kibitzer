@@ -45,3 +45,13 @@ sibling package, dry-run only.
 | `anchore/syft` (Go) | 20 listed; 17 infeasible, 3 feasible; 2 plans produced, 1 feasible move refused as entangled; zero panics |
 | `BurntSushi/ripgrep` | no Go packages, nothing to plan; zero panics |
 | `kubernetes/kubernetes` | 20 listed; 16 infeasible, 4 feasible; 4 plans produced (16 refused); zero panics; script exit 0 (2026-11-02) |
+
+## Trust model
+
+`apply_refactor` takes a client-supplied plan, so it validates before writing: only `.go` files outside
+`.git/` and `.kibitzer/` and inside the repo (no `..`, no symlink escape), an allowlist of two verify
+commands (run with `GOTOOLCHAIN=local`, a 5-minute timeout and 64 KiB output cap), and Go-identifier
+checks on package names and import aliases. The plan `id` is an integrity hash, not authentication. A WAL
+found at startup is rolled back only if every path it names is inside the repo. Not covered: the stale
+check and the write read each file separately (no re-check before each rename), and `apply_refactor`
+accepts any repo path from a local MCP client.
