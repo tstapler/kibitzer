@@ -1,0 +1,37 @@
+{
+  "operation": "sync_policy",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/util"
+  ],
+  "steps": [
+    {
+      "kind": "policy_update",
+      "transform": {
+        "old_path": ".kibitzer/inspect.json",
+        "old_sha256": "c1d88a0711f5ec13d219f745fd4c12bd32a6472330d4959fa2e36e52ffa9512d",
+        "new_path": ".kibitzer/inspect.json",
+        "new_content": "{\n  \"checks\": [\n    {\n      \"name\": \"file-complexity\",\n      \"scope\": [\n        \"lib/**\",\n        \"app/**\"\n      ]\n    }\n  ],\n  \"architecture\": {\n    \"components\": [\n      {\n        \"name\": \"lib\",\n        \"paths\": [\n          \"lib\"\n        ]\n      },\n      {\n        \"name\": \"util-tests\",\n        \"paths\": [\n          \"util/util_test.go\"\n        ]\n      }\n    ]\n  }\n}\n"
+      },
+      "reason": "path changed: `lib/util_test.go` -> `util/util_test.go`"
+    }
+  ],
+  "blockers": [],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "util/util.go"
+    },
+    {
+      "from": "lib/util_test.go",
+      "to": "util/util_test.go"
+    }
+  ],
+  "affected_packages": []
+}

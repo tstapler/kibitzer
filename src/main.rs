@@ -45,6 +45,7 @@ mod middle_man;
 mod node_kind;
 mod parameter_object;
 mod plugin;
+mod refactor;
 mod root_cause_clusters;
 mod run;
 mod run_context;
@@ -148,6 +149,12 @@ enum Command {
     Go {
         #[command(subcommand)]
         action: GoAction,
+    },
+    /// Atomic, verified, behavior-preserving code moves (Go): move files, rename a package,
+    /// extract declarations, split a package, sync repo policy. See docs/go-pkg-move-ops.md.
+    Refactor {
+        #[command(subcommand)]
+        action: refactor::RefactorAction,
     },
     /// Install, list, remove, or check the status of optional external checker plugins
     /// (see `src/plugin.rs`).
@@ -690,6 +697,7 @@ fn main() -> Result<ExitCode> {
             GoAction::BuildCost { dir } => run_go_build_cost(&dir),
             GoAction::PackageFocus { dir, mode } => run_go_package_focus(&dir, mode),
         },
+        Command::Refactor { action } => refactor::run_refactor(action),
         Command::Plugin { action } => match action {
             PluginAction::Install {
                 name,

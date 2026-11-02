@@ -1,0 +1,12 @@
+{
+  "input": "base",
+  "operation": "sync_policy",
+  "source": {
+    "operation": "move_files",
+    "src": [
+      "lib/util.go",
+      "lib/util_test.go"
+    ],
+    "dest_pkg": "example.com/m/util"
+  }
+}

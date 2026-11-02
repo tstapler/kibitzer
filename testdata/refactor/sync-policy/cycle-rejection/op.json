@@ -1,0 +1,11 @@
+{
+  "input": "cycle",
+  "operation": "sync_policy",
+  "source": {
+    "operation": "move_files",
+    "src": [
+      "lib/b.go"
+    ],
+    "dest_pkg": "example.com/m/other"
+  }
+}

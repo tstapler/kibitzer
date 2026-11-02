@@ -1,0 +1,8 @@
+{
+  "input": "hazards",
+  "operation": "move_files",
+  "src": [
+    "lib/reg.go"
+  ],
+  "dest_pkg": "example.com/m/other"
+}

@@ -1,0 +1,53 @@
+{
+  "operation": "extract_decls",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other"
+  ],
+  "steps": [
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "lib/a.go",
+        "old_sha256": "80b1966125fc0b3367759a74f0df987287fbe400df174b9f71515fd923c929eb",
+        "new_path": "lib/a.go",
+        "new_content": "package lib\n\nimport \"example.com/m/other\"\n\n// A recurses into B.\nfunc A(n int) int {\n\tif n == 0 {\n\t\treturn 0\n\t}\n\treturn other.B(n - 1)\n}\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/b.go",
+        "old_sha256": "b5f76091e8fd9ed3a9ce0cc6961f93f47da8a105761e1f42f0b9aad868e3a6c7",
+        "new_path": "other/b.go",
+        "new_content": "package other\n\nimport \"example.com/m/lib\"\n\n// B recurses into A.\nfunc B(n int) int {\n\tif n == 0 {\n\t\treturn 0\n\t}\n\treturn lib.A(n - 1)\n}\n"
+      },
+      "reason": "moved from lib/b.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "cycle_detected",
+      "message": "import cycle: example.com/m/lib -> example.com/m/other -> example.com/m/lib"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.B -> example.com/m/other.B (now `other.B`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/b.go",
+      "to": "other/b.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./other"
+  ]
+}

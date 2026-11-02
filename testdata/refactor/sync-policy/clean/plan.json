@@ -1,0 +1,45 @@
+{
+  "operation": "sync_policy",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/core"
+  ],
+  "steps": [
+    {
+      "kind": "policy_update",
+      "transform": {
+        "old_path": ".kibitzer/inspect.json",
+        "old_sha256": "c1d88a0711f5ec13d219f745fd4c12bd32a6472330d4959fa2e36e52ffa9512d",
+        "new_path": ".kibitzer/inspect.json",
+        "new_content": "{\n  \"checks\": [\n    {\n      \"name\": \"file-complexity\",\n      \"scope\": [\n        \"core/**\",\n        \"app/**\"\n      ]\n    }\n  ],\n  \"architecture\": {\n    \"components\": [\n      {\n        \"name\": \"lib\",\n        \"paths\": [\n          \"core\"\n        ]\n      },\n      {\n        \"name\": \"util-tests\",\n        \"paths\": [\n          \"core/util_test.go\"\n        ]\n      }\n    ]\n  }\n}\n"
+      },
+      "reason": "path changed: `lib/**` -> `core/**`, `lib` -> `core`, `lib/util_test.go` -> `core/util_test.go`"
+    }
+  ],
+  "blockers": [],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [
+    {
+      "from": "lib",
+      "to": "core"
+    },
+    {
+      "from": "lib/lib.go",
+      "to": "core/lib.go"
+    },
+    {
+      "from": "lib/util.go",
+      "to": "core/util.go"
+    },
+    {
+      "from": "example.com/m/lib",
+      "to": "example.com/m/core"
+    }
+  ],
+  "affected_packages": []
+}

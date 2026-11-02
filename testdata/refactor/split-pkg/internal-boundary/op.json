@@ -1,0 +1,13 @@
+{
+  "input": "base",
+  "operation": "split_pkg",
+  "pkg": "example.com/m/lib",
+  "clusters": [
+    {
+      "to": "example.com/m/other/internal/util",
+      "files": [
+        "util.go"
+      ]
+    }
+  ]
+}

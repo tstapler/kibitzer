@@ -1,0 +1,103 @@
+=== .kibitzer/inspect.json ===
+{
+  "checks": [
+    {
+      "name": "file-complexity",
+      "scope": [
+        "lib/**",
+        "app/**"
+      ]
+    }
+  ],
+  "architecture": {
+    "components": [
+      {
+        "name": "lib",
+        "paths": [
+          "lib"
+        ]
+      },
+      {
+        "name": "util-tests",
+        "paths": [
+          "util/util_test.go"
+        ]
+      }
+    ]
+  }
+}
+
+=== app/app.go ===
+package app
+
+import (
+	"fmt"
+
+	"example.com/m/lib"
+)
+
+// Run prints things.
+func Run() {
+	w := lib.Widget{N: 1}
+	fmt.Println(lib.Foo(), lib.Util(), w.Double())
+}
+
+=== app/app_test.go ===
+package app
+
+import "testing"
+
+func TestRun(t *testing.T) { Run() }
+
+=== go.mod ===
+module example.com/m
+
+go 1.21
+
+=== lib/lib.go ===
+package lib
+
+// Foo returns a greeting.
+func Foo() string { return helper() + Util() }
+
+func helper() string { return "hi" }
+
+=== lib/lib_test.go ===
+package lib
+
+import "testing"
+
+func TestFoo(t *testing.T) {
+	if Foo() == "" || helper() == "" {
+		t.Fatal("empty")
+	}
+}
+
+=== lib/util.go ===
+package lib
+
+import "strings"
+
+// Util upper-cases.
+func Util() string { return strings.ToUpper("x") }
+
+// Widget doubles.
+type Widget struct{ N int }
+
+func (w Widget) Double() int { return w.N * 2 }
+
+=== lib/util_test.go ===
+package lib_test
+
+import (
+	"testing"
+
+	"example.com/m/lib"
+)
+
+func TestUtil(t *testing.T) {
+	if lib.Util() != "X" || (lib.Widget{N: 2}).Double() != 4 {
+		t.Fatal("bad")
+	}
+}
+

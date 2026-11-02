@@ -1,0 +1,9 @@
+{
+  "input": "cycle",
+  "operation": "extract_decls",
+  "from": "example.com/m/lib",
+  "decls": [
+    "B"
+  ],
+  "to": "example.com/m/other"
+}

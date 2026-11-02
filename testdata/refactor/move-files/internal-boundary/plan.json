@@ -1,0 +1,79 @@
+{
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other/internal/util"
+  ],
+  "steps": [
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "app/app.go",
+        "old_sha256": "942bec19b93d5f5776874c875b96dc5c9758604fc94cce48bc7768a728dc5439",
+        "new_path": "app/app.go",
+        "new_content": "package app\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/m/lib\"\n\t\"example.com/m/other/internal/util\"\n)\n\n// Run prints things.\nfunc Run() {\n\tw := util.Widget{N: 1}\n\tfmt.Println(lib.Foo(), util.Util(), w.Double())\n}\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "lib/lib.go",
+        "old_sha256": "7af54395ec7a9fb63efce7602ac917ad3295415d56eacc5c912c82b3470553c0",
+        "new_path": "lib/lib.go",
+        "new_content": "package lib\n\nimport \"example.com/m/other/internal/util\"\n\n// Foo returns a greeting.\nfunc Foo() string { return helper() + util.Util() }\n\nfunc helper() string { return \"hi\" }\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "lib/util_test.go",
+        "old_sha256": "a63cf08576193cf5d83179de9a704f117bf01f84391f268acd7b0ef8f0ab282f",
+        "new_path": "lib/util_test.go",
+        "new_content": "package lib_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/other/internal/util\"\n)\n\nfunc TestUtil(t *testing.T) {\n\tif util.Util() != \"X\" || (util.Widget{N: 2}).Double() != 4 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util.go",
+        "old_sha256": "cf5e07c06135c7a2f3b74411d0f188a79eed7116882dccb06eb04a94dd23d20c",
+        "new_path": "other/internal/util/util.go",
+        "new_content": "package util\n\nimport \"strings\"\n\n// Util upper-cases.\nfunc Util() string { return strings.ToUpper(\"x\") }\n\n// Widget doubles.\ntype Widget struct{ N int }\n\nfunc (w Widget) Double() int { return w.N * 2 }\n"
+      },
+      "reason": "moved from lib/util.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "internal_visibility",
+      "message": "example.com/m/lib cannot import example.com/m/other/internal/util (internal/ boundary)"
+    },
+    {
+      "code": "internal_visibility",
+      "message": "example.com/m/app cannot import example.com/m/other/internal/util (internal/ boundary)"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Util -> example.com/m/other/internal/util.Util (now `util.Util`)",
+    "example.com/m/lib.Widget -> example.com/m/other/internal/util.Widget (now `util.Widget`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "other/internal/util/util.go"
+    }
+  ],
+  "affected_packages": [
+    "./app",
+    "./lib",
+    "./other/internal/util"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "checks": [
+    {
+      "name": "file-complexity",
+      "scope": [
+        "lib/**",
+        "app/**"
+      ]
+    }
+  ],
+  "architecture": {
+    "components": [
+      {
+        "name": "lib",
+        "paths": [
+          "lib"
+        ]
+      },
+      {
+        "name": "util-tests",
+        "paths": [
+          "lib/util_test.go"
+        ]
+      }
+    ]
+  }
+}

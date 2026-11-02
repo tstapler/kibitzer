@@ -1,0 +1,72 @@
+{
+  "operation": "rename_pkg",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/core"
+  ],
+  "steps": [
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "app/app.go",
+        "old_sha256": "942bec19b93d5f5776874c875b96dc5c9758604fc94cce48bc7768a728dc5439",
+        "new_path": "app/app.go",
+        "new_content": "package app\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/m/core\"\n)\n\n// Run prints things.\nfunc Run() {\n\tw := core.Widget{N: 1}\n\tfmt.Println(core.Foo(), core.Util(), w.Double())\n}\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/lib.go",
+        "old_sha256": "7af54395ec7a9fb63efce7602ac917ad3295415d56eacc5c912c82b3470553c0",
+        "new_path": "core/lib.go",
+        "new_content": "package core\n\n// Foo returns a greeting.\nfunc Foo() string { return helper() + Util() }\n\nfunc helper() string { return \"hi\" }\n"
+      },
+      "reason": "moved from lib/lib.go"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util.go",
+        "old_sha256": "cf5e07c06135c7a2f3b74411d0f188a79eed7116882dccb06eb04a94dd23d20c",
+        "new_path": "core/util.go",
+        "new_content": "package core\n\nimport \"strings\"\n\n// Util upper-cases.\nfunc Util() string { return strings.ToUpper(\"x\") }\n\n// Widget doubles.\ntype Widget struct{ N int }\n\nfunc (w Widget) Double() int { return w.N * 2 }\n"
+      },
+      "reason": "moved from lib/util.go"
+    }
+  ],
+  "blockers": [],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Foo -> example.com/m/core.Foo",
+    "example.com/m/lib.Util -> example.com/m/core.Util",
+    "example.com/m/lib.Widget -> example.com/m/core.Widget"
+  ],
+  "path_map": [
+    {
+      "from": "lib",
+      "to": "core"
+    },
+    {
+      "from": "lib/lib.go",
+      "to": "core/lib.go"
+    },
+    {
+      "from": "lib/util.go",
+      "to": "core/util.go"
+    },
+    {
+      "from": "example.com/m/lib",
+      "to": "example.com/m/core"
+    }
+  ],
+  "affected_packages": [
+    "./app",
+    "./core"
+  ]
+}

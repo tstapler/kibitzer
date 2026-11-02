@@ -1,0 +1,6 @@
+{
+  "input": "precycle",
+  "operation": "rename_pkg",
+  "from": "example.com/m/b",
+  "to": "example.com/m/c"
+}

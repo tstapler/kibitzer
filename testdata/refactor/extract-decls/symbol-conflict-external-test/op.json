@@ -1,0 +1,9 @@
+{
+  "input": "conflict",
+  "operation": "extract_decls",
+  "from": "example.com/m/lib",
+  "decls": [
+    "Util"
+  ],
+  "to": "example.com/m/util"
+}

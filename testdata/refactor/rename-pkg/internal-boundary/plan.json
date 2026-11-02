@@ -1,0 +1,109 @@
+{
+  "operation": "rename_pkg",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other/internal/core"
+  ],
+  "steps": [
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "app/app.go",
+        "old_sha256": "942bec19b93d5f5776874c875b96dc5c9758604fc94cce48bc7768a728dc5439",
+        "new_path": "app/app.go",
+        "new_content": "package app\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/m/other/internal/core\"\n)\n\n// Run prints things.\nfunc Run() {\n\tw := core.Widget{N: 1}\n\tfmt.Println(core.Foo(), core.Util(), w.Double())\n}\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/lib.go",
+        "old_sha256": "7af54395ec7a9fb63efce7602ac917ad3295415d56eacc5c912c82b3470553c0",
+        "new_path": "other/internal/core/lib.go",
+        "new_content": "package core\n\n// Foo returns a greeting.\nfunc Foo() string { return helper() + Util() }\n\nfunc helper() string { return \"hi\" }\n"
+      },
+      "reason": "moved from lib/lib.go"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/lib_test.go",
+        "old_sha256": "c207d38ceb1814fc95199f2a2eb43f04124772d7b8a8dcc1dd4a23fda11ff5e3",
+        "new_path": "other/internal/core/lib_test.go",
+        "new_content": "package core\n\nimport \"testing\"\n\nfunc TestFoo(t *testing.T) {\n\tif Foo() == \"\" || helper() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"
+      },
+      "reason": "moved from lib/lib_test.go"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util.go",
+        "old_sha256": "cf5e07c06135c7a2f3b74411d0f188a79eed7116882dccb06eb04a94dd23d20c",
+        "new_path": "other/internal/core/util.go",
+        "new_content": "package core\n\nimport \"strings\"\n\n// Util upper-cases.\nfunc Util() string { return strings.ToUpper(\"x\") }\n\n// Widget doubles.\ntype Widget struct{ N int }\n\nfunc (w Widget) Double() int { return w.N * 2 }\n"
+      },
+      "reason": "moved from lib/util.go"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util_test.go",
+        "old_sha256": "a63cf08576193cf5d83179de9a704f117bf01f84391f268acd7b0ef8f0ab282f",
+        "new_path": "other/internal/core/util_test.go",
+        "new_content": "package core_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/other/internal/core\"\n)\n\nfunc TestUtil(t *testing.T) {\n\tif core.Util() != \"X\" || (core.Widget{N: 2}).Double() != 4 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n"
+      },
+      "reason": "moved from lib/util_test.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "internal_visibility",
+      "message": "example.com/m/app cannot import example.com/m/other/internal/core (internal/ boundary)",
+      "file": "app/app.go",
+      "line": 6
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Foo -> example.com/m/other/internal/core.Foo",
+    "example.com/m/lib.TestFoo -> example.com/m/other/internal/core.TestFoo",
+    "example.com/m/lib.TestUtil -> example.com/m/other/internal/core.TestUtil",
+    "example.com/m/lib.Util -> example.com/m/other/internal/core.Util",
+    "example.com/m/lib.Widget -> example.com/m/other/internal/core.Widget"
+  ],
+  "path_map": [
+    {
+      "from": "lib",
+      "to": "other/internal/core"
+    },
+    {
+      "from": "lib/lib.go",
+      "to": "other/internal/core/lib.go"
+    },
+    {
+      "from": "lib/lib_test.go",
+      "to": "other/internal/core/lib_test.go"
+    },
+    {
+      "from": "lib/util.go",
+      "to": "other/internal/core/util.go"
+    },
+    {
+      "from": "lib/util_test.go",
+      "to": "other/internal/core/util_test.go"
+    },
+    {
+      "from": "example.com/m/lib",
+      "to": "example.com/m/other/internal/core"
+    }
+  ],
+  "affected_packages": [
+    "./app",
+    "./other/internal/core"
+  ]
+}

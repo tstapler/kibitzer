@@ -1,0 +1,8 @@
+{
+  "input": "plain",
+  "operation": "move_files",
+  "src": [
+    "lib/util.go"
+  ],
+  "dest_pkg": "example.com/m/util"
+}

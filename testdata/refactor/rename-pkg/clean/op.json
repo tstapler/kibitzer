@@ -1,0 +1,6 @@
+{
+  "input": "plain",
+  "operation": "rename_pkg",
+  "from": "example.com/m/lib",
+  "to": "example.com/m/core"
+}

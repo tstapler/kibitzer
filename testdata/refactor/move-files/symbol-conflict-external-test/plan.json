@@ -1,0 +1,44 @@
+{
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/util"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util.go",
+        "old_sha256": "33e59d9b57b80cd58a654fbdef433cf66c8fd456fc55ad47951ccd3e40b6f2e5",
+        "new_path": "util/util.go",
+        "new_content": "package util\n\n// Util is the thing being moved.\nfunc Util() string { return \"u\" }\n"
+      },
+      "reason": "moved from lib/util.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "symbol_conflict_external_test",
+      "message": "moved declaration `Util` collides with `Util` already declared in package util_test (util/util_ext_test.go)",
+      "file": "util/util_ext_test.go"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Util -> example.com/m/util.Util (now `util.Util`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "util/util.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./util"
+  ]
+}
