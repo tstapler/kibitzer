@@ -13,8 +13,9 @@ to the tree:
 
 The post-move package graph is built in memory. Edges follow files; resolved call edges
 decide which new edges a partial move creates. Blocking: import cycle, `internal/`
-violation, cgo (`import "C"`), a file outside the source package, and an importer that
-calls both moved and remaining symbols. Warning only: build-tagged and generated files
+violation, cgo (`import "C"`), a file outside the source package, source equal to target, a
+moved symbol that collides with a target symbol, a target-package file that imports the
+source, and an importer that calls both moved and remaining symbols. Warning only: build-tagged and generated files
 (the model ignores build constraints, so verify on every target platform).
 
 ## Plan
@@ -27,7 +28,8 @@ it needs qualifier rewriting.
 
 ## Known limits
 
-Type-only references are invisible to the call graph, so a partial move can miss an importer;
+Type-only references and calls the model leaves unresolved (for example a name that exists in
+two packages) are invisible, so a partial move can miss an importer;
 the verification commands (`go build ./...`, `go vet ./...`) are the backstop once an apply
 path exists. **There is no apply, rollback or WAL yet**, and no `apply_refactor` tool.
 

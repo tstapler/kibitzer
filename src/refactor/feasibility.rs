@@ -209,6 +209,25 @@ fn scan_moved_files(r: &Resolved) -> (Vec<BlockingReason>, Vec<Warning>) {
     (blocking, warnings)
 }
 
+/// Moved symbols whose id (name, or `Type.Method`) already exists in the target package.
+fn name_collisions(model: &ArchModel, op: &RefactorOperation, r: &Resolved) -> Vec<BlockingReason> {
+    let Some(target) = model.packages.get(&op.target_package) else {
+        return Vec::new();
+    };
+    let local = |id: &str| {
+        id.split_once("::")
+            .map_or(id.to_string(), |(_, n)| n.to_string())
+    };
+    let existing: BTreeSet<String> = target.symbols.iter().map(|s| local(&s.id)).collect();
+    symbol_files(model, op)
+        .into_iter()
+        .filter(|(_, file)| r.moved.contains(file))
+        .map(|(id, _)| local(&id))
+        .filter(|name| existing.contains(name))
+        .map(|symbol| BlockingReason::NameCollision { symbol })
+        .collect()
+}
+
 fn internal_violations(adj: &Adjacency, target: &str) -> Vec<BlockingReason> {
     adj.iter()
         .flat_map(|(from, tos)| tos.iter().map(move |to| (from, to)))
@@ -234,7 +253,19 @@ pub fn check(model: &ArchModel, op: &RefactorOperation) -> FeasibilityReport {
             };
         }
     };
+    if op.source_package == op.target_package {
+        return FeasibilityReport {
+            feasible: false,
+            blocking: vec![BlockingReason::SamePackage {
+                package: op.source_package.clone(),
+            }],
+            warnings: Vec::new(),
+            touched_files: Vec::new(),
+            importers_affected: Vec::new(),
+        };
+    }
     let (mut blocking, warnings) = scan_moved_files(&resolved);
+    blocking.extend(name_collisions(model, op, &resolved));
     let adj = post_move_graph(model, op, &resolved);
     if let Some(cycle_path) = cycle_through(&adj, &op.target_package) {
         blocking.push(BlockingReason::ImportCycle { cycle_path });
@@ -247,6 +278,12 @@ pub fn check(model: &ArchModel, op: &RefactorOperation) -> FeasibilityReport {
     );
 
     let importers = importer_files(model, op, &resolved);
+    blocking.extend(
+        importers
+            .iter()
+            .filter(|(_, pkg)| **pkg == op.target_package)
+            .map(|(file, _)| BlockingReason::TargetPackageImporter { file: file.clone() }),
+    );
     let mut touched: BTreeSet<PathBuf> = resolved.moved.clone();
     touched.extend(importers.keys().cloned());
     let importers_affected: BTreeSet<String> = importers.values().cloned().collect();

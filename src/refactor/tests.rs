@@ -297,3 +297,55 @@ fn list_operations_should_ReturnEmptyNotError_When_NothingIsSupported() {
     let ops = list_operations_for_package(&model, &format!("{MOD}/a"));
     assert_eq!(ops.len(), 2);
 }
+
+#[test]
+fn check_should_Block_When_TargetEqualsSource() {
+    let (_dir, model) = fixture("refactor-same", &[("a/a1.go", A1), ("a/a2.go", A2)]);
+    let same = check(&model, &op("a", "a", &["a/a1.go"]));
+    assert!(matches!(
+        same.blocking.as_slice(),
+        [BlockingReason::SamePackage { .. }]
+    ));
+}
+
+#[test]
+fn check_should_Block_When_MovedSymbolCollidesWithTargetSymbol() {
+    let (_dir, model) = fixture(
+        "refactor-collision",
+        &[
+            ("a/a1.go", A1),
+            ("a/a2.go", A2),
+            ("b/b.go", "package b\n\nfunc A1() {}\n"),
+        ],
+    );
+    let report = check(&model, &op("a", "b", &["a/a1.go"]));
+    assert!(
+        report
+            .blocking
+            .iter()
+            .any(|b| matches!(b, BlockingReason::NameCollision { symbol } if symbol == "A1"))
+    );
+}
+
+#[test]
+fn check_should_Block_When_TargetPackageFileImportsSource() {
+    let (_dir, model) = fixture(
+        "refactor-target-importer",
+        &[
+            ("a/a1.go", A1),
+            ("a/a2.go", A2),
+            (
+                "c/c.go",
+                "package c\n\nimport \"example.com/app/a\"\n\nfunc C() { a.A1() }\n",
+            ),
+        ],
+    );
+    let report = check(&model, &op("a", "c", &["a/a1.go"]));
+    assert!(
+        report
+            .blocking
+            .iter()
+            .any(|b| matches!(b, BlockingReason::TargetPackageImporter { .. })),
+        "got: {report:?}"
+    );
+}

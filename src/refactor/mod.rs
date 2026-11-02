@@ -56,6 +56,19 @@ pub enum BlockingReason {
     MixedImporter {
         file: PathBuf,
     },
+    /// Source and target are the same package.
+    SamePackage {
+        package: String,
+    },
+    /// A moved symbol shares a name with one already in the target package.
+    NameCollision {
+        symbol: String,
+    },
+    /// A file already in the target package imports the source and uses moved symbols; its
+    /// import would become a self-import and its qualifiers would need removing.
+    TargetPackageImporter {
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
