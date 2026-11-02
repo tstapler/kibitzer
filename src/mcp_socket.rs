@@ -226,6 +226,7 @@ impl Listener for SameUidListener {
 }
 
 pub async fn run_mcp_socket_server(path: PathBuf) -> Result<()> {
+    crate::mcp::recover_orphaned_refactors();
     let bound = bind_socket(&path)?;
     eprintln!(
         "[kibitzer] MCP server listening on unix socket {} (streamable HTTP at {MCP_PATH})",

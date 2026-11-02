@@ -70,6 +70,17 @@ pub(super) fn render(report: &PackageFocusReport) -> String {
     for item in &report.contrary_evidence {
         lines.push(format!("  contrary evidence: {item}"));
     }
+    if !report.available_operations.is_empty() {
+        let ops: Vec<String> = report
+            .available_operations
+            .iter()
+            .map(|o| format!("{:?}", o.kind))
+            .collect();
+        lines.push(format!(
+            "  available mechanical operations: {} (see simulate_refactor/plan_refactor)",
+            ops.join(LIST_SEP)
+        ));
+    }
     lines.push(format!(
         "  Coverage: {} private symbols not modeled; {} generated files excluded; test imports excluded ({}); {} unresolved edges{}",
         c.private_symbols_skipped,

@@ -305,3 +305,48 @@ fn shared_state_scan_ignores_comments_strings_and_blank_identifiers() {
     src.scan("package p\n\nvar ch = make(chan<- int)\nvar mu, other sync.Mutex\n");
     assert_eq!(src.shared_state_vars, vec!["ch", "mu"]);
 }
+
+#[test]
+fn finding_lists_available_operations_when_package_has_multiple_files() {
+    let model = model_of(
+        "focus-available-ops",
+        &[
+            ("pkg/decode.go", MIXED_DECODE),
+            ("pkg/store.go", MIXED_STORE),
+        ],
+    );
+    let reports = analyze(&model, EvidenceMode::Combined);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(!reports[0].available_operations.is_empty());
+    let json = serde_json::to_value(&reports[0]).unwrap();
+    assert!(
+        json["available_operations"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    let msg = &run(&model, EvidenceMode::Combined)[0].message;
+    assert!(msg.contains("available mechanical operations"), "{msg}");
+}
+
+#[test]
+fn single_file_package_omits_available_operations_from_json() {
+    let model = model_of(
+        "focus-no-ops",
+        &[(
+            "pkg/both.go",
+            &format!(
+                "{MIXED_DECODE}{}",
+                MIXED_STORE.replace("package pkg\n\n", "")
+            ),
+        )],
+    );
+    for report in analyze(&model, EvidenceMode::Combined) {
+        assert!(report.available_operations.is_empty());
+        assert!(
+            serde_json::to_value(&report)
+                .unwrap()
+                .get("available_operations")
+                .is_none()
+        );
+    }
+}

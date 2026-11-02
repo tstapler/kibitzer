@@ -168,6 +168,30 @@ struct GetArchitectureNodeRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct ListRefactorOperationsRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// Module-qualified Go package path to list operations for.
+    package: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct RefactorOperationRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// The operation to simulate or plan.
+    operation: crate::refactor::RefactorOperation,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ApplyRefactorRequest {
+    /// Any path inside the repo to apply to (the repo root or a subdirectory).
+    path: String,
+    /// A plan exactly as returned by `plan_refactor`.
+    plan: crate::refactor::RefactorPlan,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct CallTraversalRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
     path: String,
@@ -1138,6 +1162,98 @@ impl KibitzerServer {
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
 
+    /// Shared prologue for the refactor tools: resolve the repo root and load the model.
+    async fn refactor_model(&self, path: &str) -> Result<Arc<ArchModel>, String> {
+        let repo_root = Self::resolve_repo_root(&PathBuf::from(path)).map_err(json_error)?;
+        // Private symbols are needed: refactors move unexported code too.
+        self.load_model_off_stack(repo_root, true)
+            .await
+            .map_err(json_error)
+    }
+
+    #[tool(
+        description = "List mechanical refactoring operations (MoveFiles, ExtractPackage) \
+                        available for a Go package — returns a JSON array, `[]` when none is \
+                        supported. Read-only."
+    )]
+    async fn list_refactor_operations(
+        &self,
+        req: Parameters<ListRefactorOperationsRequest>,
+    ) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let ops = crate::refactor::catalog::list_operations_for_package(&model, &req.package);
+        serde_json::to_string(&ops)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Simulate a refactoring operation and report feasibility as JSON \
+                        ({feasible, blocking, warnings, touched_files, importers_affected}) — \
+                        import cycles, internal/ violations and cgo block; build-tagged and \
+                        generated files warn. Writes nothing."
+    )]
+    async fn simulate_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let report = crate::refactor::feasibility::check(&model, &req.operation);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Plan a MoveFiles/ExtractPackage operation for Go: returns a JSON \
+                        RefactorPlan (ordered edits, verification commands, content hashes of \
+                        every touched file). Errors when the operation is infeasible. Writes \
+                        nothing; pass the plan to apply_refactor to carry it out."
+    )]
+    async fn plan_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        match crate::refactor::catalog::plan_move_files(&model, &req.operation) {
+            Ok(plan) => serde_json::to_string(&plan)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
+            Err(e) => json_error(format!("{e:#}")),
+        }
+    }
+
+    #[tool(
+        description = "Apply a RefactorPlan from plan_refactor atomically: a stale plan (any \
+                        touched file changed since planning) is rejected before any write; after \
+                        the writes `go build ./...` and `go vet ./...` run and a failure rolls \
+                        everything back, returning the command output as the error."
+    )]
+    async fn apply_refactor(&self, req: Parameters<ApplyRefactorRequest>) -> String {
+        let req = req.0;
+        let repo_root = match Self::resolve_repo_root(&PathBuf::from(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        let applied = tokio::task::spawn_blocking(move || {
+            crate::refactor::apply::apply_plan(
+                &repo_root,
+                &req.plan,
+                &crate::refactor::apply::RealIo,
+            )
+        })
+        .await;
+        match applied {
+            Ok(Ok(result)) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
+            Ok(Err(e)) => json_error(format!("{e:#}")),
+            Err(e) => json_error(format!("apply task failed: {e}")),
+        }
+    }
+
     #[tool(
         description = "Resolve one architecture node by exact reference — a package path or a \
                         symbol id — and return it as JSON ({\"kind\": \"package\"|\"symbol\"|\"not_found\", ...}). \
@@ -1455,7 +1571,35 @@ impl ServerHandler for KibitzerServer {
     }
 }
 
+/// Names of every tool the server exposes, for `kibitzer mcp list`.
+pub fn tool_names() -> Vec<String> {
+    let mut names: Vec<String> = KibitzerServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Rolls back an apply a previous process died in the middle of, for the repo at the working
+/// directory. Best-effort: a server must still start when this fails, so errors are logged.
+pub fn recover_orphaned_refactors() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(root) = KibitzerServer::resolve_repo_root(&cwd) else {
+        return;
+    };
+    match crate::refactor::apply::recover(&root) {
+        Ok(Some(id)) => eprintln!("kibitzer: rolled back interrupted refactor {id}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("kibitzer: could not recover interrupted refactor: {e:#}"),
+    }
+}
+
 pub async fn run_mcp_server() -> Result<()> {
+    recover_orphaned_refactors();
     let server = KibitzerServer::new()
         .serve(rmcp::transport::stdio())
         .await?;
@@ -3174,6 +3318,20 @@ mod tests {
             render_run_checks_report(&[ok], Path::new("x.go")),
             "all checks passed"
         );
+    }
+
+    #[test]
+    fn refactor_tools_are_registered() {
+        let router = KibitzerServer::tool_router();
+        let tools = router.list_all();
+        for name in [
+            "list_refactor_operations",
+            "simulate_refactor",
+            "plan_refactor",
+            "apply_refactor",
+        ] {
+            assert!(tools.iter().any(|t| t.name == name), "{name} is registered");
+        }
     }
 
     #[test]
