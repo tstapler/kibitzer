@@ -446,14 +446,13 @@ fn main() -> Result<ExitCode> {
         Command::Hook => hook::run_hook(),
         Command::Mcp { socket, connect } => {
             let rt = tokio::runtime::Runtime::new()?;
-            let path_or_default =
-                |p: Option<PathBuf>| p.unwrap_or_else(mcp_socket::default_socket_path);
+            let path_or_default = mcp_socket::socket_path_or_default;
             match (socket, connect) {
                 (Some(path), _) => {
-                    rt.block_on(mcp_socket::run_mcp_socket_server(path_or_default(path)))?
+                    rt.block_on(mcp_socket::run_mcp_socket_server(path_or_default(path)?))?
                 }
                 (None, Some(path)) => {
-                    rt.block_on(mcp_bridge::run_mcp_bridge(path_or_default(path)))?
+                    rt.block_on(mcp_bridge::run_mcp_bridge(path_or_default(path)?))?
                 }
                 (None, None) => rt.block_on(mcp::run_mcp_server())?,
             }

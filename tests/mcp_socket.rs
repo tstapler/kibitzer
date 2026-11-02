@@ -19,17 +19,30 @@ impl Drop for Proc {
     }
 }
 
+/// A private scratch dir, also usable as `XDG_RUNTIME_DIR`.
 fn scratch(label: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("kbz-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     dir
 }
 
-fn start_server(socket: &Path) -> Proc {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
-        .args(["mcp", "--socket"])
-        .arg(socket)
+/// `kibitzer mcp <args>` with `XDG_RUNTIME_DIR=runtime`, so the default socket path is private.
+fn kibitzer_mcp(runtime: &Path, args: &[&Path]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kibitzer"));
+    command
+        .arg("mcp")
+        .args(args)
+        .env("XDG_RUNTIME_DIR", runtime);
+    command
+}
+
+fn start_server(runtime: &Path, socket: Option<&Path>) -> Proc {
+    let mut args = vec![Path::new("--socket")];
+    args.extend(socket);
+    let mut child = kibitzer_mcp(runtime, &args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -46,15 +59,15 @@ fn start_server(socket: &Path) -> Proc {
 }
 
 #[test]
-fn mcp_connect_should_ListTools_Through_SharedSocketServer() {
+fn mcp_connect_should_ListTools_Through_SharedSocketServer_AtTheDefaultPath() {
     let dir = scratch("e2e");
-    let socket = dir.join("run").join("mcp.sock");
-    let mut server = start_server(&socket);
+    // Neither process is given a path: both must resolve the same default.
+    let socket = dir.join("kibitzer").join("mcp.sock");
+    let mut server = start_server(&dir, None);
+    assert!(socket.exists(), "server listens at the default path");
 
     let mut bridge = Proc(
-        Command::new(env!("CARGO_BIN_EXE_kibitzer"))
-            .args(["mcp", "--connect"])
-            .arg(&socket)
+        kibitzer_mcp(&dir, &[Path::new("--connect")])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -112,10 +125,8 @@ fn mcp_connect_should_ListTools_Through_SharedSocketServer() {
 fn mcp_socket_should_RefuseToStart_When_AnotherServerOwnsPath() {
     let dir = scratch("dup");
     let socket = dir.join("run").join("mcp.sock");
-    let _server = start_server(&socket);
-    let out = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
-        .args(["mcp", "--socket"])
-        .arg(&socket)
+    let _server = start_server(&dir, Some(&socket));
+    let out = kibitzer_mcp(&dir, &[Path::new("--socket"), &socket])
         .stdin(Stdio::null())
         .output()
         .unwrap();

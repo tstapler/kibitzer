@@ -76,14 +76,18 @@ one on its own.
 
 - **Who can connect:** only processes running as your user. The socket is
   `0600`, it sits in a directory only you can write (created `0700`), and
-  the server drops any connection whose peer uid isn't its own. There's no
+  the server drops any connection whose peer uid isn't its own. In the other
+  direction, `--connect` refuses a server that isn't running as your user,
+  so nobody squatting the socket path can feed it tool results. There's no
   other authentication. Any process running as you can use every tool, so
   it can make kibitzer run a `command` check from an `inspect.json` it
   controls. That's no more access than such a process already has, since it
   could run `kibitzer mcp` (or the command) itself.
 - Without a path, the socket is `$XDG_RUNTIME_DIR/kibitzer/mcp.sock`. If
-  `XDG_RUNTIME_DIR` is unset or untrusted, it's `mcp/mcp.sock` under
-  kibitzer's cache directory (`~/.cache/kibitzer`). The server won't start
+  `XDG_RUNTIME_DIR` is unset, relative or untrusted, it's
+  `kibitzer/mcp/mcp.sock` under `$XDG_CACHE_HOME`, or under `~/.cache` if
+  that's unset. Relative values are skipped. If no absolute candidate
+  exists, both commands exit with an error and you have to pass a path. The server won't start
   if another server owns the path or answers on it. It replaces a stale
   socket, but never a file that isn't a socket.
 - Each MCP session gets its own server instance, so sessions don't share an

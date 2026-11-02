@@ -7,13 +7,13 @@
 //! reply stream are not relayed (kibitzer sends none); batches are passed through as-is,
 //! which rmcp 0.2 answers with 501.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::{Body, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
@@ -22,57 +22,94 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 
+use crate::daemon_lock::current_uid;
 use crate::mcp_socket::MCP_PATH;
 
 const SESSION_HEADER: &str = "mcp-session-id";
 const ACCEPT: &str = "application/json, text/event-stream";
+const PARSE_ERROR: i64 = -32700;
+const INTERNAL_ERROR: i64 = -32603;
+
+/// Largest single SSE event or error body accepted from the server.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The shared server, and the uid it must run as: anyone else squatting the socket path
+/// could feed fabricated tool results to the agent.
+#[derive(Clone)]
+pub(crate) struct ServerAddr {
+    pub socket: PathBuf,
+    pub uid: u32,
+}
 
 pub async fn run_mcp_bridge(socket: PathBuf) -> Result<()> {
-    bridge(
+    let server = ServerAddr {
         socket,
+        uid: current_uid(),
+    };
+    bridge(
+        server,
         tokio::io::BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
     )
     .await
 }
 
-/// Relays `input` lines to the server and its replies to `output` until `input` ends.
-/// Requests run concurrently (a slow tool call doesn't hold up others); initialize,
-/// notifications and responses are forwarded in order, each awaited before the next line.
-pub(crate) async fn bridge<R, W>(socket: PathBuf, input: R, output: W) -> Result<()>
+/// Relays `input` lines to the server and its replies to `output` until `input` ends or fails;
+/// either way the session is then closed. Requests run concurrently (a slow tool call doesn't
+/// hold up others); initialize, notifications and responses are forwarded in order.
+pub(crate) async fn bridge<R, W>(server: ServerAddr, input: R, output: W) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(write_lines(rx, output));
-    let session = Arc::new(Session::new(socket));
+    let session = Arc::new(Session::new(server));
     let mut in_flight = JoinSet::new();
-    let mut lines = input.lines();
-    while let Some(line) = lines.next_line().await? {
+    let read = relay_input(input, &session, &tx, &mut in_flight).await;
+    // The client hung up (or its stdin broke): nobody is left to read in-flight replies.
+    in_flight.abort_all();
+    session.close().await;
+    drop(tx);
+    writer.await.context("bridge writer task")??;
+    read
+}
+
+async fn relay_input<R: AsyncBufRead + Unpin>(
+    mut input: R,
+    session: &Arc<Session>,
+    tx: &mpsc::UnboundedSender<Value>,
+    in_flight: &mut JoinSet<()>,
+) -> Result<()> {
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if input.read_until(b'\n', &mut raw).await? == 0 {
+            return Ok(());
+        }
+        // Lossy, so invalid UTF-8 gets a JSON-RPC parse error instead of ending the bridge.
+        let line = String::from_utf8_lossy(&raw);
         if line.trim().is_empty() {
             continue;
         }
         let message: Value = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(e) => {
-                let _ = tx.send(rpc_error(Value::Null, -32700, &format!("parse error: {e}")));
+                let _ = tx.send(rpc_error(
+                    Value::Null,
+                    PARSE_ERROR,
+                    &format!("parse error: {e}"),
+                ));
                 continue;
             }
         };
         if is_request(&message) && !is_initialize(&message) {
-            let (session, tx) = (Arc::clone(&session), tx.clone());
+            let (session, tx) = (Arc::clone(session), tx.clone());
             in_flight.spawn(async move { session.forward(message, &tx).await });
         } else {
-            session.forward(message, &tx).await;
+            session.forward(message, tx).await;
         }
     }
-    // The client hung up: nobody is left to read in-flight replies.
-    in_flight.abort_all();
-    session.close().await;
-    drop(tx);
-    writer.await.context("bridge writer task")??;
-    Ok(())
 }
 
 async fn write_lines<W: AsyncWrite + Unpin>(
@@ -88,8 +125,12 @@ async fn write_lines<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+fn request_id(message: &Value) -> Option<&Value> {
+    message.get("method").and(message.get("id"))
+}
+
 fn is_request(message: &Value) -> bool {
-    message.get("method").is_some() && message.get("id").is_some()
+    request_id(message).is_some()
 }
 
 fn is_initialize(message: &Value) -> bool {
@@ -109,14 +150,14 @@ struct SessionState {
 }
 
 struct Session {
-    socket: PathBuf,
+    server: ServerAddr,
     state: Mutex<SessionState>,
 }
 
 impl Session {
-    fn new(socket: PathBuf) -> Self {
+    fn new(server: ServerAddr) -> Self {
         Self {
-            socket,
+            server,
             state: Mutex::new(SessionState::default()),
         }
     }
@@ -124,13 +165,13 @@ impl Session {
     /// Forwards one message; a failed request is answered with a JSON-RPC error so the
     /// client never waits forever.
     async fn forward(&self, message: Value, out: &mpsc::UnboundedSender<Value>) {
-        let id = is_request(&message).then(|| message["id"].clone());
+        let id = request_id(&message).cloned();
         if let Err(e) = self.exchange(&message, out).await {
             match id {
                 Some(id) => {
                     let _ = out.send(rpc_error(
                         id,
-                        -32603,
+                        INTERNAL_ERROR,
                         &format!("kibitzer mcp bridge: {e:#}"),
                     ));
                 }
@@ -141,7 +182,7 @@ impl Session {
 
     async fn exchange(&self, message: &Value, out: &mpsc::UnboundedSender<Value>) -> Result<()> {
         if is_initialize(message) {
-            let (session_id, reply) = open_session(&self.socket, message).await?;
+            let (session_id, reply) = open_session(&self.server, message).await?;
             let mut state = self.state.lock().await;
             state.id = Some(session_id);
             state.initialize = Some(message.clone());
@@ -149,21 +190,33 @@ impl Session {
             return Ok(());
         }
         let session_id = self.state.lock().await.id.clone();
-        let mut response = post(&self.socket, message, session_id.as_deref()).await?;
+        let mut response = post(&self.server, message, session_id.as_deref()).await?;
         if response.status() == StatusCode::UNAUTHORIZED && session_id.is_some() {
             let fresh = self.reopen(session_id.as_deref()).await?;
-            response = post(&self.socket, message, Some(&fresh)).await?;
+            response = post(&self.server, message, Some(&fresh)).await?;
         }
         let status = response.status();
         if !status.is_success() {
-            let body = response.into_body().collect().await?.to_bytes();
+            let body = Limited::new(response.into_body(), MAX_MESSAGE_BYTES)
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("reading {status} reply: {e}"))?
+                .to_bytes();
             bail!(
                 "server answered {status}: {}",
                 String::from_utf8_lossy(&body)
             );
         }
         if is_sse(&response) {
-            relay_sse(response.into_body(), message.get("id"), out).await?;
+            relay_sse(
+                response.into_body(),
+                request_id(message),
+                out,
+                MAX_MESSAGE_BYTES,
+            )
+            .await?;
+        } else if let Some(id) = request_id(message) {
+            bail!("server answered {status} without a reply to request {id}");
         }
         Ok(())
     }
@@ -181,9 +234,9 @@ impl Session {
             .initialize
             .clone()
             .context("server dropped the session before initialize was seen")?;
-        let (session_id, _reply) = open_session(&self.socket, &init).await?;
+        let (session_id, _reply) = open_session(&self.server, &init).await?;
         let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let ack = post(&self.socket, &initialized, Some(&session_id)).await?;
+        let ack = post(&self.server, &initialized, Some(&session_id)).await?;
         if !ack.status().is_success() {
             bail!("re-initialize: server answered {}", ack.status());
         }
@@ -202,14 +255,14 @@ impl Session {
             .header(SESSION_HEADER, session_id)
             .body(Full::new(Bytes::new()));
         if let Ok(request) = request {
-            let _ = send(&self.socket, request).await;
+            let _ = send(&self.server, request).await;
         }
     }
 }
 
 /// Sends `initialize` without a session; returns the new session id and the reply.
-async fn open_session(socket: &Path, initialize: &Value) -> Result<(String, Value)> {
-    let response = post(socket, initialize, None).await?;
+async fn open_session(server: &ServerAddr, initialize: &Value) -> Result<(String, Value)> {
+    let response = post(server, initialize, None).await?;
     let status = response.status();
     if !status.is_success() {
         bail!("initialize: server answered {status}");
@@ -221,7 +274,13 @@ async fn open_session(socket: &Path, initialize: &Value) -> Result<(String, Valu
         .context("initialize reply carried no session id")?
         .to_string();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    relay_sse(response.into_body(), initialize.get("id"), &tx).await?;
+    relay_sse(
+        response.into_body(),
+        request_id(initialize),
+        &tx,
+        MAX_MESSAGE_BYTES,
+    )
+    .await?;
     let reply = rx.recv().await.context("initialize got no reply")?;
     Ok((session_id, reply))
 }
@@ -234,7 +293,11 @@ fn is_sse(response: &Response<Incoming>) -> bool {
         .is_some_and(|v| v.starts_with("text/event-stream"))
 }
 
-async fn post(socket: &Path, message: &Value, session: Option<&str>) -> Result<Response<Incoming>> {
+async fn post(
+    server: &ServerAddr,
+    message: &Value,
+    session: Option<&str>,
+) -> Result<Response<Incoming>> {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(MCP_PATH)
@@ -245,14 +308,32 @@ async fn post(socket: &Path, message: &Value, session: Option<&str>) -> Result<R
         request = request.header(SESSION_HEADER, session);
     }
     let body = Full::new(Bytes::from(serde_json::to_vec(message)?));
-    send(socket, request.body(body)?).await
+    send(server, request.body(body)?).await
 }
 
-/// One HTTP/1.1 exchange on a fresh connection to `socket`.
-async fn send(socket: &Path, request: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
+/// Connects to `server.socket`, refusing (fail closed) a peer not running as `server.uid`.
+async fn connect(server: &ServerAddr) -> Result<UnixStream> {
+    let socket = &server.socket;
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connecting to {}", socket.display()))?;
+    let peer = stream
+        .peer_cred()
+        .with_context(|| format!("reading the peer uid on {}", socket.display()))?
+        .uid();
+    if peer != server.uid {
+        bail!(
+            "refusing the MCP server on {}: it runs as uid {peer}, not uid {}",
+            socket.display(),
+            server.uid
+        );
+    }
+    Ok(stream)
+}
+
+/// One HTTP/1.1 exchange on a fresh connection to the server.
+async fn send(server: &ServerAddr, request: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
+    let stream = connect(server).await?;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .context("HTTP handshake")?;
@@ -266,21 +347,30 @@ async fn send(socket: &Path, request: Request<Full<Bytes>>) -> Result<Response<I
 }
 
 /// Forwards each SSE event's JSON payload until the reply to `request_id` (the stream may be
-/// held open by keep-alives after it) or the end of the stream.
-async fn relay_sse(
-    mut body: Incoming,
+/// held open by keep-alives after it). A stream that ends first, or an event over `max`
+/// bytes, is an error.
+async fn relay_sse<B>(
+    mut body: B,
     request_id: Option<&Value>,
     out: &mpsc::UnboundedSender<Value>,
-) -> Result<()> {
+    max: usize,
+) -> Result<()>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut buffer: Vec<u8> = Vec::new();
+    // Bytes already searched for an event end, so each frame only scans what's new.
+    let mut scanned = 0;
     while let Some(frame) = body.frame().await {
         let Ok(data) = frame?.into_data() else {
             continue;
         };
         buffer.extend_from_slice(&data);
-        while let Some(end) = find_event_end(&buffer) {
-            let event: Vec<u8> = buffer.drain(..end.0 + end.1).collect();
-            let Some(message) = parse_sse_event(&event[..end.0])? else {
+        while let Some((end, delimiter)) = find_event_end(&buffer, scanned) {
+            let event: Vec<u8> = buffer.drain(..end + delimiter).collect();
+            scanned = 0;
+            let Some(message) = parse_sse_event(&event[..end])? else {
                 continue;
             };
             let done = request_id.is_some_and(|id| message.get("id") == Some(id))
@@ -290,21 +380,33 @@ async fn relay_sse(
                 return Ok(());
             }
         }
+        if buffer.len() > max {
+            bail!("server sent an SSE event over {max} bytes");
+        }
+        scanned = buffer.len();
     }
-    Ok(())
+    match request_id {
+        Some(id) => bail!("server ended the reply stream without answering request {id}"),
+        None => Ok(()),
+    }
 }
 
-/// Offset of the blank line ending the first event in `buffer`, and its length.
-fn find_event_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
-    let crlf = buffer
+/// Offset and length of the first blank line (`\n\n` or `\r\n\r\n`) ending at or after
+/// `from` (bytes before it were already searched).
+fn find_event_end(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
+    // A delimiter may straddle the old tail, so back up by one less than its longest form.
+    let start = from.saturating_sub(3);
+    let search = &buffer[start.min(buffer.len())..];
+    let lf = search.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    let crlf = search
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|i| (i, 4));
-    match (lf, crlf) {
+    let first = match (lf, crlf) {
         (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
         (a, b) => a.or(b),
-    }
+    };
+    first.map(|(i, len)| (start + i, len))
 }
 
 /// The JSON in an event's `data:` lines, or `None` for a comment/keep-alive event.
@@ -324,187 +426,5 @@ fn parse_sse_event(event: &[u8]) -> Result<Option<Value>> {
 }
 
 #[cfg(test)]
-#[allow(non_snake_case)]
-pub(crate) mod tests {
-    use std::time::Duration;
-
-    use super::*;
-    use crate::daemon_lock::current_uid;
-    use crate::mcp_socket::tests::TestServer;
-    use crate::test_support::unique_temp_dir;
-    use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
-
-    fn initialize_message(id: u64) -> Value {
-        json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "kibitzer bridge test", "version": "0"}
-        }})
-    }
-
-    /// Opens a session directly over the socket, without the bridge; returns its id.
-    pub(crate) async fn initialize_raw(socket: &Path) -> Result<String> {
-        let opened = tokio::time::timeout(
-            Duration::from_secs(10),
-            open_session(socket, &initialize_message(1)),
-        )
-        .await
-        .context("initialize timed out")??;
-        Ok(opened.0)
-    }
-
-    struct Client {
-        to_bridge: DuplexStream,
-        from_bridge: tokio::io::Lines<BufReader<DuplexStream>>,
-        task: tokio::task::JoinHandle<Result<()>>,
-    }
-
-    impl Client {
-        fn start(socket: &Path) -> Self {
-            let (to_bridge, bridge_in) = tokio::io::duplex(1 << 16);
-            let (bridge_out, from_bridge) = tokio::io::duplex(1 << 16);
-            let task = tokio::spawn(bridge(
-                socket.to_path_buf(),
-                BufReader::new(bridge_in),
-                bridge_out,
-            ));
-            Self {
-                to_bridge,
-                from_bridge: BufReader::new(from_bridge).lines(),
-                task,
-            }
-        }
-
-        async fn send(&mut self, message: &str) {
-            self.to_bridge.write_all(message.as_bytes()).await.unwrap();
-            self.to_bridge.write_all(b"\n").await.unwrap();
-        }
-
-        async fn recv(&mut self) -> Value {
-            let line = tokio::time::timeout(Duration::from_secs(30), self.from_bridge.next_line())
-                .await
-                .expect("bridge reply timed out")
-                .unwrap()
-                .expect("bridge closed its output");
-            serde_json::from_str(&line).unwrap()
-        }
-
-        async fn handshake(&mut self) {
-            self.send(&initialize_message(1).to_string()).await;
-            let reply = self.recv().await;
-            assert_eq!(reply["id"], 1);
-            assert!(
-                reply["result"]["instructions"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with("kibitzer:")),
-                "{reply}"
-            );
-            self.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-                .await;
-        }
-
-        async fn tool_names(&mut self, id: u64) -> Vec<String> {
-            self.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}).to_string())
-                .await;
-            let reply = self.recv().await;
-            assert_eq!(reply["id"], id, "{reply}");
-            reply["result"]["tools"]
-                .as_array()
-                .unwrap_or_else(|| panic!("no tools: {reply}"))
-                .iter()
-                .filter_map(|t| t["name"].as_str().map(str::to_string))
-                .collect()
-        }
-
-        async fn finish(self) {
-            drop(self.to_bridge);
-            self.task.await.unwrap().unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn bridge_should_RelayHandshakeAndToolsList_Then_CloseSessionOnEof() {
-        let dir = unique_temp_dir("mcpbr-list");
-        let server = TestServer::start(&dir, Duration::from_secs(3600), current_uid()).await;
-        let mut client = Client::start(&server.path);
-        client.handshake().await;
-        let names = client.tool_names(2).await;
-        for expected in ["list_checks", "run_checks", "architecture_assessment"] {
-            assert!(names.iter().any(|n| n == expected), "{expected}: {names:?}");
-        }
-        client.finish().await;
-        // EOF on stdin DELETEs the session.
-        assert!(server.sessions.sessions.read().await.is_empty());
-        server.stop().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn bridge_should_Reinitialize_When_ServerDroppedIdleSession() {
-        let dir = unique_temp_dir("mcpbr-idle");
-        let server = TestServer::start(&dir, Duration::from_millis(200), current_uid()).await;
-        let mut client = Client::start(&server.path);
-        client.handshake().await;
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(server.sessions.sessions.read().await.is_empty());
-        let names = client.tool_names(2).await;
-        assert!(names.iter().any(|n| n == "run_checks"), "{names:?}");
-        client.finish().await;
-        server.stop().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn bridge_should_AnswerWithRpcError_When_InputIsBadOrServerIsGone() {
-        let dir = unique_temp_dir("mcpbr-err");
-        let mut client = Client::start(&dir.join("nothing.sock"));
-        client.send("{not json").await;
-        let reply = client.recv().await;
-        assert_eq!(reply["error"]["code"], -32700, "{reply}");
-        client.send(&initialize_message(7).to_string()).await;
-        let reply = client.recv().await;
-        assert_eq!(reply["id"], 7);
-        assert_eq!(reply["error"]["code"], -32603, "{reply}");
-        // A notification that fails has nobody to answer; it must not wedge the bridge.
-        client
-            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-            .await;
-        client.finish().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn bridge_should_ReportServerError_When_RequestRejected() {
-        let dir = unique_temp_dir("mcpbr-422");
-        let server = TestServer::start(&dir, Duration::from_secs(3600), current_uid()).await;
-        let mut client = Client::start(&server.path);
-        // No session yet and not an initialize: rmcp answers 422.
-        client
-            .send(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#)
-            .await;
-        let reply = client.recv().await;
-        assert_eq!(reply["id"], 3);
-        assert!(
-            reply["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("422")),
-            "{reply}"
-        );
-        client.finish().await;
-        server.stop().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_sse_event_should_JoinDataLines_And_SkipComments() {
-        assert_eq!(parse_sse_event(b": keep-alive").unwrap(), None);
-        assert_eq!(
-            parse_sse_event(b"id: 1\ndata: {\"a\":\ndata: 1}").unwrap(),
-            Some(json!({"a": 1}))
-        );
-        assert!(parse_sse_event(b"data: nope").is_err());
-        assert_eq!(find_event_end(b"data: x\r\n\r\nrest"), Some((7, 4)));
-        assert_eq!(find_event_end(b"data: x\n\nrest"), Some((7, 2)));
-        assert_eq!(find_event_end(b"data: x\n"), None);
-    }
-}
+#[path = "mcp_bridge_tests.rs"]
+pub(crate) mod tests;

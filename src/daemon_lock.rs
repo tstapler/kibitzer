@@ -132,6 +132,10 @@ pub(crate) fn trusted_runtime_dir() -> Result<RuntimeDir, DirRejected> {
 /// resolved one so nothing re-traverses the link. A plain directory may be 0755 but never
 /// group- or other-writable.
 pub(crate) fn accept_xdg_dir(dir: &Path) -> Result<PathBuf, String> {
+    if !dir.is_absolute() {
+        // The XDG spec requires absolute paths; a relative one would resolve under the cwd.
+        return Err("it is not an absolute path".to_string());
+    }
     let is_link = std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink());
     if !is_link {
         return check_own_dir(dir, DirTrust::NotWritableByOthers, false)
@@ -733,6 +737,16 @@ mod tests {
         let got = trusted_runtime_dir_in(Some(link.clone()), &temp).unwrap();
         assert_eq!(got.path, temp.join(format!("kibitzer-{}", current_uid())));
         assert!(got.fallback_for.unwrap().reason.contains("symlink"));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn trusted_runtime_dir_should_FallBack_When_XdgIsRelative() {
+        let temp = scratch("xdg-relative");
+        let got = trusted_runtime_dir_in(Some(PathBuf::from("run")), &temp).unwrap();
+        let refused = got.fallback_for.expect("the refusal is reported");
+        assert!(refused.reason.contains("not an absolute path"), "{refused}");
+        assert_eq!(got.path, temp.join(format!("kibitzer-{}", current_uid())));
         let _ = std::fs::remove_dir_all(&temp);
     }
 

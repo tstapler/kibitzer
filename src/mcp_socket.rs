@@ -36,24 +36,30 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// on them forever.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// `$XDG_RUNTIME_DIR/kibitzer/mcp.sock` when that directory is trustworthy, else
-/// `<cache dir>/kibitzer/mcp/mcp.sock`.
-pub fn default_socket_path() -> PathBuf {
-    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let cache_dir = crate::cache::default_cache_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    default_socket_path_in(xdg, &cache_dir)
+/// The socket `--socket`/`--connect` use: `path` if given, else the shared default.
+pub fn socket_path_or_default(path: Option<PathBuf>) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path),
+        None => default_socket_path_from(|name| std::env::var_os(name)),
+    }
 }
 
-fn default_socket_path_in(xdg: Option<PathBuf>, cache_dir: &Path) -> PathBuf {
-    match xdg.map(|dir| accept_xdg_dir(&dir)) {
-        Some(Ok(dir)) => dir.join("kibitzer").join("mcp.sock"),
-        _ => cache_dir.join("mcp").join("mcp.sock"),
+/// `$XDG_RUNTIME_DIR/kibitzer/mcp.sock` when that directory is trustworthy, else
+/// `<cache dir>/kibitzer/mcp/mcp.sock`, the cache dir being `$XDG_CACHE_HOME` or
+/// `$HOME/.cache`. Relative or empty values are skipped, so the default never lands under
+/// the working directory; with no usable candidate it's an error.
+fn default_socket_path_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(Ok(dir)) = absolute("XDG_RUNTIME_DIR").map(|dir| accept_xdg_dir(&dir)) {
+        return Ok(dir.join("kibitzer").join("mcp.sock"));
     }
+    let cache = absolute("XDG_CACHE_HOME")
+        .or_else(|| absolute("HOME").map(|home| home.join(".cache")))
+        .context(
+            "no default socket path: XDG_RUNTIME_DIR, XDG_CACHE_HOME and HOME are all unset, \
+             empty or relative; pass a path explicitly",
+        )?;
+    Ok(cache.join("kibitzer").join("mcp").join("mcp.sock"))
 }
 
 /// Removes the socket when the server stops; the held lock keeps a second server off `path`.
@@ -303,24 +309,66 @@ pub(crate) mod tests {
         std::fs::symlink_metadata(path).unwrap().mode() & 0o777
     }
 
+    fn default_with(vars: &[(&str, &str)]) -> Result<PathBuf> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        default_socket_path_from(|name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.into()))
+    }
+
     #[test]
     fn default_socket_path_should_UseXdgRuntimeDir_When_Trusted() {
         let dir = unique_temp_dir("mcpsock-xdg");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(OWNER_ONLY_DIR)).unwrap();
-        let got = default_socket_path_in(Some(dir.clone()), Path::new("/cache"));
-        assert_eq!(got, dir.join("kibitzer").join("mcp.sock"));
+        let got = default_with(&[("XDG_RUNTIME_DIR", dir.to_str().unwrap()), ("HOME", "/h")]);
+        assert_eq!(got.unwrap(), dir.join("kibitzer").join("mcp.sock"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn default_socket_path_should_FallBackToCacheDir_When_XdgMissingOrUntrusted() {
-        let cache = Path::new("/cache/kibitzer");
-        let want = cache.join("mcp").join("mcp.sock");
-        assert_eq!(default_socket_path_in(None, cache), want);
+    fn default_socket_path_should_FallBackToCacheDir_When_XdgMissingUntrustedOrRelative() {
+        let want = PathBuf::from("/h/.cache/kibitzer/mcp/mcp.sock");
+        assert_eq!(default_with(&[("HOME", "/h")]).unwrap(), want);
         let dir = unique_temp_dir("mcpsock-xdg-loose");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert_eq!(default_socket_path_in(Some(dir.clone()), cache), want);
+        let loose = dir.to_str().unwrap();
+        assert_eq!(
+            default_with(&[("XDG_RUNTIME_DIR", loose), ("HOME", "/h")]).unwrap(),
+            want
+        );
+        assert_eq!(
+            default_with(&[("XDG_RUNTIME_DIR", "run"), ("HOME", "/h")]).unwrap(),
+            want
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_socket_path_should_SkipEmptyOrRelativeCacheVars_And_ErrorWithNoCandidate() {
+        assert_eq!(
+            default_with(&[("XDG_CACHE_HOME", "/c"), ("HOME", "/h")]).unwrap(),
+            PathBuf::from("/c/kibitzer/mcp/mcp.sock")
+        );
+        for cache in ["", "cache"] {
+            assert_eq!(
+                default_with(&[("XDG_CACHE_HOME", cache), ("HOME", "/h")]).unwrap(),
+                PathBuf::from("/h/.cache/kibitzer/mcp/mcp.sock"),
+                "XDG_CACHE_HOME={cache:?}"
+            );
+        }
+        for vars in [
+            &[][..],
+            &[("HOME", "")],
+            &[("HOME", "home"), ("XDG_RUNTIME_DIR", "run")],
+        ] {
+            let err = default_with(vars).unwrap_err();
+            assert!(err.to_string().contains("no default socket path"), "{err}");
+        }
+        assert_eq!(
+            socket_path_or_default(Some(PathBuf::from("/x/s.sock"))).unwrap(),
+            PathBuf::from("/x/s.sock")
+        );
     }
 
     #[tokio::test]
