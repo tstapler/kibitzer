@@ -107,6 +107,10 @@ pub struct PackageFocusReport {
     pub cycle_risks: Vec<String>,
     pub contrary_evidence: Vec<String>,
     pub coverage: Coverage,
+    /// Mechanical operations the refactor engine can carry out for this package; omitted
+    /// from JSON when none is available. Detection never depends on it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available_operations: Vec<crate::refactor::AvailableOperation>,
     #[serde(skip)]
     anchor: Option<Anchor>,
 }
@@ -132,6 +136,7 @@ impl ArchModelChecker for GoPackageFocusChecker {
                     line,
                     message,
                     severity_override: Some(Severity::Advisory),
+                    operation: None,
                 }
             })
             .collect()
@@ -144,6 +149,11 @@ pub fn analyze(model: &ArchModel, mode: EvidenceMode) -> Vec<PackageFocusReport>
         .packages
         .values()
         .filter_map(|pkg| analyze_package(model, pkg, mode))
+        .map(|mut report| {
+            report.available_operations =
+                crate::refactor::catalog::list_operations_for_package(model, &report.package);
+            report
+        })
         .collect()
 }
 
@@ -499,6 +509,7 @@ fn split_report(
         cycle_risks: test_note,
         contrary_evidence: contrary,
         coverage,
+        available_operations: vec![],
         components,
     }
 }
@@ -591,6 +602,7 @@ impl PackageFocusReport {
             cycle_risks: vec![],
             contrary_evidence: vec![contrary.to_string()],
             coverage,
+            available_operations: vec![],
             anchor,
         }
     }

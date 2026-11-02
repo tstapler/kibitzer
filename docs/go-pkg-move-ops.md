@@ -109,8 +109,8 @@ Checked with `gopls v0.24.0` (`golang.org/x/tools/gopls`, installed via Homebrew
 So the move/extract/split operations would have to be built regardless, and the one
 operation `gopls` has is driven through an LSP client with no atomicity or verification
 story. **Chosen approach: tree-sitter-go (already a kibitzer dependency) in Rust**, as an
-in-memory overlay (`src/refactor/workspace.rs`) with byte-range edits
-(`src/refactor/go_syntax.rs`) so untouched bytes are preserved exactly, then `gofmt`
+in-memory overlay (`src/go_refactor/workspace.rs`) with byte-range edits
+(`src/go_refactor/go_syntax.rs`) so untouched bytes are preserved exactly, then `gofmt`
 and the Go toolchain for verification. Advantages: no Go helper binary or LSP session,
 planning is read-only and fast (a rename plan over `kubernetes/kubernetes`, 17,846 Go
 files, takes ~0.3 s), and plans compose (split = repeated move over one overlay).
@@ -202,11 +202,11 @@ packages, and updating import-path strings outside Go source and the listed poli
   `sync-policy` fixtures plan their `source` operation first and inherit its blockers.
 * Non-blocked fixtures are applied with real `go build/vet/test` verification and then
   applied a second time (must be `already_applied`).
-* `src/refactor/golden_tests.rs` also covers failure injection after every step
+* `src/go_refactor/golden_tests.rs` also covers failure injection after every step
   (checksums of every file before/after), a real mid-apply write failure, policy-update
   failure, stale and partially applied plans, verbatim verification output and rollback,
   a failing post-apply hook, and the simulation gate.
-* Regenerate goldens with `KIBITZER_BLESS=1 cargo test --bin kibitzer refactor::golden`
+* Regenerate goldens with `KIBITZER_BLESS=1 cargo test --bin kibitzer go_refactor::golden`
   and review the diff.
 
 ## Backtest (six standard repos)
@@ -220,24 +220,29 @@ requires Go 1.27.0; the system Go is 1.26.4). Each repo was run with
 |---|---|---|---|---|
 | `kubernetes/kubernetes` (`0ba07e08`) | yes | `rename-pkg` `pkg/util/slice` → `pkg/util/sliceutil` (6 importers + 2 moved files, 8 steps) | `go build` of the 6 affected packages: exit 0 | `go build`, `go vet`, `go test -count=1` of the 6 packages: exit 0, 0, 0 (`persistentvolume` tests ok in 22.4 s); diff 14 insertions / 240 deletions (the deletions are the moved files); second apply: `already_applied` |
 | `kubernetes/kubernetes` | yes | `extract-decls` `CopyStrings,SortStrings` from `pkg/util/slice` → new `pkg/util/stringsutil` | `go build ./pkg/util/slice`: exit 0 | build/vet/test of `slice` + `stringsutil`: exit 0, 0, 0 |
-| `apache/cassandra` (`c103032`) | no — probe | `move-files` `lib/util.go`+`util_test.go` → new `util` pkg in a synthetic probe module (see below), 8,725 files in repo | `go build ./zz_kibitzer_probe/...`: exit 0 | `applied`; build/vet/test of affected pkgs: exit 0, 0, 0; plan 0.03 s |
-| `servo/servo` (`7821ec2dd`) | no — probe | same probe move, 195,563 files in repo | exit 0 | `applied`; 0, 0, 0; plan 0.20 s |
-| `BurntSushi/ripgrep` (`3fce3b5`) | no — probe | same, 237 files | exit 0 | `applied`; 0, 0, 0; plan 0.02 s |
-| `denoland/deno` (`60e01b1d`) | no — probe | same, 14,830 files | exit 0 | `applied`; 0, 0, 0; plan 0.05 s |
-| `microsoft/vscode` (`7a332eb7`) | no — probe | same, 18,647 files | exit 0 | `applied`; 0, 0, 0; plan 0.06 s |
+| `apache/cassandra` (`c103032`) + `go-chi/chi/v5` | yes (real module at repo root) | `move-files` `middleware/sunset.go`+`sunset_test.go` → new package `zzmovedsunset` | `go build ./...`, `go vet ./...`: exit 0, 0 | `applied`; verify build/vet/test exit 0, 0, 0; after `go build`/`go vet ./...`: 0, 0; diff 3 files, +5/−4 |
+| `servo/servo` (`7821ec2dd`) + `sirupsen/logrus` | yes | `rename-pkg` `hooks/test` → `hooks/testx` (7 steps) | 0, 0 | `applied`; 0, 0, 0; after: 0, 0; diff 7 files, +37/−37 |
+| `BurntSushi/ripgrep` (`3fce3b5`) + `spf13/cobra` | yes | `rename-pkg` `doc` → `docx` (11 steps) | 0, 0 | `applied`; 0, 0, 0; after: 0, 0; diff 11 files, +16/−16 |
+| `denoland/deno` (`60e01b1d`) + `urfave/cli/v3` | yes | `extract-decls` `FlagNames` → new `internal/flagnames` | 0, 0 | `applied`; 0, 0, 0; after: 0, 0; diff 3 files, +25/−19 |
+| `microsoft/vscode` (`7a332eb7`) + `spf13/viper` | yes | `rename-pkg` `internal/encoding/dotenv` → `dotenvx` | `./...` **fails before the move** (see below); module packages: build 0, vet 0 | first attempt with `./...` verification: `rolled_back` (tree restored; correct per AC4). With `--affected-only`: `applied`; 0, 0, 0; after on module packages: build 0, vet 0, `go test` ok; diff 4 files, +5/−5 |
 
-**Honest limit:** only `kubernetes/kubernetes` is a Go module, so it is the only row that
-moves the repo's own code. `cassandra`, `servo`, `ripgrep`, `deno` and `vscode` have no
-`go.mod` (run against them as-is, the tool refuses: `Error: no go.mod at <repo> (a Go
-module root is required)`, exit 1). For those five the "probe" rows add a throwaway
-`git worktree` of the repo at the listed HEAD, a `go.mod` (`module example.com/probe`) at
-its root, and the `_inputs/base` fixture (`lib/`, `app/` with tests) copied to
-`zz_kibitzer_probe/`; the move is `move-files` of `lib/util.go` + `lib/util_test.go`, applied
-with `--affected-only` verification (`GOWORK=off GOFLAGS=-mod=mod`). That shows the tool
-loads, plans, and applies correctly when embedded in a very large non-Go tree (the
-`go build` outcomes are those of the probe packages, not of the host project's Java/Rust/TS
-code), and the worktrees were removed afterwards. It is not evidence about those repos'
-own code.
+**How the five non-Go repos became Go modules:** none of them has a `go.mod`, so for each the
+backtest creates a throwaway `git worktree` of the repo at the listed HEAD, copies a real,
+small public Go module (the tracked files of the local clone, `cp -n`, never overwriting a host
+file, `.github/` skipped) into the worktree root with its own `go.mod`/`go.sum`, commits that as
+a baseline, and runs the move with `--apply` (`GOWORK=off GOFLAGS=-mod=mod`). The moves are real
+moves of that module's own code, with importers rewritten; the `go build`/`go vet` outcomes are
+those of the module, not of the host project's Java/Rust/TS code. Moves were chosen by a
+plan-only scan of every `rename-pkg` and single-file `move-files` in each candidate module;
+blocked candidates were not forced. Examples of correct refusals met on the way: chi
+`middleware` rename (`path_keyed_registration`, a test uses `runtime.Caller`), chi
+`wrap_writer` move (`unexported_dependency` on shared test helpers), and every unexported
+`extract-decls` in gorilla/mux and urfave/cli (`shared_helper`; v1 does not export).
+vscode caveat: the repo itself contains invalid `.go` fixtures
+(`extensions/vscode-colorize-tests/test/colorize-fixtures/test-13777.go`,
+`extensions/copilot/test/scenarios/test-explain/functions.go`) and a C++-bearing Go directory,
+so `go build ./...` fails at the repo root with or without the move; the tool rolled the first
+attempt back instead of declaring success. Worktrees were removed afterwards.
 
 Scale/noise run on `kubernetes/kubernetes` (plan only, nothing applied): 60 package
 directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-pkg` to

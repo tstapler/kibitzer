@@ -442,6 +442,10 @@ pub struct Config {
     /// `checks` in the first place. See docs/suppressing-checks.md.
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// Per-repo opt-in for the refactor write tools (`apply_split_refactor`, `verify_refactor`,
+    /// `revert_refactor`). Off unless the repo's own `.kibitzer/inspect.json` sets it.
+    #[serde(default)]
+    pub allow_write_tools: bool,
 }
 
 fn validate(config: &Config, config_path: &Path) -> Result<()> {
@@ -1052,6 +1056,7 @@ pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
                     architecture: local.architecture,
                     affected: local.affected,
                     disabled: Vec::new(),
+                    allow_write_tools: local.allow_write_tools,
                 },
                 root,
             ))
@@ -1062,6 +1067,7 @@ pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
                 architecture: ArchitectureConfig::default(),
                 affected: AffectedConfig::default(),
                 disabled: Vec::new(),
+                allow_write_tools: false,
             },
             start_dir(start),
         )),

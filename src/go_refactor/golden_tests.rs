@@ -1,6 +1,6 @@
 //! Golden-file harness: `testdata/refactor/<operation>/<case>/{op.json, plan.json, after.txt}`
 //! with the pre-apply tree in `testdata/refactor/_inputs/<op.json "input">/`.
-//! `KIBITZER_BLESS=1 cargo test refactor::golden` rewrites the expected files; review the diff.
+//! `KIBITZER_BLESS=1 cargo test go_refactor::golden` rewrites the expected files; review the diff.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -204,6 +204,14 @@ fn run_case(case_dir: &Path) {
             tree,
             "{name}: second apply changed the tree"
         );
+    }
+    // Opt-in: set the KIBITZER_KEEP_TREES env var to a directory to keep each applied tree for running the Go toolchain on them directly.
+    if let Some(keep) = std::env::var_os("KIBITZER_KEEP_TREES") {
+        if plan.blockers.is_empty() {
+            let dest = PathBuf::from(keep).join(name.replace('/', "__"));
+            let _ = std::fs::remove_dir_all(&dest);
+            copy_dir(&root, &dest);
+        }
     }
     let _ = std::fs::remove_dir_all(&root);
 }

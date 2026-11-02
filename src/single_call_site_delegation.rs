@@ -117,6 +117,7 @@ fn finding_for(symbol: &SymbolNode) -> ArchFinding {
             symbol.name
         ),
         severity_override: None,
+        operation: None,
     }
 }
 

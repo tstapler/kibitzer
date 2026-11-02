@@ -168,6 +168,30 @@ struct GetArchitectureNodeRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct ListRefactorOperationsRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// Module-qualified Go package path to list operations for.
+    package: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct RefactorOperationRequest {
+    /// Any path inside the repo to query (the repo root or a subdirectory).
+    path: String,
+    /// The operation to simulate or plan.
+    operation: crate::refactor::RefactorOperation,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ApplyRefactorRequest {
+    /// Any path inside the repo to apply to (the repo root or a subdirectory).
+    path: String,
+    /// A plan exactly as returned by `plan_refactor`.
+    plan: crate::refactor::RefactorPlan,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct CallTraversalRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
     path: String,
@@ -1138,6 +1162,98 @@ impl KibitzerServer {
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
 
+    /// Shared prologue for the refactor tools: resolve the repo root and load the model.
+    async fn refactor_model(&self, path: &str) -> Result<Arc<ArchModel>, String> {
+        let repo_root = Self::resolve_repo_root(&PathBuf::from(path)).map_err(json_error)?;
+        // Private symbols are needed: refactors move unexported code too.
+        self.load_model_off_stack(repo_root, true)
+            .await
+            .map_err(json_error)
+    }
+
+    #[tool(
+        description = "List mechanical refactoring operations (MoveFiles, ExtractPackage) \
+                        available for a Go package — returns a JSON array, `[]` when none is \
+                        supported. Read-only."
+    )]
+    async fn list_refactor_operations(
+        &self,
+        req: Parameters<ListRefactorOperationsRequest>,
+    ) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let ops = crate::refactor::catalog::list_operations_for_package(&model, &req.package);
+        serde_json::to_string(&ops)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Simulate a refactoring operation and report feasibility as JSON \
+                        ({feasible, blocking, warnings, touched_files, importers_affected}) — \
+                        import cycles, internal/ violations and cgo block; build-tagged and \
+                        generated files warn. Writes nothing."
+    )]
+    async fn simulate_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let report = crate::refactor::feasibility::check(&model, &req.operation);
+        serde_json::to_string(&report)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
+        description = "Plan a MoveFiles/ExtractPackage operation for Go: returns a JSON \
+                        RefactorPlan (ordered edits, verification commands, content hashes of \
+                        every touched file). Errors when the operation is infeasible. Writes \
+                        nothing; pass the plan to apply_refactor to carry it out."
+    )]
+    async fn plan_refactor(&self, req: Parameters<RefactorOperationRequest>) -> String {
+        let req = req.0;
+        let model = match self.refactor_model(&req.path).await {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        match crate::refactor::catalog::plan_move_files(&model, &req.operation) {
+            Ok(plan) => serde_json::to_string(&plan)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
+            Err(e) => json_error(format!("{e:#}")),
+        }
+    }
+
+    #[tool(
+        description = "Apply a RefactorPlan from plan_refactor atomically: a stale plan (any \
+                        touched file changed since planning) is rejected before any write; after \
+                        the writes `go build ./...` and `go vet ./...` run and a failure rolls \
+                        everything back, returning the command output as the error."
+    )]
+    async fn apply_refactor(&self, req: Parameters<ApplyRefactorRequest>) -> String {
+        let req = req.0;
+        let repo_root = match Self::resolve_repo_root(&PathBuf::from(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        let applied = tokio::task::spawn_blocking(move || {
+            crate::refactor::apply::apply_plan(
+                &repo_root,
+                &req.plan,
+                &crate::refactor::apply::RealIo,
+            )
+        })
+        .await;
+        match applied {
+            Ok(Ok(result)) => serde_json::to_string(&result)
+                .unwrap_or_else(|e| json_error(format!("error serializing response: {e}"))),
+            Ok(Err(e)) => json_error(format!("{e:#}")),
+            Err(e) => json_error(format!("apply task failed: {e}")),
+        }
+    }
+
     #[tool(
         description = "Resolve one architecture node by exact reference — a package path or a \
                         symbol id — and return it as JSON ({\"kind\": \"package\"|\"symbol\"|\"not_found\", ...}). \
@@ -1324,6 +1440,217 @@ impl KibitzerServer {
         serde_json::to_string(&response)
             .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
     }
+
+    #[tool(
+        description = "Rank mechanical refactors worth considering (currently split_package for \
+                        packages in an import cycle) — read-only. JSON ({suggestions, abstained, \
+                        truncated}); each suggestion carries evidence, feasibility from a \
+                        what-if simulation, blockers, and the plan_split_refactor call. Abstains, with \
+                        a reason, rather than recommending on thin evidence."
+    )]
+    async fn suggest_refactors(&self, req: Parameters<SuggestRefactorsRequest>) -> String {
+        let req = req.0;
+        let repo_root = match Self::resolve_repo_root(Path::new(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        let model = match self.load_model_off_stack(repo_root, true).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+        let (suggestions, abstained) = crate::refactor_split::suggest(&model, &req.scope);
+        let (suggestions, t1) = crate::refactor_split::cap_list(suggestions);
+        let (abstained, t2) = crate::refactor_split::cap_list(abstained);
+        serde_json::json!({"suggestions": suggestions, "abstained": abstained, "truncated": t1 || t2})
+            .to_string()
+    }
+
+    #[tool(
+        description = "What-if for splitting a package into sub-packages — read-only, never \
+                        writes. partition is [{name, symbols}]; unlisted symbols stay behind. \
+                        JSON ({feasible, blocker, violations_resolved, violations_introduced, \
+                        importers_affected, importer_list, importer_list_truncated})."
+    )]
+    async fn simulate_split(&self, req: Parameters<SimulateSplitRequest>) -> String {
+        let req = req.0;
+        let repo_root = match Self::resolve_repo_root(Path::new(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        let model = match self.load_model_off_stack(repo_root, true).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+        let result = crate::refactor_split::simulate_split(&model, &req.package, &req.partition);
+        serde_json::to_string(&result).unwrap_or_else(|e| json_error(e.to_string()))
+    }
+
+    #[tool(
+        description = "Plan a refactor without applying it. operation: \"split_package\" with \
+                        args {package, partition:[{name, symbols}]} (Go only; whole files move). \
+                        Persists the plan under the worktree's git dir and returns plan_id, \
+                        staleness_token (HEAD), edits (capped), importers_touched, \
+                        exported_surface_changes, verification_steps and touched_paths."
+    )]
+    async fn plan_split_refactor(&self, req: Parameters<PlanRefactorRequest>) -> String {
+        let req = req.0;
+        if req.operation != "split_package" {
+            return refactor_error_json(
+                "unsupported",
+                format!("unknown operation '{}'", req.operation),
+            );
+        }
+        let args: SplitArgs = match serde_json::from_value(req.args) {
+            Ok(a) => a,
+            Err(e) => return refactor_error_json("bad_args", format!("invalid args: {e}")),
+        };
+        let repo_root = match Self::resolve_repo_root(Path::new(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        let model = match self.load_model_off_stack(repo_root.clone(), true).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+        let planned = tokio::task::spawn_blocking(move || {
+            crate::refactor_split::plan_split(&model, &repo_root, &args.package, &args.partition)
+        })
+        .await;
+        match planned {
+            Ok(Ok(plan)) => crate::refactor_split::plan_response(&plan).to_string(),
+            Ok(Err(e)) => refactor_error_json(e.code, e.message),
+            Err(e) => json_error(format!("refactor task failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Apply a plan from plan_split_refactor atomically and run its verification \
+                        (auto-rolls back if verification fails); changes are staged, not \
+                        committed. Requires allow_write_tools: true in the repo's \
+                        .kibitzer/inspect.json. Refuses unknown/stale plans, dirty trees and \
+                        paths locked by another session's plan."
+    )]
+    async fn apply_split_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
+        self.write_tool(req.0, |repo, id| {
+            crate::refactor_split::apply(repo, id)
+                .map(|o| serde_json::to_value(o).unwrap_or_default())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Re-run the verification steps of an applied plan without re-applying it. \
+                        Requires allow_write_tools: true in .kibitzer/inspect.json."
+    )]
+    async fn verify_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
+        self.write_tool(req.0, |repo, id| {
+            crate::refactor_split::verify(repo, id)
+                .map(|v| serde_json::to_value(v).unwrap_or_default())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Restore the pre-apply state of an applied plan's files while they are \
+                        uncommitted and unmodified since apply. Requires allow_write_tools: true \
+                        in .kibitzer/inspect.json."
+    )]
+    async fn revert_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
+        self.write_tool(req.0, |repo, id| {
+            crate::refactor_split::revert(repo, id)
+                .map(|files| serde_json::json!({"reverted": true, "files": files}))
+        })
+        .await
+    }
+}
+
+fn refactor_error_json(code: &str, message: String) -> String {
+    serde_json::json!({"error": message, "code": code}).to_string()
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct SuggestRefactorsRequest {
+    /// Any path inside the repo.
+    path: String,
+    /// Package-path prefixes to restrict suggestions to; empty means the whole repo.
+    #[serde(default)]
+    scope: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct SimulateSplitRequest {
+    /// Any path inside the repo.
+    path: String,
+    /// Package key as shown by list_architecture_symbols (e.g. a Go import path).
+    package: String,
+    partition: Vec<crate::refactor_split::PartitionGroup>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct PlanRefactorRequest {
+    /// Any path inside the repo.
+    path: String,
+    /// Currently only "split_package".
+    operation: String,
+    /// Operation arguments; for split_package: {package, partition}.
+    args: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct SplitArgs {
+    package: String,
+    partition: Vec<crate::refactor_split::PartitionGroup>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct PlanIdRequest {
+    /// Any path inside the repo the plan was made for.
+    path: String,
+    plan_id: String,
+}
+
+impl KibitzerServer {
+    /// Shared gate for the write tools: only the repo's own `.kibitzer/inspect.json`
+    /// (not a global config) can enable them.
+    async fn write_tool<F>(&self, req: PlanIdRequest, f: F) -> String
+    where
+        F: FnOnce(&Path, &str) -> Result<serde_json::Value, crate::refactor_split::RefactorError>
+            + Send
+            + 'static,
+    {
+        let repo_root = match Self::resolve_repo_root(Path::new(&req.path)) {
+            Ok(r) => r,
+            Err(e) => return json_error(e),
+        };
+        // Only the repo's own config may enable writes; a parent directory's must not.
+        let enabled = {
+            let root = repo_root.clone();
+            let start = PathBuf::from(&req.path);
+            tokio::task::spawn_blocking(move || match find_config(&root) {
+                // The config must sit at the requested path's own repo root, not an ancestor's.
+                Ok(Some((c, dir))) => {
+                    c.allow_write_tools
+                        && std::fs::canonicalize(&dir).ok()
+                            == std::fs::canonicalize(find_repo_root(&start)).ok()
+                }
+                _ => false,
+            })
+            .await
+            .unwrap_or(false)
+        };
+        if !enabled {
+            return refactor_error_json(
+                "opt_in_required",
+                "write tools are disabled; set \"allow_write_tools\": true in this repo's .kibitzer/inspect.json".into(),
+            );
+        }
+        let id = req.plan_id;
+        match tokio::task::spawn_blocking(move || f(&repo_root, &id)).await {
+            Ok(Ok(v)) => v.to_string(),
+            Ok(Err(e)) => refactor_error_json(e.code, e.message),
+            Err(e) => json_error(format!("refactor task failed: {e}")),
+        }
+    }
 }
 
 impl KibitzerServer {
@@ -1455,7 +1782,35 @@ impl ServerHandler for KibitzerServer {
     }
 }
 
+/// Names of every tool the server exposes, for `kibitzer mcp list`.
+pub fn tool_names() -> Vec<String> {
+    let mut names: Vec<String> = KibitzerServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Rolls back an apply a previous process died in the middle of, for the repo at the working
+/// directory. Best-effort: a server must still start when this fails, so errors are logged.
+pub fn recover_orphaned_refactors() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(root) = KibitzerServer::resolve_repo_root(&cwd) else {
+        return;
+    };
+    match crate::refactor::apply::recover(&root) {
+        Ok(Some(id)) => eprintln!("kibitzer: rolled back interrupted refactor {id}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("kibitzer: could not recover interrupted refactor: {e:#}"),
+    }
+}
+
 pub async fn run_mcp_server() -> Result<()> {
+    recover_orphaned_refactors();
     let server = KibitzerServer::new()
         .serve(rmcp::transport::stdio())
         .await?;
@@ -3177,6 +3532,20 @@ mod tests {
     }
 
     #[test]
+    fn refactor_tools_are_registered() {
+        let router = KibitzerServer::tool_router();
+        let tools = router.list_all();
+        for name in [
+            "list_refactor_operations",
+            "simulate_refactor",
+            "plan_refactor",
+            "apply_refactor",
+        ] {
+            assert!(tools.iter().any(|t| t.name == name), "{name} is registered");
+        }
+    }
+
+    #[test]
     fn call_traversal_tools_are_registered_with_json_descriptions() {
         let router = KibitzerServer::tool_router();
         let tools = router.list_all();
@@ -3480,5 +3849,167 @@ mod tests {
             assert!(!output.contains("[Blocking]"), "got: {output}");
             assert!(!output.contains("[Advisory]"), "got: {output}");
         }
+    }
+
+    #[tokio::test]
+    async fn parent_directory_opt_in_does_not_enable_write_tools() {
+        let parent = tmp_dir("refactor-optin-parent");
+        std::fs::create_dir_all(parent.join(".kibitzer")).unwrap();
+        std::fs::write(
+            parent.join(".kibitzer/inspect.json"),
+            r#"{"allow_write_tools": true}"#,
+        )
+        .unwrap();
+        let repo = parent.join("child");
+        std::fs::create_dir_all(&repo).unwrap();
+        let out = KibitzerServer::new()
+            .apply_split_refactor(Parameters(PlanIdRequest {
+                path: repo.display().to_string(),
+                plan_id: "abc123".into(),
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["code"], "opt_in_required", "{out}");
+    }
+
+    #[tokio::test]
+    async fn refactor_tools_end_to_end_over_the_server() {
+        use std::process::Command;
+        let dir = tmp_dir("refactor-e2e");
+        let w = |p: &str, c: &str| {
+            let f = dir.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, c).unwrap();
+        };
+        w("go.mod", "module fixture\n\ngo 1.21\n");
+        w(
+            "a/x.go",
+            "package a\n\nimport \"fixture/b\"\n\nfunc X() int { return b.B() }\n",
+        );
+        w("a/y.go", "package a\n\nfunc Y() int { return 1 }\n");
+        w(
+            "b/b.go",
+            "package b\n\nimport \"fixture/a\"\n\nfunc B() int { return a.Y() }\n",
+        );
+        w(".kibitzer/inspect.json", r#"{"allow_write_tools": true}"#);
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "init"],
+        ] {
+            let st = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(&args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let path = dir.display().to_string();
+        let server = KibitzerServer::new();
+        let json = |out: String| -> serde_json::Value { serde_json::from_str(&out).unwrap() };
+
+        let sug = json(
+            server
+                .suggest_refactors(Parameters(SuggestRefactorsRequest {
+                    path: path.clone(),
+                    scope: vec![],
+                }))
+                .await,
+        );
+        assert_eq!(sug["suggestions"][0]["package"], "fixture/a", "{sug}");
+
+        let partition = vec![crate::refactor_split::PartitionGroup {
+            name: "ypart".into(),
+            symbols: vec!["Y".into()],
+        }];
+        let sim = json(
+            server
+                .simulate_split(Parameters(SimulateSplitRequest {
+                    path: path.clone(),
+                    package: "fixture/a".into(),
+                    partition: partition.clone(),
+                }))
+                .await,
+        );
+        assert_eq!(sim["feasible"], true, "{sim}");
+
+        let unsupported = json(
+            server
+                .plan_split_refactor(Parameters(PlanRefactorRequest {
+                    path: path.clone(),
+                    operation: "nope".into(),
+                    args: serde_json::json!({}),
+                }))
+                .await,
+        );
+        assert_eq!(unsupported["code"], "unsupported");
+        let bad_args = json(
+            server
+                .plan_split_refactor(Parameters(PlanRefactorRequest {
+                    path: path.clone(),
+                    operation: "split_package".into(),
+                    args: serde_json::json!({"package": 1}),
+                }))
+                .await,
+        );
+        assert_eq!(bad_args["code"], "bad_args");
+
+        let plan = json(
+            server
+                .plan_split_refactor(Parameters(PlanRefactorRequest {
+                    path: path.clone(),
+                    operation: "split_package".into(),
+                    args: serde_json::json!({"package": "fixture/a", "partition": partition}),
+                }))
+                .await,
+        );
+        let id = plan["plan_id"].as_str().unwrap().to_string();
+        assert!(!dir.join("a/ypart").exists(), "plan must not write");
+
+        let req = || PlanIdRequest {
+            path: path.clone(),
+            plan_id: id.clone(),
+        };
+        let applied = json(server.apply_split_refactor(Parameters(req())).await);
+        assert_eq!(applied["applied"], true, "{applied}");
+        assert!(dir.join("a/ypart").exists());
+        let verified = json(server.verify_refactor(Parameters(req())).await);
+        assert!(verified.get("passed").is_some(), "{verified}");
+        let reverted = json(server.revert_refactor(Parameters(req())).await);
+        assert_eq!(reverted["reverted"], true, "{reverted}");
+        assert!(!dir.join("a/ypart").exists(), "revert restores the tree");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_tools_are_inert_without_opt_in() {
+        let dir = tmp_dir("refactor-optin");
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
+        std::fs::write(dir.join("keep.txt"), "x").unwrap();
+        let server = KibitzerServer::new();
+        let out = server
+            .apply_split_refactor(Parameters(PlanIdRequest {
+                path: dir.display().to_string(),
+                plan_id: "abc123".into(),
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["code"], "opt_in_required", "{out}");
+        assert!(v["error"].as_str().unwrap().contains("allow_write_tools"));
+        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no files created"
+        );
     }
 }

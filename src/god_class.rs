@@ -169,6 +169,7 @@ fn god_class_findings_for_package(pkg: &PackageNode, model: &ArchModel) -> Vec<A
                     ids.len()
                 ),
                 severity_override: None,
+                operation: None,
             })
         })
         .collect()

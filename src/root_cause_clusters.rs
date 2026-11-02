@@ -347,6 +347,7 @@ mod tests {
             line: Some(3),
             message: "[import-cycles] cycle involves a.rs".to_string(),
             severity_override: None,
+            operation: None,
         };
         let findings = vec![finding];
         let result = corroborate(Path::new(""), &["a.rs"], &HashMap::new(), &findings);
@@ -368,6 +369,7 @@ mod tests {
             line: Some(3),
             message: "[import-cycles] cycle involves pkg/a.rs".to_string(),
             severity_override: None,
+            operation: None,
         };
         let findings = vec![finding];
         let result = corroborate(
@@ -386,6 +388,7 @@ mod tests {
             line: None,
             message: "[instability] pkg/domain is in the zone of pain".to_string(),
             severity_override: None,
+            operation: None,
         };
         let findings = vec![finding];
         let mut file_packages = HashMap::new();
@@ -407,6 +410,7 @@ mod tests {
             line: None,
             message: "cycle involves unrelated.rs".to_string(),
             severity_override: None,
+            operation: None,
         };
         let findings = vec![finding];
         assert_eq!(
