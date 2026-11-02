@@ -169,3 +169,18 @@ fn backtest_suggest_on_env_repo() {
         eprintln!("  ABSTAIN {} {}", x.package, x.reason);
     }
 }
+
+#[test]
+fn group_names_must_be_safe_go_identifiers() {
+    for bad in ["../x", "a/b", "x\"", "Upper", "func", "", "1a"] {
+        assert!(!valid_go_ident(bad), "{bad:?} should be rejected");
+    }
+    assert!(valid_go_ident("svc_store2"));
+}
+
+#[test]
+fn truncation_respects_char_boundaries() {
+    let mut s = "é".repeat(3000);
+    truncate_at_boundary(&mut s, 4000);
+    assert!(s.len() <= 4000 && s.chars().all(|c| c == 'é'));
+}

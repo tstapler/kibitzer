@@ -1393,9 +1393,14 @@ impl KibitzerServer {
             Ok(m) => m,
             Err(e) => return json_error(e),
         };
-        match crate::refactor::plan_split(&model, &repo_root, &args.package, &args.partition) {
-            Ok(plan) => crate::refactor::plan_response(&plan).to_string(),
-            Err(e) => refactor_error_json(e.code, e.message),
+        let planned = tokio::task::spawn_blocking(move || {
+            crate::refactor::plan_split(&model, &repo_root, &args.package, &args.partition)
+        })
+        .await;
+        match planned {
+            Ok(Ok(plan)) => crate::refactor::plan_response(&plan).to_string(),
+            Ok(Err(e)) => refactor_error_json(e.code, e.message),
+            Err(e) => json_error(format!("refactor task failed: {e}")),
         }
     }
 
@@ -1495,7 +1500,21 @@ impl KibitzerServer {
             Ok(r) => r,
             Err(e) => return json_error(e),
         };
-        let enabled = matches!(find_config(&repo_root), Ok(Some((c, _))) if c.allow_write_tools);
+        // Only the repo's own config may enable writes; a parent directory's must not.
+        let enabled = {
+            let root = repo_root.clone();
+            let start = PathBuf::from(&req.path);
+            tokio::task::spawn_blocking(move || match find_config(&root) {
+                // The config must sit at the requested path's own repo root, not an ancestor's.
+                Ok(Some((c, dir))) => {
+                    c.allow_write_tools
+                        && std::fs::canonicalize(&dir).ok() == std::fs::canonicalize(find_repo_root(&start)).ok()
+                }
+                _ => false,
+            })
+            .await
+            .unwrap_or(false)
+        };
         if !enabled {
             return refactor_error_json(
                 "opt_in_required",
@@ -3665,6 +3684,23 @@ mod tests {
             assert!(!output.contains("[Blocking]"), "got: {output}");
             assert!(!output.contains("[Advisory]"), "got: {output}");
         }
+    }
+
+    #[tokio::test]
+    async fn parent_directory_opt_in_does_not_enable_write_tools() {
+        let parent = tmp_dir("refactor-optin-parent");
+        std::fs::create_dir_all(parent.join(".kibitzer")).unwrap();
+        std::fs::write(parent.join(".kibitzer/inspect.json"), r#"{"allow_write_tools": true}"#).unwrap();
+        let repo = parent.join("child");
+        std::fs::create_dir_all(&repo).unwrap();
+        let out = KibitzerServer::new()
+            .apply_refactor(Parameters(PlanIdRequest {
+                path: repo.display().to_string(),
+                plan_id: "abc123".into(),
+            }))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["code"], "opt_in_required", "{out}");
     }
 
     #[tokio::test]

@@ -56,6 +56,20 @@ fn graph_of(model: &ArchModel) -> ImportGraph {
     graph
 }
 
+const GO_KEYWORDS: &[&str] = &[
+    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for", "func",
+    "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select", "struct",
+    "switch", "type", "var",
+];
+
+/// Group names become a directory, a Go package clause and an import alias.
+fn valid_go_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !GO_KEYWORDS.contains(&name)
+}
+
 /// Which group (by index; `partition.len()` = the remainder left in the original package)
 /// owns each symbol id of `package`. Methods follow their parent type.
 fn assign_groups(
@@ -72,6 +86,9 @@ fn assign_groups(
     for (i, g) in partition.iter().enumerate() {
         if g.name.is_empty() || !names.insert(g.name.as_str()) {
             return Err(format!("group name '{}' is empty or duplicated", g.name));
+        }
+        if !valid_go_ident(&g.name) {
+            return Err(format!("group name '{}' must match [a-z_][a-z0-9_]* and not be a Go keyword", g.name));
         }
         if g.symbols.is_empty() {
             return Err(format!("group '{}' has no symbols", g.name));
@@ -690,17 +707,19 @@ fn acquire_locks(repo: &Path, plan: &RefactorPlan) -> Result<(), RefactorError> 
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default();
                         let owner = cur["plan_id"].as_str().unwrap_or("");
-                        let live = cur["head"].as_str() == Some(plan.staleness_token.as_str());
-                        if owner == plan.plan_id {
-                            break;
-                        }
+                        // An unreadable lock body counts as live: never steal on a guess.
+                        let live = cur["head"].as_str().map_or(true, |h| h == plan.staleness_token);
                         if live || attempt == 1 {
                             return err(
                                 "lock_conflict",
                                 format!("{rel} is locked by plan '{owner}' from another session"),
                             );
                         }
-                        let _ = std::fs::remove_file(&lf); // stale: owner's HEAD is gone
+                        // Stale: owner's HEAD is gone. Rename is atomic, so only one stealer wins.
+                        let tomb = lf.with_extension(format!("stale-{}", plan.plan_id));
+                        if std::fs::rename(&lf, &tomb).is_ok() {
+                            let _ = std::fs::remove_file(&tomb);
+                        }
                     }
                     Err(e) => return err("io", e.to_string()),
                 }
@@ -736,6 +755,13 @@ pub struct Verification {
     pub output: String,
 }
 
+fn truncate_at_boundary(s: &mut String, max: usize) {
+    if s.len() > max {
+        let end = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        s.truncate(end);
+    }
+}
+
 pub fn run_verification(repo: &Path, plan: &RefactorPlan) -> Verification {
     if plan.verification_steps.is_empty() {
         return Verification { passed: true, skipped: true, output: "no verification steps for this repo".into() };
@@ -752,14 +778,14 @@ pub fn run_verification(repo: &Path, plan: &RefactorPlan) -> Verification {
                 output.push_str(&String::from_utf8_lossy(&o.stdout));
                 output.push_str(&String::from_utf8_lossy(&o.stderr));
                 if !o.status.success() {
-                    output.truncate(4000);
+                    truncate_at_boundary(&mut output, 4000);
                     return Verification { passed: false, skipped: false, output };
                 }
             }
             Err(e) => return Verification { passed: false, skipped: false, output: e.to_string() },
         }
     }
-    output.truncate(4000);
+    truncate_at_boundary(&mut output, 4000);
     Verification { passed: true, skipped: false, output }
 }
 
@@ -838,7 +864,11 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
     }
     let mut add = vec!["add", "-A", "--"];
     add.extend(paths_refs(&plan));
-    git(repo, &add)?;
+    if let Err(e) = git(repo, &add) {
+        restore_originals(repo, &plan);
+        release_locks(repo, &plan);
+        return Err(e);
+    }
     let verification = run_verification(repo, &plan);
     if !verification.passed {
         restore_originals(repo, &plan);
@@ -851,7 +881,11 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
         });
     }
     plan.status = PlanStatus::Applied;
-    save_plan(repo, &plan)?;
+    if let Err(e) = save_plan(repo, &plan) {
+        restore_originals(repo, &plan);
+        release_locks(repo, &plan);
+        return Err(e);
+    }
     let diff_summary = git(repo, &["diff", "--cached", "--stat"]).unwrap_or_default();
     Ok(ApplyOutcome { applied: true, rolled_back: false, diff_summary, verification })
 }
