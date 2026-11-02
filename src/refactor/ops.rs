@@ -97,12 +97,22 @@ fn file_hazards(f: &mut Findings, path: &str, src: &str, partial: bool) {
     }
 }
 
-fn dir_hazards(ws: &Workspace, f: &mut Findings, dir: &str) {
+fn dir_hazards(ws: &Workspace, f: &mut Findings, dir: &str, whole_dir: bool) {
     if ws.native_dirs.contains(dir) {
         f.block(BlockingDiagnostic::new(
             "native_sources",
             format!("{dir} contains non-Go sources (.c/.h/.s/...) that are not moved"),
         ));
+    }
+    if ws.asset_dirs.contains(dir) {
+        let msg = format!(
+            "{dir} has testdata/ or other non-Go files that are not moved with the Go files"
+        );
+        if whole_dir {
+            f.block(BlockingDiagnostic::new("non_go_assets", msg));
+        } else {
+            f.warnings.push(msg);
+        }
     }
 }
 
@@ -179,7 +189,7 @@ pub fn partial_move(
     let b_name = dest_info
         .as_ref()
         .map_or_else(|| derive_pkg_name(dest_import), |p| p.name.clone());
-    dir_hazards(ws, f, from_dir);
+    dir_hazards(ws, f, from_dir, false);
 
     // 1. Choose units.
     let mut units: Vec<Unit> = vec![];
@@ -442,8 +452,8 @@ pub fn partial_move(
             for spec in gs::imports(&src) {
                 let alias = match &spec.name {
                     gs::ImportName::Alias(x) => Some(x.clone()),
-                    gs::ImportName::Dot => Some(".".to_string()),
-                    gs::ImportName::Blank => Some("_".to_string()),
+                    // Dot/blank imports can't be proven used, so they stay with the source file.
+                    gs::ImportName::Dot | gs::ImportName::Blank => continue,
                     gs::ImportName::Implicit => None,
                 };
                 content = gs::add_import(&content, &spec.path, alias.as_deref());
@@ -477,11 +487,6 @@ pub fn partial_move(
                     text: String::new(),
                 });
             }
-            rest_edits.retain(|e| {
-                !moved_edits
-                    .iter()
-                    .any(|m| m.start == e.start && m.text == e.text)
-            });
             let mut rest = gs::apply_edits(&src, rest_edits);
             if refs_b {
                 rest = gs::add_import(&rest, dest_import, None);
@@ -530,19 +535,35 @@ pub fn partial_move(
         let b_alias_existing = gs::imports(&src)
             .into_iter()
             .find(|i| i.path == b_dir_import);
+        let mut alias_needed = false;
         let bq = match &b_alias_existing {
             Some(i) => match &i.name {
                 gs::ImportName::Alias(x) => x.clone(),
                 _ => b_name.clone(),
             },
+            None if b_name == q => {
+                // Same package name on both sides: import the new package under an alias.
+                alias_needed = true;
+                import_alias_for(dest_import)
+            }
             None => b_name.clone(),
         };
         if b_alias_existing.is_none() {
-            let clash = gs::imports(&src).iter().any(|i| {
-                i.path != a_import && spec_name(ws, i).as_deref() == Some(b_name.as_str())
-            }) || gs::top_level_names(&src).contains(&b_name);
+            let clash = gs::imports(&src)
+                .iter()
+                .any(|i| i.path != a_import && spec_name(ws, i).as_deref() == Some(bq.as_str()))
+                || gs::top_level_names(&src).contains(&bq)
+                || bq == q;
             if clash {
-                f.block(BlockingDiagnostic::new("import_name_collision", format!("importing {b_dir_import} as `{b_name}` would collide with an existing name")).at(&file, None));
+                f.block(
+                    BlockingDiagnostic::new(
+                        "import_name_collision",
+                        format!(
+                            "importing {b_dir_import} as `{bq}` would collide with an existing name"
+                        ),
+                    )
+                    .at(&file, None),
+                );
                 continue;
             }
         }
@@ -566,10 +587,14 @@ pub fn partial_move(
                     ));
                 }
                 let out = {
-                    let added = gs::add_import(&new_src, &b_dir_import, None);
+                    let added = gs::add_import(
+                        &new_src,
+                        &b_dir_import,
+                        alias_needed.then_some(bq.as_str()),
+                    );
                     gs::prune_unused_imports(&added, &known_name_fn(ws))
                 };
-                importing_b.push(super_import_of(ws, &file_dir));
+                importing_b.push(ws.import_of_dir(&file_dir));
                 ws.set(&file, out);
                 f.affected_dirs.insert(file_dir);
             }
@@ -628,8 +653,17 @@ pub fn partial_move(
     surface(f, &a_import, dest_import, &b_name, &moved_units);
 }
 
-fn super_import_of(ws: &Workspace, dir: &str) -> String {
-    ws.import_of_dir(dir)
+/// Distinct alias for importing `import` when its package name equals the importer's:
+/// the last two path elements, e.g. `m/sub/lib` -> `sublib`.
+fn import_alias_for(import: &str) -> String {
+    let parts: Vec<&str> = import.rsplit('/').take(2).collect();
+    let joined: String = parts
+        .iter()
+        .rev()
+        .flat_map(|p| p.chars())
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    joined.to_lowercase()
 }
 
 fn new_dest_paths(
@@ -653,13 +687,13 @@ fn symbol_conflicts(
     just_placed: &BTreeSet<String>,
 ) {
     // Evaluate against the destination as it was on disk: pre-existing files only.
-    let mut shadow: BTreeMap<String, ()> = BTreeMap::new();
+    let mut shadow: BTreeSet<String> = BTreeSet::new();
     for p in ws.files_in_dir(dest_dir) {
         if !just_placed.contains(&p) {
-            shadow.insert(p, ());
+            shadow.insert(p);
         }
     }
-    for df in shadow.keys() {
+    for df in &shadow {
         let Some(src) = ws.get(df) else { continue };
         let kind = if is_ext_test(df, src) {
             "ext_test"
@@ -852,7 +886,7 @@ pub fn rename_pkg(
             format!("{from_import} has nested packages; moving them is not part of rename-pkg"),
         ));
     }
-    dir_hazards(ws, f, &from_dir);
+    dir_hazards(ws, f, &from_dir, true);
     let new_name = match name_override {
         Some(n) => n.to_string(),
         None if a.name == derive_pkg_name(from_import) => derive_pkg_name(to_import),

@@ -299,6 +299,10 @@ fn negative_fixtures_report_the_expected_blocker() {
     );
     for (case, code) in [
         ("move-files/hazard-build-tag", "build_constraint"),
+        (
+            "move-files/hazard-build-tag-license-header",
+            "build_constraint",
+        ),
         ("move-files/hazard-cgo", "cgo"),
         ("move-files/hazard-generated", "generated_file"),
         ("move-files/hazard-init-registration", "init_registration"),
@@ -593,4 +597,94 @@ fn rename_handles_tags_generated_and_init_but_blocks_cgo_native_and_embed() {
     )
     .unwrap();
     assert_eq!(codes(&rename(&root)), vec!["go_embed"]);
+}
+
+#[test]
+fn move_into_a_same_named_package_imports_it_under_an_alias() {
+    let root = input_copy("samename");
+    let plan = plan_move_files(
+        &root,
+        &["lib/moved.go".into()],
+        "example.com/m/sub/lib",
+        None,
+    )
+    .unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    let app = plan
+        .steps
+        .iter()
+        .find(|s| s.transform.new_path.as_deref() == Some("app/main.go"))
+        .unwrap();
+    let content = app.transform.new_content.as_ref().unwrap();
+    assert!(
+        content.contains("sublib \"example.com/m/sub/lib\"") && content.contains("sublib.Moved()"),
+        "{content}"
+    );
+    let opts = ApplyOptions {
+        verify: go_available(),
+        ..Default::default()
+    };
+    let result = apply(&plan, &root, &opts).unwrap();
+    assert_eq!(
+        result.status,
+        ApplyStatus::Applied,
+        "{:?}",
+        result.verify.map(|v| v.build.output)
+    );
+}
+
+#[test]
+fn plans_cannot_write_outside_the_repo_or_inject_go_flags() {
+    let root = input_copy("base");
+    let mut plan = base_move_plan(&root);
+    plan.steps[0].transform.new_path = Some("../escape.go".into());
+    let before = checksums(&root);
+    assert!(
+        apply(&plan, &root, &ApplyOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("leaves the repository")
+    );
+    let mut plan = base_move_plan(&root);
+    plan.affected_packages = vec!["-toolexec=evil".into()];
+    assert!(
+        apply(&plan, &root, &ApplyOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("not a relative package path")
+    );
+    assert_eq!(checksums(&root), before);
+    assert!(!root.parent().unwrap().join("escape.go").exists());
+}
+
+#[test]
+fn sync_policy_rewrites_guard_configs_for_modules_without_a_dot() {
+    let root = input_copy("nodot");
+    let source = plan_rename_pkg(&root, "myapp/lib", "myapp/core", None, None).unwrap();
+    assert!(source.blockers.is_empty(), "{:?}", source.blockers);
+    let policy = plan_sync_policy(&root, &source).unwrap();
+    let step = policy
+        .steps
+        .iter()
+        .find(|s| s.transform.new_path.as_deref() == Some(".golangci.yml"))
+        .expect("guard step");
+    assert!(
+        step.transform
+            .new_content
+            .as_ref()
+            .unwrap()
+            .contains("\"myapp/core\"")
+    );
+}
+
+#[test]
+fn rename_blocks_when_testdata_would_be_stranded_but_partial_moves_only_warn() {
+    let root = input_copy("plain");
+    std::fs::create_dir_all(root.join("lib/testdata")).unwrap();
+    std::fs::write(root.join("lib/testdata/g.txt"), "x").unwrap();
+    let rename =
+        plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+    assert!(rename.blockers.iter().any(|b| b.code == "non_go_assets"));
+    let mv = plan_move_files(&root, &["lib/util.go".into()], "example.com/m/util", None).unwrap();
+    assert!(mv.blockers.is_empty() && mv.warnings.iter().any(|w| w.contains("testdata")));
 }

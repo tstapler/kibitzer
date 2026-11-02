@@ -193,7 +193,34 @@ fn prune_empty_dirs(root: &Path, plan: &MovePlan) {
     }
 }
 
+/// Plans are data a reviewer may have edited: keep every path inside the repo and every
+/// package argument a plain relative package path (never a `go` flag).
+fn validate_plan(plan: &MovePlan) -> Result<()> {
+    for s in &plan.steps {
+        for p in [&s.transform.old_path, &s.transform.new_path]
+            .into_iter()
+            .flatten()
+        {
+            let path = Path::new(p);
+            let escapes = path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+            if escapes || p.is_empty() {
+                bail!("plan path `{p}` is absolute or leaves the repository; refusing to apply");
+            }
+        }
+    }
+    for pkg in &plan.affected_packages {
+        if pkg != "." && !(pkg.starts_with("./") && !pkg.contains("..")) {
+            bail!("plan package `{pkg}` is not a relative package path; refusing to apply");
+        }
+    }
+    Ok(())
+}
+
 pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyResult> {
+    validate_plan(plan)?;
     if !plan.blockers.is_empty() {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
         bail!(
@@ -216,6 +243,7 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
             status: ApplyStatus::AlreadyApplied,
             applied_steps: 0,
             verify: None,
+            restore_errors: vec![],
             plan: plan.clone(),
         });
     }
@@ -252,11 +280,12 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
         let ok = v.ok();
         verify = Some(v);
         if !ok {
-            journal.restore();
+            let restore_errors = journal.restore();
             return Ok(ApplyResult {
                 status: ApplyStatus::RolledBack,
                 applied_steps: 0,
                 verify,
+                restore_errors,
                 plan: plan.clone(),
             });
         }
@@ -266,6 +295,7 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
         status: ApplyStatus::Applied,
         applied_steps: plan.steps.len(),
         verify,
+        restore_errors: vec![],
         plan: plan.clone(),
     })
 }

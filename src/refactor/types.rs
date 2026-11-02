@@ -154,6 +154,9 @@ pub struct ApplyResult {
     pub applied_steps: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyResult>,
+    /// Paths that could not be restored after a rollback (empty when the rollback was clean).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore_errors: Vec<String>,
     pub plan: MovePlan,
 }
 

@@ -20,7 +20,8 @@ Shared flags: `--repo <dir>` (module root, default `.`), `--out <file>`, `--simu
 <file>` (embed feasibility-simulation JSON), `--apply`, `--post-apply <shell cmd>`,
 `--affected-only`. Without `--apply` nothing is written and the plan JSON is printed
 (exit 2 if it has blockers). With `--apply`, exit 3 means verification failed and the
-tree was rolled back.
+tree was rolled back; exit 4 means the rollback itself failed for some path (listed in
+`restore_errors`) and the tree must be inspected.
 
 `split-pkg` takes `{"clusters":[{"to":"import/path","files":["a.go","b_test.go"]}]}`
 (`--focus-json` is an alias for `--partition`); the clusters are applied in order as
@@ -30,14 +31,17 @@ this partition does not exist yet, so the file format is defined here.
 ### Plan and apply model
 
 * Paths in a plan are repo-relative; each step carries the new content and the SHA-256
-  of the content it replaces. A plan is the exact bytes that will be written (already
-  `gofmt`ed, so applying never reformats).
+  of the content it replaces. A plan is the exact bytes that will be written. Rewritten
+  files are `gofmt`ed at plan time only when the original was already gofmt-clean, so a
+  pre-existing formatting problem is not folded into the diff. Plan paths must stay inside
+  the repo and `affected_packages` must be relative package paths; anything else is
+  rejected before any write.
 * **Idempotence.** Before writing, every step is classified against disk: all steps
   already at their target state → `already_applied` (no-op); some → error `plan is
   partially applied … nothing was modified`; any source changed since planning → error
   `stale plan … nothing was modified`.
 * **Atomicity.** Every touched path (old and new) is snapshotted; each write goes to a
-  temp file then `rename`. On any failure — a write, a removal, or verification — every
+  temp file then `rename`. On a write/removal failure or a failed verification — a write, a removal, or verification — every
   snapshotted path is restored (the restore loop calls `create_dir_all` before each
   write), directories created by the apply are removed, and temp files are deleted.
 * **Verification.** After writing: optional `--post-apply` hook (for regeneration), then
@@ -55,6 +59,12 @@ this partition does not exist yet, so the file format is defined here.
   `.go-arch-lint.yml`, `.depguard.yml`. A policy plan built from a blocked move plan is
   itself blocked. It is never folded into the move plan, so a reviewer can accept one
   without the other.
+
+Limits of the guarantee: there is no signal handling (a kill during `go test` leaves the
+written, unverified tree, and the next `apply` of the plan reports it as partially
+applied); file modes and symlinks are not preserved across the temp-file rename; and
+verification has no baseline or timeout, so a pre-existing `go vet`/`go test` failure
+rolls every move back.
 
 ## Why tree-sitter in Rust (and not `gopls`)
 
@@ -114,7 +124,7 @@ implementation notes asked to avoid. What replaces resolution:
 
 | Situation | rename-pkg | move-files / extract-decls / split-pkg | Where |
 |---|---|---|---|
-| Build constraints (`//go:build`, `// +build`, `_linux.go` suffixes) | Handled — files move intact with their tags | **Blocked** `build_constraint` — tag variants other than the host's cannot be verified | `file_hazards` |
+| Build constraints (`//go:build`, `// +build` — found by comment position, so a license block above is fine — and GOOS/GOARCH filename suffixes) | Handled — files move intact with their tags | **Blocked** `build_constraint` — tag variants other than the host's cannot be verified | `file_hazards` |
 | cgo (`import "C"`) | **Blocked** `cgo` — preamble and sibling `.c/.h` files would be left behind | **Blocked** `cgo` | `file_hazards` |
 | `.s/.c/.h/.cc/.cpp/.syso` files in the source dir | **Blocked** `native_sources` | **Blocked** `native_sources` | `dir_hazards` |
 | `//go:embed` | **Blocked** `go_embed` | **Blocked** `go_embed` | `file_hazards` |
@@ -124,6 +134,8 @@ implementation notes asked to avoid. What replaces resolution:
 | Dot import of the source package | Path rewritten | **Blocked** `dot_import` | importer loop |
 | Import-path strings in reflection/plugins/config the tool cannot see | Not detected (no resolved references); `go test` is the backstop | Not detected | — |
 | Nested packages under the source dir | **Blocked** `has_subpackages` | n/a | `rename_pkg` |
+| `testdata/` or other non-Go files (not `*.md`/`OWNERS`/dotfiles) in the source dir | **Blocked** `non_go_assets` — they are not moved | Warning | `dir_hazards` |
+| Moving into a package with the same name as the source | n/a | Handled — importers import the destination under a distinct alias (`m/sub/lib` → `sublib`) | importer loop |
 | Nested Go modules, `vendor/`, `testdata/`, `_*`/`.*` dirs | Skipped, never edited | Skipped | `Workspace::walk` |
 | Cross-module move (destination outside `module`) | **Blocked** `outside_module` | **Blocked** `outside_module` | |
 | Method and receiver type split across packages | n/a | **Blocked** `method_split` (extract moves methods with their type) | |
@@ -142,6 +154,18 @@ implementation notes asked to avoid. What replaces resolution:
 | `format_failed` | A rewritten file does not parse (`gofmt` rejected it) |
 
 Exported-surface changes are listed in `surface_changes` (`old.Path.Name -> new.Path.Name`).
+
+## Known limits of the rewrite
+
+* Third-party imports are never pruned (their package name cannot be guessed from the
+  path), so an extracted file keeps any third-party import it no longer uses and fails
+  verification instead of being cleaned; standard-library and module-local imports are
+  pruned. Dot and blank imports stay with the source file and are not copied to the
+  destination.
+* A split-out destination file starts with only a `package` clause; the source file's
+  license header is not copied.
+* A trailing comment on the line of the previous declaration is not treated as the next
+  declaration's doc comment.
 
 ## Out of v1
 
@@ -191,7 +215,8 @@ code.
 
 Scale/noise run on `kubernetes/kubernetes` (plan only, nothing applied): 60 package
 directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-pkg` to
-`<pkg>x`: **38 clean, 22 blocked, 0 errors, 23.8 s total (~0.4 s each)**. Blockers:
-`has_subpackages` ×18, `shadowed_package_name` ×4. The four shadow blockers are the
+`<pkg>x`: **37 clean, 23 blocked, 0 errors (~0.4 s each)**. Blockers: `has_subpackages` ×18,
+`shadowed_package_name` ×4, `non_go_assets` ×1 (counts re-run after the `non_go_assets`
+check was added; before it, 38 clean / 22 blocked). The four shadow blockers are the
 conservative-by-design case described above; they were not individually triaged for
 being true or false positives.

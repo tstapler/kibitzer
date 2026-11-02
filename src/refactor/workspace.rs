@@ -17,6 +17,8 @@ pub struct Workspace {
     moves: BTreeMap<String, String>,
     /// Directories holding non-Go sources a package move would leave behind (cgo, asm).
     pub native_dirs: BTreeSet<String>,
+    /// Directories with `testdata/` or other non-Go files a directory move would strand.
+    pub asset_dirs: BTreeSet<String>,
     imports_memo: std::cell::RefCell<HashMap<String, Vec<String>>>,
 }
 
@@ -74,6 +76,7 @@ impl Workspace {
             edits: BTreeMap::new(),
             moves: BTreeMap::new(),
             native_dirs: BTreeSet::new(),
+            asset_dirs: BTreeSet::new(),
             imports_memo: Default::default(),
         };
         ws.walk(root, "")?;
@@ -88,6 +91,9 @@ impl Workspace {
             let child_rel = join(rel, &name);
             let ty = e.file_type()?;
             if ty.is_dir() {
+                if name == "testdata" {
+                    self.asset_dirs.insert(rel.to_string());
+                }
                 if name.starts_with('.')
                     || name.starts_with('_')
                     || SKIP_DIRS.contains(&name.as_str())
@@ -107,6 +113,8 @@ impl Workspace {
                     && NATIVE_EXTS.contains(&ext)
                 {
                     self.native_dirs.insert(rel.to_string());
+                } else if !(name.ends_with(".md") || name == "OWNERS" || name.starts_with('.')) {
+                    self.asset_dirs.insert(rel.to_string());
                 }
             }
         }

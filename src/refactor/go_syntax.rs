@@ -321,13 +321,16 @@ pub fn reliable_import_name(spec: &ImportSpec, known_pkg_name: Option<&str>) -> 
             if let Some(n) = known_pkg_name {
                 return Some(n.to_string());
             }
+            // Standard-library paths (no dot in the first element) are named by their last
+            // element; third-party names (`.../go` -> `jsoniter`) cannot be guessed.
+            let first = spec.path.split('/').next().unwrap_or("");
             let last = spec.path.rsplit('/').next().unwrap_or("");
             let is_version = last.len() > 1
                 && last.starts_with('v')
                 && last[1..].chars().all(|c| c.is_ascii_digit());
             let plain =
                 !last.is_empty() && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            (plain && !is_version).then(|| last.to_string())
+            (!first.contains('.') && plain && !is_version).then(|| last.to_string())
         }
     }
 }
@@ -496,7 +499,9 @@ pub fn top_decls(src: &str) -> Vec<TopDecl> {
         let mut j = i;
         while j > 0 {
             let prev = kids[j - 1];
+            let own_line = j < 2 || kids[j - 2].end_position().row < prev.start_position().row;
             let adjacent = prev.kind() == "comment"
+                && own_line
                 && prev.end_position().row + 1 >= kids[j].start_position().row;
             if adjacent {
                 start = prev.start_byte();
@@ -595,10 +600,49 @@ pub fn is_generated(src: &str) -> bool {
 }
 
 pub fn has_build_constraint(path: &str, src: &str) -> bool {
-    const OS: &[&str] = &[
-        "linux", "darwin", "windows", "freebsd", "openbsd", "netbsd", "plan9", "solaris", "js",
-        "wasip1", "amd64", "arm64", "386", "arm", "wasm", "ppc64le", "s390x", "riscv64", "mips",
-        "android", "ios",
+    const SUFFIXES: &[&str] = &[
+        "aix",
+        "android",
+        "darwin",
+        "dragonfly",
+        "freebsd",
+        "hurd",
+        "illumos",
+        "ios",
+        "js",
+        "linux",
+        "nacl",
+        "netbsd",
+        "openbsd",
+        "plan9",
+        "solaris",
+        "wasip1",
+        "windows",
+        "zos",
+        "386",
+        "amd64",
+        "amd64p32",
+        "arm",
+        "armbe",
+        "arm64",
+        "arm64be",
+        "loong64",
+        "mips",
+        "mipsle",
+        "mips64",
+        "mips64le",
+        "mips64p32",
+        "mips64p32le",
+        "ppc",
+        "ppc64",
+        "ppc64le",
+        "riscv",
+        "riscv64",
+        "s390",
+        "s390x",
+        "sparc",
+        "sparc64",
+        "wasm",
     ];
     let stem = path
         .rsplit('/')
@@ -606,15 +650,28 @@ pub fn has_build_constraint(path: &str, src: &str) -> bool {
         .unwrap_or(path)
         .trim_end_matches(".go")
         .trim_end_matches("_test");
-    let suffix_hit = stem.rsplit('_').next().is_some_and(|s| OS.contains(&s)) && stem.contains('_');
-    suffix_hit
-        || src
+    if stem.contains('_')
+        && stem
+            .rsplit('_')
+            .next()
+            .is_some_and(|s| SUFFIXES.contains(&s))
+    {
+        return true;
+    }
+    // Constraints live in comments before the package clause (after any license block).
+    let Some(tree) = parse(src) else { return false };
+    for n in children(tree.root_node()) {
+        if n.kind() != "comment" {
+            break;
+        }
+        if text(n, src)
             .lines()
-            .take_while(|l| {
-                let t = l.trim();
-                t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*')
-            })
             .any(|l| l.starts_with("//go:build") || l.starts_with("// +build"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn imports_cgo(src: &str) -> bool {
@@ -714,5 +771,42 @@ mod tests {
             "package a\n\n// #include <x.h>\nimport \"C\"\n"
         ));
         assert!(has_init_func("package a\n\nfunc init() {}\n"));
+    }
+
+    #[test]
+    fn trailing_comment_is_not_the_next_decls_doc() {
+        let src = "package a\n\nvar Stay = 1 // trailing\nfunc Go() int { return 2 }\n";
+        let d = top_decls(src);
+        assert!(!src[d[1].start..d[1].end].contains("trailing"));
+    }
+
+    #[test]
+    fn license_block_does_not_hide_build_constraint() {
+        let licensed =
+            "/*\nCopyright 2020 Someone.\n\nLicensed.\n*/\n\n//go:build linux\npackage a\n";
+        assert!(has_build_constraint("a.go", licensed));
+        assert!(has_build_constraint("a_dragonfly.go", "package a\n"));
+    }
+
+    #[test]
+    fn third_party_import_names_are_not_guessed() {
+        let spec = |p: &str| ImportSpec {
+            path: p.into(),
+            name: ImportName::Implicit,
+            line: 1,
+            spec_start: 0,
+            spec_end: 0,
+            path_start: 0,
+            path_end: 0,
+            sole_decl: None,
+        };
+        assert_eq!(
+            reliable_import_name(&spec("strings"), None).as_deref(),
+            Some("strings")
+        );
+        assert_eq!(
+            reliable_import_name(&spec("github.com/json-iterator/go"), None),
+            None
+        );
     }
 }

@@ -99,12 +99,11 @@ pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
         .filter(|m| !m.from.is_empty())
         .collect();
     maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+    let module_prefix = format!("{}/", source.module);
     let import_maps: Vec<&PathMapping> = maps
         .iter()
         .copied()
-        .filter(|m| {
-            m.from.contains('.') && !m.from.ends_with(".go") && m.from.starts_with(&source.module)
-        })
+        .filter(|m| m.from == source.module || m.from.starts_with(&module_prefix))
         .collect();
     let mut steps = vec![];
     let mut warnings = vec![];
