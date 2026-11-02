@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Effective uid of this process.
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -90,6 +90,21 @@ fn check_own_dir(dir: &Path, trust: DirTrust, tighten: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// Creates `dir` (mode 0700) if missing; an existing one must be ours, not a symlink, and not
+/// writable by group or others, so nobody else can replace a socket inside it.
+pub(crate) fn ensure_socket_dir(dir: &Path) -> Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create its parent: {e}"))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_own_dir(dir, DirTrust::NotWritableByOthers, false)
+        }
+        Err(e) => Err(format!("cannot create it: {e}")),
+    }
+}
+
 /// A runtime directory kibitzer will use, and the refusal that led to it when it is the private
 /// fallback for an `XDG_RUNTIME_DIR` that was not acceptable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +131,7 @@ pub(crate) fn trusted_runtime_dir() -> Result<RuntimeDir, DirRejected> {
 /// followed once, and its target must be a private directory of ours; the returned path is the
 /// resolved one so nothing re-traverses the link. A plain directory may be 0755 but never
 /// group- or other-writable.
-fn accept_xdg_dir(dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn accept_xdg_dir(dir: &Path) -> Result<PathBuf, String> {
     let is_link = std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink());
     if !is_link {
         return check_own_dir(dir, DirTrust::NotWritableByOthers, false)

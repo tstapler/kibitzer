@@ -1,0 +1,450 @@
+//! `kibitzer mcp --socket`: the MCP server as streamable HTTP over a Unix domain socket, so one
+//! long-lived process can serve many clients instead of each client spawning `kibitzer mcp`.
+//!
+//! There is no authentication beyond the OS: the socket is 0600 in a directory only this user
+//! can write, and each connection's peer uid must equal ours. Any process running as this user
+//! can still connect, exactly as it could run `kibitzer mcp` itself. Each MCP session gets its
+//! own `KibitzerServer` (and so its own architecture-model cache slot), like a stdio process.
+
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use axum::Router;
+use axum::serve::Listener;
+use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, SessionConfig};
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+
+use crate::daemon_lock::{accept_xdg_dir, current_uid, ensure_socket_dir, open_lock_file};
+use crate::mcp::KibitzerServer;
+
+pub const MCP_PATH: &str = "/mcp";
+
+const OWNER_ONLY_DIR: u32 = 0o700;
+const OWNER_ONLY_FILE: u32 = 0o600;
+
+/// rmcp's default is no idle timeout. After this, an idle session's worker (and its
+/// `KibitzerServer`) ends and rmcp drops it from the session map (see
+/// `idle_session_should_LeaveSessionMap_When_KeepAliveExpires`); `--connect` re-initializes.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Open SSE streams never finish on their own, so graceful shutdown would otherwise wait
+/// on them forever.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// `$XDG_RUNTIME_DIR/kibitzer/mcp.sock` when that directory is trustworthy, else
+/// `<cache dir>/kibitzer/mcp/mcp.sock`.
+pub fn default_socket_path() -> PathBuf {
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let cache_dir = crate::cache::default_cache_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    default_socket_path_in(xdg, &cache_dir)
+}
+
+fn default_socket_path_in(xdg: Option<PathBuf>, cache_dir: &Path) -> PathBuf {
+    match xdg.map(|dir| accept_xdg_dir(&dir)) {
+        Some(Ok(dir)) => dir.join("kibitzer").join("mcp.sock"),
+        _ => cache_dir.join("mcp").join("mcp.sock"),
+    }
+}
+
+/// Removes the socket when the server stops; the held lock keeps a second server off `path`.
+struct SocketFile {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub(crate) struct BoundSocket {
+    listener: UnixListener,
+    file: SocketFile,
+}
+
+/// Binds `path` owner-only: 0700 parent, 0600 socket, never reachable by others even briefly
+/// (it is bound in a private staging directory, chmodded, then renamed into place). Refuses a
+/// path another server owns or answers on, or that isn't a socket; removes a stale socket.
+pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .with_context(|| format!("socket path {} has no parent directory", path.display()))?;
+    ensure_socket_dir(parent)
+        .map_err(|why| anyhow::anyhow!("refusing socket directory {}: {why}", parent.display()))?;
+
+    let lock_path = path.with_extension("lock");
+    let lock = open_lock_file(&lock_path)
+        .with_context(|| format!("opening lock {}", lock_path.display()))?;
+    if lock.try_lock().is_err() {
+        bail!(
+            "another kibitzer MCP server already owns {}",
+            path.display()
+        );
+    }
+
+    remove_stale_socket(path)?;
+    let listener = bind_via_private_staging(parent, path)?;
+    listener.set_nonblocking(true)?;
+    Ok(BoundSocket {
+        listener: UnixListener::from_std(listener)?,
+        file: SocketFile {
+            path: path.to_path_buf(),
+            _lock: lock,
+        },
+    })
+}
+
+/// Removes a socket nothing answers on; refuses a live one or a non-socket.
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_socket() => {
+            bail!(
+                "{} exists and is not a socket; refusing to replace it",
+                path.display()
+            )
+        }
+        Ok(_) if std::os::unix::net::UnixStream::connect(path).is_ok() => {
+            bail!("a server is already answering on {}", path.display())
+        }
+        Ok(_) => std::fs::remove_file(path)
+            .with_context(|| format!("removing stale socket {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("checking {}", path.display())),
+    }
+}
+
+/// Binds inside a fresh 0700 directory and chmods before the rename, so the socket is never
+/// reachable by others even if `parent` is merely not-writable (e.g. 0755).
+fn bind_via_private_staging(
+    parent: &Path,
+    path: &Path,
+) -> Result<std::os::unix::net::UnixListener> {
+    let staging = parent.join(format!(".mcp-bind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::DirBuilder::new()
+        .mode(OWNER_ONLY_DIR)
+        .create(&staging)
+        .with_context(|| format!("creating {}", staging.display()))?;
+    let staged = staging.join("s");
+    let bound = std::os::unix::net::UnixListener::bind(&staged)
+        .and_then(|l| {
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
+            std::fs::rename(&staged, path)?;
+            Ok(l)
+        })
+        .with_context(|| format!("binding {}", path.display()));
+    let _ = std::fs::remove_dir_all(&staging);
+    bound
+}
+
+/// Accepts only connections whose peer runs as `uid`; others are dropped unanswered.
+struct SameUidListener {
+    inner: UnixListener,
+    uid: u32,
+}
+
+impl Listener for SameUidListener {
+    type Io = UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = Listener::accept(&mut self.inner).await;
+            match stream.peer_cred() {
+                Ok(cred) if cred.uid() == self.uid => return (stream, addr),
+                Ok(cred) => eprintln!(
+                    "[kibitzer] rejected MCP socket connection from uid {}",
+                    cred.uid()
+                ),
+                Err(e) => eprintln!("[kibitzer] rejected MCP socket connection: {e}"),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+pub async fn run_mcp_socket_server(path: PathBuf) -> Result<()> {
+    let bound = bind_socket(&path)?;
+    eprintln!(
+        "[kibitzer] MCP server listening on unix socket {} (streamable HTTP at {MCP_PATH})",
+        path.display()
+    );
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_termination_signal().await;
+        eprintln!("[kibitzer] shutting down MCP server");
+        let _ = tx.send(true);
+    });
+    serve(
+        bound,
+        rx,
+        session_manager(SESSION_IDLE_TIMEOUT),
+        current_uid(),
+    )
+    .await
+}
+
+async fn wait_for_termination_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+fn session_manager(idle_timeout: Duration) -> Arc<LocalSessionManager> {
+    Arc::new(LocalSessionManager {
+        sessions: Default::default(),
+        session_config: SessionConfig {
+            keep_alive: Some(idle_timeout),
+            ..Default::default()
+        },
+    })
+}
+
+/// Serves until `shutdown` flips to true, drains for at most `SHUTDOWN_GRACE`, then removes
+/// the socket.
+async fn serve(
+    bound: BoundSocket,
+    shutdown: watch::Receiver<bool>,
+    sessions: Arc<LocalSessionManager>,
+    allowed_uid: u32,
+) -> Result<()> {
+    let BoundSocket { listener, file } = bound;
+    let service = StreamableHttpService::new(
+        || Ok(KibitzerServer::new()),
+        sessions,
+        StreamableHttpServerConfig::default(),
+    );
+    let app = Router::new().route_service(MCP_PATH, service);
+    let listener = SameUidListener {
+        inner: listener,
+        uid: allowed_uid,
+    };
+    let server =
+        axum::serve(listener, app).with_graceful_shutdown(until_shutdown(shutdown.clone()));
+    let result = tokio::select! {
+        result = server => result.context("MCP server failed"),
+        _ = async {
+            until_shutdown(shutdown).await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => Ok(()),
+    };
+    drop(file);
+    result
+}
+
+async fn until_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if shutdown.wait_for(|stop| *stop).await.is_err() {
+        // Sender dropped without signalling: never shut down on that alone.
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+pub(crate) mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+    use crate::test_support::unique_temp_dir;
+
+    pub(crate) struct TestServer {
+        pub path: PathBuf,
+        pub sessions: Arc<LocalSessionManager>,
+        stop: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl TestServer {
+        pub(crate) async fn start(dir: &Path, idle: Duration, allowed_uid: u32) -> Self {
+            let path = dir.join("run").join("mcp.sock");
+            let bound = bind_socket(&path).unwrap();
+            let sessions = session_manager(idle);
+            let (stop, rx) = watch::channel(false);
+            let task = tokio::spawn(serve(bound, rx, Arc::clone(&sessions), allowed_uid));
+            Self {
+                path,
+                sessions,
+                stop,
+                task,
+            }
+        }
+
+        pub(crate) async fn stop(self) {
+            self.stop.send(true).unwrap();
+            self.task.await.unwrap().unwrap();
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn default_socket_path_should_UseXdgRuntimeDir_When_Trusted() {
+        let dir = unique_temp_dir("mcpsock-xdg");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(OWNER_ONLY_DIR)).unwrap();
+        let got = default_socket_path_in(Some(dir.clone()), Path::new("/cache"));
+        assert_eq!(got, dir.join("kibitzer").join("mcp.sock"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_socket_path_should_FallBackToCacheDir_When_XdgMissingOrUntrusted() {
+        let cache = Path::new("/cache/kibitzer");
+        let want = cache.join("mcp").join("mcp.sock");
+        assert_eq!(default_socket_path_in(None, cache), want);
+        let dir = unique_temp_dir("mcpsock-xdg-loose");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(default_socket_path_in(Some(dir.clone()), cache), want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_should_CreatePrivateDirAndOwnerOnlySocket() {
+        let dir = unique_temp_dir("mcpsock-perm");
+        let path = dir.join("run").join("mcp.sock");
+        let bound = bind_socket(&path).unwrap();
+        assert_eq!(mode(path.parent().unwrap()), OWNER_ONLY_DIR);
+        assert_eq!(mode(&path), OWNER_ONLY_FILE);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        // Nothing left behind from staging.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".mcp-bind"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        drop(bound);
+        assert!(!path.exists(), "dropping the bound socket unlinks it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_should_RefuseSecondOwner_And_LiveServer() {
+        let dir = unique_temp_dir("mcpsock-live");
+        let path = dir.join("run").join("mcp.sock");
+        let _first = bind_socket(&path).unwrap();
+        let err = bind_socket(&path).err().unwrap();
+        assert!(err.to_string().contains("already owns"), "{err}");
+
+        // A socket something answers on, without our lock (e.g. a pre-lock server).
+        let other = dir.join("other").join("mcp.sock");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        let _live = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        let err = bind_socket(&other).err().unwrap();
+        assert!(err.to_string().contains("already answering"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_should_ReplaceStaleSocket_And_RefuseNonSocket() {
+        let dir = unique_temp_dir("mcpsock-stale");
+        let path = dir.join("run").join("mcp.sock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(
+            path.exists(),
+            "a dropped std listener leaves its socket file"
+        );
+        let bound = bind_socket(&path).unwrap();
+        assert_eq!(mode(&path), OWNER_ONLY_FILE);
+        drop(bound);
+
+        std::fs::write(&path, "not a socket").unwrap();
+        let err = bind_socket(&path).err().unwrap();
+        assert!(err.to_string().contains("not a socket"), "{err}");
+        assert!(path.exists(), "a non-socket file is never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_should_RefuseDirWritableByOthers() {
+        let dir = unique_temp_dir("mcpsock-loose");
+        let run = dir.join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = bind_socket(&run.join("mcp.sock")).err().unwrap();
+        assert!(
+            err.to_string().contains("refusing socket directory"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serve_should_DropConnection_When_PeerUidDiffers() {
+        let dir = unique_temp_dir("mcpsock-uid");
+        let server = TestServer::start(&dir, SESSION_IDLE_TIMEOUT, current_uid() + 1).await;
+        let reply = crate::mcp_bridge::tests::initialize_raw(&server.path).await;
+        assert!(
+            reply.is_err(),
+            "a foreign-uid peer must get no answer: {reply:?}"
+        );
+        server.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serve_should_AnswerInitialize_And_UnlinkSocketOnShutdown() {
+        let dir = unique_temp_dir("mcpsock-serve");
+        let server = TestServer::start(&dir, SESSION_IDLE_TIMEOUT, current_uid()).await;
+        let path = server.path.clone();
+        let session = crate::mcp_bridge::tests::initialize_raw(&path)
+            .await
+            .unwrap();
+        assert!(!session.is_empty());
+        assert_eq!(server.sessions.sessions.read().await.len(), 1);
+        server.stop().await;
+        assert!(!path.exists(), "shutdown unlinks the socket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn idle_session_should_LeaveSessionMap_When_KeepAliveExpires() {
+        let dir = unique_temp_dir("mcpsock-idle");
+        let server = TestServer::start(&dir, Duration::from_millis(200), current_uid()).await;
+        crate::mcp_bridge::tests::initialize_raw(&server.path)
+            .await
+            .unwrap();
+        assert_eq!(server.sessions.sessions.read().await.len(), 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !server.sessions.sessions.read().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "idle session never left the map"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        server.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

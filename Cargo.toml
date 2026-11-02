@@ -32,10 +32,15 @@ tree-sitter-kotlin-ng = "1.1.0"
 rmcp = { version = "0.2", features = ["server", "transport-io", "transport-streamable-http-server", "transport-worker"] }
 # "transport-worker" is listed explicitly because rmcp 0.2.1's streamable-HTTP server
 # session code needs it but its feature doesn't enable it (fails to compile without).
-# axum hosts rmcp's tower `StreamableHttpService` for `kibitzer mcp --http`; HTTP/1 only.
+# axum hosts rmcp's tower `StreamableHttpService` on the `kibitzer mcp --socket` Unix socket;
+# hyper (client side) carries `kibitzer mcp --connect`'s requests to it. HTTP/1 only.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 schemars = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "signal", "time"] }
 tower-lsp = "0.20.0"
 tree-sitter-rust = "0.24"
 sha2 = "0.11"

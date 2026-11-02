@@ -35,7 +35,8 @@ kibitzer run [dir] --trigger batch   # batch mode: check every file under dir
 kibitzer install [--global] [--dry-run]  # wire the PostToolUse hook into settings.json
 kibitzer hook                        # Claude Code PostToolUse hook, reads event off stdin
 kibitzer mcp                         # serve as an MCP server over stdio
-kibitzer mcp --http 127.0.0.1:8787   # serve MCP over streamable HTTP at /mcp (see below)
+kibitzer mcp --socket [path]         # one shared MCP server on a Unix socket (see below)
+kibitzer mcp --connect [path]        # stdio MCP bridge to that shared server
 kibitzer lsp                         # serve as an LSP server over stdio (diagnostics) (see docs/lsp.md)
 kibitzer daemon start|stop|status    # background daemon that caches check results
 kibitzer check native primitive-obsession <file>   # run a single built-in check directly
@@ -54,27 +55,41 @@ New to kibitzer? See `docs/getting-started.md` for a walkthrough of wiring
 it into a repo end to end. See `docs/checking-invocations.md` for how
 checks are wired up.
 
-### MCP over HTTP
+### One shared MCP server
 
 By default each MCP client spawns its own `kibitzer mcp` over stdio. To
-serve many clients from one long-lived process instead, run it over
-streamable HTTP and register the URL:
+serve many clients from one long-lived process instead, run a shared server
+on a Unix socket and register the stdio bridge with each client:
 
 ```bash
-kibitzer mcp --http 127.0.0.1:8787
-claude mcp add --transport http kibitzer http://127.0.0.1:8787/mcp
+kibitzer mcp --socket          # $XDG_RUNTIME_DIR/kibitzer/mcp.sock by default
+claude mcp add kibitzer -- kibitzer mcp --connect
 ```
 
-- The endpoint has **no authentication**. Any client that can reach it can
-  run every tool, and tools read whatever absolute paths they're given.
-- It binds loopback only: a non-loopback address is refused unless you also
-  pass `--allow-remote`. While bound to loopback, requests whose `Host` or
-  `Origin` isn't loopback get `403` (DNS-rebinding protection). With
-  `--allow-remote` on a non-loopback address that check is off.
+Both flags take an optional path (`--socket <PATH>`, `--connect <PATH>`).
+The server speaks MCP streamable HTTP at `/mcp` over the socket, but Claude
+Code's HTTP transport takes a URL and can't reach a Unix socket. That's what
+`--connect` is for: a stdio MCP server that forwards each message to the
+socket and loads no checks itself. When the server has dropped the
+bridge's session (idle for 2 hours, or restarted), the bridge opens a new
+one on its own.
+
+- **Who can connect:** only processes running as your user. The socket is
+  `0600`, it sits in a directory only you can write (created `0700`), and
+  the server drops any connection whose peer uid isn't its own. There's no
+  other authentication. Any process running as you can use every tool, so
+  it can make kibitzer run a `command` check from an `inspect.json` it
+  controls. That's no more access than such a process already has, since it
+  could run `kibitzer mcp` (or the command) itself.
+- Without a path, the socket is `$XDG_RUNTIME_DIR/kibitzer/mcp.sock`. If
+  `XDG_RUNTIME_DIR` is unset or untrusted, it's `mcp/mcp.sock` under
+  kibitzer's cache directory (`~/.cache/kibitzer`). The server won't start
+  if another server owns the path or answers on it. It replaces a stale
+  socket, but never a file that isn't a socket.
 - Each MCP session gets its own server instance, so sessions don't share an
-  architecture-model cache. A session idle for 2 hours is closed; the
-  client must re-initialize.
-- Ctrl-C or `SIGTERM` stops it, waiting up to 5 seconds for open streams.
+  architecture-model cache.
+- Ctrl-C or `SIGTERM` stops it. It waits up to 5 seconds for open streams,
+  then removes the socket.
 - Unlike stdio mode, the server's working directory doesn't follow each
   client's project. The one cwd-sensitive behavior is test-file detection:
   it ignores `test/`, `spec/`, … components only in the part of a path above

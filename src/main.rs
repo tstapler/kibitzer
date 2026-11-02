@@ -38,7 +38,8 @@ mod jaccard;
 mod lsp;
 mod markdown_text;
 mod mcp;
-mod mcp_http;
+mod mcp_bridge;
+mod mcp_socket;
 mod mermaid;
 mod middle_man;
 mod node_kind;
@@ -92,17 +93,17 @@ enum Command {
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
-    /// Run kibitzer as an MCP server over stdio, or over streamable HTTP with `--http`.
+    /// Run kibitzer as an MCP server over stdio; or as one shared server on a Unix socket
+    /// (`--socket`) that stdio clients reach through `--connect`.
     Mcp {
-        /// Serve MCP over streamable HTTP at this address (e.g. 127.0.0.1:8787; port 0
-        /// picks a free one) on the `/mcp` path, instead of over stdio. There is no
-        /// authentication.
-        #[arg(long, value_name = "ADDR")]
-        http: Option<std::net::SocketAddr>,
-        /// Allow `--http` to bind a non-loopback address. Anyone who can reach it can
-        /// run every MCP tool, including reading any file path this user can read.
-        #[arg(long, requires = "http")]
-        allow_remote: bool,
+        /// Serve MCP (streamable HTTP at /mcp) on this Unix socket, owner-only, instead of
+        /// stdio. Defaults to $XDG_RUNTIME_DIR/kibitzer/mcp.sock.
+        #[arg(long, value_name = "PATH", num_args = 0..=1, conflicts_with = "connect")]
+        socket: Option<Option<PathBuf>>,
+        /// Serve MCP over stdio by forwarding to a `--socket` server at this path (same
+        /// default), without loading any checks in this process.
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        connect: Option<Option<PathBuf>>,
     },
     /// Run kibitzer as an LSP server over stdio, publishing check results as diagnostics.
     Lsp,
@@ -443,11 +444,18 @@ fn main() -> Result<ExitCode> {
             deny_blocking_suppression,
         ),
         Command::Hook => hook::run_hook(),
-        Command::Mcp { http, allow_remote } => {
+        Command::Mcp { socket, connect } => {
             let rt = tokio::runtime::Runtime::new()?;
-            match http {
-                Some(addr) => rt.block_on(mcp_http::run_mcp_http_server(addr, allow_remote))?,
-                None => rt.block_on(mcp::run_mcp_server())?,
+            let path_or_default =
+                |p: Option<PathBuf>| p.unwrap_or_else(mcp_socket::default_socket_path);
+            match (socket, connect) {
+                (Some(path), _) => {
+                    rt.block_on(mcp_socket::run_mcp_socket_server(path_or_default(path)))?
+                }
+                (None, Some(path)) => {
+                    rt.block_on(mcp_bridge::run_mcp_bridge(path_or_default(path)))?
+                }
+                (None, None) => rt.block_on(mcp::run_mcp_server())?,
             }
             Ok(ExitCode::SUCCESS)
         }
