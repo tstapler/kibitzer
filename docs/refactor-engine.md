@@ -30,8 +30,9 @@ it needs qualifier rewriting.
 
 Type-only references and calls the model leaves unresolved (for example a name that exists in
 two packages) are invisible, so a partial move can miss an importer;
-the verification commands (`go build ./...`, `go vet ./...`) are the backstop once an apply
-path exists. **There is no apply, rollback or WAL yet**, and no `apply_refactor` tool.
+the verification commands (`go build ./...`, `go vet ./...`) run by `apply_refactor` are the
+backstop and trigger rollback. Apply is serialized within one process only; verification builds
+only the first moved file's Go module and has no timeout.
 
 ## Backtest
 
@@ -43,4 +44,4 @@ sibling package, dry-run only.
 |---|---|
 | `anchore/syft` (Go) | 20 listed; 17 infeasible, 3 feasible; 2 plans produced, 1 feasible move refused as entangled; zero panics |
 | `BurntSushi/ripgrep` | no Go packages, nothing to plan; zero panics |
-| `kubernetes/kubernetes` | not run: not cloned on the machine that ran this |
+| `kubernetes/kubernetes` | 20 listed; 16 infeasible, 4 feasible; 4 plans produced (16 refused); zero panics; script exit 0 (2026-11-02) |
