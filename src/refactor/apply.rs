@@ -43,18 +43,67 @@ impl ApplyIo for RealIo {
         let Some(program) = parts.next() else {
             return (false, "empty command".into());
         };
-        match std::process::Command::new(program)
-            .args(parts)
-            .current_dir(dir)
-            .output()
-        {
-            Ok(out) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                (out.status.success(), text)
+        run_bounded(program, parts, dir, cmd)
+    }
+}
+
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Runs a verification command without a shell, with a wall-clock timeout and capped output.
+/// `GOTOOLCHAIN=local` stops a repo's go.mod from downloading and running another toolchain.
+fn run_bounded<'a>(
+    program: &str,
+    args: impl Iterator<Item = &'a str>,
+    dir: &Path,
+    cmd: &str,
+) -> (bool, String) {
+    use std::io::Read as _;
+    let mut child = match std::process::Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .env("GOTOOLCHAIN", "local")
+        .env("GOFLAGS", "-mod=readonly")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (false, format!("failed to run `{cmd}`: {e}")),
+    };
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(s) = stream {
+                let _ = s.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
             }
-            Err(e) => (false, format!("failed to run `{cmd}`: {e}")),
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|s| Box::new(s) as _));
+    let err = drain(child.stderr.take().map(|s| Box::new(s) as _));
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st.success()),
+            Ok(None) if start.elapsed() > VERIFY_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!(
+                    "`{cmd}` timed out after {}s",
+                    VERIFY_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => break Err(format!("waiting for `{cmd}`: {e}")),
         }
+    };
+    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
+    text.push_str(&String::from_utf8_lossy(&err.join().unwrap_or_default()));
+    match status {
+        Ok(ok) => (ok, text),
+        Err(msg) => (false, format!("{msg}\n{text}")),
     }
 }
 
@@ -123,8 +172,38 @@ fn recover_locked(root: &Path) -> Result<Option<String>> {
             path.display()
         )
     })?;
+    check_wal_paths(root, &wal)?;
     rollback(root, &wal)?;
     Ok(Some(wal.plan_id))
+}
+
+/// The WAL lives in the repo, so a hostile one must not steer rollback at files outside it.
+fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
+    let backups = plans_dir(root).join(BACKUP_DIR);
+    for e in &wal.entries {
+        for p in [&e.original, &e.dest, &e.temp] {
+            if !is_inside(root, p) || is_protected(root, p) {
+                bail!(
+                    "WAL names {} outside the repository; refusing to roll back",
+                    p.display()
+                );
+            }
+        }
+        if e.backup.parent() != Some(backups.as_path()) {
+            bail!(
+                "WAL backup {} is not in {}",
+                e.backup.display(),
+                backups.display()
+            );
+        }
+    }
+    if let Some(d) = wal.created_dirs.iter().find(|d| !is_inside(root, d)) {
+        bail!(
+            "WAL names {} outside the repository; refusing to roll back",
+            d.display()
+        );
+    }
+    Ok(())
 }
 
 /// Restores every original from its backup, then removes whatever the apply created. Leaves the
@@ -157,6 +236,13 @@ fn rollback(root: &Path, wal: &Wal) -> Result<()> {
     ignore_missing(std::fs::remove_file(wal_path(root)))?;
     let _ = std::fs::remove_dir_all(plans_dir(root).join(BACKUP_DIR));
     Ok(())
+}
+
+fn ignore_missing_io(r: std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 fn ignore_missing(r: std::io::Result<()>) -> Result<()> {
@@ -210,17 +296,70 @@ fn check_plan(root: &Path, plan: &RefactorPlan) -> Result<()> {
             Edit::ReplaceImportPath { new_path, .. } if !is_safe_import_path(new_path) => {
                 bail!("`{new_path}` is not a valid import path");
             }
+            Edit::ReplaceImportPath { old_path, .. } if !is_safe_import_path(old_path) => {
+                bail!("`{old_path}` is not a valid import path");
+            }
+            Edit::ReplaceImportPath { alias: Some(a), .. }
+                if !is_go_ident(a) || a == "_" || a == "init" =>
+            {
+                bail!("`{a}` is not a valid import alias");
+            }
             _ => {}
         }
     }
     paths.extend(plan.touched.iter().map(|t| t.path.as_path()));
+    if let Some(p) = paths
+        .iter()
+        .find(|p| p.extension().is_none_or(|e| e != "go") || is_protected(root, p))
+    {
+        bail!("{} is not an editable .go file", p.display());
+    }
     if let Some(p) = paths.iter().find(|p| !is_inside(root, p)) {
         bail!("{} is outside the repository", p.display());
     }
     Ok(())
 }
 
+const GO_KEYWORDS: [&str; 25] = [
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+];
+
+/// `.git` and `.kibitzer` hold hooks and check commands; an edit there is code execution.
+fn is_protected(root: &Path, p: &Path) -> bool {
+    p.strip_prefix(root).is_ok_and(|rel| {
+        rel.components()
+            .any(|c| c.as_os_str() == ".git" || c.as_os_str() == ".kibitzer")
+    })
+}
+
 fn is_go_ident(s: &str) -> bool {
+    if GO_KEYWORDS.contains(&s) {
+        return false;
+    }
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
         && chars.all(|c| c.is_alphanumeric() || c == '_')
@@ -328,7 +467,12 @@ fn compute_outputs(plan: &RefactorPlan) -> Result<Vec<Output>> {
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = std::fs::File::create(path)?;
+    // Never follow a planted symlink at a temp name: drop whatever is there and create anew.
+    ignore_missing_io(std::fs::remove_file(path))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()
 }

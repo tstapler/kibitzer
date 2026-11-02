@@ -521,23 +521,133 @@ mod apply_tests {
         assert_tree_unchanged(&dir, &files);
     }
 
+    fn resign(plan: &mut RefactorPlan) {
+        use sha2::{Digest, Sha256};
+        plan.id = String::new();
+        let json = serde_json::to_string(&*plan).unwrap();
+        plan.id = Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+    }
+
+    type Forge = fn(&mut RefactorPlan, &Path);
+
+    /// A plan an MCP client could forge: valid id, hostile content. Each must be refused before
+    /// any write, with the tree untouched.
     #[test]
-    fn is_inside_should_Reject_When_PathEscapesRootByDotDotOrSymlink() {
-        let root = std::env::temp_dir().join(format!("kib-inside-{}", std::process::id()));
-        let outside = std::env::temp_dir().join(format!("kib-outside-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        assert!(super::super::apply::is_inside(&root, &root.join("a/b.go")));
-        assert!(!super::super::apply::is_inside(
+    fn apply_should_Refuse_When_ForgedPlanIsValidlySigned() {
+        let cases: Vec<(&str, &str, Forge)> = vec![
+            ("disallowed command", "not allowed", |p, _| {
+                p.verification_cmds.push("rm -rf /".into());
+            }),
+            ("bad package name", "not a valid Go package name", |p, _| {
+                for e in &mut p.edits {
+                    if let Edit::ReplacePackageDecl { new_name, .. } = e {
+                        *new_name = "a b".into();
+                    }
+                }
+            }),
+            (
+                "import path injection",
+                "not a valid import path",
+                |p, _| {
+                    for e in &mut p.edits {
+                        if let Edit::ReplaceImportPath { new_path, .. } = e {
+                            *new_path = "x\"\nimport \"os".into();
+                        }
+                    }
+                },
+            ),
+            ("unrecorded edit target", "did not record", |p, _| {
+                p.touched.remove(0);
+            }),
+            (
+                "destination escapes via ..",
+                "outside the repository",
+                |p, dir| {
+                    for e in &mut p.edits {
+                        if let Edit::MoveFile { to, .. } = e {
+                            *to = dir.join("../../escaped.go");
+                        }
+                    }
+                },
+            ),
+            (
+                "touched path outside root",
+                "outside the repository",
+                |p, _| {
+                    let mut extra = p.touched[0].clone();
+                    extra.path = PathBuf::from("/etc/x.go");
+                    p.touched.push(extra);
+                },
+            ),
+        ];
+        for (name, want, forge) in cases {
+            let files = base_files();
+            let (dir, mut plan) = plan_for("apply-forged", &files, &op("a", "b", &["a/a1.go"]));
+            forge(&mut plan, &dir);
+            resign(&mut plan);
+            let err = format!(
+                "{:#}",
+                apply_plan(&dir, &plan, &FakeIo::new(None, false)).unwrap_err()
+            );
+            assert!(err.contains(want), "{name}: got {err}");
+            assert_tree_unchanged(&dir, &files);
+            assert!(
+                !dir.join(".kibitzer/plans/.wal").exists(),
+                "{name}: WAL written"
+            );
+        }
+    }
+
+    #[test]
+    fn is_inside_should_Reject_When_PathUsesDotDot() {
+        let root = crate::test_support::unique_temp_dir("inside-dotdot");
+        assert!(crate::refactor::apply::is_inside(
+            &root,
+            &root.join("a/b.go")
+        ));
+        assert!(!crate::refactor::apply::is_inside(
             &root,
             &root.join("../../etc/x")
         ));
-        assert!(!super::super::apply::is_inside(
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_inside_should_Reject_When_SymlinkLeavesRoot() {
+        let root = crate::test_support::unique_temp_dir("inside-link");
+        let outside = crate::test_support::unique_temp_dir("inside-outside");
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(!crate::refactor::apply::is_inside(
             &root,
             &root.join("link/x.go")
         ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn recover_should_Refuse_When_WalNamesPathOutsideRepo() {
+        let dir = crate::test_support::unique_temp_dir("hostile-wal");
+        let plans = dir.join(".kibitzer/plans");
+        std::fs::create_dir_all(plans.join(".wal-backup")).unwrap();
+        std::fs::write(plans.join(".wal-backup/0"), "owned").unwrap();
+        let victim = crate::test_support::unique_temp_dir("hostile-victim").join("bashrc");
+        std::fs::write(&victim, "original").unwrap();
+        let wal = serde_json::json!({
+            "plan_id": "x",
+            "created_dirs": [],
+            "entries": [{
+                "original": victim, "backup": plans.join(".wal-backup/0"),
+                "dest": victim, "temp": dir.join("t.go.tmp")
+            }]
+        });
+        std::fs::write(plans.join(".wal"), wal.to_string()).unwrap();
+        let err = recover(&dir).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("outside the repository"),
+            "got {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
     }
 }
