@@ -136,6 +136,7 @@ impl ArchModelChecker for GoPackageFocusChecker {
                     line,
                     message,
                     severity_override: Some(Severity::Advisory),
+                    operation: None,
                 }
             })
             .collect()

@@ -128,6 +128,7 @@ fn finding_for_type(
             delegating.len()
         ),
         severity_override: None,
+        operation: None,
     })
 }
 

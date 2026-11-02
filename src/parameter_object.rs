@@ -109,6 +109,7 @@ fn findings_for(model: &ArchModel, config: &ArchitectureConfig) -> Vec<ArchFindi
                         format_group(subset)
                     ),
                     severity_override: Some(Severity::Advisory),
+                    operation: None,
                 }
             })
             .collect()
