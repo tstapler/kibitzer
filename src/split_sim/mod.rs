@@ -290,7 +290,19 @@ fn generated_or_unknown(
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Blocker, String> {
     let path = raw.strip_prefix("./").unwrap_or(raw);
-    let on_disk = read(path).or_else(|| {
+    // Partition names arrive from CLI/MCP input; never read outside the repo root.
+    let escapes_root = std::path::Path::new(path).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    });
+    let on_disk = if escapes_root { None } else { read(path) }.or_else(|| {
+        if escapes_root {
+            return None;
+        }
         model
             .packages
             .values()
