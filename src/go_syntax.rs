@@ -1143,5 +1143,40 @@ mod tests {
             "go files {total}: both {both}, new-only {new_only}, old-only {old_only}\n{}",
             samples.join("\n")
         );
+        assert_eq!(
+            old_only, 0,
+            "the shared implementation lost a constraint the legacy scan saw"
+        );
+    }
+
+    #[test]
+    fn add_import_places_the_spec_exactly_and_keeps_the_file_valid() {
+        let valid = |s: &str| parse(s).is_some_and(|t| !t.root_node().has_error());
+        // Single import widened into a group.
+        let out = add_import("package a\n\nimport \"fmt\"\n", "x/y", None);
+        assert_eq!(out, "package a\n\nimport (\n\t\"fmt\"\n\t\"x/y\"\n)\n");
+        // Existing group with a trailing comment, aliased addition.
+        let out = add_import(
+            "package a\nimport (\n\t\"fmt\" // c\n)\n",
+            "x/y",
+            Some("al"),
+        );
+        assert_eq!(
+            out,
+            "package a\nimport (\n\t\"fmt\" // c\n\tal \"x/y\"\n)\n"
+        );
+        assert!(valid(&out));
+        // Already imported: unchanged.
+        let same = "package a\n\nimport \"x/y\"\n";
+        assert_eq!(add_import(same, "x/y", None), same);
+        // No import declaration at all.
+        let out = add_import("package a\n\nfunc f() {}\n", "x/y", None);
+        assert!(valid(&out) && out.contains("\"x/y\""), "{out}");
+        // Blank embed import widened into a group keeps its blank name.
+        let out = add_import("package a\n\nimport _ \"embed\"\n", "x/y", None);
+        assert!(
+            valid(&out) && out.contains("_ \"embed\"") && out.contains("\"x/y\""),
+            "{out}"
+        );
     }
 }

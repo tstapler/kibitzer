@@ -1,9 +1,5 @@
-//! Atomic apply of a [`RefactorPlan`]: all writes land or the tree is restored.
-//!
-//! Order: validate and compute every new file body in memory (nothing written) → the shared
-//! transaction ([`txn`]) backs up originals, writes its log, swaps files in → verify with the Go
-//! toolchain → commit, or roll back. The transaction, path guards and bounded command runner are
-//! shared with the CLI engine in `refactor_core`.
+//! Atomic apply of a `RefactorPlan`: compute every new body in memory, run the shared
+//! transaction (`txn`), verify with the Go toolchain, then commit or roll back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -180,6 +176,14 @@ fn compute_outputs(plan: &RefactorPlan) -> Result<Vec<Output>> {
                 let base = new_name.strip_suffix("_test").unwrap_or(new_name);
                 *body = go_syntax::rewrite_package_clause(body, base)
                     .with_context(|| format!("no package clause in {}", file.display()))?;
+                // Written value must equal the declared one (a hand-edited plan can disagree
+                // with the `_test` suffix the file already has).
+                if go_syntax::package_name(body).as_deref() != Some(new_name.as_str()) {
+                    bail!(
+                        "package clause of {} would not become `{new_name}`; refusing to apply",
+                        file.display()
+                    );
+                }
             }
             Edit::ReplaceImportPath {
                 file,
@@ -239,6 +243,9 @@ fn go_module_dir(root: &Path, start: &Path) -> PathBuf {
 /// Applies `plan` under `root`. Errors leave the tree as it was: a stale or invalid plan is
 /// rejected before any write, and a failed write or failed build/vet is rolled back.
 pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<ApplyResult> {
+    // Lock and crash-recover first, so the stale check and the new bodies below are computed
+    // against a tree no other apply can change before our writes land.
+    let session = txn::session(root)?;
     check_plan(root, plan)?;
     check_not_stale(plan)?;
     let outputs = compute_outputs(plan)?;
@@ -259,7 +266,7 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
         }
     }
     let rename = |from: &Path, to: &Path| io.rename(from, to);
-    let pending = txn::begin(root, &plan.id, &changes, &rename)?;
+    let pending = session.begin(&plan.id, &changes, &rename)?;
     match verify(root, plan, io) {
         Ok(verification) => {
             pending.commit()?;
@@ -271,11 +278,26 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
         }
         Err(cause) => Err(match pending.rollback() {
             Ok(()) => cause.context("apply rolled back; the tree is unchanged"),
-            Err(rb) => anyhow::anyhow!(
-                "{cause:#}\nrollback also failed ({rb:#}); the WAL is kept so the next start can retry"
-            ),
+            Err(rb) => anyhow::Error::new(txn::RollbackFailed {
+                cause: format!("{cause:#}"),
+                rollback: format!("{rb:#}"),
+            }),
         }),
     }
+}
+
+/// A failing `go vet ./...` can print megabytes; an MCP client needs the head of it.
+const MAX_ERROR_OUTPUT: usize = 64 * 1024;
+
+pub(super) fn cap_output(output: &str) -> String {
+    if output.len() <= MAX_ERROR_OUTPUT {
+        return output.to_string();
+    }
+    let mut end = MAX_ERROR_OUTPUT;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[output truncated at 64 KiB]", &output[..end])
 }
 
 fn verify(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<Vec<VerificationStep>> {
@@ -291,7 +313,7 @@ fn verify(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<Vec<Veri
     for cmd in &plan.verification_cmds {
         let (ok, output) = io.run(cmd, &module_dir);
         if !ok {
-            bail!("`{cmd}` failed:\n{output}");
+            bail!("`{cmd}` failed:\n{}", cap_output(&output));
         }
         steps.push(VerificationStep {
             cmd: cmd.clone(),

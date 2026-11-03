@@ -172,7 +172,9 @@ impl MovePlan {
         let mut unsigned = self.clone();
         unsigned.plan_id = String::new();
         unsigned.repo_root = String::new();
-        let json = serde_json::to_vec(&unsigned).unwrap_or_default();
+        // Serialization of these derived types cannot fail; panicking beats an id that silently
+        // hashes the empty string for every plan.
+        let json = serde_json::to_vec(&unsigned).expect("MovePlan serializes");
         crate::refactor_core::sha256_hex(&json)
     }
 

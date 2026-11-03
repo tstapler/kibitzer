@@ -101,4 +101,26 @@ mod tests {
         assert!(is_protected(root, Path::new("/r/.kibitzer/inspect.json")));
         assert!(!is_protected(root, Path::new("/r/pkg/a.go")));
     }
+
+    #[test]
+    fn predicates_reject_the_awkward_inputs() {
+        for bad in ["a`b", "a\\b", "a\nb", "a\tb", "a\u{7}b"] {
+            assert!(!is_safe_import_path(bad), "{bad:?}");
+        }
+        assert!(is_go_ident("é") && is_go_ident("日本"));
+        assert!(
+            is_go_ident("_") && is_go_ident("init"),
+            "syntactically valid; callers add their own bans"
+        );
+        let root = Path::new("/r");
+        assert!(
+            !is_protected(root, Path::new("/elsewhere/.git/x")),
+            "outside root is not this predicate's job"
+        );
+        assert!(
+            is_protected(root, Path::new("/r/a/.git/../b")),
+            "a .git component anywhere in the path counts"
+        );
+        assert!(!is_inside(root, Path::new("/r/../etc/passwd")));
+    }
 }

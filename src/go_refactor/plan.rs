@@ -71,6 +71,12 @@ pub fn build_plan(
             f.blockers.push(b);
         }
     }
+    for u in &ws.unreadable {
+        f.blockers.push(BlockingDiagnostic::new(
+            "unreadable_go_file",
+            format!("{u}; importers in it cannot be found or rewritten"),
+        ));
+    }
     let mut steps = vec![];
     let mut gofmt_missing = false;
     let moved_origins: BTreeSet<&String> = ws.moves().values().collect();
@@ -103,7 +109,14 @@ pub fn build_plan(
                     .at(&path, None),
             );
         }
-        let basis_clean = basis.is_none_or(|b| matches!(gofmt(b), Ok(Some(ref x)) if x == b));
+        let basis_fmt = basis.map(gofmt);
+        // Without gofmt the basis check cannot run either, so the warning must be set here too.
+        if matches!(basis_fmt, Some(Ok(None))) {
+            gofmt_missing = true;
+        }
+        let basis_clean = basis_fmt
+            .as_ref()
+            .is_none_or(|r| matches!(r, Ok(Some(x)) if Some(x.as_str()) == basis));
         if basis_clean {
             match gofmt(&content) {
                 Ok(Some(formatted)) => content = formatted,

@@ -119,12 +119,27 @@ fn run_plan(root: &Path, op: &Value) -> MovePlan {
     }
 }
 
+/// Whether the Go toolchain can be used to verify applied trees. Under CI (or
+/// `KIBITZER_REQUIRE_GO`) a missing toolchain is a failure: otherwise every apply below would
+/// silently skip `go build/vet/test`, the only independent check that the rewritten Go compiles.
 fn go_available() -> bool {
-    std::process::Command::new("go")
+    let ok = std::process::Command::new("go")
         .arg("version")
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    if !ok
+        && (std::env::var_os("CI").is_some() || std::env::var_os("KIBITZER_REQUIRE_GO").is_some())
+    {
+        panic!(
+            "the Go toolchain is required here (CI or KIBITZER_REQUIRE_GO is set) but `go version` failed"
+        );
+    }
+    ok
 }
+
+/// Applied golden cases whose result was checked by `go build/vet/test` (see `golden_cases`).
+static APPLIED_WITH_GO: AtomicUsize = AtomicUsize::new(0);
+static APPLIED_GO_PLANS: AtomicUsize = AtomicUsize::new(0);
 
 fn run_case(case_dir: &Path) {
     let op: Value =
@@ -177,6 +192,12 @@ fn run_case(case_dir: &Path) {
         let result =
             apply(&plan, &root, &opts).unwrap_or_else(|e| panic!("{name}: apply failed: {e:#}"));
         assert_eq!(result.status, ApplyStatus::Applied, "{name}");
+        if !policy_only {
+            APPLIED_GO_PLANS.fetch_add(1, Ordering::SeqCst);
+            if result.verify.is_some() {
+                APPLIED_WITH_GO.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         if let Some(v) = &result.verify {
             assert!(
                 v.ok(),
@@ -237,9 +258,28 @@ fn golden_cases() {
         "expected the full fixture matrix, found {}",
         cases.len()
     );
+    APPLIED_WITH_GO.store(0, Ordering::SeqCst);
+    APPLIED_GO_PLANS.store(0, Ordering::SeqCst);
     for c in cases {
         run_case(&c);
     }
+    // Proof the verification path ran: every applied Go-changing case went through
+    // go build/vet/test (not merely "no failure was observed").
+    let (applied, verified) = (
+        APPLIED_GO_PLANS.load(Ordering::SeqCst),
+        APPLIED_WITH_GO.load(Ordering::SeqCst),
+    );
+    assert!(
+        applied >= 9,
+        "expected the applied golden cases, saw {applied}"
+    );
+    if go_available() {
+        assert_eq!(
+            verified, applied,
+            "{applied} golden cases applied but only {verified} were verified with go"
+        );
+    }
+    eprintln!("golden: {applied} applied cases, {verified} verified with go build/vet/test");
 }
 
 /// Every operation must have the five AC-1 shapes.
@@ -471,6 +511,7 @@ fn stale_or_partial_plan_is_a_clear_error_without_mutation() {
 #[test]
 fn failed_verification_reports_output_verbatim_and_rolls_back() {
     if !go_available() {
+        eprintln!("SKIP: no Go toolchain (set KIBITZER_REQUIRE_GO=1 to make this a failure)");
         return;
     }
     let root = input_copy("base");
@@ -509,6 +550,7 @@ fn failed_verification_reports_output_verbatim_and_rolls_back() {
 #[test]
 fn successful_apply_embeds_all_three_command_outputs() {
     if !go_available() {
+        eprintln!("SKIP: no Go toolchain (set KIBITZER_REQUIRE_GO=1 to make this a failure)");
         return;
     }
     let root = input_copy("base");
@@ -537,6 +579,7 @@ fn successful_apply_embeds_all_three_command_outputs() {
 #[test]
 fn post_apply_hook_failure_rolls_back() {
     if !go_available() {
+        eprintln!("SKIP: no Go toolchain (set KIBITZER_REQUIRE_GO=1 to make this a failure)");
         return;
     }
     let root = input_copy("base");
@@ -835,15 +878,11 @@ fn plans_may_only_touch_expected_files_and_never_through_symlinks() {
     let mut plan = base_move_plan(&root);
     plan.steps[0].transform.new_path = Some(".github/workflows/x.yml".into());
     let plan = plan.sealed();
+    let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
     assert!(
-        apply(&plan, &root, &ApplyOptions::default())
-            .unwrap_err()
-            .to_string()
-            .contains("may not touch")
-            || apply(&plan, &root, &ApplyOptions::default())
-                .unwrap_err()
-                .to_string()
-                .contains("not a file this operation may touch")
+        err.to_string()
+            .contains("not a file this operation may touch"),
+        "{err:#}"
     );
 
     // A non-policy plan cannot carry policy steps (and so cannot skip verification).
@@ -955,4 +994,212 @@ fn path_mappings_that_would_inject_yaml_are_refused() {
     source.path_map[0].to = "example.com/m/core\n  evil-key: true".into();
     let err = plan_sync_policy(&root, &source).unwrap_err();
     assert!(err.to_string().contains("not valid in a path"), "{err:#}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Staleness, plan validation and forged policy plans
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_move_whose_source_changed_after_planning_is_stale_and_writes_nothing() {
+    let root = input_copy("base");
+    let plan = base_move_plan(&root);
+    std::fs::write(
+        root.join("lib/util.go"),
+        "package lib\n\n// edited after planning\n",
+    )
+    .unwrap();
+    let before = checksums(&root);
+    let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("changed since the plan was made"),
+        "{err:#}"
+    );
+    assert_eq!(checksums(&root), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_source_is_a_conflict_not_a_missing_file() {
+    let root = input_copy("base");
+    let plan = base_move_plan(&root);
+    // A directory where the planned file was fails to read with a non-NotFound error, as root too.
+    std::fs::remove_file(root.join("app/app.go")).unwrap();
+    std::fs::create_dir(root.join("app/app.go")).unwrap();
+    let before = checksums(&root);
+    let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("not readable"), "{err:#}");
+    assert_eq!(checksums(&root), before);
+}
+
+/// One way to corrupt a plan for the table-driven refusal tests below.
+type PlanMutator = Box<dyn Fn(&mut MovePlan)>;
+
+#[test]
+fn every_validate_plan_branch_refuses_before_writing() {
+    let rows: Vec<(&str, PlanMutator, &str)> = vec![
+        (
+            "absolute path",
+            Box::new(|p| p.steps[0].transform.new_path = Some("/abs.go".into())),
+            "leaves the repository",
+        ),
+        (
+            "empty path",
+            Box::new(|p| p.steps[0].transform.new_path = Some(String::new())),
+            "leaves the repository",
+        ),
+        (
+            "dotdot",
+            Box::new(|p| p.steps[0].transform.new_path = Some("a/../../x.go".into())),
+            "leaves the repository",
+        ),
+        (
+            "git dir",
+            Box::new(|p| p.steps[0].transform.new_path = Some(".git/hooks/x.go".into())),
+            "may touch",
+        ),
+        (
+            "hidden dir",
+            Box::new(|p| p.steps[0].transform.new_path = Some("a/.h/x.go".into())),
+            "may touch",
+        ),
+        (
+            "not go",
+            Box::new(|p| p.steps[0].transform.new_path = Some("x.txt".into())),
+            "may touch",
+        ),
+        (
+            "pkg dot go",
+            Box::new(|p| p.affected_packages = vec!["./a.go".into()]),
+            "relative package path",
+        ),
+        (
+            "pkg dotdot",
+            Box::new(|p| p.affected_packages = vec!["./../x".into()]),
+            "relative package path",
+        ),
+        (
+            "pkg no prefix",
+            Box::new(|p| p.affected_packages = vec!["a".into()]),
+            "relative package path",
+        ),
+        (
+            "pkg space",
+            Box::new(|p| p.affected_packages = vec!["./x y".into()]),
+            "relative package path",
+        ),
+        (
+            "pkg flag",
+            Box::new(|p| p.affected_packages = vec!["-toolexec=evil".into()]),
+            "relative package path",
+        ),
+    ];
+    for (label, mutate, want) in rows {
+        let root = input_copy("base");
+        let mut plan = base_move_plan(&root);
+        mutate(&mut plan);
+        let before = checksums(&root);
+        let err = apply(&plan.sealed(), &root, &ApplyOptions::default()).expect_err(label);
+        assert!(err.to_string().contains(want), "{label}: {err:#}");
+        assert_eq!(checksums(&root), before, "{label}: tree changed");
+    }
+}
+
+#[test]
+fn a_policy_plan_may_only_touch_the_known_policy_files() {
+    for bad in ["a.go", ".golangci.yml.bak", ".github/workflows/x.yml"] {
+        let root = input_copy("base");
+        let source =
+            plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+        let mut policy = plan_sync_policy(&root, &source).unwrap();
+        policy.steps[0].transform.new_path = Some(bad.into());
+        let before = checksums(&root);
+        let err = apply(&policy.sealed(), &root, &ApplyOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("may touch"), "{bad}: {err:#}");
+        assert_eq!(checksums(&root), before);
+    }
+}
+
+#[test]
+fn a_resealed_forged_sync_policy_plan_is_rejected_in_every_shape() {
+    let forge: Vec<(&str, PlanMutator)> = vec![
+        (
+            "hostile path_map",
+            Box::new(|p| p.path_map[0].to = "x\n  evil: 1".into()),
+        ),
+        (
+            "dropped step",
+            Box::new(|p| {
+                p.steps.pop();
+            }),
+        ),
+        (
+            "extra step",
+            Box::new(|p| {
+                let mut extra = p.steps[0].clone();
+                extra.transform.old_path = None;
+                extra.transform.old_sha256 = None;
+                extra.transform.new_path = Some(".golangci.yml".into());
+                extra.transform.new_content = Some("run:\n  skip-dirs: [\"/\"]\n".into());
+                p.steps.push(extra);
+            }),
+        ),
+    ];
+    for (label, mutate) in forge {
+        let root = input_copy("base");
+        // A second policy file, so the genuine plan has two steps and "drop one" is a forgery
+        // (dropping the only step of a one-step plan is just an empty, harmless plan).
+        std::fs::write(
+            root.join(".golangci.yml"),
+            "linters-settings:\n  depguard:\n    rules:\n      main:\n        files:\n          - \"example.com/m/lib/**\"\n",
+        )
+        .unwrap();
+        let source =
+            plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+        let mut policy = plan_sync_policy(&root, &source).unwrap();
+        assert!(
+            policy.steps.len() >= 2,
+            "{label}: expected two policy steps"
+        );
+        mutate(&mut policy);
+        let before = checksums(&root);
+        assert!(
+            apply(&policy.sealed(), &root, &ApplyOptions::default()).is_err(),
+            "{label}: forged plan was applied"
+        );
+        assert_eq!(checksums(&root), before, "{label}: tree changed");
+    }
+}
+
+#[test]
+fn rollback_that_itself_fails_is_reported_as_a_dirty_tree() {
+    let root = input_copy("base");
+    let plan = base_move_plan(&root);
+    let sabotage = |_: &Path, _: &Path| {
+        let _ = std::fs::remove_dir_all(root.join(".kibitzer/plans/.wal-backup"));
+        Err(std::io::Error::other("injected"))
+    };
+    let result = apply_with(&plan, &root, &ApplyOptions::default(), &sabotage).unwrap();
+    assert_eq!(result.status, ApplyStatus::RolledBack);
+    assert!(
+        !result.restore_errors.is_empty(),
+        "a failed rollback must be visible"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_go_file_blocks_planning_instead_of_being_skipped() {
+    let root = scratch(
+        "unreadable-go",
+        &[
+            ("lib/a.go", "package lib\n\nfunc A() {}\n"),
+            ("app/app.go", "package app\n"),
+        ],
+    );
+    // Not valid UTF-8: the workspace cannot read it, so it could hide an importer.
+    std::fs::write(root.join("app/odd.go"), [0x70u8, 0x61, 0xff, 0xfe, 0x0a]).unwrap();
+    let plan = plan_move_files(&root, &["lib/a.go".into()], "example.com/m/dest", None).unwrap();
+    let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
+    assert!(codes.contains(&"unreadable_go_file"), "{codes:?}");
 }

@@ -7,8 +7,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::plan::sha256_hex;
 use super::types::{FileTransform, MovePlan, OperationKind, PathMapping, PlanStep, PlanStepKind};
+use crate::refactor_core::sha256_hex;
 
 /// Keys whose string values (or array elements) are repo paths/globs.
 const PATH_KEYS: &[&str] = &[

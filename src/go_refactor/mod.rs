@@ -268,7 +268,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn emit(value: &impl serde::Serialize, out: &Option<PathBuf>) -> Result<()> {
+fn emit(value: &impl serde::Serialize, out: Option<&Path>) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     match out {
         Some(p) => std::fs::write(p, format!("{json}\n"))
@@ -329,7 +329,7 @@ pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
         GoRefactorAction::Apply { plan, common } => (read_json(&plan)?, common),
     };
     if !common.apply {
-        emit(&plan, &common.out)?;
+        emit(&plan, common.out.as_deref())?;
         return Ok(if plan.blockers.is_empty() {
             ExitCode::SUCCESS
         } else {
@@ -345,7 +345,7 @@ pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
             .verify_timeout_secs
             .map(std::time::Duration::from_secs),
     )?;
-    emit(&result, &common.out)?;
+    emit(&result, common.out.as_deref())?;
     Ok(if !result.restore_errors.is_empty() {
         // A rollback that itself failed leaves the tree dirty: distinguish it from a clean one.
         ExitCode::from(4)

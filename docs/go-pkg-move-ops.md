@@ -64,7 +64,7 @@ this partition does not exist yet, so the file format is defined here.
 
 Limits of the guarantee: there is no signal handling (a kill during `go test` leaves the
 written, unverified tree, and the next `apply` of the plan reports it as partially
-applied); verification has no baseline or timeout, so a pre-existing `go vet`/`go test` failure
+applied); verification has no baseline, so a pre-existing `go vet`/`go test` failure
 rolls every move back.
 
 ## Trust model
@@ -125,7 +125,7 @@ So the move/extract/split operations would have to be built regardless, and the 
 operation `gopls` has is driven through an LSP client with no atomicity or verification
 story. **Chosen approach: tree-sitter-go (already a kibitzer dependency) in Rust**, as an
 in-memory overlay (`src/go_refactor/workspace.rs`) with byte-range edits
-(`src/go_refactor/go_syntax.rs`) so untouched bytes are preserved exactly, then `gofmt`
+(`src/go_syntax.rs`) so untouched bytes are preserved exactly, then `gofmt`
 and the Go toolchain for verification. Advantages: no Go helper binary or LSP session,
 planning is read-only and fast (a rename plan over `kubernetes/kubernetes`, 17,846 Go
 files, takes ~0.3 s), and plans compose (split = repeated move over one overlay).
@@ -200,7 +200,7 @@ Exported-surface changes are listed in `surface_changes` (`old.Path.Name -> new.
 * A trailing comment on the line of the previous declaration is not treated as the next
   declaration's doc comment.
 
-## One shared core, two planners
+## One shared core, two planners (and a third engine outside it)
 
 `kibitzer refactor go` (`src/go_refactor/`, five operations, Workspace-based planning) and the
 MCP `plan_refactor`/`apply_refactor` engine (`src/refactor/`, #159, ArchModel-based
@@ -223,6 +223,27 @@ for the MCP engine: it now flags files constrained only by their GOOS/GOARCH fil
 `build_constraint_vs_legacy_on_corpus` in `src/go_syntax.rs`): 2,496 flagged by both, 221
 flagged only by the new implementation (all suffix- or comment-aware cases), 0 only by the
 old one.
+
+The MCP split engine (`src/refactor_split.rs`, #158: `plan_split_refactor`, `apply_split_refactor`,
+`verify_refactor`, `revert_refactor`) is **not** on the shared core: it has its own file writer,
+restore and shell-based verification, and no crash recovery. Moving it onto `refactor_core::{txn,
+exec}` is the natural next step. To avoid a name clash with the move engine's tools (both
+originally used `plan_refactor`/`apply_refactor`), the split tools were renamed
+`plan_split_refactor`/`apply_split_refactor`; `plan_refactor`/`apply_refactor` now mean the move
+engine, so a client written against the old split-tool schema gets a schema error.
+
+Transaction behavior worth knowing (all in `refactor_core/txn.rs`, covered by its tests):
+the process-wide lock is taken first and held through staleness checks, body computation,
+writes and verification, and any orphaned log is rolled back before anything is read. Backups
+and the log are fsynced, and renames are followed by a directory sync. Crash recovery trusts
+nothing on disk: every path in a log must resolve (symlinks followed) inside the repo and avoid
+`.git`/`.kibitzer`, the temp name must be the one the module would pick, backups must be
+regular files, and `.kibitzer` may not be a symlink; a log from the first MCP release
+(`{original, backup, dest, temp}`) is still understood. A crash while changing a `.kibitzer`
+file therefore needs a manual restore from `.kibitzer/plans/.wal-backup`; the error says so.
+The lock is per process: two kibitzer processes on one repo are not serialized. The verification
+runner no longer sets `GOWORK=off` (a `go.work` workspace is a legitimate layout), does not hang
+on a descendant that keeps the output pipe open, and the child dies with its parent on Linux.
 
 ## Known limits
 

@@ -1,20 +1,15 @@
-//! All-or-nothing multi-file write with crash recovery.
-//!
-//! Order: back up every original and make a write-ahead log durable → write temp files → rename
-//! them into place and delete removed files → the caller verifies → [`Pending::commit`] drops the
-//! log, or [`Pending::rollback`] restores from the backups. A crash leaves the log behind so
-//! [`recover`] finishes the rollback on the next start; dropping an undecided [`Pending`]
-//! (a panic mid-verify) rolls back too.
+//! All-or-nothing multi-file write with crash recovery: back up originals and make a log
+//! durable, write temp files, rename them in; the caller then verifies and calls
+//! [`Pending::commit`] (drop the log) or [`Pending::rollback`]. A crash leaves the log for
+//! [`recover`]; dropping an undecided [`Pending`] rolls back.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::MutexGuard;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-
-use super::guard::is_inside;
 
 /// Serializes transactions in this process so one never rolls back another's live log. Two
 /// separate processes on one repo are not covered.
@@ -43,6 +38,63 @@ struct Wal {
     plan_id: String,
     entries: Vec<Entry>,
     created_dirs: Vec<PathBuf>,
+}
+
+/// The first release of the MCP engine logged `{original, backup, dest, temp}`; a crash under that
+/// build must still be recoverable after an upgrade.
+#[derive(Deserialize)]
+struct LegacyEntry {
+    original: PathBuf,
+    backup: PathBuf,
+    dest: PathBuf,
+    temp: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnyEntry {
+    Current(Entry),
+    Legacy(LegacyEntry),
+}
+
+#[derive(Deserialize)]
+struct WalRepr {
+    plan_id: String,
+    entries: Vec<AnyEntry>,
+    created_dirs: Vec<PathBuf>,
+}
+
+impl From<WalRepr> for Wal {
+    fn from(r: WalRepr) -> Self {
+        let mut entries = Vec::new();
+        for e in r.entries {
+            match e {
+                AnyEntry::Current(e) => entries.push(e),
+                AnyEntry::Legacy(l) if l.dest == l.original => entries.push(Entry {
+                    path: l.original,
+                    backup: Some(l.backup),
+                    temp: Some(l.temp),
+                }),
+                AnyEntry::Legacy(l) => {
+                    entries.push(Entry {
+                        path: l.original,
+                        backup: Some(l.backup),
+                        temp: None,
+                    });
+                    entries.push(Entry {
+                        path: l.dest,
+                        backup: None,
+                        temp: Some(l.temp),
+                    });
+                }
+            }
+        }
+        Wal {
+            plan_id: r.plan_id,
+            entries,
+            created_dirs: r.created_dirs,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,10 +149,10 @@ impl Pending {
         self.settled = true;
         match rollback(&self.root, &self.wal) {
             Ok(()) => cause.context("apply rolled back; the tree is unchanged"),
-            Err(rb) => anyhow::anyhow!(
-                "{cause:#}\nrollback also failed ({rb:#}); the WAL at {} is kept so the next start can retry",
-                wal_path(&self.root).display()
-            ),
+            Err(rb) => anyhow::Error::new(RollbackFailed {
+                cause: format!("{cause:#}"),
+                rollback: format!("{rb:#}"),
+            }),
         }
     }
 }
@@ -131,34 +183,80 @@ impl Drop for Pending {
     }
 }
 
-/// Applies `changes` (absolute paths under `root`). Any failure before this returns rolls the
-/// tree back; afterwards the caller owns the decision.
-pub fn begin(root: &Path, plan_id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+/// Holds the process-wide lock after crash recovery, so a caller can check staleness and compute
+/// its new file bodies against a tree no other transaction can change, then [`Session::begin`].
+pub struct Session {
+    root: PathBuf,
+    lock: MutexGuard<'static, ()>,
+}
+
+/// Takes the lock, then rolls back any transaction a crashed process left behind.
+pub fn session(root: &Path) -> Result<Session> {
     let lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     recover_locked(root)?;
-    let mut seen = BTreeSet::new();
-    if let Some(c) = changes.iter().find(|c| !seen.insert(&c.path)) {
-        bail!("{} is changed twice in one plan", c.path.display());
-    }
-    let wal = match write_wal(root, plan_id, changes) {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(backup_dir(root));
-            return Err(e);
-        }
-    };
-    let pending = Pending {
+    Ok(Session {
         root: root.to_path_buf(),
-        wal,
-        settled: false,
-        _lock: lock,
-    };
-    match swap(&pending.wal, changes, rename) {
-        Ok(()) => Ok(pending),
-        Err(e) => Err(pending.fail(e)),
+        lock,
+    })
+}
+
+/// Returned (inside an `anyhow::Error`) when a failed apply could not be fully rolled back: the
+/// tree may be dirty and the log is kept for [`recover`]. Callers `downcast_ref` to tell this from
+/// a clean rollback.
+#[derive(Debug)]
+pub struct RollbackFailed {
+    pub cause: String,
+    pub rollback: String,
+}
+
+impl std::fmt::Display for RollbackFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}\nrollback also failed ({}); the WAL is kept so the next start can retry",
+            self.cause, self.rollback
+        )
     }
+}
+
+impl std::error::Error for RollbackFailed {}
+
+impl Session {
+    /// Applies `changes` (absolute paths under the root). A failure before this returns rolls
+    /// the tree back; afterwards the caller owns the decision.
+    pub fn begin(self, plan_id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+        let root = self.root;
+        let mut seen = BTreeSet::new();
+        if let Some(c) = changes.iter().find(|c| !seen.insert(&c.path)) {
+            bail!("{} is changed twice in one plan", c.path.display());
+        }
+        ensure_plans_dir_is_real(&root)?;
+        let wal = match write_wal(&root, plan_id, changes) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = cleanup(&root);
+                return Err(e);
+            }
+        };
+        let pending = Pending {
+            root,
+            wal,
+            settled: false,
+            _lock: self.lock,
+        };
+        match swap(&pending.wal, changes, rename) {
+            Ok(()) => Ok(pending),
+            Err(e) => Err(pending.fail(e)),
+        }
+    }
+}
+
+/// [`session`] then [`Session::begin`], for callers with nothing to check in between.
+#[cfg(test)]
+pub fn begin(root: &Path, plan_id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+    session(root)?.begin(plan_id, changes, rename)
 }
 
 /// Rolls back a transaction a crashed process left half-done. Returns the interrupted plan id,
@@ -170,53 +268,121 @@ pub fn recover(root: &Path) -> Result<Option<String>> {
     recover_locked(root)
 }
 
+/// A log is a few KiB; refusing a huge one keeps a hostile repo from exhausting memory on every
+/// automatic recovery.
+const MAX_WAL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// `.kibitzer` or `.kibitzer/plans` as a symlink would send the log, backups and cleanup outside
+/// the repo.
+fn ensure_plans_dir_is_real(root: &Path) -> Result<()> {
+    for d in [root.join(".kibitzer"), plans_dir(root)] {
+        if std::fs::symlink_metadata(&d).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!(
+                "{} is a symlink; refusing to use it for the transaction log",
+                d.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn recover_locked(root: &Path) -> Result<Option<String>> {
+    ensure_plans_dir_is_real(root)?;
     let path = wal_path(root);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
+    let text = match std::fs::File::open(&path) {
+        Ok(f) => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::Read::take(f, MAX_WAL_BYTES + 1), &mut s)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if s.len() as u64 > MAX_WAL_BYTES {
+                bail!(
+                    "{} is larger than {MAX_WAL_BYTES} bytes; refusing to read it",
+                    path.display()
+                );
+            }
+            s
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let wal: Wal = serde_json::from_str(&text).with_context(|| {
-        format!(
-            "{} is corrupt; restore from {BACKUP_DIR} by hand",
-            path.display()
-        )
-    })?;
+    let wal: Wal = serde_json::from_str::<WalRepr>(&text)
+        .map(Wal::from)
+        .with_context(|| {
+            format!(
+                "{} is corrupt; restore from {BACKUP_DIR} by hand",
+                path.display()
+            )
+        })?;
     check_wal_paths(root, &wal)?;
     rollback(root, &wal)?;
     Ok(Some(wal.plan_id))
 }
 
-/// The log lives in the repo, so a hostile one must not steer rollback at files outside it, at
-/// `.git`, or at the log's own directory.
+/// `p` resolved against the real filesystem (symlinks followed on the deepest existing ancestor),
+/// relative to the canonical root; `None` when it escapes the root, uses `..`, or is itself a
+/// symlink (a symlink at the final component would redirect a restore or delete).
+fn resolved_rel(root: &Path, p: &Path) -> Option<PathBuf> {
+    if !p.starts_with(root) || p.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let canon_root = root.canonicalize().ok()?;
+    let existing = p
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a).is_ok())?;
+    let tail = p.strip_prefix(existing).ok()?;
+    let resolved = existing.canonicalize().ok()?.join(tail);
+    resolved
+        .strip_prefix(&canon_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+/// Crash recovery trusts nothing in the on-disk log: a hostile repo can plant one. Every path it
+/// names must stay inside the repo after symlinks are resolved and must not touch `.git` or
+/// `.kibitzer` (hooks and check commands are code execution). A crash during a change to a
+/// `.kibitzer` file therefore needs a manual rollback from the backups; in-process rollback uses
+/// the in-memory log and is not subject to this.
 fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
     let backups = backup_dir(root);
-    let guarded = |p: &Path| {
-        p.strip_prefix(root).is_ok_and(|rel| {
-            rel.components().any(|c| c.as_os_str() == ".git") || rel.starts_with(PLANS_DIR)
+    let refuse = |p: &Path| {
+        anyhow::anyhow!(
+            "WAL names {} outside the repository or in .git/.kibitzer; refusing to roll back \
+             automatically (inspect {} and restore by hand, then delete the WAL)",
+            p.display(),
+            backups.display()
+        )
+    };
+    let allowed = |p: &Path| {
+        resolved_rel(root, p).is_some_and(|rel| {
+            !rel.components()
+                .any(|c| c.as_os_str() == ".git" || c.as_os_str() == ".kibitzer")
         })
     };
     for e in &wal.entries {
-        for p in std::iter::once(&e.path).chain(e.temp.iter()) {
-            if !is_inside(root, p) || guarded(p) {
-                bail!(
-                    "WAL names {} outside the repository; refusing to roll back",
-                    p.display()
-                );
-            }
+        if !allowed(&e.path) {
+            return Err(refuse(&e.path));
+        }
+        if let Some(t) = &e.temp
+            && (!allowed(t) || *t != temp_path(&e.path))
+        {
+            return Err(refuse(t));
         }
         if let Some(b) = &e.backup
-            && b.parent() != Some(backups.as_path())
+            && (b.parent() != Some(backups.as_path())
+                || !std::fs::symlink_metadata(b).is_ok_and(|m| m.is_file()))
         {
-            bail!("WAL backup {} is not in {}", b.display(), backups.display());
+            bail!(
+                "WAL backup {} is not a regular file in {}",
+                b.display(),
+                backups.display()
+            );
         }
     }
-    if let Some(d) = wal.created_dirs.iter().find(|d| !is_inside(root, d)) {
-        bail!(
-            "WAL names {} outside the repository; refusing to roll back",
-            d.display()
-        );
+    if let Some(d) = wal.created_dirs.iter().find(|d| !allowed(d)) {
+        return Err(refuse(d));
     }
     Ok(())
 }
@@ -231,6 +397,10 @@ fn rollback(root: &Path, wal: &Wal) -> Result<()> {
                 std::fs::copy(b, &e.path).with_context(|| {
                     format!("restoring {} from {}", e.path.display(), b.display())
                 })?;
+                // The backups are deleted next; make the restored file durable first.
+                std::fs::File::open(&e.path)
+                    .and_then(|f| f.sync_all())
+                    .with_context(|| format!("syncing {}", e.path.display()))?;
             }
             None => ignore_missing(std::fs::remove_file(&e.path))?,
         }
@@ -257,10 +427,7 @@ fn cleanup(root: &Path) -> Result<()> {
 }
 
 fn ignore_missing(r: std::io::Result<()>) -> Result<()> {
-    match r {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
-    }
+    ignore_missing_io(r).map_err(Into::into)
 }
 
 fn ignore_missing_io(r: std::io::Result<()>) -> std::io::Result<()> {
@@ -279,6 +446,11 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()
+}
+
+/// Best-effort directory fsync so a rename survives power loss (not supported on every platform).
+fn sync_dir(dir: &Path) {
+    let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
 }
 
 fn temp_path(dest: &Path) -> PathBuf {
@@ -308,7 +480,9 @@ fn write_wal(root: &Path, plan_id: &str, changes: &[Change]) -> Result<Wal> {
         let backup = match std::fs::symlink_metadata(&c.path) {
             Ok(m) if m.is_file() => {
                 let b = backup_dir(root).join(i.to_string());
-                std::fs::copy(&c.path, &b)?;
+                // Read + synced write (not `copy`): the log must never point at a backup that a
+                // power loss could leave empty.
+                write_synced(&b, &std::fs::read(&c.path)?)?;
                 Some(b)
             }
             Ok(_) => bail!("{} is not a regular file", c.path.display()),
@@ -337,6 +511,7 @@ fn write_wal(root: &Path, plan_id: &str, changes: &[Change]) -> Result<Wal> {
     let tmp = plans_dir(root).join(".wal.tmp");
     write_synced(&tmp, &serde_json::to_vec(&wal)?)?;
     std::fs::rename(&tmp, wal_path(root))?;
+    sync_dir(&plans_dir(root));
     Ok(wal)
 }
 
@@ -360,6 +535,9 @@ fn swap(wal: &Wal, changes: &[Change], rename: Rename) -> Result<()> {
     for e in &wal.entries {
         if let Some(temp) = &e.temp {
             rename(temp, &e.path).with_context(|| format!("renaming into {}", e.path.display()))?;
+            if let Some(dir) = e.path.parent() {
+                sync_dir(dir);
+            }
         }
     }
     for (c, e) in changes.iter().zip(&wal.entries) {
@@ -473,5 +651,334 @@ mod tests {
         let changes = [put(root.join("a"), "1"), put(root.join("a"), "2")];
         assert!(begin(&root, "p", &changes, &real_rename).is_err());
         assert!(!root.join("a").exists());
+    }
+
+    // --- hostile or damaged logs -----------------------------------------------------------
+
+    fn write_wal_json(root: &Path, wal: serde_json::Value, backups: &[(&str, &str)]) {
+        let plans = root.join(".kibitzer/plans");
+        std::fs::create_dir_all(plans.join(".wal-backup")).unwrap();
+        for (name, body) in backups {
+            std::fs::write(plans.join(".wal-backup").join(name), body).unwrap();
+        }
+        std::fs::write(plans.join(".wal"), wal.to_string()).unwrap();
+    }
+
+    fn entry(path: &Path, backup: Option<&Path>, temp: Option<&Path>) -> serde_json::Value {
+        serde_json::json!({ "path": path, "backup": backup, "temp": temp })
+    }
+
+    #[test]
+    fn a_planted_log_cannot_restore_into_kibitzer_or_git() {
+        let root = scratch("hostile-kibitzer");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".kibitzer/inspect.json"), "{}").ok();
+        std::fs::create_dir_all(root.join(".kibitzer")).unwrap();
+        std::fs::write(root.join(".kibitzer/inspect.json"), "good").unwrap();
+        std::fs::write(root.join(".git/hooks/pre-commit"), "good-hook").unwrap();
+        let backup = root.join(".kibitzer/plans/.wal-backup/0");
+        for victim in [
+            root.join(".kibitzer/inspect.json"),
+            root.join(".git/hooks/pre-commit"),
+        ] {
+            write_wal_json(
+                &root,
+                serde_json::json!({"plan_id":"x","created_dirs":[],"entries":[entry(&victim, Some(&backup), None)]}),
+                &[("0", "PAYLOAD")],
+            );
+            let err = recover(&root).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("refusing to roll back"),
+                "{err:#}"
+            );
+            assert!(
+                std::fs::read_to_string(&victim)
+                    .unwrap()
+                    .starts_with("good"),
+                "{} was overwritten by a planted log",
+                victim.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlink_cannot_launder_a_protected_target_past_the_path_check() {
+        let root = scratch("hostile-symlink");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/hooks/pre-commit"), "good-hook").unwrap();
+        std::os::unix::fs::symlink(".git/hooks/pre-commit", root.join("link")).unwrap();
+        // A symlinked directory component too: `d -> .git/hooks`, entry `d/pre-commit`.
+        std::os::unix::fs::symlink(".git/hooks", root.join("d")).unwrap();
+        let backup = root.join(".kibitzer/plans/.wal-backup/0");
+        for victim in [root.join("link"), root.join("d/pre-commit")] {
+            write_wal_json(
+                &root,
+                serde_json::json!({"plan_id":"x","created_dirs":[],"entries":[entry(&victim, Some(&backup), None)]}),
+                &[("0", "PAYLOAD")],
+            );
+            assert!(
+                recover(&root).is_err(),
+                "{} passed the guard",
+                victim.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(".git/hooks/pre-commit")).unwrap(),
+                "good-hook"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlinked_backup_and_a_mismatched_temp_are_refused() {
+        let root = scratch("hostile-backup");
+        let secret = scratch("hostile-secret").join("key");
+        std::fs::write(&secret, "SECRET").unwrap();
+        std::fs::write(root.join("a.go"), "package a\n").unwrap();
+        std::fs::write(root.join("victim.go"), "keep me\n").unwrap();
+        let backups = root.join(".kibitzer/plans/.wal-backup");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::os::unix::fs::symlink(&secret, backups.join("0")).unwrap();
+        write_wal_json(
+            &root,
+            serde_json::json!({"plan_id":"x","created_dirs":[],"entries":[entry(&root.join("a.go"), Some(&backups.join("0")), None)]}),
+            &[],
+        );
+        assert!(recover(&root).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.go")).unwrap(),
+            "package a\n"
+        );
+
+        // `temp` must be the one name this module would have chosen, or rollback would delete
+        // any in-repo file the log names.
+        write_wal_json(
+            &root,
+            serde_json::json!({"plan_id":"x","created_dirs":[],"entries":[entry(&root.join("a.go"), None, Some(&root.join("victim.go")))]}),
+            &[],
+        );
+        assert!(recover(&root).is_err());
+        assert!(root.join("victim.go").exists());
+    }
+
+    #[test]
+    fn created_dirs_in_a_planted_log_are_checked_too() {
+        let root = scratch("hostile-dirs");
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        write_wal_json(
+            &root,
+            serde_json::json!({"plan_id":"x","created_dirs":[root.join(".git/refs")],"entries":[]}),
+            &[],
+        );
+        assert!(recover(&root).is_err());
+        assert!(root.join(".git/refs").exists());
+    }
+
+    #[test]
+    fn a_symlinked_kibitzer_dir_is_refused_and_nothing_is_written_through_it() {
+        let root = scratch("kibitzer-symlink");
+        let outside = scratch("kibitzer-outside");
+        std::os::unix::fs::symlink(&outside, root.join(".kibitzer")).unwrap();
+        let changes = [put(root.join("a"), "x")];
+        assert!(begin(&root, "p", &changes, &real_rename).is_err());
+        assert!(recover(&root).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!root.join("a").exists());
+    }
+
+    #[test]
+    fn an_oversized_log_is_refused_without_being_read_into_memory() {
+        let root = scratch("huge-wal");
+        let plans = root.join(".kibitzer/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(
+            plans.join(".wal"),
+            vec![b' '; (MAX_WAL_BYTES + 10) as usize],
+        )
+        .unwrap();
+        let err = recover(&root).unwrap_err();
+        assert!(format!("{err:#}").contains("larger than"), "{err:#}");
+    }
+
+    #[test]
+    fn a_torn_log_is_a_clear_error_that_leaves_the_tree_alone() {
+        let root = scratch("torn-wal");
+        std::fs::write(root.join("a"), "old").unwrap();
+        let plans = root.join(".kibitzer/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join(".wal"), "{\"plan_id\":\"x\",\"entries\":[{\"pa").unwrap();
+        let err = recover(&root).unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "old");
+        // And a new transaction refuses to start over it rather than clobbering the evidence.
+        assert!(begin(&root, "p", &[put(root.join("b"), "x")], &real_rename).is_err());
+        assert!(!root.join("b").exists());
+    }
+
+    #[test]
+    fn a_log_from_the_first_mcp_release_is_still_recoverable() {
+        let root = scratch("legacy-wal");
+        // Crash state of a moved-and-rewritten file under the old format: a.go deleted, b.go new.
+        std::fs::write(root.join("b.go"), "NEW BODY").unwrap();
+        let plans = root.join(".kibitzer/plans");
+        std::fs::create_dir_all(plans.join(".wal-backup")).unwrap();
+        std::fs::write(plans.join(".wal-backup/0"), "ORIGINAL").unwrap();
+        let wal = serde_json::json!({
+            "plan_id": "old",
+            "created_dirs": [],
+            "entries": [{
+                "original": root.join("a.go"), "backup": plans.join(".wal-backup/0"),
+                "dest": root.join("b.go"), "temp": root.join(".b.go.kibitzer-tmp"),
+            }]
+        });
+        std::fs::write(plans.join(".wal"), wal.to_string()).unwrap();
+        assert_eq!(recover(&root).unwrap().as_deref(), Some("old"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.go")).unwrap(),
+            "ORIGINAL"
+        );
+        assert!(!root.join("b.go").exists());
+    }
+
+    // --- crash recovery ------------------------------------------------------------------
+
+    #[test]
+    fn a_crash_mid_swap_with_leftover_temps_and_deletes_is_fully_rolled_back() {
+        let root = scratch("midswap");
+        std::fs::write(root.join("a"), "A-old").unwrap();
+        std::fs::write(root.join("gone"), "G-old").unwrap();
+        let changes = [
+            put(root.join("a"), "A-new"),
+            put(root.join("sub/b"), "B-new"),
+            Change {
+                path: root.join("gone"),
+                op: Op::Delete,
+            },
+        ];
+        let renames = std::cell::Cell::new(0);
+        let dies_on_second = |from: &Path, to: &Path| {
+            renames.set(renames.get() + 1);
+            if renames.get() == 2 {
+                panic!("simulated kill");
+            }
+            std::fs::rename(from, to)
+        };
+        simulate_kill(true);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = begin(&root, "p", &changes, &dies_on_second);
+        }));
+        simulate_kill(false);
+        assert!(crashed.is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a")).unwrap(),
+            "A-new",
+            "first rename landed"
+        );
+        assert!(
+            root.join("sub/.b.kibitzer-tmp").exists(),
+            "a temp is left behind"
+        );
+        assert!(wal_path(&root).exists());
+
+        assert_eq!(recover(&root).unwrap().as_deref(), Some("p"));
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "A-old");
+        assert_eq!(std::fs::read_to_string(root.join("gone")).unwrap(), "G-old");
+        assert!(
+            !root.join("sub").exists(),
+            "created directory and temp removed"
+        );
+        assert!(!root.join(".kibitzer").exists());
+    }
+
+    #[test]
+    fn the_next_transaction_recovers_an_orphan_before_doing_anything() {
+        let root = scratch("orphan-then-begin");
+        std::fs::write(root.join("a"), "old").unwrap();
+        let p1 = begin(&root, "p1", &[put(root.join("a"), "from-p1")], &real_rename).unwrap();
+        simulate_kill(true);
+        drop(p1);
+        simulate_kill(false);
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "from-p1");
+        let p2 = session(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a")).unwrap(),
+            "old",
+            "session() must roll the orphan back before the caller reads the tree"
+        );
+        drop(p2);
+    }
+
+    #[test]
+    fn a_crash_while_changing_a_kibitzer_file_needs_a_manual_rollback_with_a_clear_message() {
+        let root = scratch("kibitzer-crash");
+        std::fs::create_dir_all(root.join(".kibitzer")).unwrap();
+        std::fs::write(root.join(".kibitzer/inspect.json"), "old").unwrap();
+        let target = root.join(".kibitzer/inspect.json");
+        // In-process rollback (a failed verify) restores it normally: it uses the in-memory log.
+        let p = begin(&root, "p", &[put(target.clone(), "new")], &real_rename).unwrap();
+        p.rollback().unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        // A crash leaves the on-disk log, which recovery refuses to act on for `.kibitzer` paths.
+        let p = begin(&root, "p", &[put(target.clone(), "new")], &real_rename).unwrap();
+        simulate_kill(true);
+        drop(p);
+        simulate_kill(false);
+        let err = recover(&root).unwrap_err();
+        assert!(format!("{err:#}").contains("restore by hand"), "{err:#}");
+        assert!(
+            root.join(".kibitzer/plans/.wal-backup/0").exists(),
+            "backup kept for the manual step"
+        );
+    }
+
+    #[test]
+    fn a_symlink_planted_at_the_temp_name_is_replaced_not_followed() {
+        let root = scratch("temp-symlink");
+        let outside = scratch("temp-outside").join("target");
+        std::fs::write(&outside, "UNTOUCHED").unwrap();
+        std::fs::write(root.join("a"), "old").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".a.kibitzer-tmp")).unwrap();
+        begin(&root, "p", &[put(root.join("a"), "new")], &real_rename)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "UNTOUCHED");
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_failed_rollback_is_a_typed_error_not_just_text() {
+        let root = scratch("rollback-fails");
+        std::fs::write(root.join("a"), "old").unwrap();
+        let sabotage = |_: &Path, _: &Path| {
+            // Destroy the backup the rollback needs, then fail the rename.
+            let _ = std::fs::remove_dir_all(root.join(".kibitzer/plans/.wal-backup"));
+            Err(std::io::Error::other("injected"))
+        };
+        let err = begin(&root, "p", &[put(root.join("a"), "new")], &sabotage)
+            .err()
+            .unwrap();
+        assert!(err.downcast_ref::<RollbackFailed>().is_some(), "{err:#}");
+        assert!(wal_path(&root).exists(), "log kept so recover can retry");
+    }
+
+    #[test]
+    fn the_lock_covers_everything_between_session_and_commit() {
+        let root = scratch("lock");
+        let first = session(&root).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r2 = root.clone();
+        let t = std::thread::spawn(move || {
+            let _second = session(&r2).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second session started while the first still held the lock"
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second session after release");
+        t.join().unwrap();
     }
 }

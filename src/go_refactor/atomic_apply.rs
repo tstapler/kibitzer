@@ -238,6 +238,9 @@ pub(super) fn apply_with(
     opts: &ApplyOptions,
     rename: Rename,
 ) -> Result<ApplyResult> {
+    // Lock and crash-recover before reading anything: staleness and idempotence below must be
+    // judged against a tree no other apply can change before our writes land.
+    let session = txn::session(root)?;
     validate_plan(plan, root)?;
     if !plan.blockers.is_empty() {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
@@ -275,7 +278,20 @@ pub(super) fn apply_with(
     if plan.operation == OperationKind::SyncPolicy {
         check_policy_derivation(plan, root)?;
     }
-    let pending = txn::begin(root, &plan.plan_id, &changes_for(root, plan), rename)?;
+    let pending = match session.begin(&plan.plan_id, &changes_for(root, plan), rename) {
+        Ok(p) => p,
+        // The write failed and so did the rollback: report a dirty tree (exit 4), not a plain error.
+        Err(e) if e.downcast_ref::<txn::RollbackFailed>().is_some() => {
+            return Ok(ApplyResult {
+                status: ApplyStatus::RolledBack,
+                applied_steps: 0,
+                verify: None,
+                restore_errors: vec![format!("{e:#}")],
+                plan: plan.clone(),
+            });
+        }
+        Err(e) => return Err(e),
+    };
     let mut verify = None;
     if opts.verify {
         let v = run_verify(

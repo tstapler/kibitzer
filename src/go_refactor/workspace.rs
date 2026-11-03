@@ -19,6 +19,9 @@ pub struct Workspace {
     pub native_dirs: BTreeSet<String>,
     /// Directories with `testdata/` or other non-Go files a directory move would strand.
     pub asset_dirs: BTreeSet<String>,
+    /// `.go` files that could not be read (permissions, not UTF-8): invisible to importer
+    /// discovery, so the plan must refuse rather than silently skip them.
+    pub unreadable: Vec<String>,
     imports_memo: std::cell::RefCell<HashMap<String, Vec<String>>>,
     /// dir -> files, rebuilt lazily after any edit so graph walks don't rescan every path.
     dir_index: std::cell::RefCell<Option<HashMap<String, Vec<String>>>>,
@@ -75,6 +78,7 @@ impl Workspace {
             moves: BTreeMap::new(),
             native_dirs: BTreeSet::new(),
             asset_dirs: BTreeSet::new(),
+            unreadable: Vec::new(),
             imports_memo: Default::default(),
             dir_index: Default::default(),
         };
@@ -105,8 +109,11 @@ impl Workspace {
                 self.walk(&e.path(), &child_rel)?;
             } else if ty.is_file() {
                 if name.ends_with(".go") {
-                    if let Ok(s) = std::fs::read_to_string(e.path()) {
-                        self.orig.insert(child_rel, s);
+                    match std::fs::read_to_string(e.path()) {
+                        Ok(s) => {
+                            self.orig.insert(child_rel, s);
+                        }
+                        Err(err) => self.unreadable.push(format!("{child_rel}: {err}")),
                     }
                 } else if let Some(ext) = name.rsplit('.').next()
                     && NATIVE_EXTS.contains(&ext)
