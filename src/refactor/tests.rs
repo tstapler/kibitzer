@@ -484,6 +484,7 @@ mod apply_tests {
         let (dir, plan) = plan_for("apply-orphan", &files, &op("a", "b", &["a/a1.go"]));
         // Simulate a kill after the first rename: the process dies without cleanup.
         let wal_dir = dir.join(".kibitzer/plans");
+        crate::refactor_core::txn::simulate_kill(true);
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct Crash;
             impl ApplyIo for Crash {
@@ -497,6 +498,7 @@ mod apply_tests {
             }
             let _ = apply_plan(&dir, &plan, &Crash);
         }));
+        crate::refactor_core::txn::simulate_kill(false);
         assert!(crashed.is_err());
         assert!(wal_dir.join(".wal").exists(), "WAL survives the crash");
         assert!(dir.join("b/a1.go").exists(), "tree is partially applied");
@@ -604,11 +606,11 @@ mod apply_tests {
     #[test]
     fn is_inside_should_Reject_When_PathUsesDotDot() {
         let root = crate::test_support::unique_temp_dir("inside-dotdot");
-        assert!(crate::refactor::apply::is_inside(
+        assert!(crate::refactor_core::guard::is_inside(
             &root,
             &root.join("a/b.go")
         ));
-        assert!(!crate::refactor::apply::is_inside(
+        assert!(!crate::refactor_core::guard::is_inside(
             &root,
             &root.join("../../etc/x")
         ));
@@ -620,7 +622,7 @@ mod apply_tests {
         let root = crate::test_support::unique_temp_dir("inside-link");
         let outside = crate::test_support::unique_temp_dir("inside-outside");
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        assert!(!crate::refactor::apply::is_inside(
+        assert!(!crate::refactor_core::guard::is_inside(
             &root,
             &root.join("link/x.go")
         ));
@@ -638,8 +640,8 @@ mod apply_tests {
             "plan_id": "x",
             "created_dirs": [],
             "entries": [{
-                "original": victim, "backup": plans.join(".wal-backup/0"),
-                "dest": victim, "temp": dir.join("t.go.tmp")
+                "path": victim, "backup": plans.join(".wal-backup/0"),
+                "temp": dir.join("t.go.tmp")
             }]
         });
         std::fs::write(plans.join(".wal"), wal.to_string()).unwrap();
