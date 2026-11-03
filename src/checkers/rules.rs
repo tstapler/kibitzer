@@ -46,7 +46,7 @@ const MAGIC_LITERAL_ALLOWLIST: &[&str] = &["0", "1", "-1", ""];
 /// 2,399 real findings (63 of 70 false positives) found small ints dominating the numeric
 /// noise; non-trivial values such as `60` or `0.75rem` stay flagged.
 const MAGIC_LITERAL_NUMERIC_ALLOWLIST: &[&str] = &[
-    "2", "3", "4", "5", "6", "7", "8", "9", "10", "16", "100", "1000", "2026",
+    "0.5", "2", "3", "4", "5", "6", "7", "8", "9", "10", "16", "100", "1000", "2026",
 ];
 /// A literal in a test file (`checkers::is_test_file`) needs this many occurrences — 64% of
 /// the sampled findings were in tests, where repeated fixture values are idiomatic.
@@ -1782,7 +1782,18 @@ fn is_allowlisted_literal(raw: &str, kind: &str, cfg: &LangRuleConfig) -> bool {
             || MAGIC_LITERAL_NUMERIC_ALLOWLIST.contains(&number.as_str());
     }
     // A one-character string (`","`, `"x"`) is a delimiter or label, not a magic value.
-    MAGIC_LITERAL_ALLOWLIST.contains(&value) || value.chars().count() == 1
+    MAGIC_LITERAL_ALLOWLIST.contains(&value)
+        || value.chars().count() == 1
+        || is_format_placeholder(value)
+}
+
+/// A string that is a single format-args placeholder (`{p}`, `{}`, `{:?}`): an inline
+/// capture, not a value worth naming.
+fn is_format_placeholder(value: &str) -> bool {
+    value
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .is_some_and(|inner| !inner.contains(['{', '}']))
 }
 
 /// Matches `^[\w\-./:#]{1,40}$` on the unquoted value: test ids, dict/log keys, paths.

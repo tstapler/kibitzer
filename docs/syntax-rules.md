@@ -191,6 +191,15 @@ exclusions. Each is a tree-sitter node check, not a line regex:
   `*TestBase.java`/`.kt`, `*_tests.py` and `*.integrationTest.ts(x)`. Paths under the working
   directory are judged relative to it, so a checkout under `~/test/` is not all test code. Other users of
   `is_test_file`: `duplicate-code-fuzzy`, `go-package-focus`, `middle-man`.
+- **Rust `#[cfg(test)]` numerics** (issue #142): numerics inside a `#[cfg(test)]` item or
+  `#![cfg(test)]` file are now skipped as well, so in-crate fixtures neither fire nor inflate
+  production counts. This narrows the "numerics in tests keep >= 10" rule above to separate test
+  *files* only; the earlier 5-of-13 lost-true-positive figure came from test files, not in-crate
+  modules. `0.5` joins the numeric allowlist, and a string that is only a format placeholder
+  (`"{p}"`, `"{}"`, `"{:?}"`) is never flagged. Backtest (`replace-magic-literal` findings, first
+  1,500 `.rs` files per repo, baseline `6012779` vs. this change): servo 311 -> 285, ripgrep
+  40 -> 28, deno 1032 -> 860, kibitzer 35 -> 30. Fewer findings everywhere; no triage of the
+  removed set beyond the unit tests and the issue's reproduction.
 - **Attributes and annotations**: a literal inside `#[..]`/`#![..]`, a Java/Kotlin `@Annotation(..)`,
   a Python/TS `@decorator(..)`, or a Go struct tag.
 - **Type-suffixed or float spellings of allowlisted numbers**: digit separators, a type suffix
