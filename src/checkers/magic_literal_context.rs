@@ -527,7 +527,10 @@ mod tests {
 
     #[test]
     fn rust_half_and_format_placeholders_should_NotBeFlagged() {
-        assert_eq!(count(Language::Rust, "a.rs", &repeated(Language::Rust, "0.5", 5)), 0);
+        assert_eq!(
+            count(Language::Rust, "a.rs", &repeated(Language::Rust, "0.5", 5)),
+            0
+        );
         let fmt = "fn f(p: u8) {\n    let a = format!(\"{p}\");\n    let b = format!(\"{p}\");\n    let c = format!(\"{p}\");\n}\n";
         assert_eq!(count(Language::Rust, "a.rs", fmt), 0);
     }
