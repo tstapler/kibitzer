@@ -1,4 +1,5 @@
 {
+  "plan_id": "26be72ce97318db67e4179414050fea6dd72ad69751c1a3466b1aff096d2e458",
   "operation": "sync_policy",
   "repo_root": "<repo>",
   "module": "example.com/m",

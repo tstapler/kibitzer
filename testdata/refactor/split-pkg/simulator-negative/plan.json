@@ -1,4 +1,5 @@
 {
+  "plan_id": "6a874b6b62cd10fbeaafefb9b9206b80b3bcd6e12159c4b95554d324b78df691",
   "operation": "split_pkg",
   "repo_root": "<repo>",
   "module": "example.com/m",

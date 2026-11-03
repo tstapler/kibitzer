@@ -83,6 +83,11 @@ pub struct PathMapping {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovePlan {
+    /// SHA-256 of the plan's contents (see [`MovePlan::compute_id`]); `apply` refuses a plan whose
+    /// id does not match, so an edited or truncated plan is caught. It is a checksum, not a
+    /// signature: whoever edits a plan can also recompute it.
+    #[serde(default)]
+    pub plan_id: String,
     pub operation: OperationKind,
     pub repo_root: String,
     pub module: String,
@@ -160,6 +165,24 @@ pub struct ApplyResult {
     pub plan: MovePlan,
 }
 
+impl MovePlan {
+    /// Hash of everything but the id itself and `repo_root` (informational; apply uses the root it
+    /// is given).
+    pub fn compute_id(&self) -> String {
+        let mut unsigned = self.clone();
+        unsigned.plan_id = String::new();
+        unsigned.repo_root = String::new();
+        let json = serde_json::to_vec(&unsigned).unwrap_or_default();
+        crate::refactor_core::sha256_hex(&json)
+    }
+
+    /// Stamps `plan_id`; call after the last change to the plan.
+    pub fn sealed(mut self) -> Self {
+        self.plan_id = self.compute_id();
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +190,7 @@ mod tests {
     #[test]
     fn plan_round_trips_through_json() {
         let plan = MovePlan {
+            plan_id: String::new(),
             operation: OperationKind::MoveFiles,
             repo_root: ".".into(),
             module: "example.com/m".into(),
@@ -194,5 +218,30 @@ mod tests {
         assert_eq!(back.steps, plan.steps);
         assert_eq!(back.blockers, plan.blockers);
         assert!(!json.contains("simulation_result"));
+    }
+
+    #[test]
+    fn sealed_id_ignores_repo_root_but_catches_content_edits() {
+        let mut plan = MovePlan {
+            plan_id: String::new(),
+            operation: OperationKind::MoveFiles,
+            repo_root: "/a".into(),
+            module: "m".into(),
+            from: vec![],
+            to: vec![],
+            steps: vec![],
+            blockers: vec![],
+            warnings: vec![],
+            surface_changes: vec![],
+            path_map: vec![],
+            affected_packages: vec![],
+            simulation_result: None,
+        }
+        .sealed();
+        assert_eq!(plan.plan_id, plan.compute_id());
+        plan.repo_root = "<repo>".into();
+        assert_eq!(plan.plan_id, plan.compute_id());
+        plan.module = "other".into();
+        assert_ne!(plan.plan_id, plan.compute_id());
     }
 }

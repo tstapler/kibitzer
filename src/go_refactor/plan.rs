@@ -4,19 +4,13 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use sha2::{Digest, Sha256};
-
 use super::ops::Findings;
 use super::types::{
     BlockingDiagnostic, FileTransform, MovePlan, OperationKind, PlanStep, PlanStepKind,
 };
 use super::workspace::{Workspace, dir_of};
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
+pub use crate::refactor_core::sha256_hex;
 
 /// `gofmt` over stdin. `Ok(None)` when gofmt is unavailable.
 fn gofmt(src: &str) -> Result<Option<String>, String> {
@@ -184,6 +178,7 @@ pub fn build_plan(
         .collect();
     f.blockers.dedup();
     MovePlan {
+        plan_id: String::new(),
         operation: op,
         repo_root: repo_root.to_string(),
         module: ws.module.clone(),
@@ -197,6 +192,7 @@ pub fn build_plan(
         affected_packages,
         simulation_result: simulation,
     }
+    .sealed()
 }
 
 fn key(s: &PlanStep) -> String {

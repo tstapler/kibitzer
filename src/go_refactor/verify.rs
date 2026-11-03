@@ -1,27 +1,28 @@
-//! Post-apply verification: `go build`, `go vet`, `go test`, captured verbatim.
+//! Post-apply verification: `go build`, `go vet`, `go test`, captured verbatim (each stream
+//! capped at 1 MiB, with a note when it is) under a wall-clock timeout.
 
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 use super::types::{CommandOutcome, VerifyResult};
+use crate::refactor_core::exec::{self, EnvPolicy};
 
-fn run(root: &Path, program: &str, args: &[String]) -> CommandOutcome {
-    let command = format!("{program} {}", args.join(" "));
-    match Command::new(program).args(args).current_dir(root).output() {
-        Ok(out) => CommandOutcome {
-            command,
-            exit_code: out.status.code(),
-            output: format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ),
-        },
-        Err(e) => CommandOutcome {
-            command,
-            exit_code: None,
-            output: format!("failed to run {program}: {e}"),
-        },
+/// Default budget per command; `go test ./...` on a large module is slow, not hung.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+fn run(root: &Path, program: &str, args: &[String], timeout: Duration) -> CommandOutcome {
+    let out = exec::run(&exec::Spec {
+        program,
+        args,
+        dir: root,
+        timeout,
+        // The operator runs this CLI on their own checkout and may pin GOTOOLCHAIN/GOFLAGS.
+        env: EnvPolicy::Inherit,
+    });
+    CommandOutcome {
+        command: out.command,
+        exit_code: out.exit_code,
+        output: out.output,
     }
 }
 
@@ -34,6 +35,7 @@ pub fn run_verify(
     affected: &[String],
     affected_only: bool,
     post_apply: Option<&str>,
+    timeout: Duration,
 ) -> VerifyResult {
     let targets: Vec<String> =
         if !affected_only || affected.is_empty() || affected.len() > MAX_EXPLICIT_PACKAGES {
@@ -41,7 +43,7 @@ pub fn run_verify(
         } else {
             affected.to_vec()
         };
-    let hook = post_apply.map(|cmd| run(root, "sh", &["-c".to_string(), cmd.to_string()]));
+    let hook = post_apply.map(|cmd| run(root, "sh", &["-c".to_string(), cmd.to_string()], timeout));
     let with = |head: &[&str]| -> Vec<String> {
         head.iter()
             .map(|s| s.to_string())
@@ -64,8 +66,8 @@ pub fn run_verify(
     }
     VerifyResult {
         post_apply_hook: hook,
-        build: run(root, "go", &with(&["build"])),
-        vet: run(root, "go", &with(&["vet"])),
-        test: run(root, "go", &with(&["test", "-count=1"])),
+        build: run(root, "go", &with(&["build"]), timeout),
+        vet: run(root, "go", &with(&["vet"]), timeout),
+        test: run(root, "go", &with(&["test", "-count=1"]), timeout),
     }
 }

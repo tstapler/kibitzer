@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::plan::sha256_hex;
@@ -92,7 +92,24 @@ fn replace_import_paths(text: &str, imports: &[&PathMapping]) -> String {
     out
 }
 
+/// Import and directory paths only: these strings are pasted into YAML and JSON policy files, so
+/// a newline or quote in one would inject structure.
+fn plain_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/-~+@*".contains(c))
+}
+
 pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
+    if let Some(m) = source.path_map.iter().find(|m| {
+        !(plain_path(&m.from) && plain_path(&m.to) || m.from.is_empty() && plain_path(&m.to))
+    }) {
+        bail!(
+            "path mapping `{}` -> `{}` has characters that are not valid in a path; refusing to write it into policy files",
+            m.from,
+            m.to
+        );
+    }
     let mut maps: Vec<&PathMapping> = source
         .path_map
         .iter()
@@ -158,6 +175,7 @@ pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
         }
     }
     Ok(MovePlan {
+        plan_id: String::new(),
         operation: OperationKind::SyncPolicy,
         repo_root: source.repo_root.clone(),
         module: source.module.clone(),
@@ -171,7 +189,8 @@ pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
         path_map: source.path_map.clone(),
         affected_packages: vec![],
         simulation_result: source.simulation_result.clone(),
-    })
+    }
+    .sealed())
 }
 
 #[cfg(test)]

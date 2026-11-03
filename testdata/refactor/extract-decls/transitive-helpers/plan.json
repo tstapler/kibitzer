@@ -1,4 +1,5 @@
 {
+  "plan_id": "d1a2598134585cab6255f0d2ad82e3065a80222bc8a947805e50185bd385988c",
   "operation": "extract_decls",
   "repo_root": "<repo>",
   "module": "example.com/m",

@@ -55,6 +55,9 @@ pub struct CommonArgs {
     /// Verify only the plan's affected packages instead of `./...`.
     #[arg(long)]
     affected_only: bool,
+    /// Seconds each verification command may run before it is killed (default 1800).
+    #[arg(long)]
+    verify_timeout_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -244,6 +247,7 @@ pub fn apply_plan(
     plan: &MovePlan,
     post_apply: Option<String>,
     affected_only: bool,
+    verify_timeout: Option<std::time::Duration>,
 ) -> Result<types::ApplyResult> {
     let policy_only = plan.operation == OperationKind::SyncPolicy;
     atomic_apply::apply(
@@ -253,7 +257,7 @@ pub fn apply_plan(
             verify: !policy_only,
             affected_only,
             post_apply,
-            inject_failure_after_step: None,
+            verify_timeout,
         },
     )
 }
@@ -337,6 +341,9 @@ pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
         &plan,
         common.post_apply.clone(),
         common.affected_only,
+        common
+            .verify_timeout_secs
+            .map(std::time::Duration::from_secs),
     )?;
     emit(&result, &common.out)?;
     Ok(if !result.restore_errors.is_empty() {

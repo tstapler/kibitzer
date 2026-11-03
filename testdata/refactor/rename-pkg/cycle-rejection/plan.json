@@ -1,4 +1,5 @@
 {
+  "plan_id": "28f3b098d70377dfb40b63a9e6d7ed46fa7fb0fb2aaf06e74464a08c912c2c6e",
   "operation": "rename_pkg",
   "repo_root": "<repo>",
   "module": "example.com/m",

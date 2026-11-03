@@ -284,11 +284,7 @@ fn find_go_mod_upward(start_dir: &Path, repo_root: &Path) -> Option<(String, Pat
     let mut dir = start_dir;
     loop {
         if let Ok(contents) = std::fs::read_to_string(dir.join("go.mod"))
-            && let Some(module) = contents.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix("module ")
-                    .map(|rest| rest.trim().to_string())
-            })
+            && let Some(module) = crate::go_call_resolution::parse_module_path(&contents)
         {
             return Some((module, dir.to_path_buf()));
         }

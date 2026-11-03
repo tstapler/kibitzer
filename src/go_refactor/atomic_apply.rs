@@ -1,14 +1,16 @@
-//! Atomic, idempotent plan application: snapshot every touched path, write via
-//! temp-then-rename, and restore the snapshot byte-for-byte on any failure.
+//! Atomic, idempotent plan application. Classifies each step (pending / already done / stale),
+//! hands the writes to the shared write-ahead-logged transaction (`refactor_core::txn`), verifies
+//! with the Go toolchain, and commits or restores the tree byte-for-byte.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use super::plan::sha256_hex;
 use super::types::{ApplyResult, ApplyStatus, MovePlan, OperationKind, PlanStep, PlanStepKind};
-use super::verify::run_verify;
+use super::verify::{DEFAULT_TIMEOUT, run_verify};
+use crate::refactor_core::sha256_hex;
+use crate::refactor_core::txn::{self, Change, Op, Rename};
 
 #[derive(Default)]
 pub struct ApplyOptions {
@@ -16,8 +18,8 @@ pub struct ApplyOptions {
     pub verify: bool,
     pub affected_only: bool,
     pub post_apply: Option<String>,
-    /// Test hook: fail right after step `n` has been written.
-    pub inject_failure_after_step: Option<usize>,
+    /// Per-command budget for verification; `None` means 30 minutes.
+    pub verify_timeout: Option<Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,148 +89,6 @@ fn classify(root: &Path, s: &PlanStep) -> StepState {
     }
 }
 
-struct Journal {
-    root: PathBuf,
-    snapshot: BTreeMap<String, Option<Vec<u8>>>,
-    perms: BTreeMap<String, std::fs::Permissions>,
-    created_dirs: Vec<PathBuf>,
-    tmp_files: Vec<PathBuf>,
-    /// While set, dropping the journal restores the tree (covers a panic mid-apply).
-    armed: bool,
-}
-
-impl Drop for Journal {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.restore();
-        }
-    }
-}
-
-impl Journal {
-    fn new(root: &Path, plan: &MovePlan) -> Result<Self> {
-        let mut snapshot = BTreeMap::new();
-        let mut perms = BTreeMap::new();
-        for s in &plan.steps {
-            for p in [&s.transform.old_path, &s.transform.new_path]
-                .into_iter()
-                .flatten()
-            {
-                if !snapshot.contains_key(p) {
-                    let full = root.join(p);
-                    let bytes = match std::fs::read(&full) {
-                        Ok(b) => Some(b),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => bail!("cannot snapshot {p}: {e}"),
-                    };
-                    if let Ok(m) = std::fs::metadata(&full) {
-                        perms.insert(p.clone(), m.permissions());
-                    }
-                    snapshot.insert(p.clone(), bytes);
-                }
-            }
-        }
-        Ok(Self {
-            root: root.to_path_buf(),
-            snapshot,
-            perms,
-            created_dirs: vec![],
-            tmp_files: vec![],
-            armed: true,
-        })
-    }
-
-    fn ensure_parent(&mut self, full: &Path) -> std::io::Result<()> {
-        let Some(parent) = full.parent() else {
-            return Ok(());
-        };
-        let mut missing = vec![];
-        let mut cur = parent;
-        while !cur.exists() && cur != self.root {
-            missing.push(cur.to_path_buf());
-            match cur.parent() {
-                Some(p) => cur = p,
-                None => break,
-            }
-        }
-        std::fs::create_dir_all(parent)?;
-        missing.reverse();
-        self.created_dirs.extend(missing);
-        Ok(())
-    }
-
-    /// Write via an exclusively created temp file (never follows a pre-planted symlink),
-    /// carrying over the permissions of `mode_from` so a move keeps a file's mode.
-    fn write_atomic(
-        &mut self,
-        rel: &str,
-        content: &[u8],
-        mode_from: Option<&str>,
-    ) -> std::io::Result<()> {
-        use std::io::Write;
-        let full = self.root.join(rel);
-        self.ensure_parent(&full)?;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let tmp = full.with_file_name(format!(
-            ".{}.kibitzer-tmp.{}.{nanos}",
-            super::workspace::base_of(rel),
-            std::process::id()
-        ));
-        self.tmp_files.push(tmp.clone());
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(content)?;
-        drop(file);
-        if let Some(perms) = mode_from.and_then(|m| self.perms.get(m)) {
-            std::fs::set_permissions(&tmp, perms.clone())?;
-        }
-        std::fs::rename(&tmp, &full)
-    }
-
-    /// Put every snapshotted path back. Errors are collected, never short-circuited.
-    fn restore(&mut self) -> Vec<String> {
-        self.armed = false;
-        let mut errors = vec![];
-        for tmp in self.tmp_files.drain(..) {
-            let _ = std::fs::remove_file(tmp);
-        }
-        for (rel, original) in &self.snapshot {
-            let full = self.root.join(rel);
-            match original {
-                Some(bytes) => {
-                    let r = full
-                        .parent()
-                        .map_or(Ok(()), std::fs::create_dir_all)
-                        .and_then(|()| std::fs::write(&full, bytes));
-                    if let Err(e) = r {
-                        errors.push(format!("restore {rel}: {e}"));
-                    } else if let Some(perms) = self.perms.get(rel) {
-                        let _ = std::fs::set_permissions(&full, perms.clone());
-                    }
-                }
-                None => {
-                    if let Err(e) = std::fs::remove_file(&full)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        errors.push(format!("remove {rel}: {e}"));
-                    }
-                }
-            }
-        }
-        for d in self.created_dirs.iter().rev() {
-            let _ = std::fs::remove_dir(d);
-        }
-        for e in &errors {
-            eprintln!("kibitzer refactor: {e}");
-        }
-        errors
-    }
-}
-
 fn prune_empty_dirs(root: &Path, plan: &MovePlan) {
     for s in &plan.steps {
         if let Some(old) = &s.transform.old_path
@@ -253,8 +113,16 @@ const POLICY_FILES: &[&str] = &[
 /// never a path outside the repo or one that crosses a symlink; and package arguments must
 /// be plain relative package paths (never a `go` flag).
 fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
+    if plan.plan_id != plan.compute_id() {
+        bail!(
+            "plan_id does not match the plan's contents (edited or corrupted); regenerate the plan"
+        );
+    }
     let policy = plan.operation == OperationKind::SyncPolicy;
     for s in &plan.steps {
+        if s.transform.old_path.is_some() && s.transform.old_sha256.is_none() {
+            bail!("plan step is missing old_sha256 for an existing file; refusing to apply");
+        }
         if policy != (s.kind == PlanStepKind::PolicyUpdate) {
             bail!(
                 "plan step kind {:?} does not belong to a {:?} plan; refusing to apply",
@@ -297,14 +165,79 @@ fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
         }
     }
     for pkg in &plan.affected_packages {
-        if pkg != "." && !(pkg.starts_with("./") && !pkg.contains("..")) {
+        let plain = pkg.starts_with("./")
+            && !pkg.ends_with(".go")
+            && !pkg.split('/').any(|c| c == "..")
+            && pkg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "./_-".contains(c));
+        if pkg != "." && !plain {
             bail!("plan package `{pkg}` is not a relative package path; refusing to apply");
         }
     }
     Ok(())
 }
 
+fn changes_for(root: &Path, plan: &MovePlan) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for s in &plan.steps {
+        let t = &s.transform;
+        if let (Some(new), Some(content)) = (&t.new_path, &t.new_content) {
+            changes.push(Change {
+                path: root.join(new),
+                op: Op::Put {
+                    bytes: content.clone().into_bytes(),
+                    mode_from: Some(root.join(t.old_path.as_deref().unwrap_or(new))),
+                },
+            });
+        }
+        if let Some(old) = &t.old_path
+            && t.new_path.as_ref() != Some(old)
+        {
+            changes.push(Change {
+                path: root.join(old),
+                op: Op::Delete,
+            });
+        }
+    }
+    changes
+}
+
+/// A sync-policy plan must be exactly what the tool derives from the tree and its own path map,
+/// so a foreign or hand-edited plan cannot plant content (a check `command`, a loosened guard)
+/// in a policy file under a valid-looking id.
+fn check_policy_derivation(plan: &MovePlan, root: &Path) -> Result<()> {
+    let expected = super::policy::sync_policy(root, plan)?;
+    let shape = |p: &MovePlan| {
+        p.steps
+            .iter()
+            .map(|s| {
+                (
+                    s.transform.new_path.clone(),
+                    s.transform.new_content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if shape(&expected) != shape(plan) {
+        bail!(
+            "sync-policy plan differs from what the tool derives from its path map; refusing to apply"
+        );
+    }
+    Ok(())
+}
+
 pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyResult> {
+    apply_with(plan, root, opts, &txn::real_rename)
+}
+
+/// [`apply`] with an injectable `rename`, so tests can fail a chosen write.
+pub(super) fn apply_with(
+    plan: &MovePlan,
+    root: &Path,
+    opts: &ApplyOptions,
+    rename: Rename,
+) -> Result<ApplyResult> {
     validate_plan(plan, root)?;
     if !plan.blockers.is_empty() {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
@@ -339,21 +272,10 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
         );
     }
 
-    let mut journal = Journal::new(root, plan)?;
-    let outcome = write_steps(&mut journal, plan, opts);
-    if let Err(e) = outcome {
-        let restore_errors = journal.restore();
-        if restore_errors.is_empty() {
-            return Err(e.context("apply failed; working tree restored"));
-        }
-        return Err(e.context(format!(
-            "apply failed AND restore had errors: {}",
-            restore_errors.join("; ")
-        )));
+    if plan.operation == OperationKind::SyncPolicy {
+        check_policy_derivation(plan, root)?;
     }
-    // Temp files are gone after a successful rename; forget them so restore won't look.
-    journal.tmp_files.clear();
-
+    let pending = txn::begin(root, &plan.plan_id, &changes_for(root, plan), rename)?;
     let mut verify = None;
     if opts.verify {
         let v = run_verify(
@@ -361,11 +283,16 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
             &plan.affected_packages,
             opts.affected_only,
             opts.post_apply.as_deref(),
+            opts.verify_timeout.unwrap_or(DEFAULT_TIMEOUT),
         );
         let ok = v.ok();
         verify = Some(v);
         if !ok {
-            let restore_errors = journal.restore();
+            let restore_errors = pending
+                .rollback()
+                .err()
+                .map(|e| vec![format!("{e:#}")])
+                .unwrap_or_default();
             return Ok(ApplyResult {
                 status: ApplyStatus::RolledBack,
                 applied_steps: 0,
@@ -375,7 +302,7 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
             });
         }
     }
-    journal.armed = false;
+    pending.commit()?;
     prune_empty_dirs(root, plan);
     Ok(ApplyResult {
         status: ApplyStatus::Applied,
@@ -384,141 +311,4 @@ pub fn apply(plan: &MovePlan, root: &Path, opts: &ApplyOptions) -> Result<ApplyR
         restore_errors: vec![],
         plan: plan.clone(),
     })
-}
-
-fn write_steps(journal: &mut Journal, plan: &MovePlan, opts: &ApplyOptions) -> Result<()> {
-    for (i, s) in plan.steps.iter().enumerate() {
-        let t = &s.transform;
-        if let (Some(new), Some(content)) = (&t.new_path, &t.new_content) {
-            journal
-                .write_atomic(
-                    new,
-                    content.as_bytes(),
-                    t.old_path.as_deref().or(Some(new.as_str())),
-                )
-                .map_err(|e| anyhow::anyhow!("writing {new}: {e}"))?;
-        }
-        if let Some(old) = &t.old_path
-            && t.new_path.as_ref() != Some(old)
-        {
-            std::fs::remove_file(journal.root.join(old))
-                .map_err(|e| anyhow::anyhow!("removing {old}: {e}"))?;
-        }
-        if opts.inject_failure_after_step == Some(i) {
-            bail!("injected failure after step {i} ({:?})", s.kind);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::go_refactor::types::{FileTransform, OperationKind, PlanStepKind};
-
-    fn one_step_plan(old: &str, new: &str) -> MovePlan {
-        MovePlan {
-            operation: OperationKind::MoveFiles,
-            repo_root: ".".into(),
-            module: "m".into(),
-            from: vec![],
-            to: vec![],
-            steps: vec![PlanStep {
-                kind: PlanStepKind::MoveFile,
-                transform: FileTransform {
-                    old_path: Some(old.into()),
-                    old_sha256: None,
-                    new_path: Some(new.into()),
-                    new_content: Some("package z\n".into()),
-                },
-                reason: String::new(),
-            }],
-            blockers: vec![],
-            warnings: vec![],
-            surface_changes: vec![],
-            path_map: vec![],
-            affected_packages: vec![],
-            simulation_result: None,
-        }
-    }
-
-    fn scratch_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("kibitzer-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    #[test]
-    fn unreadable_file_is_a_conflict_not_a_missing_file() {
-        let root = scratch_root("unreadable");
-        // A directory where a file is expected fails to read with a non-NotFound error, on any user.
-        std::fs::create_dir_all(root.join("a.go")).unwrap();
-        let plan = one_step_plan("a.go", "b.go");
-        assert!(matches!(
-            classify(&root, &plan.steps[0]),
-            StepState::Conflict(m) if m.contains("not readable")
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn dropping_an_armed_journal_restores_the_tree() {
-        let root = scratch_root("drop-guard");
-        std::fs::write(root.join("a.go"), "package a\n").unwrap();
-        let plan = one_step_plan("a.go", "b.go");
-        {
-            let journal = Journal::new(&root, &plan).unwrap();
-            // Simulate a half-finished apply, then unwind without an explicit restore.
-            std::fs::write(root.join("b.go"), "package z\n").unwrap();
-            std::fs::remove_file(root.join("a.go")).unwrap();
-            drop(journal);
-        }
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.go")).unwrap(),
-            "package a\n"
-        );
-        assert!(!root.join("b.go").exists());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn restore_recreates_missing_parent_directories() {
-        let root = std::env::temp_dir().join(format!("kibitzer-restore-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("x/y")).unwrap();
-        std::fs::write(root.join("x/y/z.go"), "package z\n").unwrap();
-        let plan = MovePlan {
-            operation: OperationKind::MoveFiles,
-            repo_root: ".".into(),
-            module: "m".into(),
-            from: vec![],
-            to: vec![],
-            steps: vec![PlanStep {
-                kind: PlanStepKind::MoveFile,
-                transform: FileTransform {
-                    old_path: Some("x/y/z.go".into()),
-                    old_sha256: None,
-                    new_path: Some("n/z.go".into()),
-                    new_content: Some("package z\n".into()),
-                },
-                reason: String::new(),
-            }],
-            blockers: vec![],
-            warnings: vec![],
-            surface_changes: vec![],
-            path_map: vec![],
-            affected_packages: vec![],
-            simulation_result: None,
-        };
-        let mut journal = Journal::new(&root, &plan).unwrap();
-        // The whole source directory vanishes mid-apply, as after a pruned move.
-        std::fs::remove_dir_all(root.join("x")).unwrap();
-        assert!(journal.restore().is_empty());
-        assert_eq!(
-            std::fs::read_to_string(root.join("x/y/z.go")).unwrap(),
-            "package z\n"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }

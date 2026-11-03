@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 
 use super::feasibility::{self, Resolved};
 use super::{
@@ -12,6 +11,7 @@ use super::{
 };
 use crate::arch_model::ArchModel;
 use crate::go_syntax::{self, ImportName};
+use crate::refactor_core::sha256_hex;
 
 fn is_test_file(path: &Path) -> bool {
     path.file_name()
@@ -55,11 +55,7 @@ pub fn list_operations_for_package(model: &ArchModel, package: &str) -> Vec<Avai
 
 fn module_name(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("go.mod")).ok()?;
-    text.lines().find_map(|l| {
-        l.trim()
-            .strip_prefix("module ")
-            .map(|m| m.trim().to_string())
-    })
+    crate::go_call_resolution::parse_module_path(&text)
 }
 
 /// `(module path, module dir)` of the nearest `go.mod` above `start`, within the repo.
@@ -112,13 +108,6 @@ fn target_package_name(op: &RefactorOperation, dir: &Path) -> String {
 
 fn read_file(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Plans a MoveFiles/ExtractPackage operation. Errors when the operation is infeasible or

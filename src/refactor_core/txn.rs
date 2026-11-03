@@ -250,6 +250,9 @@ fn rollback(root: &Path, wal: &Wal) -> Result<()> {
 fn cleanup(root: &Path) -> Result<()> {
     ignore_missing(std::fs::remove_file(wal_path(root)))?;
     let _ = std::fs::remove_dir_all(backup_dir(root));
+    // Only succeed when empty, so a repo's own `.kibitzer/` files are never touched.
+    let _ = std::fs::remove_dir(plans_dir(root));
+    let _ = std::fs::remove_dir(root.join(".kibitzer"));
     Ok(())
 }
 
