@@ -29,6 +29,32 @@ impl Findings {
     }
 }
 
+/// `add_import` for the planner: a file we cannot safely edit becomes a blocking diagnostic and is
+/// left as it was, so the plan can never contain a half-made edit.
+fn add_import_or_block(
+    f: &mut Findings,
+    file: &str,
+    src: &str,
+    path: &str,
+    alias: Option<&str>,
+) -> String {
+    match gs::add_import(src, path, alias) {
+        Ok(edited) => edited,
+        Err(why) => {
+            f.block(
+                BlockingDiagnostic::new(
+                    "unsafe_import_edit",
+                    format!(
+                        "cannot add the import of `{path}` to {file}: {why}; refusing to edit it"
+                    ),
+                )
+                .at(file, None),
+            );
+            src.to_string()
+        }
+    }
+}
+
 fn is_exported(name: &str) -> bool {
     name.chars().next().is_some_and(char::is_uppercase)
 }
@@ -483,7 +509,7 @@ pub fn partial_move(
         if whole {
             let mut content = apply_with_pkg_clause(&src, moved_edits, &b_name);
             if need_a_import_in.contains(file) {
-                content = gs::add_import(&content, &a_import, None);
+                content = add_import_or_block(f, file, &content, &a_import, None);
             }
             let dest = join(&dest_dir, base_of(file));
             if ws.get(&dest).is_some() {
@@ -523,10 +549,10 @@ pub fn partial_move(
                     gs::ImportName::Dot | gs::ImportName::Blank => continue,
                     gs::ImportName::Implicit => None,
                 };
-                content = gs::add_import(&content, &spec.path, alias.as_deref());
+                content = add_import_or_block(f, file, &content, &spec.path, alias.as_deref());
             }
             if need_a_import_in.contains(file) {
-                content = gs::add_import(&content, &a_import, None);
+                content = add_import_or_block(f, file, &content, &a_import, None);
             }
             let kn = known_name_fn(ws);
             content = gs::prune_unused_imports(&content, &kn);
@@ -556,14 +582,14 @@ pub fn partial_move(
             }
             let mut rest = gs::apply_edits(&src, rest_edits);
             if refs_b {
-                rest = gs::add_import(&rest, dest_import, None);
+                rest = add_import_or_block(f, file, &rest, dest_import, None);
             }
             let kn = known_name_fn(ws);
             rest = gs::prune_unused_imports(&rest, &kn);
             remaining_updates.push((file.clone(), rest));
         } else if !rest_edits.is_empty() {
             let mut rest = gs::apply_edits(&src, rest_edits);
-            rest = gs::add_import(&rest, dest_import, None);
+            rest = add_import_or_block(f, file, &rest, dest_import, None);
             remaining_updates.push((file.clone(), rest));
         }
     }
@@ -654,7 +680,9 @@ pub fn partial_move(
                     ));
                 }
                 let out = {
-                    let added = gs::add_import(
+                    let added = add_import_or_block(
+                        f,
+                        &file,
                         &new_src,
                         &b_dir_import,
                         alias_needed.then_some(bq.as_str()),

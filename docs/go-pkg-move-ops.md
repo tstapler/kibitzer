@@ -69,7 +69,9 @@ rolls every move back.
 
 ## Trust model
 
-Planning (no `--apply`) only reads files and runs `gofmt`. **`--apply` runs `go build`,
+Planning (no `--apply`) only reads files and runs `gofmt` (twice per plan, over a private temp
+directory: once on the originals to learn whether they were already formatted, once on the rewritten
+bodies; on a 227-importer kubernetes rename that is 2 spawns instead of 456 and ~2.5 s instead of ~3.8 s). **`--apply` runs `go build`,
 `go vet` and `go test` in the target repo, which executes that repo's own test and `init`
 code** (and `go` may fetch a toolchain named by `go.mod`), as does a `--post-apply`
 command; the child inherits your environment, so pin `GOTOOLCHAIN`/`GOFLAGS` yourself if you
@@ -185,6 +187,8 @@ remaining gap. What replaces resolution:
 | `dest_exists`, `dest_file_exists`, `same_package`, `main_package`, `mixed_packages`, `no_such_package`, `no_such_file`, `no_such_decl`, `nothing_to_move`, `overlapping_clusters`, `multiple_source_packages` | Selection/destination errors |
 | `simulation_blocker` | The embedded feasibility-simulation result reports a blocker |
 | `format_failed` | A rewritten file does not parse (`gofmt` rejected it) |
+| `unsafe_import_edit` | A file needs an import added but its import group cannot be edited safely (syntax error, missing `)`, no package clause): the file is left as it was and the plan is blocked (`extract-decls/unsafe-import-splice`) |
+| `unreadable_go_file` | A `.go` file in the module could not be read (permissions, not UTF-8), so importers in it cannot be found |
 
 Exported-surface changes are listed in `surface_changes` (`old.Path.Name -> new.Path.Name`).
 
@@ -200,7 +204,7 @@ Exported-surface changes are listed in `surface_changes` (`old.Path.Name -> new.
 * A trailing comment on the line of the previous declaration is not treated as the next
   declaration's doc comment.
 
-## One shared core, two planners (and a third engine outside it)
+## One shared core, three planners
 
 `kibitzer refactor go` (`src/go_refactor/`, five operations, Workspace-based planning) and the
 MCP `plan_refactor`/`apply_refactor` engine (`src/refactor/`, #159, ArchModel-based
@@ -225,12 +229,16 @@ flagged only by the new implementation (all suffix- or comment-aware cases), 0 o
 old one.
 
 The MCP split engine (`src/refactor_split.rs`, #158: `plan_split_refactor`, `apply_split_refactor`,
-`verify_refactor`, `revert_refactor`) is **not** on the shared core: it has its own file writer,
-restore and shell-based verification, and no crash recovery. Moving it onto `refactor_core::{txn,
-exec}` is the natural next step. To avoid a name clash with the move engine's tools (both
-originally used `plan_refactor`/`apply_refactor`), the split tools were renamed
-`plan_split_refactor`/`apply_split_refactor`; `plan_refactor`/`apply_refactor` now mean the move
-engine, so a client written against the old split-tool schema gets a schema error.
+`verify_refactor`, `revert_refactor`) is the third planner and is on the same core for everything
+that touches disk: `apply` and `revert` are `txn` transactions (so a failed write, a failed
+verification, a panic or a killed process leaves the tree as it was, and the next `apply` or
+`revert` recovers an orphaned log before it looks at the tree), and its verification steps run
+through `exec` with a 10-minute timeout. What it keeps of its own: its plan format (stored under
+the git dir), its clean-tree and `HEAD` staleness checks, and its cross-session path locks. To avoid a name clash
+with the move engine's tools (both originally used `plan_refactor`/`apply_refactor`), the split
+tools were renamed `plan_split_refactor`/`apply_split_refactor`; `plan_refactor`/`apply_refactor`
+now mean the move engine, so a client written against the old split-tool schema gets a schema
+error.
 
 Transaction behavior worth knowing (all in `refactor_core/txn.rs`, covered by its tests):
 the process-wide lock is taken first and held through staleness checks, body computation,
@@ -258,9 +266,6 @@ on a descendant that keeps the output pipe open, and the child dies with its par
 * A planned file that is a symlink (or any non-regular file) is refused by the transaction, where the
   first MCP release copied through it; the planner does not yet skip symlinks up front, so such a
   plan fails cleanly at apply, before any write.
-* `add_import` returns the source unchanged when it cannot splice safely (a malformed import
-  group); the CLI's always-on `go build` catches that, but a caller without verification would not
-  notice.
 
 ## Out of v1
 

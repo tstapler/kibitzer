@@ -369,6 +369,8 @@ fn negative_fixtures_report_the_expected_blocker() {
             "move-files/hazard-path-keyed-registration",
             "path_keyed_registration",
         ),
+        // An importer whose import group cannot be edited safely: a blocker, never a silent skip.
+        ("extract-decls/unsafe-import-splice", "unsafe_import_edit"),
         ("rename-pkg/hazard-dynamic-reference", "import_path_string"),
         (
             "rename-pkg/hazard-dynamic-reference",

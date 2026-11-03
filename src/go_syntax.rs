@@ -279,19 +279,34 @@ fn drop_empty_import_decls(src: &str) -> String {
     apply_edits(src, edits)
 }
 
-/// Add `import [alias] "path"` unless an import of `path` already exists.
-pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> String {
+/// Why [`add_import`] refused to edit: splicing into this file could corrupt it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ImportSpliceError(pub &'static str);
+
+impl std::fmt::Display for ImportSpliceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ImportSpliceError {}
+
+/// Add `import [alias] "path"` unless an import of `path` already exists (then `Ok(src)`).
+/// Any situation where the splice point cannot be trusted is an `Err`, never a silent no-op:
+/// the caller must turn it into a diagnostic rather than plan around an unedited file.
+pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> Result<String, ImportSpliceError> {
     if imports(src).iter().any(|i| i.path == path) {
-        return src.to_string();
+        return Ok(src.to_string());
     }
     let spec = match alias {
         Some(a) => format!("{a} \"{path}\""),
         None => format!("\"{path}\""),
     };
-    let Some(tree) = parse(src) else {
-        return src.to_string();
-    };
+    let tree = parse(src).ok_or(ImportSpliceError("the file does not parse"))?;
     let root = tree.root_node();
+    if root.has_error() {
+        return Err(ImportSpliceError("the file has syntax errors"));
+    }
     let decls: Vec<Node> = children(root)
         .into_iter()
         .filter(|n| n.kind() == "import_declaration")
@@ -301,25 +316,23 @@ pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> String {
             .into_iter()
             .find(|c| c.kind() == "import_spec_list")
     }) {
-        // A group missing its `)` (syntax error) or an inline `import ("a")` cannot take a new
-        // line safely: leave the file alone rather than splice into a literal.
-        let Some(close) = children(list)
+        let close = children(list)
             .into_iter()
             .rfind(|c| c.kind() == ")" && !c.is_missing() && c.end_byte() > c.start_byte())
             .map(|c| c.start_byte())
-        else {
-            return src.to_string();
-        };
+            .ok_or(ImportSpliceError(
+                "the import group has no closing parenthesis",
+            ))?;
         let at_line_start = src[..close].trim_end_matches([' ', '\t']).ends_with('\n');
         let lead = if at_line_start { "" } else { "\n" };
-        return apply_edits(
+        return Ok(apply_edits(
             src,
             vec![Edit {
                 start: close,
                 end: close,
                 text: format!("{lead}\t{spec}\n"),
             }],
-        );
+        ));
     }
     if let Some(d) = decls.first() {
         // Single `import "x"`: widen into a group.
@@ -327,29 +340,27 @@ pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> String {
             .trim_start_matches("import")
             .trim()
             .to_string();
-        return apply_edits(
+        return Ok(apply_edits(
             src,
             vec![Edit {
                 start: d.start_byte(),
                 end: d.end_byte(),
                 text: format!("import (\n\t{existing}\n\t{spec}\n)"),
             }],
-        );
+        ));
     }
-    let Some(pc) = children(root)
+    let pc = children(root)
         .into_iter()
         .find(|n| n.kind() == "package_clause")
-    else {
-        return src.to_string();
-    };
-    apply_edits(
+        .ok_or(ImportSpliceError("the file has no package clause"))?;
+    Ok(apply_edits(
         src,
         vec![Edit {
             start: pc.end_byte(),
             end: pc.end_byte(),
             text: format!("\n\nimport {spec}"),
         }],
-    )
+    ))
 }
 
 /// Package qualifiers used in the file: `x` in `x.Foo` (expression) and `x.T` (type).
@@ -860,11 +871,11 @@ mod tests {
     #[test]
     fn add_and_remove_import() {
         let src = "package a\n\nimport \"fmt\"\n\nfunc f() { fmt.Println() }\n";
-        let added = add_import(src, "x/y", None);
+        let added = add_import(src, "x/y", None).unwrap();
         assert!(
             added.contains("import (") && added.contains("\"x/y\"") && added.contains("\"fmt\"")
         );
-        let bare = add_import("package a\n", "x/y", None);
+        let bare = add_import("package a\n", "x/y", None).unwrap();
         assert!(bare.contains("import \"x/y\""));
         let removed = remove_import(&added, "x/y");
         assert!(!removed.contains("x/y"));
@@ -1019,16 +1030,25 @@ mod tests {
     }
 
     #[test]
-    fn add_import_leaves_malformed_or_inline_groups_alone_or_valid() {
-        // Missing `)`: no panic, no splice into the literal.
+    fn add_import_refuses_unsafe_splices_and_handles_inline_groups() {
+        // Missing `)`: an error naming the reason, no panic, nothing spliced into the literal.
         let broken = "package a\nimport (\n\t\"os\"\n";
-        assert_eq!(add_import(broken, "fmt", None), broken);
+        assert!(add_import(broken, "fmt", None).is_err());
         // Multi-byte text before a missing `)` must not hit a char boundary.
         let multibyte = "package a\nimport (\n\t\"\u{e9}\"";
-        assert_eq!(add_import(multibyte, "fmt", None), multibyte);
+        assert!(add_import(multibyte, "fmt", None).is_err());
+        // Syntax errors anywhere make the splice point untrustworthy.
+        let err = add_import("package a\nfunc (", "fmt", None).unwrap_err();
+        assert_eq!(err, ImportSpliceError("the file has syntax errors"));
+        assert!(
+            add_import("func f() {}\n", "fmt", None).is_err(),
+            "no package clause"
+        );
+        // Already imported is not an error even in a broken file: nothing needs splicing.
+        assert_eq!(add_import(broken, "os", None).unwrap(), broken);
         // Inline group gets a newline so the result is still valid Go.
         let inline = "package a\n\nimport (\"a\")\n";
-        let out = add_import(inline, "b", None);
+        let out = add_import(inline, "b", None).unwrap();
         assert!(
             parse(&out).is_some_and(|t| !t.root_node().has_error()),
             "{out}"
@@ -1153,14 +1173,15 @@ mod tests {
     fn add_import_places_the_spec_exactly_and_keeps_the_file_valid() {
         let valid = |s: &str| parse(s).is_some_and(|t| !t.root_node().has_error());
         // Single import widened into a group.
-        let out = add_import("package a\n\nimport \"fmt\"\n", "x/y", None);
+        let out = add_import("package a\n\nimport \"fmt\"\n", "x/y", None).unwrap();
         assert_eq!(out, "package a\n\nimport (\n\t\"fmt\"\n\t\"x/y\"\n)\n");
         // Existing group with a trailing comment, aliased addition.
         let out = add_import(
             "package a\nimport (\n\t\"fmt\" // c\n)\n",
             "x/y",
             Some("al"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             out,
             "package a\nimport (\n\t\"fmt\" // c\n\tal \"x/y\"\n)\n"
@@ -1168,12 +1189,12 @@ mod tests {
         assert!(valid(&out));
         // Already imported: unchanged.
         let same = "package a\n\nimport \"x/y\"\n";
-        assert_eq!(add_import(same, "x/y", None), same);
+        assert_eq!(add_import(same, "x/y", None).unwrap(), same);
         // No import declaration at all.
-        let out = add_import("package a\n\nfunc f() {}\n", "x/y", None);
+        let out = add_import("package a\n\nfunc f() {}\n", "x/y", None).unwrap();
         assert!(valid(&out) && out.contains("\"x/y\""), "{out}");
         // Blank embed import widened into a group keeps its blank name.
-        let out = add_import("package a\n\nimport _ \"embed\"\n", "x/y", None);
+        let out = add_import("package a\n\nimport _ \"embed\"\n", "x/y", None).unwrap();
         assert!(
             valid(&out) && out.contains("_ \"embed\"") && out.contains("\"x/y\""),
             "{out}"

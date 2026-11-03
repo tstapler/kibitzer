@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use crate::arch_model::ArchModel;
 use crate::architecture_checks::find_cycles;
 use crate::import_graph::ImportGraph;
+use crate::refactor_core::exec::{self, EnvPolicy};
+use crate::refactor_core::txn;
 
 /// Cap on any listed collection in a response; counts and a `truncated` flag accompany it.
 pub const LIST_CAP: usize = 50;
@@ -919,6 +921,9 @@ fn truncate_at_boundary(s: &mut String, max: usize) {
     }
 }
 
+/// Per verification step; a hung build must not hold the plan locks forever.
+const VERIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn run_verification(repo: &Path, plan: &RefactorPlan) -> Verification {
     if plan.verification_steps.is_empty() {
         return Verification {
@@ -938,31 +943,21 @@ pub fn run_verification(repo: &Path, plan: &RefactorPlan) -> Verification {
                 output,
             };
         }
-        match Command::new("sh")
-            .arg("-c")
-            .arg(step)
-            .current_dir(repo)
-            .output()
-        {
-            Ok(o) => {
-                output.push_str(&String::from_utf8_lossy(&o.stdout));
-                output.push_str(&String::from_utf8_lossy(&o.stderr));
-                if !o.status.success() {
-                    truncate_at_boundary(&mut output, 4000);
-                    return Verification {
-                        passed: false,
-                        skipped: false,
-                        output,
-                    };
-                }
-            }
-            Err(e) => {
-                return Verification {
-                    passed: false,
-                    skipped: false,
-                    output: e.to_string(),
-                };
-            }
+        let run = exec::run(&exec::Spec {
+            program: "sh",
+            args: &["-c".to_string(), step.clone()],
+            dir: repo,
+            timeout: VERIFICATION_TIMEOUT,
+            env: EnvPolicy::Inherit,
+        });
+        output.push_str(&run.output);
+        if !run.ok() {
+            truncate_at_boundary(&mut output, 4000);
+            return Verification {
+                passed: false,
+                skipped: false,
+                output,
+            };
         }
     }
     truncate_at_boundary(&mut output, 4000);
@@ -977,24 +972,67 @@ fn paths_refs(plan: &RefactorPlan) -> Vec<&str> {
     plan.touched_paths.iter().map(String::as_str).collect()
 }
 
-fn restore_originals(repo: &Path, plan: &RefactorPlan) {
-    for e in &plan.edits {
-        let p = repo.join(&e.file);
-        match &e.original {
-            Some(orig) => {
-                let _ = std::fs::write(&p, orig);
-            }
-            None => {
-                let _ = std::fs::remove_file(&p);
-                if let Some(parent) = p.parent() {
-                    let _ = std::fs::remove_dir(parent); // only if now empty
+fn txn_error(e: anyhow::Error) -> RefactorError {
+    RefactorError {
+        code: "io",
+        message: format!("{e:#}"),
+    }
+}
+
+/// The plan's edits as transaction changes: the writes and deletions `apply` makes.
+fn apply_changes(repo: &Path, plan: &RefactorPlan) -> Vec<txn::Change> {
+    plan.edits
+        .iter()
+        .map(|e| txn::Change {
+            path: repo.join(&e.file),
+            op: if e.kind == "write" {
+                txn::Op::Put {
+                    bytes: e.content.clone().unwrap_or_default().into_bytes(),
+                    mode_from: None,
                 }
-            }
+            } else {
+                txn::Op::Delete
+            },
+        })
+        .collect()
+}
+
+/// The inverse: put each file back to its plan-time content, or delete what the plan created.
+fn revert_changes(repo: &Path, plan: &RefactorPlan) -> Vec<txn::Change> {
+    plan.edits
+        .iter()
+        .map(|e| txn::Change {
+            path: repo.join(&e.file),
+            op: match &e.original {
+                Some(orig) => txn::Op::Put {
+                    bytes: orig.clone().into_bytes(),
+                    mode_from: None,
+                },
+                None => txn::Op::Delete,
+            },
+        })
+        .collect()
+}
+
+/// Unstages the plan's paths (apply `git add`s them) and drops directories the plan created.
+fn reset_index(repo: &Path, plan: &RefactorPlan) {
+    for e in plan.edits.iter().filter(|e| e.original.is_none()) {
+        if let Some(parent) = repo.join(&e.file).parent() {
+            let _ = std::fs::remove_dir(parent); // only if now empty
         }
     }
     let mut args = vec!["reset", "-q", "--"];
     args.extend(paths_refs(plan));
     let _ = git(repo, &args);
+}
+
+/// Rolls an applied-but-failed plan back through the transaction, unstages it and releases its
+/// locks. `Err` carries the rollback failure (the log is kept for the next recovery).
+fn abort_apply(repo: &Path, plan: &RefactorPlan, pending: txn::Pending) -> Result<(), String> {
+    let rolled = pending.rollback().map_err(|e| format!("{e:#}"));
+    reset_index(repo, plan);
+    release_locks(repo, plan);
+    rolled
 }
 
 #[derive(Debug, Serialize)]
@@ -1006,6 +1044,9 @@ pub struct ApplyOutcome {
 }
 
 pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
+    // Lock and crash-recover first: a half-applied tree left by a killed process is restored
+    // before the HEAD and dirty-tree checks below look at it.
+    let session = txn::session(repo).map_err(txn_error)?;
     let mut plan = load_plan(repo, id)?;
     if plan.status != PlanStatus::Planned {
         return err(
@@ -1039,33 +1080,35 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
             return Err(e);
         }
     }
-    for e in &plan.edits {
-        let p = repo.join(&e.file);
-        let res = match e.kind.as_str() {
-            "write" => p
-                .parent()
-                .map(std::fs::create_dir_all)
-                .transpose()
-                .and_then(|_| std::fs::write(&p, e.content.as_deref().unwrap_or(""))),
-            _ => std::fs::remove_file(&p),
-        };
-        if let Err(io) = res {
-            restore_originals(repo, &plan);
+    let pending = match session.begin(
+        &plan.plan_id,
+        &apply_changes(repo, &plan),
+        &txn::real_rename,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
             release_locks(repo, &plan);
-            return err("io", format!("writing {}: {io}", e.file));
+            return Err(txn_error(e));
         }
-    }
+    };
     let mut add = vec!["add", "-A", "--"];
     add.extend(paths_refs(&plan));
     if let Err(e) = git(repo, &add) {
-        restore_originals(repo, &plan);
-        release_locks(repo, &plan);
-        return Err(e);
+        return Err(match abort_apply(repo, &plan, pending) {
+            Ok(()) => e,
+            Err(rb) => RefactorError {
+                code: e.code,
+                message: format!("{}; rollback also failed: {rb}", e.message),
+            },
+        });
     }
-    let verification = run_verification(repo, &plan);
+    let mut verification = run_verification(repo, &plan);
     if !verification.passed {
-        restore_originals(repo, &plan);
-        release_locks(repo, &plan);
+        if let Err(rb) = abort_apply(repo, &plan, pending) {
+            verification
+                .output
+                .push_str(&format!("\nrollback failed: {rb}"));
+        }
         return Ok(ApplyOutcome {
             applied: false,
             rolled_back: true,
@@ -1075,10 +1118,11 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
     }
     plan.status = PlanStatus::Applied;
     if let Err(e) = save_plan(repo, &plan) {
-        restore_originals(repo, &plan);
-        release_locks(repo, &plan);
+        let _ = abort_apply(repo, &plan, pending);
         return Err(e);
     }
+    // Last, so the plan can still be rolled back if saving it failed.
+    pending.commit().map_err(txn_error)?;
     let diff_summary = git(repo, &["diff", "--cached", "--stat"]).unwrap_or_default();
     Ok(ApplyOutcome {
         applied: true,
@@ -1100,6 +1144,7 @@ pub fn verify(repo: &Path, id: &str) -> Result<Verification, RefactorError> {
 }
 
 pub fn revert(repo: &Path, id: &str) -> Result<Vec<String>, RefactorError> {
+    let session = txn::session(repo).map_err(txn_error)?;
     let mut plan = load_plan(repo, id)?;
     if plan.status != PlanStatus::Applied {
         return err(
@@ -1127,7 +1172,17 @@ pub fn revert(repo: &Path, id: &str) -> Result<Vec<String>, RefactorError> {
             );
         }
     }
-    restore_originals(repo, &plan);
+    // The inverse edit set is itself a transaction: all files return to their plan-time content
+    // or none does, and a crash mid-revert is recovered like any other.
+    session
+        .begin(
+            &format!("revert-{}", plan.plan_id),
+            &revert_changes(repo, &plan),
+            &txn::real_rename,
+        )
+        .and_then(txn::Pending::commit)
+        .map_err(txn_error)?;
+    reset_index(repo, &plan);
     release_locks(repo, &plan);
     plan.status = PlanStatus::Reverted;
     save_plan(repo, &plan)?;
