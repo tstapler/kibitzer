@@ -1080,4 +1080,68 @@ mod tests {
         assert_eq!(unquote("`\"x\"`"), "\"x\"");
         assert_eq!(unquote("plain"), "plain");
     }
+
+    /// The line scan the #159 engine used before it shared this module.
+    fn legacy_has_build_constraint(source: &str) -> bool {
+        for line in source.lines() {
+            let t = line.trim();
+            if t.starts_with("package ") {
+                return false;
+            }
+            if t.starts_with("//go:build") || t.starts_with("// +build") {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Backtest, not a unit test: `KIBITZER_GO_CORPUS=<dir> cargo test --bin kibitzer
+    /// build_constraint_vs_legacy -- --ignored --nocapture` counts files where the shared
+    /// implementation and the legacy scan disagree.
+    #[test]
+    #[ignore]
+    fn build_constraint_vs_legacy_on_corpus() {
+        let Some(dir) = std::env::var_os("KIBITZER_GO_CORPUS") else {
+            return;
+        };
+        let (mut total, mut both, mut new_only, mut old_only) = (0, 0, 0, 0);
+        let mut samples = vec![];
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let Ok(ft) = e.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "go")
+                    && let Ok(src) = std::fs::read_to_string(&p)
+                {
+                    total += 1;
+                    let new = has_build_constraint(&p.to_string_lossy(), &src);
+                    let old = legacy_has_build_constraint(&src);
+                    match (new, old) {
+                        (true, true) => both += 1,
+                        (true, false) => {
+                            new_only += 1;
+                            if samples.len() < 5 {
+                                samples.push(format!("new-only {}", p.display()));
+                            }
+                        }
+                        (false, true) => {
+                            old_only += 1;
+                            samples.push(format!("OLD-ONLY {}", p.display()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        println!(
+            "go files {total}: both {both}, new-only {new_only}, old-only {old_only}\n{}",
+            samples.join("\n")
+        );
+    }
 }

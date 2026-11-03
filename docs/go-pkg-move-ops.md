@@ -72,10 +72,25 @@ rolls every move back.
 Planning (no `--apply`) only reads files and runs `gofmt`. **`--apply` runs `go build`,
 `go vet` and `go test` in the target repo, which executes that repo's own test and `init`
 code** (and `go` may fetch a toolchain named by `go.mod`), as does a `--post-apply`
-command. Only apply to repositories you trust, and only apply plans you have reviewed;
-`apply --plan` re-validates the plan's paths but a reviewed-and-edited plan can still add
-or rewrite Go source. Verification output (stdout/stderr, unbounded) is embedded verbatim in
-the result JSON, so treat saved results as you would test logs.
+command; the child inherits your environment, so pin `GOTOOLCHAIN`/`GOFLAGS` yourself if you
+need to. Only apply to repositories you trust. Each command has a timeout (default 30 min,
+`--verify-timeout-secs`; the whole process group is killed) and each output stream is capped
+at 1 MiB with a note when truncated.
+
+A plan carries a `plan_id`, the SHA-256 of its contents (everything but `repo_root`).
+`apply` refuses a plan whose id does not match, whose steps lack `old_sha256` for an existing
+file, whose paths leave the repo or cross a symlink, or (for `sync_policy`) whose content is
+not exactly what the tool derives from the tree and the plan's path map. The id is a
+**checksum, not a signature**: it catches edits and truncation, not a plan forged with a
+recomputed id, so review plans you did not generate. A plan can still add or rewrite `.go`
+files, and `go test` then runs them.
+
+Writes go through the shared write-ahead-logged transaction (`src/refactor_core/txn.rs`): a
+failure, a failed verification, or a panic restores every touched file; a killed process
+leaves a log that the next `apply` rolls back before doing anything else. A rollback that
+itself fails exits 4 (a clean rollback exits 3). Files written by a `--post-apply` hook or
+by `go` itself are not rolled back. Verification output is embedded verbatim (capped) in the
+result JSON, so treat saved results as you would test logs.
 
 ## Why tree-sitter in Rust (and not `gopls`)
 
@@ -185,24 +200,40 @@ Exported-surface changes are listed in `surface_changes` (`old.Path.Name -> new.
 * A trailing comment on the line of the previous declaration is not treated as the next
   declaration's doc comment.
 
-## Known follow-ups (found in the sdd:6-verify review)
+## One shared core, two planners
 
-* **Two move engines coexist.** `src/go_refactor/` (this CLI, five operations, journal-based
-  applier) and `src/refactor/` (#159, MCP, WAL-based applier, build/vet allowlist only) were
-  developed in parallel and share no code or plan schema. Duplicated: plan hash helper
-  (`sha256_hex` in three files), Go package/import parsing (`go_refactor/go_syntax.rs`, 884
-  lines, is a superset of `refactor/go_syntax.rs`, 198 lines, and the two
-  `has_build_constraint` functions disagree on filename suffixes and block comments), and
-  `go.mod` module-line parsing. The safer shared core is a separate change; until then
-  `go_refactor` runs `go test` and an optional `--post-apply` shell command (see Trust model),
-  which #159 does not.
-* `ops.rs::partial_move` is ~500 lines and only golden-tested; splitting it per operation is
-  a mechanical follow-up.
-* `write_atomic` does not `fsync` before `rename`, so it is atomic against failure and panic
-  (a `Drop` guard restores the tree) but not against power loss. Files written by a
-  `--post-apply` hook or by `go` itself are not rolled back. A rollback that itself fails
-  exits 4 (a clean rollback exits 3).
-* `verify.rs` runs commands without a timeout.
+`kibitzer refactor go` (`src/go_refactor/`, five operations, Workspace-based planning) and the
+MCP `plan_refactor`/`apply_refactor` engine (`src/refactor/`, #159, ArchModel-based
+planning) plan differently but apply, verify and roll back through the same code:
+
+| Concern | Single implementation |
+|---|---|
+| Go syntax (package clause, imports, build constraints, cgo, declarations) | `src/go_syntax.rs` (the former 198-line `refactor/go_syntax.rs` is deleted) |
+| `go.mod` module line | `go_call_resolution::parse_module_path` (used by import graph, both engines) |
+| SHA-256 | `refactor_core::sha256_hex` |
+| Bounded command runner (no shell, timeout, process-group kill, output cap; `Locked` env for MCP, `Inherit` for the CLI) | `refactor_core/exec.rs` |
+| Path/name guards (`is_inside`, `is_protected`, `is_go_ident`, `is_safe_import_path`) | `refactor_core/guard.rs` |
+| Backup + WAL + temp-and-rename + crash `recover` + rollback-on-drop | `refactor_core/txn.rs` |
+
+What remains separate on purpose: the plan schemas (`MovePlan` is content-based: each step
+carries the final bytes; `RefactorPlan` is edit-based), the planners, and the MCP engine's
+restriction to `go build ./...`/`go vet ./...` (the CLI also runs `go test`). Behavior change
+for the MCP engine: it now flags files constrained only by their GOOS/GOARCH filename suffix
+(`*_linux.go`) as build-tagged. Backtest on `kubernetes/kubernetes` (17,846 `.go` files,
+`build_constraint_vs_legacy_on_corpus` in `src/go_syntax.rs`): 2,496 flagged by both, 221
+flagged only by the new implementation (all suffix- or comment-aware cases), 0 only by the
+old one.
+
+## Known limits
+
+* `ops.rs::partial_move` is ~500 lines and covered by golden tests only.
+* `verify` cannot stop a `--post-apply` hook or `go` from writing files outside the plan, and
+  those are not rolled back. A `SIGINT` mid-verification leaves the log behind; the next
+  `apply` in that repo restores the tree first.
+* Not mitigated: the window between path validation and the write (an attacker with local
+  write access to the repo during apply can swap a directory for a symlink).
+* The workspace walk reads every `.go` file fully (no size cap, no depth limit).
+* `--out` follows symlinks and uses the default file mode.
 
 ## Out of v1
 
