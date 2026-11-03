@@ -13,10 +13,30 @@ pub struct Edit {
     pub text: String,
 }
 
-pub fn apply_edits(src: &str, mut edits: Vec<Edit>) -> String {
-    edits.sort_by(|a, b| b.start.cmp(&a.start).then(b.end.cmp(&a.end)));
+/// Applies non-overlapping edits. Two inserts at one offset keep their input order. Overlapping
+/// or out-of-range edits are a bug in the caller and panic with a clear message rather than
+/// producing a corrupt file.
+pub fn apply_edits(src: &str, edits: Vec<Edit>) -> String {
+    let mut ordered: Vec<(usize, Edit)> = edits.into_iter().enumerate().collect();
+    ordered.sort_by(|(i, a), (j, b)| (a.start, a.end, *i).cmp(&(b.start, b.end, *j)));
+    for w in ordered.windows(2) {
+        assert!(
+            w[0].1.end <= w[1].1.start,
+            "overlapping edits {}..{} and {}..{}",
+            w[0].1.start,
+            w[0].1.end,
+            w[1].1.start,
+            w[1].1.end
+        );
+    }
     let mut out = src.to_string();
-    for e in edits {
+    for (_, e) in ordered.into_iter().rev() {
+        assert!(
+            e.end <= src.len(),
+            "edit {}..{} is out of range",
+            e.start,
+            e.end
+        );
         out.replace_range(e.start..e.end, &e.text);
     }
     out
@@ -105,8 +125,14 @@ pub struct ImportSpec {
     pub sole_decl: Option<(usize, usize)>,
 }
 
+/// Strips exactly one pair of surrounding `"` or `` ` ``; an inner quote belongs to the literal.
 fn unquote(s: &str) -> String {
-    s.trim_matches(|c| c == '"' || c == '`').to_string()
+    for q in ['"', '`'] {
+        if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
+            return inner.to_string();
+        }
+    }
+    s.to_string()
 }
 
 pub fn imports(src: &str) -> Vec<ImportSpec> {
@@ -275,13 +301,23 @@ pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> String {
             .into_iter()
             .find(|c| c.kind() == "import_spec_list")
     }) {
-        let close = list.end_byte() - 1; // the ')'
+        // A group missing its `)` (syntax error) or an inline `import ("a")` cannot take a new
+        // line safely: leave the file alone rather than splice into a literal.
+        let Some(close) = children(list)
+            .into_iter()
+            .rfind(|c| c.kind() == ")" && !c.is_missing() && c.end_byte() > c.start_byte())
+            .map(|c| c.start_byte())
+        else {
+            return src.to_string();
+        };
+        let at_line_start = src[..close].trim_end_matches([' ', '\t']).ends_with('\n');
+        let lead = if at_line_start { "" } else { "\n" };
         return apply_edits(
             src,
             vec![Edit {
                 start: close,
                 end: close,
-                text: format!("\t{spec}\n"),
+                text: format!("{lead}\t{spec}\n"),
             }],
         );
     }
@@ -774,7 +810,26 @@ pub fn uses_go_embed(src: &str) -> bool {
 pub fn has_init_func(src: &str) -> bool {
     top_decls(src)
         .iter()
-        .any(|d| d.kind == DeclKind::Func && src[d.start..d.end].contains("func init("))
+        .any(|d| d.kind == DeclKind::Func && is_init_decl(&src[d.start..d.end]))
+}
+
+/// `func init(` after any leading doc comments (whitespace before `(` allowed); a comment or
+/// string that merely mentions it does not count.
+fn is_init_decl(decl: &str) -> bool {
+    let mut rest = decl.trim_start();
+    loop {
+        if let Some(r) = rest.strip_prefix("//") {
+            rest = r.split_once('\n').map_or("", |(_, tail)| tail).trim_start();
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map_or("", |(_, tail)| tail).trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.strip_prefix("func")
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix("init"))
+        .is_some_and(|r| r.trim_start().starts_with('('))
 }
 
 #[cfg(test)]
@@ -961,5 +1016,68 @@ mod tests {
             "package a\n\n// +build linux\n"
         ));
         assert!(has_build_constraint("a_linux.go", "package a\n"));
+    }
+
+    #[test]
+    fn add_import_leaves_malformed_or_inline_groups_alone_or_valid() {
+        // Missing `)`: no panic, no splice into the literal.
+        let broken = "package a\nimport (\n\t\"os\"\n";
+        assert_eq!(add_import(broken, "fmt", None), broken);
+        // Multi-byte text before a missing `)` must not hit a char boundary.
+        let multibyte = "package a\nimport (\n\t\"\u{e9}\"";
+        assert_eq!(add_import(multibyte, "fmt", None), multibyte);
+        // Inline group gets a newline so the result is still valid Go.
+        let inline = "package a\n\nimport (\"a\")\n";
+        let out = add_import(inline, "b", None);
+        assert!(
+            parse(&out).is_some_and(|t| !t.root_node().has_error()),
+            "{out}"
+        );
+        assert!(out.contains("\"a\"") && out.contains("\"b\""));
+    }
+
+    #[test]
+    fn same_offset_inserts_keep_input_order_and_overlaps_are_loud() {
+        let ins = |at: usize, s: &str| Edit {
+            start: at,
+            end: at,
+            text: s.into(),
+        };
+        assert_eq!(apply_edits("ab", vec![ins(1, "X"), ins(1, "Y")]), "aXYb");
+        let overlap = std::panic::catch_unwind(|| {
+            apply_edits(
+                "abcdef",
+                vec![
+                    Edit {
+                        start: 1,
+                        end: 4,
+                        text: String::new(),
+                    },
+                    Edit {
+                        start: 2,
+                        end: 3,
+                        text: String::new(),
+                    },
+                ],
+            )
+        });
+        assert!(overlap.is_err());
+    }
+
+    #[test]
+    fn init_detection_ignores_comments_and_accepts_odd_spacing() {
+        assert!(has_init_func(
+            "package a\n\n// init sets up.\nfunc init () {}\n"
+        ));
+        assert!(!has_init_func(
+            "package a\n\n// call func init( later\nfunc other() { _ = \"func init(\" }\n"
+        ));
+    }
+
+    #[test]
+    fn unquote_strips_only_the_delimiters() {
+        assert_eq!(unquote("\"\\\"\""), "\\\"");
+        assert_eq!(unquote("`\"x\"`"), "\"x\"");
+        assert_eq!(unquote("plain"), "plain");
     }
 }

@@ -100,6 +100,20 @@ fn plain_path(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._/-~+@*".contains(c))
 }
 
+/// Reads a policy file; `None` only when it does not exist. A symlink is refused so a plan can
+/// never embed (or later write through to) a file outside the repo.
+fn read_policy_file(root: &Path, rel: &str) -> Result<Option<String>> {
+    let path = root.join(rel);
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => bail!("{rel} is a symlink; refusing to read it"),
+        Ok(_) => std::fs::read_to_string(&path)
+            .map(Some)
+            .with_context(|| format!("reading {rel}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {rel}")),
+    }
+}
+
 pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
     if let Some(m) = source.path_map.iter().find(|m| {
         !(plain_path(&m.from) && plain_path(&m.to) || m.from.is_empty() && plain_path(&m.to))
@@ -126,7 +140,7 @@ pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
     let mut warnings = vec![];
 
     let inspect = ".kibitzer/inspect.json";
-    if let Ok(raw) = std::fs::read_to_string(root.join(inspect)) {
+    if let Some(raw) = read_policy_file(root, inspect)? {
         let mut v: Value =
             serde_json::from_str(&raw).with_context(|| format!("parsing {inspect}"))?;
         let canonical = format!("{}\n", serde_json::to_string_pretty(&v)?);
@@ -157,7 +171,7 @@ pub fn sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {
         }
     }
     for name in GUARD_FILES {
-        let Ok(raw) = std::fs::read_to_string(root.join(name)) else {
+        let Some(raw) = read_policy_file(root, name)? else {
             continue;
         };
         let new = replace_import_paths(&raw, &import_maps);

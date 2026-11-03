@@ -956,6 +956,14 @@ pub fn rename_pkg(
     }
     dir_hazards(ws, f, &from_dir, true);
     string_references(ws, f, from_import, None);
+    if let Some(n) = name_override
+        && !crate::refactor_core::guard::is_go_ident(n)
+    {
+        f.blockers.push(BlockingDiagnostic::new(
+            "invalid_package_name",
+            format!("`{n}` is not a valid Go package name"),
+        ));
+    }
     let new_name = match name_override {
         Some(n) => n.to_string(),
         None if a.name == derive_pkg_name(from_import) => derive_pkg_name(to_import),
