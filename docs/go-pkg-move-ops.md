@@ -255,6 +255,12 @@ on a descendant that keeps the output pipe open, and the child dies with its par
   write access to the repo during apply can swap a directory for a symlink).
 * The workspace walk reads every `.go` file fully (no size cap, no depth limit).
 * `--out` follows symlinks and uses the default file mode.
+* A planned file that is a symlink (or any non-regular file) is refused by the transaction, where the
+  first MCP release copied through it; the planner does not yet skip symlinks up front, so such a
+  plan fails cleanly at apply, before any write.
+* `add_import` returns the source unchanged when it cannot splice safely (a malformed import
+  group); the CLI's always-on `go build` catches that, but a caller without verification would not
+  notice.
 
 ## Out of v1
 
