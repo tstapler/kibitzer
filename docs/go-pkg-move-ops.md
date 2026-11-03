@@ -261,14 +261,18 @@ packages, and updating import-path strings outside Go source and the listed poli
 
 ## Backtest (six standard repos)
 
-Procedure: `scripts/clone-backtest-repos.sh` clones (HEAD below); for the Go repo a
-throwaway `git worktree`, with `GOFLAGS=-mod=vendor GOTOOLCHAIN=go1.27.0` (the module
-requires Go 1.27.0; the system Go is 1.26.4). Each repo was run with
-`kibitzer refactor go rename-pkg --repo <repo> …`.
+**Reproduce:** `scripts/clone-backtest-repos.sh && cargo build --release &&
+scripts/go-move-backtest.sh all` (or `ONLY=k8s scripts/go-move-backtest.sh all`) runs every row
+below in a throwaway `git worktree` per repo (the corpus checkouts are not modified) and prints
+`go build`/`go vet` before and after, the tool's status and verify exit codes, and the diff size.
+Kubernetes is a `go.work` workspace needing Go 1.27.0 (`GOTOOLCHAIN=go1.27.0`, set by the
+script; the system Go here is 1.26.x) and `-mod=vendor`, so its before/after builds cover the
+affected packages rather than `./...`. All rows were last re-run on the binary built from the
+shared `refactor_core` (see "One shared core, two planners").
 
 | Repo (HEAD) | Go module? | Simulated move | Before | After |
 |---|---|---|---|---|
-| `kubernetes/kubernetes` (`0ba07e08`) | yes | `rename-pkg` `pkg/util/slice` → `pkg/util/sliceutil` (6 importers + 2 moved files, 8 steps) | `go build` of the 6 affected packages: exit 0 | `go build`, `go vet`, `go test -count=1` of the 6 packages: exit 0, 0, 0 (`persistentvolume` tests ok in 22.4 s); diff 14 insertions / 240 deletions (the deletions are the moved files); second apply: `already_applied` |
+| `kubernetes/kubernetes` (`0ba07e08`) | yes | `rename-pkg` `pkg/util/slice` → `pkg/util/sliceutil` (6 importers + 2 moved files, 8 steps) | `go build` of the 6 affected packages: exit 0 | `go build`, `go vet`, `go test -count=1` of the 6 packages: exit 0, 0, 0 (`persistentvolume` tests ok in 22.4 s); diff 8 files, +16/−16 (rename-detected); second apply: `already_applied` |
 | `kubernetes/kubernetes` | yes | `extract-decls` `CopyStrings,SortStrings` from `pkg/util/slice` → new `pkg/util/stringsutil` | `go build ./pkg/util/slice`: exit 0 | build/vet/test of `slice` + `stringsutil`: exit 0, 0, 0 |
 | `apache/cassandra` (`c103032`) + `go-chi/chi/v5` | yes (real module at repo root) | `move-files` `middleware/sunset.go`+`sunset_test.go` → new package `zzmovedsunset` | `go build ./...`, `go vet ./...`: exit 0, 0 | `applied`; verify build/vet/test exit 0, 0, 0; after `go build`/`go vet ./...`: 0, 0; diff 3 files, +5/−4 |
 | `servo/servo` (`7821ec2dd`) + `sirupsen/logrus` | yes | `rename-pkg` `hooks/test` → `hooks/testx` (7 steps) | 0, 0 | `applied`; 0, 0, 0; after: 0, 0; diff 7 files, +37/−37 |
