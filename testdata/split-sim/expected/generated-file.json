@@ -1,0 +1,63 @@
+{
+  "package": "ex.com/ss/lib",
+  "abstained": null,
+  "feasible": true,
+  "parts": {
+    "P1": [
+      "lib/a.go"
+    ],
+    "P2": [
+      "lib/b.go"
+    ]
+  },
+  "cycles": [],
+  "exported_surface_delta": {
+    "must_export": [],
+    "already_exported": [],
+    "part_local_unexported": []
+  },
+  "callers_to_rewrite": [],
+  "blockers": [
+    {
+      "kind": "generated_file_in_partition",
+      "severity": "warning",
+      "file": "zz_generated.go",
+      "line": null,
+      "part": "P2",
+      "detail": "generated file is absent from the model: references to and from it are not analysed, and it must be regenerated for the new package"
+    }
+  ],
+  "reverse_dep_impact": {
+    "before": {
+      "node": "ex.com/ss/lib",
+      "direct": 0,
+      "transitive": 0,
+      "transitive_packages": []
+    },
+    "after": [
+      {
+        "node": "ex.com/ss/lib#P1",
+        "direct": 0,
+        "transitive": 0,
+        "transitive_packages": []
+      },
+      {
+        "node": "ex.com/ss/lib#P2",
+        "direct": 0,
+        "transitive": 0,
+        "transitive_packages": []
+      }
+    ]
+  },
+  "coverage": {
+    "private_symbols_skipped": 0,
+    "generated_files_skipped": 1,
+    "unresolved_call_sites_in_package": 0,
+    "notes": [
+      "Shared-state detection is syntactic (unexported fields accessed across parts, package-level locks); sharing through parameters, interface fields or unexported types is not detected.",
+      "Package-level var/const uses are found by identifier match, not name resolution; a shadowing local is miscounted.",
+      "Every part is assumed to become a new package path; importers are attributed to the parts whose symbols they call, and importers with no attributable use are assumed to need every part.",
+      "1 generated files are absent from the model; references to or from them are not analysed."
+    ]
+  }
+}

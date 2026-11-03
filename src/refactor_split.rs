@@ -1,5 +1,5 @@
 //! Mechanical-refactor core behind the `suggest_refactors` / `simulate_split` /
-//! `plan_refactor` / `apply_refactor` / `verify_refactor` / `revert_refactor` MCP tools
+//! `plan_split_refactor` / `apply_split_refactor` / `verify_refactor` / `revert_refactor` MCP tools
 //! (docs/refactor-tools.md). Pure functions over `ArchModel` plus on-disk plan state under
 //! the worktree's git dir, so plans survive the shared-socket server's per-session models.
 
@@ -373,7 +373,7 @@ pub struct Abstention {
 
 pub fn plan_call(package: &str, partition: &[PartitionGroup]) -> String {
     format!(
-        "plan_refactor({})",
+        "plan_split_refactor({})",
         serde_json::json!({"operation":"split_package","args":{"package":package,"partition":partition}})
     )
 }
@@ -1017,7 +1017,10 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
         safe_rel(&e.file)?;
     }
     if head(repo)? != plan.staleness_token {
-        return err("stale_plan", "HEAD changed since plan_refactor; plan again");
+        return err(
+            "stale_plan",
+            "HEAD changed since plan_split_refactor; plan again",
+        );
     }
     acquire_locks(repo, &plan)?;
     // Dirty check runs while the locks are held so two sessions cannot both pass it.
@@ -1135,7 +1138,7 @@ pub fn cap_list<T>(v: Vec<T>) -> (Vec<T>, bool) {
     cap(v)
 }
 
-/// Bounded response for `plan_refactor`: edit contents stay on disk, lists are capped.
+/// Bounded response for `plan_split_refactor`: edit contents stay on disk, lists are capped.
 pub fn plan_response(plan: &RefactorPlan) -> serde_json::Value {
     let edits: Vec<_> = plan
         .edits
@@ -1162,5 +1165,5 @@ pub fn plan_response(plan: &RefactorPlan) -> serde_json::Value {
 }
 
 #[cfg(test)]
-#[path = "refactor_tests.rs"]
+#[path = "refactor_split_tests.rs"]
 mod tests;

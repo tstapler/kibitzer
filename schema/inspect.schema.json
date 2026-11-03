@@ -12,7 +12,7 @@
       ]
     },
     "allow_write_tools": {
-      "description": "Per-repo opt-in for the refactor write tools (`apply_refactor`, `verify_refactor`, `revert_refactor`). Off unless the repo's own `.kibitzer/inspect.json` sets it.",
+      "description": "Per-repo opt-in for the refactor write tools (`apply_split_refactor`, `verify_refactor`, `revert_refactor`). Off unless the repo's own `.kibitzer/inspect.json` sets it.",
       "default": false,
       "type": "boolean"
     },
