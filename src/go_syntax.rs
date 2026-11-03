@@ -18,7 +18,7 @@ pub struct Edit {
 /// producing a corrupt file.
 pub fn apply_edits(src: &str, edits: Vec<Edit>) -> String {
     let mut ordered: Vec<(usize, Edit)> = edits.into_iter().enumerate().collect();
-    ordered.sort_by(|(i, a), (j, b)| (a.start, a.end, *i).cmp(&(b.start, b.end, *j)));
+    ordered.sort_by_key(|(i, e)| (e.start, e.end, *i));
     for w in ordered.windows(2) {
         assert!(
             w[0].1.end <= w[1].1.start,

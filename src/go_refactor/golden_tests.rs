@@ -206,12 +206,12 @@ fn run_case(case_dir: &Path) {
         );
     }
     // Opt-in: set the KIBITZER_KEEP_TREES env var to a directory to keep each applied tree for running the Go toolchain on them directly.
-    if let Some(keep) = std::env::var_os("KIBITZER_KEEP_TREES") {
-        if plan.blockers.is_empty() {
-            let dest = PathBuf::from(keep).join(name.replace('/', "__"));
-            let _ = std::fs::remove_dir_all(&dest);
-            copy_dir(&root, &dest);
-        }
+    if let Some(keep) = std::env::var_os("KIBITZER_KEEP_TREES")
+        && plan.blockers.is_empty()
+    {
+        let dest = PathBuf::from(keep).join(name.replace('/', "__"));
+        let _ = std::fs::remove_dir_all(&dest);
+        copy_dir(&root, &dest);
     }
     let _ = std::fs::remove_dir_all(&root);
 }

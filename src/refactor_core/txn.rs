@@ -105,7 +105,7 @@ impl Pending {
     }
 }
 
-/// A killed process runs no destructors; tests flip this to leave the log behind like one.
+// A killed process runs no destructors; tests flip this to leave the log behind like one.
 #[cfg(test)]
 thread_local! {
     static KILLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
