@@ -337,3 +337,16 @@ directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-
 check was added; before it, 38 clean / 22 blocked). The four shadow blockers are the
 conservative-by-design case described above; they were not individually triaged for
 being true or false positives.
+
+### Re-run after the function-split / shared-guard refactor
+
+Behavior-preserving refactor (long functions split into phase helpers, shared path/symlink
+guard and `sha256_hex`, per-fixture golden reporting). `scripts/go-move-backtest.sh all` was run
+with a release binary built from the pre-change commit `5c86255` ("before") and from the
+refactor head ("after"), same corpus and same HEADs as the table above.
+
+Result: the two logs are identical after masking commit hashes (`diff` empty). All seven runs
+report `status: applied`, verify exit codes `{build: 0, vet: 0, test: 0}`, and the same
+`go build`/`go vet` before/after exit codes and diff sizes in both builds (vscode-viper `./...`
+fails with exit 1 both before and after, for the pre-existing reason described above). No
+regression in plan/apply correctness.
