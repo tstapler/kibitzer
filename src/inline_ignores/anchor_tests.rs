@@ -115,6 +115,11 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
         "whole-repo architecture check, reports a cluster of functions at its first member",
     ),
     (
+        "go-encapsulate-variable",
+        "whole-repo architecture check needing a two-package model, not a single-file fixture; \
+         end-to-end suppression is covered in tests/encapsulate_variable_cli.rs",
+    ),
+    (
         "go-blank-imports",
         "an adjacent comment of any kind counts as the justification, so a directive above the \
          import clears the finding by construction rather than by suppression",

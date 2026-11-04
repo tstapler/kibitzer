@@ -891,6 +891,7 @@ fn go_exception_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.go"],
         ),
+        whole_repo_check("go-encapsulate-variable", "encapsulate-variable"),
         native_check(
             "go-bulk-fetch-linear-scan",
             Severity::Advisory,

@@ -1433,6 +1433,134 @@ pub fn extract_field_access_sites_for_file(
     sites
 }
 
+/// Cross-package field writes (`x.Field = v`, `x.Field++`) where `x` is a parameter, `var`,
+/// or composite-literal local whose declared type is package-qualified (`*pkg.T`) and
+/// `pkg` resolves through `file_aliases`. Covers bare functions as well as methods, unlike
+/// `extract_field_access_sites_for_file` (own-receiver only, so it can never see a write
+/// across packages). `file` is left empty for the caller, same convention.
+///
+/// Syntactic only: a local re-declared under a different type keeps the last binding
+/// `collect_typed_locals` saw, and `pkg.Var.Field = v` (package-level var) is not resolved.
+/// Output edges are `access == Write` only.
+pub fn extract_cross_package_writes_for_file(
+    source: &str,
+    tree: &Tree,
+    package_path: &str,
+    file_aliases: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<crate::arch_model::FieldAccessEdge> {
+    let mut out = Vec::new();
+    walk_cross_package_writes(
+        tree.root_node(),
+        source,
+        package_path,
+        file_aliases,
+        &mut out,
+    );
+    out
+}
+
+fn walk_cross_package_writes(
+    node: Node,
+    source: &str,
+    package_path: &str,
+    file_aliases: Option<&std::collections::HashMap<String, String>>,
+    out: &mut Vec<crate::arch_model::FieldAccessEdge>,
+) {
+    let kind = GoKind::of(node);
+    if matches!(
+        kind,
+        GoKind::FunctionDeclaration | GoKind::MethodDeclaration
+    ) {
+        let Some(name) = node
+            .child_by_field_name("name")
+            .map(|n| strip_generic_params(node_text(n, source)))
+        else {
+            return;
+        };
+        let parent = (kind == GoKind::MethodDeclaration)
+            .then(|| go_receiver_type_name(node, source))
+            .flatten();
+        let caller_id = build_id(package_path, parent.as_deref(), &name);
+
+        let mut locals = std::collections::HashMap::new();
+        crate::god_class::collect_typed_locals(node, source, &mut locals);
+        collect_address_of_literal_locals(node, source, &mut locals);
+        let qualified: std::collections::HashMap<String, String> = locals
+            .into_iter()
+            .filter(|(_, ty)| ty.contains('.'))
+            .filter_map(|(var, ty)| {
+                crate::god_class::resolve_qualified_type(&ty, file_aliases).map(|t| (var, t))
+            })
+            .collect();
+        if !qualified.is_empty() {
+            collect_writes_on_locals(node, source, &caller_id, &qualified, out);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_cross_package_writes(child, source, package_path, file_aliases, out);
+    }
+}
+
+/// `y := &pkg.T{...}` — the pointer-to-literal form `collect_typed_locals` (shared with
+/// god-class ATFD) doesn't bind; kept local so that metric's numbers don't shift.
+fn collect_address_of_literal_locals(
+    node: Node,
+    source: &str,
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    if GoKind::of(node) == GoKind::ShortVarDeclaration
+        && let Some(left) = node.child_by_field_name("left")
+        && let Some(right) = node.child_by_field_name("right")
+        && left.named_child_count() == 1
+        && right.named_child_count() == 1
+        && let Some(name) = left.named_child(0)
+        && let Some(unary) = right.named_child(0)
+        && GoKind::of(unary) == GoKind::UnaryExpression
+        && let Some(literal) = unary.child_by_field_name("operand")
+        && GoKind::of(literal) == GoKind::CompositeLiteral
+        && let Some(ty) = literal
+            .child_by_field_name("type")
+            .and_then(|t| crate::god_class::simple_type_name(t, source))
+    {
+        out.insert(node_text(name, source).to_string(), ty);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_address_of_literal_locals(child, source, out);
+    }
+}
+
+fn collect_writes_on_locals(
+    node: Node,
+    source: &str,
+    caller_id: &str,
+    locals: &std::collections::HashMap<String, String>,
+    out: &mut Vec<crate::arch_model::FieldAccessEdge>,
+) {
+    if GoKind::of(node) == GoKind::SelectorExpression
+        && !crate::god_class::is_call_target(node)
+        && let Some(operand) = node.child_by_field_name("operand")
+        && GoKind::of(operand) == GoKind::Identifier
+        && let Some(target) = locals.get(node_text(operand, source))
+        && let Some(field) = node.child_by_field_name("field")
+        && selector_access_kind(node) == AccessKind::Write
+    {
+        out.push(crate::arch_model::FieldAccessEdge {
+            from: caller_id.to_string(),
+            to: format!("{target}.{}", node_text(field, source)),
+            access: AccessKind::Write,
+            file: PathBuf::new(),
+            line: node.start_position().row + 1,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_writes_on_locals(child, source, caller_id, locals, out);
+    }
+}
+
 /// One raw `extends`/`implements` site found in source, before resolution against the
 /// rest of the model (mirrors `RawCallSite`/`RawFieldAccessSite`'s "raw" naming — a later
 /// pass turns these into `TypeRelationEdge`s). `kind_hint` is `None` only for source

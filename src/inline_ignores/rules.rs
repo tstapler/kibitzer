@@ -98,6 +98,7 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("go-package-focus", OwnerMatch::Unowned),
     rule("isp-fat-interface", OwnerMatch::Unowned),
     rule("remove-middle-man", OwnerMatch::Unowned),
+    rule("encapsulate-variable", OwnerMatch::Unowned),
     rule("unreferenced-private-symbol", OwnerMatch::Unowned),
     rule("test-no-assertion", OwnerMatch::Prefix("test-no-assertion")),
     rule("go-type-switch-density", OwnerMatch::SameName),

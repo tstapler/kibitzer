@@ -104,7 +104,8 @@ In Markdown the comment is an HTML comment:
   rule list or reason is reported as `[ignore-syntax]` and suppresses nothing.
 - **Native checkers only.** Directives apply to kibitzer's own per-file checkers (the
   ones `kibitzer check list` shows). A shell `command` check, a plugin, an
-  architecture check and a file type with no native checker ignore them, so the hook
+  architecture check (except `encapsulate-variable`, which applies them to its own
+  write-site findings) and a file type with no native checker ignore them, so the hook
   and MCP footers offer the syntax only when a failing native finding could use it.
 - **Scope.** A comment on its own line covers its own rows and the row directly
   below. If comment lines follow it with no blank row between (a reason continued on

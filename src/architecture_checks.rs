@@ -627,6 +627,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::unreferenced_symbols::UnreferencedPrivateSymbolChecker),
         Box::new(crate::single_call_site_delegation::SingleCallSiteDelegationChecker),
         Box::new(crate::middle_man::MiddleManChecker),
+        Box::new(crate::encapsulate_variable::EncapsulateVariableChecker),
         Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
     ]
 }
