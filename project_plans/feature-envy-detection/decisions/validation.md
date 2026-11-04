@@ -17,7 +17,19 @@ other corpus repos (Rust/Java/TS) are out of the checker's scope.
 |---|---|
 | MIN_FOREIGN=3, call edges counted as-is | 480 + 580 = 1060 |
 | + call edges counted only for types the field walker also saw | 166 + 95 = 261 |
-| + MIN_FOREIGN=5 (shipped) | 97 + 50 = 147 (12 move-function, 135 move-field) |
+| + MIN_FOREIGN=5 | 97 + 50 = 147 (12 move-function, 135 move-field) |
+| + skip methods with no own signal (no own-field access and no own-type call) — shipped | 85 + 43 = 128 |
+
+The FP samples below were taken before the last row; the no-own-signal guard removes the
+zero-own helper class they were dominated by, but the post-guard rate was not re-sampled.
+
+## sdd:6-verify follow-ups (not done, deliberately)
+
+- Gate on a single dominant target type (Tsantalis & Chatzigeorgiou) instead of the summed
+  foreign count; deviates from the criterion-2 wording, so left for a follow-up.
+- Count own-type calls in `local`; same reason.
+- Generic receivers (`Binding[T]`) and `New*` constructors have no dedicated test/suppression.
+- `INTENTIONAL_DELEGATION_SUFFIXES` duplicates `middle_man.rs`; share it when a third user appears.
 
 ## Root cause of the first-run noise
 

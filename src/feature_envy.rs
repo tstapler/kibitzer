@@ -43,10 +43,11 @@ impl ArchModelChecker for FeatureEnvyChecker {
     }
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
+        let index = EdgeIndex::new(model);
         let mut findings: Vec<ArchFinding> = model
             .packages
             .values()
-            .flat_map(|pkg| feature_envy_findings_for_package(pkg, model))
+            .flat_map(|pkg| feature_envy_findings_for_package(pkg, model, &index))
             .collect();
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
@@ -69,34 +70,65 @@ fn foreign_field_accesses_per_type(
     counts
 }
 
-/// Resolved calls from `method_id` to methods of a different type, keyed `"{pkg}::{Type}"`.
-/// Method ids are `{pkg}::{Type}.{name}`; free-function targets have no type prefix and are
-/// not counted.
-fn foreign_call_counts_per_type(method_id: &str, model: &ArchModel) -> HashMap<String, usize> {
-    let own_prefix = method_id.rsplit_once('.').map(|(prefix, _)| prefix);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for edge in &model.call_edges {
-        if !edge.resolved || edge.from != method_id {
-            continue;
+/// Per-method views of the model's edge lists, built once so each method lookup is O(1)
+/// instead of a scan over every edge in the repo.
+struct EdgeIndex<'a> {
+    resolved_callees: HashMap<&'a str, Vec<&'a str>>,
+    own_field_accesses: HashMap<&'a str, usize>,
+}
+
+impl<'a> EdgeIndex<'a> {
+    fn new(model: &'a ArchModel) -> Self {
+        let mut resolved_callees: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in model.call_edges.iter().filter(|e| e.resolved) {
+            resolved_callees
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
         }
-        let Some((callee_type, _)) = edge.to.rsplit_once('.') else {
+        let mut own_field_accesses: HashMap<&str, usize> = HashMap::new();
+        for access in &model.field_accesses {
+            *own_field_accesses.entry(access.from.as_str()).or_insert(0) += 1;
+        }
+        Self {
+            resolved_callees,
+            own_field_accesses,
+        }
+    }
+
+    fn callees(&self, method_id: &str) -> &[&'a str] {
+        self.resolved_callees
+            .get(method_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn local_field_access_count(&self, method_id: &str) -> usize {
+        self.own_field_accesses.get(method_id).copied().unwrap_or(0)
+    }
+}
+
+/// Calls from `method_id` to methods of a different type, keyed `"{pkg}::{Type}"`, plus the
+/// number of calls to its own type. Method ids are `{pkg}::{Type}.{name}`; free-function
+/// targets have no type prefix and are not counted.
+fn call_counts_by_type(method_id: &str, callees: &[&str]) -> (HashMap<String, usize>, usize) {
+    let own_prefix = method_id.rsplit_once('.').map(|(prefix, _)| prefix);
+    let mut foreign: HashMap<String, usize> = HashMap::new();
+    let mut own_calls = 0;
+    for callee in callees {
+        let Some((callee_type, _)) = callee.rsplit_once('.') else {
             continue;
         };
         // A package path can contain '.', so a free function `k8s.io/x::F` splits to `k8s`.
-        if !callee_type.contains("::") || Some(callee_type) == own_prefix {
+        if !callee_type.contains("::") {
             continue;
         }
-        *counts.entry(callee_type.to_string()).or_insert(0) += 1;
+        if Some(callee_type) == own_prefix {
+            own_calls += 1;
+        } else {
+            *foreign.entry(callee_type.to_string()).or_insert(0) += 1;
+        }
     }
-    counts
-}
-
-fn local_field_access_count(method_id: &str, model: &ArchModel) -> usize {
-    model
-        .field_accesses
-        .iter()
-        .filter(|a| a.from == method_id)
-        .count()
+    (foreign, own_calls)
 }
 
 /// Same-package foreign types come back from the ATFD walker as bare names, while call
@@ -138,7 +170,11 @@ fn is_envious(foreign: usize, local: usize) -> bool {
         && foreign as f64 / total as f64 >= FEATURE_ENVY_RATIO_THRESHOLD
 }
 
-fn feature_envy_findings_for_package(pkg: &PackageNode, model: &ArchModel) -> Vec<ArchFinding> {
+fn feature_envy_findings_for_package(
+    pkg: &PackageNode,
+    model: &ArchModel,
+    index: &EdgeIndex,
+) -> Vec<ArchFinding> {
     let symbols_by_id: HashMap<&str, &SymbolNode> =
         pkg.symbols.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut files = FileCache::new();
@@ -174,9 +210,14 @@ fn feature_envy_findings_for_package(pkg: &PackageNode, model: &ArchModel) -> Ve
             // Call edges resolve by bare method name (`arch_model::resolve_one_call_edge`), so
             // `mu.Lock()` binds to an unrelated `noCopy.Lock`; trust a call target only when the
             // type-aware field walker also saw that type accessed in this method.
-            let mut call_counts = foreign_call_counts_per_type(id, model);
+            let (mut call_counts, own_calls) = call_counts_by_type(id, index.callees(id));
             call_counts.retain(|ty, _| field_counts.contains_key(ty));
-            let local = local_field_access_count(id, model);
+            let local = index.local_field_access_count(id);
+            // A method that neither touches its own receiver's fields nor calls its own type's
+            // methods is a free-standing helper, not an envious member.
+            if local == 0 && own_calls == 0 {
+                continue;
+            }
 
             let counts = MethodCounts {
                 field_counts,
@@ -481,6 +522,16 @@ mod tests {
             &HashMap::from([("pkg::Customer".to_string(), 2)]),
         );
         assert_eq!(merged, HashMap::from([("pkg::Customer".to_string(), 5)]));
+    }
+
+    #[test]
+    fn zero_own_signal_helper_is_suppressed_but_an_own_type_call_counts_as_signal() {
+        let helper = run("fe-helper", "order.go", &go_source(5), |_| {});
+        assert!(helper.is_empty());
+        let member = run("fe-member", "order.go", &go_source(5), |m| {
+            call(m, "pkg::Order.Calc", "pkg::Order.Helper");
+        });
+        assert_eq!(member.len(), 1);
     }
 
     #[test]
