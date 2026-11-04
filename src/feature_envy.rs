@@ -23,8 +23,9 @@ use crate::god_class::{FileCache, collect_foreign_field_accesses, find_method_no
 
 /// Minimum foreign share of all of a method's counted accesses.
 const FEATURE_ENVY_RATIO_THRESHOLD: f64 = 0.33;
-/// Minimum foreign accesses before flagging; noise guard for tiny methods.
-const FEATURE_ENVY_MIN_FOREIGN: usize = 3;
+/// Minimum foreign accesses before flagging; noise guard for tiny methods. Raised from 3
+/// after the public-corpus backtest (see `decisions/validation.md`).
+const FEATURE_ENVY_MIN_FOREIGN: usize = 5;
 /// Minimum foreign + own accesses before a method is evaluated at all.
 const FEATURE_ENVY_MIN_TOTAL: usize = 4;
 const INTENTIONAL_DELEGATION_SUFFIXES: [&str; 4] = ["Adapter", "Wrapper", "Proxy", "Decorator"];
@@ -170,7 +171,11 @@ fn feature_envy_findings_for_package(pkg: &PackageNode, model: &ArchModel) -> Ve
                 foreign_field_accesses_per_type(node, source, type_name, file_aliases),
                 &pkg.path,
             );
-            let call_counts = foreign_call_counts_per_type(id, model);
+            // Call edges resolve by bare method name (`arch_model::resolve_one_call_edge`), so
+            // `mu.Lock()` binds to an unrelated `noCopy.Lock`; trust a call target only when the
+            // type-aware field walker also saw that type accessed in this method.
+            let mut call_counts = foreign_call_counts_per_type(id, model);
+            call_counts.retain(|ty, _| field_counts.contains_key(ty));
             let local = local_field_access_count(id, model);
 
             let counts = MethodCounts {
@@ -372,7 +377,7 @@ mod tests {
 
     #[test]
     fn flags_move_function_candidate_with_canonical_message() {
-        let findings = run("fe-fn", "order.go", &go_source(2), |m| {
+        let findings = run("fe-fn", "order.go", &go_source(3), |m| {
             own_access(m, "pkg::Order.Calc", 1);
             call(m, "pkg::Order.Calc", "pkg::Customer.Rate");
             call(m, "pkg::Order.Calc", "pkg::Customer.Base");
@@ -386,7 +391,7 @@ mod tests {
         );
         assert!(
             msg.contains(
-                "4 foreign accesses (4 to pkg::Customer) vs 1 own (ratio 0.80, threshold 0.33); \
+                "5 foreign accesses (5 to pkg::Customer) vs 1 own (ratio 0.83, threshold 0.33); \
              dominant target: pkg::Customer — consider Move Function"
             ),
             "{msg}"
@@ -396,7 +401,7 @@ mod tests {
 
     #[test]
     fn flags_move_field_candidate() {
-        let findings = run("fe-fld", "order.go", &go_source(4), |m| {
+        let findings = run("fe-fld", "order.go", &go_source(5), |m| {
             own_access(m, "pkg::Order.Calc", 1);
         });
         assert_eq!(findings.len(), 1);
@@ -406,7 +411,7 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("4 foreign field accesses (4 to pkg::Customer) vs 1 own (ratio 0.80"),
+            msg.contains("5 foreign field accesses (5 to pkg::Customer) vs 1 own (ratio 0.83"),
             "{msg}"
         );
         assert!(msg.ends_with("consider Move Field"), "{msg}");
@@ -414,7 +419,7 @@ mod tests {
 
     #[test]
     fn suppresses_test_file_method() {
-        let findings = run("fe-test", "order_test.go", &go_source(4), |m| {
+        let findings = run("fe-test", "order_test.go", &go_source(5), |m| {
             own_access(m, "pkg::Order.Calc", 1);
         });
         assert!(findings.is_empty());
@@ -422,13 +427,13 @@ mod tests {
 
     #[test]
     fn suppresses_pure_delegation_adapter_type_and_low_total() {
-        let delegating = run("fe-deleg", "order.go", &go_source(4), |m| {
+        let delegating = run("fe-deleg", "order.go", &go_source(5), |m| {
             own_access(m, "pkg::Order.Calc", 1);
             m.packages.get_mut("pkg").unwrap().symbols[0].is_pure_delegation = true;
         });
         assert!(delegating.is_empty());
 
-        let adapter = run("fe-adapter", "order.go", &go_source(4), |m| {
+        let adapter = run("fe-adapter", "order.go", &go_source(5), |m| {
             own_access(m, "pkg::OrderAdapter.Calc", 1);
             let sym = &mut m.packages.get_mut("pkg").unwrap().symbols[0];
             sym.parent = Some("OrderAdapter".to_string());
@@ -436,30 +441,30 @@ mod tests {
         });
         assert!(adapter.is_empty());
 
-        // 3 foreign + 0 own = total 3 < MIN_TOTAL.
+        // 3 foreign + 0 own = total 3 < MIN_TOTAL (MIN_FOREIGN=5 now subsumes it).
         let tiny = run("fe-tiny", "order.go", &go_source(3), |_| {});
         assert!(tiny.is_empty());
     }
 
     #[test]
     fn below_threshold_is_a_true_negative() {
-        // Too few foreign accesses.
-        let few = run("fe-few", "order.go", &go_source(2), |m| {
-            own_access(m, "pkg::Order.Calc", 3);
+        // 4 foreign < MIN_FOREIGN=5 despite a high ratio.
+        let few = run("fe-few", "order.go", &go_source(4), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
         });
         assert!(few.is_empty());
-        // 3 foreign vs 7 own = ratio 0.30 < 0.33.
-        let low_ratio = run("fe-ratio", "order.go", &go_source(3), |m| {
-            own_access(m, "pkg::Order.Calc", 7);
+        // 5 foreign vs 11 own = ratio 0.31 < 0.33.
+        let low_ratio = run("fe-ratio", "order.go", &go_source(5), |m| {
+            own_access(m, "pkg::Order.Calc", 11);
         });
         assert!(low_ratio.is_empty());
     }
 
     #[test]
     fn bare_and_qualified_same_package_keys_merge() {
-        // 2 field accesses (bare `Customer`) + 2 calls (`pkg::Customer`): neither alone
-        // reaches MIN_FOREIGN=3 as a split, nor does field-only (2); merged it is 4.
-        let findings = run("fe-norm", "order.go", &go_source(2), |m| {
+        // 3 field accesses (bare `Customer`) + 2 calls (`pkg::Customer`): neither alone
+        // reaches MIN_FOREIGN=5 as a split; merged under one key it is 5.
+        let findings = run("fe-norm", "order.go", &go_source(3), |m| {
             own_access(m, "pkg::Order.Calc", 1);
             call(m, "pkg::Order.Calc", "pkg::Customer.Rate");
             call(m, "pkg::Order.Calc", "pkg::Customer.Base");
@@ -468,7 +473,7 @@ mod tests {
         assert!(
             findings[0]
                 .message
-                .contains("4 foreign accesses (4 to pkg::Customer)")
+                .contains("5 foreign accesses (5 to pkg::Customer)")
         );
 
         let merged = merge_counts(
@@ -476,6 +481,18 @@ mod tests {
             &HashMap::from([("pkg::Customer".to_string(), 2)]),
         );
         assert_eq!(merged, HashMap::from([("pkg::Customer".to_string(), 5)]));
+    }
+
+    #[test]
+    fn name_collision_call_edges_without_field_evidence_are_ignored() {
+        // `mu.Lock()`-style edges bound to an unrelated type must not tip a method over.
+        let findings = run("fe-collide", "order.go", &go_source(3), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+            for name in ["A", "B", "C"] {
+                call(m, "pkg::Order.Calc", &format!("pkg::noCopy.{name}"));
+            }
+        });
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -490,7 +507,7 @@ mod tests {
     fn second_shorter_file_in_package_does_not_panic() {
         let dir = crate::test_support::unique_temp_dir("fe-stale");
         let long = dir.join("a_long.go");
-        let mut long_src = go_source(4);
+        let mut long_src = go_source(5);
         long_src.push_str(&"// padding line\n".repeat(200));
         std::fs::write(&long, &long_src).unwrap();
         let short = dir.join("b_short.go");
