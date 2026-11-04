@@ -274,7 +274,52 @@ fn walk(node: Node, src: &[u8], env: &Env, out: &mut Vec<NilCheck>) {
             }
             walk_children(node, src, &scope, out);
         }
+        GoKind::ForStatement | GoKind::ExpressionSwitchStatement | GoKind::TypeSwitchStatement => {
+            let mut scope = env.clone();
+            declare_header(node, src, &mut scope);
+            walk_children(node, src, &scope, out);
+        }
         _ => walk_children(node, src, env, out),
+    }
+}
+
+/// Names a `for`/`switch` header introduces (initializer, range vars, type-switch alias);
+/// none of them is typed, so each only shadows an outer typed name.
+fn declare_header(node: Node, src: &[u8], env: &mut Env) {
+    if let Some(init) = node.child_by_field_name("initializer") {
+        declare_stmt(init, src, env);
+    }
+    if let Some(alias) = node.child_by_field_name("alias") {
+        shadow_identifiers(alias, src, env);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match GoKind::of(child) {
+            GoKind::ForClause => {
+                if let Some(init) = child.child_by_field_name("initializer") {
+                    declare_stmt(init, src, env);
+                }
+            }
+            GoKind::RangeClause => {
+                let declares = {
+                    let mut c = child.walk();
+                    child.children(&mut c).any(|t| t.kind() == ":=")
+                };
+                if declares && let Some(left) = child.child_by_field_name("left") {
+                    shadow_identifiers(left, src, env);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn shadow_identifiers(list: Node, src: &[u8], env: &mut Env) {
+    let mut cursor = list.walk();
+    for id in list.named_children(&mut cursor) {
+        if GoKind::of(id) == GoKind::Identifier {
+            bind(env, text(id, src), None);
+        }
     }
 }
 
@@ -311,9 +356,19 @@ fn declare_typed(node: Node, src: &[u8], env: &mut Env) {
 fn declare_params(list: Node, src: &[u8], env: &mut Env) {
     let mut cursor = list.walk();
     for param in list.children(&mut cursor) {
-        if GoKind::of(param) == GoKind::ParameterDeclaration {
-            declare_typed(param, src, env);
+        match GoKind::of(param) {
+            GoKind::ParameterDeclaration => declare_typed(param, src, env),
+            // `svc ...*Svc` is a slice, so the name is shadowed but not typed.
+            GoKind::VariadicParameterDeclaration => shadow_receiver_names(param, src, env),
+            _ => {}
         }
+    }
+}
+
+fn shadow_receiver_names(param: Node, src: &[u8], env: &mut Env) {
+    let mut names = param.walk();
+    for name in param.children_by_field_name("name", &mut names) {
+        bind(env, text(name, src), None);
     }
 }
 
@@ -510,6 +565,26 @@ mod tests {
         // later, nested block and must not leak backwards.
         let src = "package p\nfunc f() {\n\ta, err := g()\n\tif err != nil {\n\t\th()\n\t} else {\n\t}\n\t{\n\t\tvar err *StatusError\n\t\tif err != nil {\n\t\t\terr.Error()\n\t\t}\n\t}\n}\n";
         assert_eq!(types(src), ["StatusError"]);
+    }
+
+    #[test]
+    fn range_variable_shadows_a_typed_parameter() {
+        let src = "package p\nfunc f(p *Pod, all []*Pod) {\n\tfor _, p := range all {\n\t\tif p != nil {\n\t\t\tp.Run()\n\t\t}\n\t}\n}\n";
+        assert!(types(src).is_empty());
+    }
+
+    #[test]
+    fn switch_initializer_and_type_switch_alias_shadow_a_typed_parameter() {
+        let init = "package p\nfunc f(s *Svc) {\n\tswitch s := get(); {\n\tdefault:\n\t\tif s == nil {\n\t\t} else {\n\t\t}\n\t}\n}\n";
+        assert!(types(init).is_empty());
+        let alias = "package p\nfunc f(s *Svc, v any) {\n\tswitch s := v.(type) {\n\tdefault:\n\t\tif s == nil {\n\t\t} else {\n\t\t}\n\t}\n}\n";
+        assert!(types(alias).is_empty());
+    }
+
+    #[test]
+    fn variadic_parameter_shadows_a_typed_outer_name() {
+        let src = "package p\nfunc f(s *Svc) {\n\tg := func(s ...*Svc) {\n\t\tif s == nil {\n\t\t} else {\n\t\t}\n\t}\n\tg()\n}\n";
+        assert!(types(src).is_empty());
     }
 
     #[test]
