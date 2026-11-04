@@ -973,8 +973,15 @@ fn paths_refs(plan: &RefactorPlan) -> Vec<&str> {
 }
 
 fn txn_error(e: anyhow::Error) -> RefactorError {
+    // A failed rollback leaves the tree possibly dirty and the log on disk: callers must be able
+    // to tell it from an ordinary I/O failure.
+    let code = if e.downcast_ref::<txn::RollbackFailed>().is_some() {
+        "rollback_failed"
+    } else {
+        "io"
+    };
     RefactorError {
-        code: "io",
+        code,
         message: format!("{e:#}"),
     }
 }
@@ -1065,7 +1072,17 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
     }
     acquire_locks(repo, &plan)?;
     // Dirty check runs while the locks are held so two sessions cannot both pass it.
-    let status = git(repo, &["status", "--porcelain"]);
+    // The transaction's own lock file lives in `.kibitzer/plans`; it is not the user's change.
+    let status = git(
+        repo,
+        &[
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":(exclude).kibitzer/plans",
+        ],
+    );
     match status {
         Ok(s) if s.trim().is_empty() => {}
         Ok(_) => {
@@ -1121,8 +1138,16 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
         let _ = abort_apply(repo, &plan, pending);
         return Err(e);
     }
-    // Last, so the plan can still be rolled back if saving it failed.
-    pending.commit().map_err(txn_error)?;
+    // Last, so the plan can still be rolled back if saving it failed. A failed commit can leave
+    // the log behind, which the next recovery rolls back: the plan must then read Planned again
+    // and its locks must not stay held.
+    if let Err(e) = pending.commit() {
+        plan.status = PlanStatus::Planned;
+        let _ = save_plan(repo, &plan);
+        reset_index(repo, &plan);
+        release_locks(repo, &plan);
+        return Err(txn_error(e));
+    }
     let diff_summary = git(repo, &["diff", "--cached", "--stat"]).unwrap_or_default();
     Ok(ApplyOutcome {
         applied: true,

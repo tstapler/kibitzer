@@ -296,3 +296,13 @@ fn a_crashed_revert_is_rolled_back_and_the_revert_then_completes() {
     assert!(run_git_out(&dir, &["status", "--porcelain"]).is_empty());
     assert!(!dir.join(".kibitzer/plans/.wal").exists());
 }
+
+#[test]
+fn txn_error_keeps_a_failed_rollback_distinct_from_plain_io() {
+    let failed = anyhow::Error::new(txn::RollbackFailed {
+        cause: "boom".into(),
+        rollback: "disk gone".into(),
+    });
+    assert_eq!(txn_error(failed).code, "rollback_failed");
+    assert_eq!(txn_error(anyhow::anyhow!("plain")).code, "io");
+}
