@@ -153,17 +153,29 @@ struct NilCheck {
 
 /// Same shape and failure semantics as `duplicate_cross_file_checker::DuplicateIndex`:
 /// last-writer-wins on concurrent saves, stale entries for deleted files are not pruned.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SpecialCaseIndex {
+    /// Bump when the layout changes; a mismatched index is discarded and rebuilt.
+    #[serde(default)]
+    version: u32,
     occurrences: HashMap<String, Vec<(String, usize)>>,
     files: HashMap<String, Vec<String>>,
+}
+
+const INDEX_VERSION: u32 = 1;
+
+impl Default for SpecialCaseIndex {
+    fn default() -> Self {
+        Self { version: INDEX_VERSION, occurrences: HashMap::new(), files: HashMap::new() }
+    }
 }
 
 impl SpecialCaseIndex {
     fn load(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
+            .filter(|idx| idx.version == INDEX_VERSION)
             .unwrap_or_default()
     }
 
@@ -609,7 +621,50 @@ mod tests {
         assert_eq!(f[0].line, 7);
         assert!(f[0].message.contains("`T`"));
         assert!(f[0].message.contains("3 times"));
+        assert!(f[0].message.contains("across 3 files"));
         assert!(f[0].message.contains("Introduce Special Case"));
+    }
+
+    #[test]
+    fn two_files_with_three_occurrences_fire_at_min_three_but_not_four() {
+        let c = |line| NilCheck { type_name: "T".into(), line };
+        let mut idx = SpecialCaseIndex::default();
+        idx.reindex_and_find(Path::new("a.go"), &[c(1), c(2)], 3);
+        assert_eq!(idx.reindex_and_find(Path::new("b.go"), &[c(1)], 3).len(), 1);
+        assert!(idx.reindex_and_find(Path::new("b.go"), &[c(1)], 4).is_empty());
+    }
+
+    #[test]
+    fn removing_a_files_checks_drops_it_from_the_count() {
+        let c = |line| NilCheck { type_name: "T".into(), line };
+        let mut idx = SpecialCaseIndex::default();
+        for f in ["a.go", "b.go", "c.go"] {
+            idx.reindex_and_find(Path::new(f), &[c(1)], 3);
+        }
+        idx.reindex_and_find(Path::new("c.go"), &[], 3);
+        assert!(!idx.files.contains_key("c.go"));
+        assert_eq!(idx.occurrences["T"].len(), 2);
+        assert!(idx.reindex_and_find(Path::new("d.go"), &[c(1)], 3).len() == 1);
+        idx.reindex_and_find(Path::new("d.go"), &[], 3);
+        idx.reindex_and_find(Path::new("a.go"), &[], 3);
+        idx.reindex_and_find(Path::new("b.go"), &[], 3);
+        assert!(!idx.occurrences.contains_key("T"));
+    }
+
+    #[test]
+    fn corrupt_or_wrong_version_index_is_discarded() {
+        let dir = std::env::temp_dir().join(format!("kibitzer-isc-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(SpecialCaseIndex::load(&path).occurrences.is_empty());
+        std::fs::write(&path, r#"{"occurrences":{"T":[["a.go",1]]},"files":{"a.go":["T"]}}"#).unwrap();
+        assert!(SpecialCaseIndex::load(&path).occurrences.is_empty());
+        let mut idx = SpecialCaseIndex::default();
+        idx.reindex_and_find(Path::new("a.go"), &[NilCheck { type_name: "T".into(), line: 1 }], 3);
+        idx.save(&path).unwrap();
+        assert_eq!(SpecialCaseIndex::load(&path).occurrences["T"].len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

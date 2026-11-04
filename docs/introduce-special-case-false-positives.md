@@ -33,6 +33,7 @@ redirectable with `KIBITZER_SPECIAL_CASE_INDEX_DIR`.
 | Types the repo does not own (`time.Timer`, `zap.Logger`, `os.File`) | A null object cannot be added to a stdlib or third-party type. | Not filtered outside `vendor/`; suppress with `kibitzer:ignore`. |
 | `else` branch that never uses `x` (`if class != nil { log(class) } else { log(claim) }`) | The `else` alone qualifies the `if`. | Not filtered. |
 | Same type name in different packages | Types are keyed by their written name (`Config`), so unrelated `Config` types add up. | Not filtered; known over-count. |
+| Deleted or renamed files | Their index entries are not pruned (same as `duplicate-code-cross-file`), so counts can stay inflated until the index is cleared. | Not filtered; a mismatched index `version` is discarded and rebuilt. |
 | Parenthesized condition (`if (x == nil)`) | Not unwrapped. | Missed; known under-count. |
 | Syntactic type resolution | Types introduced by `:=` from a function call or a field access are not resolved, so those checks are skipped. | Unresolved identifiers are ignored; under-counts. |
 
