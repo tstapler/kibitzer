@@ -192,9 +192,19 @@ fn failed_verification_rolls_back() {
 
 #[test]
 fn edit_paths_must_stay_inside_repo() {
-    assert!(safe_rel("../outside").is_err());
-    assert!(safe_rel("/etc/passwd").is_err());
-    assert!(safe_rel("a/b.go").is_ok());
+    let dir = fixture();
+    assert!(safe_rel(&dir, "../outside").is_err());
+    assert!(safe_rel(&dir, "/etc/passwd").is_err());
+    assert!(safe_rel(&dir, "a/b.go").is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_paths_must_not_cross_a_symlink_out_of_the_repo() {
+    let dir = fixture();
+    let outside = fixture();
+    std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+    assert!(safe_rel(&dir, "link/x.go").is_err());
 }
 
 /// Backtest driver (docs/refactor-tools.md): `KIBITZER_BACKTEST_REPO=<path> cargo test

@@ -72,6 +72,33 @@ pub fn is_inside(root: &Path, p: &Path) -> bool {
         .is_ok_and(|c| c.starts_with(canon_root))
 }
 
+/// A repo-relative plan path must be non-empty, relative, and free of `..`.
+pub fn check_plan_rel_path(p: &str) -> anyhow::Result<()> {
+    let path = Path::new(p);
+    let escapes = path.is_absolute() || path.components().any(|c| c == Component::ParentDir);
+    if escapes || p.is_empty() {
+        anyhow::bail!("plan path `{p}` is absolute or leaves the repository; refusing to apply");
+    }
+    Ok(())
+}
+
+/// No existing component of `p` under `root` may be a symlink (a not-yet-existing tail is fine).
+pub fn check_no_symlink_crossing(root: &Path, p: &str) -> anyhow::Result<()> {
+    let mut cur = root.to_path_buf();
+    for comp in Path::new(p).components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                anyhow::bail!("plan path `{p}` crosses a symlink; refusing to apply")
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => anyhow::bail!("plan path `{p}` cannot be inspected: {e}; refusing to apply"),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

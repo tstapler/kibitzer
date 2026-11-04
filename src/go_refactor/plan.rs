@@ -178,148 +178,21 @@ pub fn build_plan(
     mut f: Findings,
     simulation: Option<serde_json::Value>,
 ) -> MovePlan {
-    if let Some(sim) = &simulation {
-        for b in simulation_blockers(sim) {
-            f.blockers.push(b);
-        }
-    }
-    for u in &ws.unreadable {
-        f.blockers.push(BlockingDiagnostic::new(
-            "unreadable_go_file",
-            format!("{u}; importers in it cannot be found or rewritten"),
-        ));
-    }
-    let mut steps = vec![];
-    let mut gofmt_missing = false;
+    add_workspace_blockers(ws, &mut f, simulation.as_ref());
     let moved_origins: BTreeSet<&String> = ws.moves().values().collect();
     let changed = ws.changed_paths();
-    // Format everything up front: two gofmt runs for the whole plan (the originals, to learn
-    // whether each was already gofmt-clean, and the rewritten bodies).
-    let (basis_fmt, content_fmt) = {
-        let mut bases: Vec<Source> = vec![];
-        let mut contents: Vec<Source> = vec![];
-        for path in &changed {
-            let Some(new) = ws.get(path) else { continue };
-            let basis = ws
-                .moves()
-                .get(path)
-                .and_then(|o| ws.original(o))
-                .or_else(|| ws.original(path));
-            if let Some(b) = basis {
-                bases.push((path.as_str(), b));
-            }
-            contents.push((path.as_str(), new));
-        }
-        (gofmt_batch(&bases), gofmt_batch(&contents))
-    };
-    for path in changed {
-        let new = ws.get(&path).map(str::to_string);
-        let orig = ws.original(&path).map(str::to_string);
-        let Some(mut content) = new else {
-            if orig.is_some() && !moved_origins.contains(&path) {
-                steps.push(PlanStep {
-                    kind: PlanStepKind::DeleteFile,
-                    transform: FileTransform {
-                        old_path: Some(path.clone()),
-                        old_sha256: orig.as_deref().map(|o| sha256_hex(o.as_bytes())),
-                        new_path: None,
-                        new_content: None,
-                    },
-                    reason: "file removed".into(),
-                });
-            }
-            continue;
-        };
-        let origin = ws.moves().get(&path).cloned();
-        let basis = origin
-            .as_ref()
-            .and_then(|o| ws.original(o))
-            .or(orig.as_deref());
-        if crate::go_syntax::parse(&content).is_none_or(|t| t.root_node().has_error()) {
-            f.blockers.push(
-                BlockingDiagnostic::new("syntax_error", "file does not parse as Go (before or after the rewrite); refusing to plan around it")
-                    .at(&path, None),
-            );
-        }
-        let basis_result = basis_fmt.get(&path);
-        // Without gofmt the basis check cannot run either, so the warning must be set here too.
-        if matches!(basis_result, Some(Ok(None))) {
-            gofmt_missing = true;
-        }
-        let basis_clean =
-            basis_result.is_none_or(|r| matches!(r, Ok(Some(x)) if Some(x.as_str()) == basis));
-        if basis_clean {
-            match content_fmt.get(&path).cloned().unwrap_or(Ok(None)) {
-                Ok(Some(formatted)) => content = formatted,
-                Ok(None) => gofmt_missing = true,
-                Err(e) => f.blockers.push(
-                    BlockingDiagnostic::new(
-                        "format_failed",
-                        format!("rewritten file does not parse: {}", e.trim()),
-                    )
-                    .at(&path, None),
-                ),
-            }
-        }
-        let (kind, reason, old_path) = match (&origin, &orig) {
-            (Some(o), _) => (
-                PlanStepKind::MoveFile,
-                format!("moved from {o}"),
-                Some(o.clone()),
-            ),
-            (None, Some(_)) => {
-                if basis == Some(content.as_str()) {
-                    continue;
-                }
-                (
-                    PlanStepKind::RewriteFile,
-                    "import/qualifier/declaration rewrite".to_string(),
-                    Some(path.clone()),
-                )
-            }
-            (None, None) => (
-                PlanStepKind::CreateFile,
-                "new file holding extracted declarations".to_string(),
-                None,
-            ),
-        };
-        steps.push(PlanStep {
-            kind,
-            transform: FileTransform {
-                old_sha256: basis.map(|b| sha256_hex(b.as_bytes())),
-                old_path,
-                new_path: Some(path),
-                new_content: Some(content),
-            },
-            reason,
-        });
-    }
+    let fmt = format_all(ws, &changed);
+    let mut gofmt_missing = false;
+    let mut steps: Vec<PlanStep> = changed
+        .into_iter()
+        .filter_map(|path| step_for(ws, path, &moved_origins, &fmt, &mut f, &mut gofmt_missing))
+        .collect();
     if gofmt_missing {
         f.warnings
             .push("gofmt not found on PATH; rewritten files were not formatted".into());
     }
     steps.sort_by_key(key);
-
-    let mut dirs: BTreeSet<String> = f.affected_dirs.clone();
-    for s in &steps {
-        for p in [&s.transform.old_path, &s.transform.new_path]
-            .into_iter()
-            .flatten()
-        {
-            dirs.insert(dir_of(p).to_string());
-        }
-    }
-    let affected_packages = dirs
-        .into_iter()
-        .filter(|d| !ws.files_in_dir(d).is_empty())
-        .map(|d| {
-            if d.is_empty() {
-                ".".to_string()
-            } else {
-                format!("./{d}")
-            }
-        })
-        .collect();
+    let affected_packages = affected_packages(ws, &f, &steps);
     f.blockers.dedup();
     MovePlan {
         plan_id: String::new(),
@@ -337,6 +210,173 @@ pub fn build_plan(
         simulation_result: simulation,
     }
     .sealed()
+}
+
+fn add_workspace_blockers(
+    ws: &Workspace,
+    f: &mut Findings,
+    simulation: Option<&serde_json::Value>,
+) {
+    if let Some(sim) = simulation {
+        f.blockers.extend(simulation_blockers(sim));
+    }
+    for u in &ws.unreadable {
+        f.blockers.push(BlockingDiagnostic::new(
+            "unreadable_go_file",
+            format!("{u}; importers in it cannot be found or rewritten"),
+        ));
+    }
+}
+
+/// gofmt results for the originals (to learn whether each was already gofmt-clean) and the
+/// rewritten bodies: two gofmt runs for the whole plan.
+struct Formatted2 {
+    basis: HashMap<String, Formatted>,
+    content: HashMap<String, Formatted>,
+}
+
+fn format_all(ws: &Workspace, changed: &[String]) -> Formatted2 {
+    let mut bases: Vec<Source> = vec![];
+    let mut contents: Vec<Source> = vec![];
+    for path in changed {
+        let Some(new) = ws.get(path) else { continue };
+        let basis = ws
+            .moves()
+            .get(path)
+            .and_then(|o| ws.original(o))
+            .or_else(|| ws.original(path));
+        if let Some(b) = basis {
+            bases.push((path.as_str(), b));
+        }
+        contents.push((path.as_str(), new));
+    }
+    Formatted2 {
+        basis: gofmt_batch(&bases),
+        content: gofmt_batch(&contents),
+    }
+}
+
+/// The plan step for one changed path, or `None` when nothing needs writing.
+fn step_for(
+    ws: &Workspace,
+    path: String,
+    moved_origins: &BTreeSet<&String>,
+    fmt: &Formatted2,
+    f: &mut Findings,
+    gofmt_missing: &mut bool,
+) -> Option<PlanStep> {
+    let orig = ws.original(&path).map(str::to_string);
+    let Some(mut content) = ws.get(&path).map(str::to_string) else {
+        return (orig.is_some() && !moved_origins.contains(&path)).then(|| PlanStep {
+            kind: PlanStepKind::DeleteFile,
+            transform: FileTransform {
+                old_path: Some(path.clone()),
+                old_sha256: orig.as_deref().map(|o| sha256_hex(o.as_bytes())),
+                new_path: None,
+                new_content: None,
+            },
+            reason: "file removed".into(),
+        });
+    };
+    let origin = ws.moves().get(&path).cloned();
+    let basis = origin
+        .as_ref()
+        .and_then(|o| ws.original(o))
+        .or(orig.as_deref());
+    if crate::go_syntax::parse(&content).is_none_or(|t| t.root_node().has_error()) {
+        f.blockers.push(
+            BlockingDiagnostic::new("syntax_error", "file does not parse as Go (before or after the rewrite); refusing to plan around it")
+                .at(&path, None),
+        );
+    }
+    format_content(&path, basis, &mut content, fmt, f, gofmt_missing);
+    let (kind, reason, old_path) = match (&origin, &orig) {
+        (Some(o), _) => (
+            PlanStepKind::MoveFile,
+            format!("moved from {o}"),
+            Some(o.clone()),
+        ),
+        (None, Some(_)) => {
+            if basis == Some(content.as_str()) {
+                return None;
+            }
+            (
+                PlanStepKind::RewriteFile,
+                "import/qualifier/declaration rewrite".to_string(),
+                Some(path.clone()),
+            )
+        }
+        (None, None) => (
+            PlanStepKind::CreateFile,
+            "new file holding extracted declarations".to_string(),
+            None,
+        ),
+    };
+    Some(PlanStep {
+        kind,
+        transform: FileTransform {
+            old_sha256: basis.map(|b| sha256_hex(b.as_bytes())),
+            old_path,
+            new_path: Some(path),
+            new_content: Some(content),
+        },
+        reason,
+    })
+}
+
+/// Applies the gofmt result to `content`, but only when the file's original was already
+/// gofmt-clean (otherwise formatting would add unrelated churn to the diff).
+fn format_content(
+    path: &str,
+    basis: Option<&str>,
+    content: &mut String,
+    fmt: &Formatted2,
+    f: &mut Findings,
+    gofmt_missing: &mut bool,
+) {
+    let basis_result = fmt.basis.get(path);
+    // Without gofmt the basis check cannot run either, so the warning must be set here too.
+    if matches!(basis_result, Some(Ok(None))) {
+        *gofmt_missing = true;
+    }
+    let basis_clean =
+        basis_result.is_none_or(|r| matches!(r, Ok(Some(x)) if Some(x.as_str()) == basis));
+    if !basis_clean {
+        return;
+    }
+    match fmt.content.get(path).cloned().unwrap_or(Ok(None)) {
+        Ok(Some(formatted)) => *content = formatted,
+        Ok(None) => *gofmt_missing = true,
+        Err(e) => f.blockers.push(
+            BlockingDiagnostic::new(
+                "format_failed",
+                format!("rewritten file does not parse: {}", e.trim()),
+            )
+            .at(path, None),
+        ),
+    }
+}
+
+fn affected_packages(ws: &Workspace, f: &Findings, steps: &[PlanStep]) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = f.affected_dirs.clone();
+    for s in steps {
+        for p in [&s.transform.old_path, &s.transform.new_path]
+            .into_iter()
+            .flatten()
+        {
+            dirs.insert(dir_of(p).to_string());
+        }
+    }
+    dirs.into_iter()
+        .filter(|d| !ws.files_in_dir(d).is_empty())
+        .map(|d| {
+            if d.is_empty() {
+                ".".to_string()
+            } else {
+                format!("./{d}")
+            }
+        })
+        .collect()
 }
 
 fn key(s: &PlanStep) -> String {

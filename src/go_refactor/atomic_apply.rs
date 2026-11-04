@@ -9,8 +9,8 @@ use anyhow::{Result, bail};
 
 use super::types::{ApplyResult, ApplyStatus, MovePlan, OperationKind, PlanStep, PlanStepKind};
 use super::verify::{DEFAULT_TIMEOUT, run_verify};
-use crate::refactor_core::sha256_hex;
 use crate::refactor_core::txn::{self, Change, Op, Rename};
+use crate::refactor_core::{guard, sha256_hex};
 
 #[derive(Default)]
 pub struct ApplyOptions {
@@ -29,57 +29,59 @@ enum StepState {
     Conflict(String),
 }
 
-fn read(root: &Path, rel: &str) -> Option<Vec<u8>> {
-    std::fs::read(root.join(rel)).ok()
+/// One read per file: `Ok(None)` is a missing file, `Err` an unreadable one (which must not
+/// look like a missing one).
+fn read_once(root: &Path, rel: &str) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(root.join(rel)) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn classify(root: &Path, s: &PlanStep) -> StepState {
     let t = &s.transform;
-    // `read` maps every error to "absent"; an unreadable file must not look like a missing one.
-    for p in [&t.old_path, &t.new_path].into_iter().flatten() {
-        if let Err(e) = std::fs::read(root.join(p))
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return StepState::Conflict(format!("{p} is not readable: {e}"));
-        }
-    }
+    let load = |p: &Option<String>| match p {
+        None => Ok(None),
+        Some(p) => read_once(root, p).map_err(|e| format!("{p} is not readable: {e}")),
+    };
+    let (old, new) = match (load(&t.old_path), load(&t.new_path)) {
+        (Ok(o), Ok(n)) => (o, n),
+        (Err(m), _) | (_, Err(m)) => return StepState::Conflict(m),
+    };
     let want = t.new_content.as_deref().map(str::as_bytes);
-    let old_matches = |p: &str| match (read(root, p), &t.old_sha256) {
-        (Some(b), Some(h)) => &sha256_hex(&b) == h,
+    let old_matches = match (&old, &t.old_sha256) {
+        (Some(b), Some(h)) => &sha256_hex(b) == h,
         (Some(_), None) => true,
         (None, _) => false,
     };
     match (&t.old_path, &t.new_path) {
         (Some(o), Some(n)) if o == n => {
-            let cur = read(root, o);
-            if cur.as_deref() == want {
+            if old.as_deref() == want {
                 StepState::Done
-            } else if old_matches(o) {
+            } else if old_matches {
                 StepState::Pending
             } else {
                 StepState::Conflict(format!("{o} changed since the plan was made"))
             }
         }
-        (Some(o), Some(n)) => {
-            let (old, new) = (read(root, o), read(root, n));
-            match (old.is_some(), new) {
-                (false, Some(b)) if Some(b.as_slice()) == want => StepState::Done,
-                (true, None) if old_matches(o) => StepState::Pending,
-                (true, None) => StepState::Conflict(format!("{o} changed since the plan was made")),
-                _ => StepState::Conflict(format!(
-                    "{o} -> {n}: neither the plan's before nor after state"
-                )),
-            }
-        }
-        (None, Some(n)) => match read(root, n) {
+        (Some(o), Some(n)) => match (old.is_some(), new) {
+            (false, Some(b)) if Some(b.as_slice()) == want => StepState::Done,
+            (true, None) if old_matches => StepState::Pending,
+            (true, None) => StepState::Conflict(format!("{o} changed since the plan was made")),
+            _ => StepState::Conflict(format!(
+                "{o} -> {n}: neither the plan's before nor after state"
+            )),
+        },
+        (None, Some(n)) => match new {
             None => StepState::Pending,
             Some(b) if Some(b.as_slice()) == want => StepState::Done,
             Some(_) => StepState::Conflict(format!("{n} already exists with different content")),
         },
         (Some(o), None) => {
-            if read(root, o).is_none() {
+            if old.is_none() {
                 StepState::Done
-            } else if old_matches(o) {
+            } else if old_matches {
                 StepState::Pending
             } else {
                 StepState::Conflict(format!("{o} changed since the plan was made"))
@@ -134,14 +136,7 @@ fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
             .into_iter()
             .flatten()
         {
-            let path = Path::new(p);
-            let escapes = path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-            if escapes || p.is_empty() {
-                bail!("plan path `{p}` is absolute or leaves the repository; refusing to apply");
-            }
+            guard::check_plan_rel_path(p)?;
             let allowed = if policy {
                 POLICY_FILES.contains(&p.as_str())
             } else {
@@ -150,18 +145,7 @@ fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
             if !allowed {
                 bail!("plan path `{p}` is not a file this operation may touch; refusing to apply");
             }
-            let mut cur = root.to_path_buf();
-            for comp in path.components() {
-                cur.push(comp);
-                match std::fs::symlink_metadata(&cur) {
-                    Ok(m) if m.file_type().is_symlink() => {
-                        bail!("plan path `{p}` crosses a symlink; refusing to apply")
-                    }
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) => bail!("plan path `{p}` cannot be inspected: {e}; refusing to apply"),
-                }
-            }
+            guard::check_no_symlink_crossing(root, p)?;
         }
     }
     for pkg in &plan.affected_packages {
@@ -241,6 +225,45 @@ pub(super) fn apply_with(
     // Lock and crash-recover before reading anything: staleness and idempotence below must be
     // judged against a tree no other apply can change before our writes land.
     let session = txn::session(root)?;
+    if let Some(already) = preflight(plan, root)? {
+        return Ok(already);
+    }
+    let pending = match session.begin(&plan.plan_id, &changes_for(root, plan), rename) {
+        Ok(p) => p,
+        // The write failed and so did the rollback: report a dirty tree (exit 4), not a plain error.
+        Err(e) if e.downcast_ref::<txn::RollbackFailed>().is_some() => {
+            return Ok(result(
+                plan,
+                ApplyStatus::RolledBack,
+                0,
+                None,
+                vec![format!("{e:#}")],
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    verify_and_settle(plan, root, opts, pending)
+}
+
+fn result(
+    plan: &MovePlan,
+    status: ApplyStatus,
+    applied_steps: usize,
+    verify: Option<super::types::VerifyResult>,
+    restore_errors: Vec<String>,
+) -> ApplyResult {
+    ApplyResult {
+        status,
+        applied_steps,
+        verify,
+        restore_errors,
+        plan: plan.clone(),
+    }
+}
+
+/// Validates the plan and judges every step against the tree. `Some` means there is nothing to
+/// do (already applied); an `Err` means the plan is invalid, stale or partially applied.
+fn preflight(plan: &MovePlan, root: &Path) -> Result<Option<ApplyResult>> {
     validate_plan(plan, root)?;
     if !plan.blockers.is_empty() {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
@@ -260,13 +283,13 @@ pub(super) fn apply_with(
     }
     let done = states.iter().filter(|s| **s == StepState::Done).count();
     if done == plan.steps.len() {
-        return Ok(ApplyResult {
-            status: ApplyStatus::AlreadyApplied,
-            applied_steps: 0,
-            verify: None,
-            restore_errors: vec![],
-            plan: plan.clone(),
-        });
+        return Ok(Some(result(
+            plan,
+            ApplyStatus::AlreadyApplied,
+            0,
+            None,
+            vec![],
+        )));
     }
     if done > 0 {
         bail!(
@@ -274,24 +297,19 @@ pub(super) fn apply_with(
             plan.steps.len()
         );
     }
-
     if plan.operation == OperationKind::SyncPolicy {
         check_policy_derivation(plan, root)?;
     }
-    let pending = match session.begin(&plan.plan_id, &changes_for(root, plan), rename) {
-        Ok(p) => p,
-        // The write failed and so did the rollback: report a dirty tree (exit 4), not a plain error.
-        Err(e) if e.downcast_ref::<txn::RollbackFailed>().is_some() => {
-            return Ok(ApplyResult {
-                status: ApplyStatus::RolledBack,
-                applied_steps: 0,
-                verify: None,
-                restore_errors: vec![format!("{e:#}")],
-                plan: plan.clone(),
-            });
-        }
-        Err(e) => return Err(e),
-    };
+    Ok(None)
+}
+
+/// Verifies the written tree (when asked) and either commits it or restores it byte-for-byte.
+fn verify_and_settle(
+    plan: &MovePlan,
+    root: &Path,
+    opts: &ApplyOptions,
+    pending: txn::Pending,
+) -> Result<ApplyResult> {
     let mut verify = None;
     if opts.verify {
         let v = run_verify(
@@ -309,22 +327,22 @@ pub(super) fn apply_with(
                 .err()
                 .map(|e| vec![format!("{e:#}")])
                 .unwrap_or_default();
-            return Ok(ApplyResult {
-                status: ApplyStatus::RolledBack,
-                applied_steps: 0,
+            return Ok(result(
+                plan,
+                ApplyStatus::RolledBack,
+                0,
                 verify,
                 restore_errors,
-                plan: plan.clone(),
-            });
+            ));
         }
     }
     pending.commit()?;
     prune_empty_dirs(root, plan);
-    Ok(ApplyResult {
-        status: ApplyStatus::Applied,
-        applied_steps: plan.steps.len(),
+    Ok(result(
+        plan,
+        ApplyStatus::Applied,
+        plan.steps.len(),
         verify,
-        restore_errors: vec![],
-        plan: plan.clone(),
-    })
+        vec![],
+    ))
 }
