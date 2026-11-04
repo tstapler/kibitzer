@@ -426,7 +426,7 @@ struct ForeignAccessCtx<'a> {
     file_aliases: Option<&'a HashMap<String, String>>,
 }
 
-fn collect_foreign_field_accesses(
+pub(crate) fn collect_foreign_field_accesses(
     method: Node,
     source: &str,
     own_type: &str,

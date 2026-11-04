@@ -20,6 +20,7 @@ mod dedup;
 mod encapsulate_variable;
 mod extract_class;
 mod false_positive;
+mod feature_envy;
 mod git_cmd;
 mod glob;
 mod go_build_cost;
