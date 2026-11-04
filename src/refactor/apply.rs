@@ -253,6 +253,7 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
     for o in &outputs {
         changes.push(Change {
             path: o.dest.clone(),
+            expect_sha256: None,
             op: Op::Put {
                 bytes: o.body.clone().into_bytes(),
                 mode_from: Some(o.original.clone()),
@@ -261,6 +262,7 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
         if o.dest != o.original {
             changes.push(Change {
                 path: o.original.clone(),
+                expect_sha256: None,
                 op: Op::Delete,
             });
         }

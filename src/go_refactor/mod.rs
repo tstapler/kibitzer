@@ -135,6 +135,19 @@ struct PartitionCluster {
     files: Vec<String>,
 }
 
+/// The load-workspace / collect-findings / build-plan shape every `plan_*` entry point shares.
+fn plan_with(
+    root: &Path,
+    op: OperationKind,
+    sim: Option<serde_json::Value>,
+    build: impl FnOnce(&mut Workspace, &mut Findings),
+) -> Result<MovePlan> {
+    let mut ws = Workspace::load(root)?;
+    let mut f = Findings::default();
+    build(&mut ws, &mut f);
+    Ok(plan::build_plan(&ws, op, &root.to_string_lossy(), f, sim))
+}
+
 /// Plan a move-files operation (also the entry point golden tests use).
 pub fn plan_move_files(
     root: &Path,
@@ -142,31 +155,24 @@ pub fn plan_move_files(
     dest: &str,
     sim: Option<serde_json::Value>,
 ) -> Result<MovePlan> {
-    let mut ws = Workspace::load(root)?;
-    let mut f = Findings::default();
-    let mut by_dir: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for s in srcs {
-        by_dir
-            .entry(workspace::dir_of(s).to_string())
-            .or_default()
-            .push(workspace::base_of(s).to_string());
-    }
-    if by_dir.len() > 1 {
-        f.blockers.push(types::BlockingDiagnostic::new(
-            "multiple_source_packages",
-            "move-files takes files from exactly one package; run it once per package",
-        ));
-    }
-    for (dir, files) in by_dir {
-        ops::partial_move(&mut ws, &mut f, &dir, dest, &Selection::Files(files));
-    }
-    Ok(plan::build_plan(
-        &ws,
-        OperationKind::MoveFiles,
-        &root.to_string_lossy(),
-        f,
-        sim,
-    ))
+    plan_with(root, OperationKind::MoveFiles, sim, |ws, f| {
+        let mut by_dir: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for s in srcs {
+            by_dir
+                .entry(workspace::dir_of(s).to_string())
+                .or_default()
+                .push(workspace::base_of(s).to_string());
+        }
+        if by_dir.len() > 1 {
+            f.blockers.push(types::BlockingDiagnostic::new(
+                "multiple_source_packages",
+                "move-files takes files from exactly one package; run it once per package",
+            ));
+        }
+        for (dir, files) in by_dir {
+            ops::partial_move(ws, f, &dir, dest, &Selection::Files(files));
+        }
+    })
 }
 
 pub fn plan_rename_pkg(
@@ -176,16 +182,9 @@ pub fn plan_rename_pkg(
     name: Option<&str>,
     sim: Option<serde_json::Value>,
 ) -> Result<MovePlan> {
-    let mut ws = Workspace::load(root)?;
-    let mut f = Findings::default();
-    ops::rename_pkg(&mut ws, &mut f, from, to, name);
-    Ok(plan::build_plan(
-        &ws,
-        OperationKind::RenamePkg,
-        &root.to_string_lossy(),
-        f,
-        sim,
-    ))
+    plan_with(root, OperationKind::RenamePkg, sim, |ws, f| {
+        ops::rename_pkg(ws, f, from, to, name)
+    })
 }
 
 pub fn plan_extract_decls(
@@ -195,24 +194,15 @@ pub fn plan_extract_decls(
     to: &str,
     sim: Option<serde_json::Value>,
 ) -> Result<MovePlan> {
-    let mut ws = Workspace::load(root)?;
-    let mut f = Findings::default();
-    match ws.dir_of_import(from) {
-        Some(dir) => {
-            ops::partial_move(&mut ws, &mut f, &dir, to, &Selection::Decls(decls.to_vec()))
+    plan_with(root, OperationKind::ExtractDecls, sim, |ws, f| {
+        match ws.dir_of_import(from) {
+            Some(dir) => ops::partial_move(ws, f, &dir, to, &Selection::Decls(decls.to_vec())),
+            None => f.blockers.push(types::BlockingDiagnostic::new(
+                "outside_module",
+                format!("{from} is outside module {}", ws.module),
+            )),
         }
-        None => f.blockers.push(types::BlockingDiagnostic::new(
-            "outside_module",
-            format!("{from} is outside module {}", ws.module),
-        )),
-    }
-    Ok(plan::build_plan(
-        &ws,
-        OperationKind::ExtractDecls,
-        &root.to_string_lossy(),
-        f,
-        sim,
-    ))
+    })
 }
 
 pub fn plan_split_pkg(
@@ -221,8 +211,6 @@ pub fn plan_split_pkg(
     clusters: &[(String, Vec<String>)],
     sim: Option<serde_json::Value>,
 ) -> Result<MovePlan> {
-    let mut ws = Workspace::load(root)?;
-    let mut f = Findings::default();
     let cs: Vec<Cluster> = clusters
         .iter()
         .map(|(to, files)| Cluster {
@@ -230,14 +218,9 @@ pub fn plan_split_pkg(
             files: files.clone(),
         })
         .collect();
-    ops::split_pkg(&mut ws, &mut f, pkg, &cs);
-    Ok(plan::build_plan(
-        &ws,
-        OperationKind::SplitPkg,
-        &root.to_string_lossy(),
-        f,
-        sim,
-    ))
+    plan_with(root, OperationKind::SplitPkg, sim, |ws, f| {
+        ops::split_pkg(ws, f, pkg, &cs)
+    })
 }
 
 pub fn plan_sync_policy(root: &Path, source: &MovePlan) -> Result<MovePlan> {

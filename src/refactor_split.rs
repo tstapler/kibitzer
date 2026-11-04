@@ -1024,6 +1024,7 @@ fn apply_changes(repo: &Path, plan: &RefactorPlan) -> Vec<txn::Change> {
         .iter()
         .map(|e| txn::Change {
             path: repo.join(&e.file),
+            expect_sha256: None,
             op: if e.kind == "write" {
                 txn::Op::Put {
                     bytes: e.content.clone().unwrap_or_default().into_bytes(),
@@ -1042,6 +1043,7 @@ fn revert_changes(repo: &Path, plan: &RefactorPlan) -> Vec<txn::Change> {
         .iter()
         .map(|e| txn::Change {
             path: repo.join(&e.file),
+            expect_sha256: None,
             op: match &e.original {
                 Some(orig) => txn::Op::Put {
                     bytes: orig.clone().into_bytes(),

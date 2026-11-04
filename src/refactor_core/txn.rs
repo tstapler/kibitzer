@@ -96,6 +96,9 @@ pub enum Op {
 pub struct Change {
     pub path: PathBuf,
     pub op: Op,
+    /// When set, the bytes read for the backup must hash to this, closing the window between the
+    /// caller's staleness check and the swap.
+    pub expect_sha256: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -432,6 +435,19 @@ fn resolved_rel(root: &Path, p: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Shell commands that undo the log by hand: copy each backup back, remove files the plan created.
+/// Printed when automatic recovery refuses, so the user is not left to reverse-engineer the log.
+fn manual_restore_commands(wal: &Wal) -> String {
+    wal.entries
+        .iter()
+        .map(|e| match &e.backup {
+            Some(b) => format!("  cp -p '{}' '{}'", b.display(), e.path.display()),
+            None => format!("  rm -f '{}'", e.path.display()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Crash recovery trusts nothing in the on-disk log: a hostile repo can plant one. Every path it
 /// names must stay inside the repo after symlinks are resolved and must not touch `.git` or
 /// `.kibitzer` (hooks and check commands are code execution). A crash during a change to a
@@ -442,9 +458,10 @@ fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
     let refuse = |p: &Path| {
         anyhow::anyhow!(
             "WAL names {} outside the repository or in .git/.kibitzer; refusing to roll back \
-             automatically (inspect {} and restore by hand, then delete the WAL)",
+             automatically; restore by hand, then delete {}:\n{}",
             p.display(),
-            backups.display()
+            wal_path(root).display(),
+            manual_restore_commands(wal)
         )
     };
     let allowed = |p: &Path| {
@@ -589,9 +606,15 @@ fn write_wal(root: &Path, plan_id: &str, changes: &[Change]) -> Result<Wal> {
             Ok(m) if m.is_file() => {
                 mode = Some(std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
                 let b = backup_dir(root).join(i.to_string());
+                let original = std::fs::read(&c.path)?;
+                if let Some(want) = &c.expect_sha256
+                    && &super::sha256_hex(&original) != want
+                {
+                    bail!("{} changed since the plan was made", c.path.display());
+                }
                 // Read + synced write (not `copy`): the log must never point at a backup that a
                 // power loss could leave empty.
-                write_synced(&b, &std::fs::read(&c.path)?)?;
+                write_synced(&b, &original)?;
                 Some(b)
             }
             Ok(_) => bail!("{} is not a regular file", c.path.display()),
@@ -672,11 +695,38 @@ mod tests {
     fn put(path: PathBuf, text: &str) -> Change {
         Change {
             path,
+            expect_sha256: None,
             op: Op::Put {
                 bytes: text.as_bytes().to_vec(),
                 mode_from: None,
             },
         }
+    }
+
+    #[test]
+    fn a_file_changed_after_the_staleness_check_is_refused_and_left_alone() {
+        let root = scratch("toctou");
+        std::fs::write(root.join("a"), "edited-after-plan").unwrap();
+        let mut stale = put(root.join("a"), "new");
+        stale.expect_sha256 = Some(crate::refactor_core::sha256_hex(b"as-planned"));
+        let err = begin(&root, "p", &[stale], &real_rename).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("changed since the plan"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a")).unwrap(),
+            "edited-after-plan"
+        );
+        assert!(!wal_path(&root).exists(), "no log left behind");
+
+        let mut fresh = put(root.join("a"), "new");
+        fresh.expect_sha256 = Some(crate::refactor_core::sha256_hex(b"edited-after-plan"));
+        begin(&root, "p2", &[fresh], &real_rename)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
     }
 
     #[test]
@@ -688,6 +738,7 @@ mod tests {
             put(root.join("d/b"), "fresh"),
             Change {
                 path: root.join("gone"),
+                expect_sha256: None,
                 op: Op::Delete,
             },
         ];
@@ -797,10 +848,10 @@ mod tests {
                 &[("0", "PAYLOAD")],
             );
             let err = recover(&root).unwrap_err();
-            assert!(
-                format!("{err:#}").contains("refusing to roll back"),
-                "{err:#}"
-            );
+            let msg = format!("{err:#}");
+            assert!(msg.contains("refusing to roll back"), "{msg}");
+            let restore = format!("cp -p '{}' '{}'", backup.display(), victim.display());
+            assert!(msg.contains(&restore), "missing restore command in: {msg}");
             assert!(
                 std::fs::read_to_string(&victim)
                     .unwrap()
@@ -961,6 +1012,7 @@ mod tests {
             put(root.join("sub/b"), "B-new"),
             Change {
                 path: root.join("gone"),
+                expect_sha256: None,
                 op: Op::Delete,
             },
         ];

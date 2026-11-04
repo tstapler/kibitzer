@@ -169,6 +169,9 @@ fn changes_for(root: &Path, plan: &MovePlan) -> Vec<Change> {
         if let (Some(new), Some(content)) = (&t.new_path, &t.new_content) {
             changes.push(Change {
                 path: root.join(new),
+                expect_sha256: (t.old_path.as_ref() == Some(new))
+                    .then(|| t.old_sha256.clone())
+                    .flatten(),
                 op: Op::Put {
                     bytes: content.clone().into_bytes(),
                     mode_from: Some(root.join(t.old_path.as_deref().unwrap_or(new))),
@@ -180,6 +183,7 @@ fn changes_for(root: &Path, plan: &MovePlan) -> Vec<Change> {
         {
             changes.push(Change {
                 path: root.join(old),
+                expect_sha256: t.old_sha256.clone(),
                 op: Op::Delete,
             });
         }
