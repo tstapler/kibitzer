@@ -235,77 +235,138 @@ fn extract_nil_checks(root: Node, src: &[u8]) -> Vec<NilCheck> {
     out
 }
 
-fn is_func(node: Node) -> bool {
-    matches!(
-        GoKind::of(node),
-        GoKind::FunctionDeclaration | GoKind::MethodDeclaration | GoKind::FuncLiteral
-    )
-}
-
+/// Scoped like Go: a declaration is visible from its statement to the end of its block, a
+/// nested function sees the enclosing scope's names, and a name the checker cannot type
+/// (`a, err := f()`) clears any type it had, so a shadowed `err` is never mistaken for an
+/// outer typed variable.
 fn walk(node: Node, src: &[u8], env: &Env, out: &mut Vec<NilCheck>) {
-    let scoped;
-    let env = if is_func(node) {
-        let mut e = env.clone();
-        for field in ["receiver", "parameters"] {
-            if let Some(list) = node.child_by_field_name(field) {
-                collect_decls(list, src, &mut e);
+    match GoKind::of(node) {
+        GoKind::FunctionDeclaration | GoKind::MethodDeclaration | GoKind::FuncLiteral => {
+            let mut scope = env.clone();
+            // The receiver stays untyped: `if r != nil` inside a type's own method is a
+            // nil-safe receiver, with no caller to simplify.
+            if let Some(list) = node.child_by_field_name("receiver") {
+                shadow_receiver(list, src, &mut scope);
+            }
+            if let Some(list) = node.child_by_field_name("parameters") {
+                declare_params(list, src, &mut scope);
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                walk(body, src, &scope, out);
             }
         }
-        if let Some(body) = node.child_by_field_name("body") {
-            collect_decls(body, src, &mut e);
+        // The grammar wraps a block's (and a case clause's) statements in a statement list.
+        GoKind::Block | GoKind::StatementList => {
+            let mut scope = env.clone();
+            let mut cursor = node.walk();
+            for stmt in node.children(&mut cursor) {
+                declare_stmt(stmt, src, &mut scope);
+                walk(stmt, src, &scope, out);
+            }
         }
-        scoped = e;
-        &scoped
-    } else {
-        env
-    };
-    if GoKind::of(node) == GoKind::IfStatement
-        && let Some(check) = nil_check(node, src, env)
-    {
-        out.push(check);
+        GoKind::IfStatement => {
+            let mut scope = env.clone();
+            if let Some(init) = node.child_by_field_name("initializer") {
+                declare_stmt(init, src, &mut scope);
+            }
+            if let Some(check) = nil_check(node, src, &scope) {
+                out.push(check);
+            }
+            walk_children(node, src, &scope, out);
+        }
+        _ => walk_children(node, src, env, out),
     }
+}
+
+fn walk_children(node: Node, src: &[u8], env: &Env, out: &mut Vec<NilCheck>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk(child, src, env, out);
     }
 }
 
-/// Records `name -> type` for parameters/`var` specs/`x := &T{}`. Nested function
-/// literals are skipped so their locals don't leak out. One flat map per function: a
-/// later redeclaration of the same name (shadowing) overwrites the earlier type.
-fn collect_decls(node: Node, src: &[u8], env: &mut Env) {
-    match GoKind::of(node) {
-        GoKind::ParameterDeclaration | GoKind::VarSpec => {
-            if let Some(ty) = node.child_by_field_name("type").and_then(|t| normalize_type(t, src)) {
-                let mut cursor = node.walk();
-                for name in node.children_by_field_name("name", &mut cursor) {
-                    env.insert(text(name, src), ty.clone());
-                }
-            }
+/// Binds `name` to `ty`, or clears it when the new declaration's type is unknown.
+fn bind(env: &mut Env, name: String, ty: Option<String>) {
+    match ty {
+        Some(ty) => {
+            env.insert(name, ty);
         }
-        GoKind::ShortVarDeclaration => {
-            let (Some(l), Some(r)) = (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
-            ) else {
-                return;
-            };
-            let mut lc = l.walk();
-            let mut rc = r.walk();
-            for (name, value) in l.named_children(&mut lc).zip(r.named_children(&mut rc)) {
-                if GoKind::of(name) == GoKind::Identifier
-                    && let Some(ty) = literal_type(value, src)
-                {
-                    env.insert(text(name, src), ty);
-                }
-            }
+        None => {
+            env.remove(&name);
         }
-        _ if is_func(node) => return,
-        _ => {}
     }
+}
+
+/// A parameter or `var` spec: `name... Type`.
+fn declare_typed(node: Node, src: &[u8], env: &mut Env) {
+    let ty = node
+        .child_by_field_name("type")
+        .and_then(|t| normalize_type(t, src));
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_decls(child, src, env);
+    for name in node.children_by_field_name("name", &mut cursor) {
+        bind(env, text(name, src), ty.clone());
+    }
+}
+
+fn declare_params(list: Node, src: &[u8], env: &mut Env) {
+    let mut cursor = list.walk();
+    for param in list.children(&mut cursor) {
+        if GoKind::of(param) == GoKind::ParameterDeclaration {
+            declare_typed(param, src, env);
+        }
+    }
+}
+
+/// Shadows the receiver's name without typing it.
+fn shadow_receiver(list: Node, src: &[u8], env: &mut Env) {
+    let mut cursor = list.walk();
+    for param in list.children(&mut cursor) {
+        let mut names = param.walk();
+        for name in param.children_by_field_name("name", &mut names) {
+            bind(env, text(name, src), None);
+        }
+    }
+}
+
+/// `x := &T{}` types `x`; every other `:=` (including `a, err := f()`) leaves its names untyped.
+fn declare_short_var(node: Node, src: &[u8], env: &mut Env) {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    let (mut lc, mut rc) = (left.walk(), right.walk());
+    let names: Vec<Node> = left.named_children(&mut lc).collect();
+    let values: Vec<Node> = right.named_children(&mut rc).collect();
+    for (i, name) in names.iter().enumerate() {
+        if GoKind::of(*name) != GoKind::Identifier {
+            continue;
+        }
+        let ty = if names.len() == values.len() {
+            literal_type(values[i], src)
+        } else {
+            None
+        };
+        bind(env, text(*name, src), ty);
+    }
+}
+
+/// Applies the declaration (if any) that `stmt` makes to the scope that follows it.
+fn declare_stmt(stmt: Node, src: &[u8], env: &mut Env) {
+    match GoKind::of(stmt) {
+        GoKind::ShortVarDeclaration => declare_short_var(stmt, src, env),
+        GoKind::VarDeclaration | GoKind::VarSpecList => {
+            let mut cursor = stmt.walk();
+            for child in stmt.children(&mut cursor) {
+                match GoKind::of(child) {
+                    GoKind::VarSpec => declare_typed(child, src, env),
+                    GoKind::VarSpecList => declare_stmt(child, src, env),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -365,9 +426,13 @@ fn nil_check(if_stmt: Node, src: &[u8], env: &Env) -> Option<NilCheck> {
     })
 }
 
+/// True when `name.Method(...)` is called anywhere under `node`; reading a field
+/// (`name.Field`) does not count.
 fn calls_method_on(node: Node, name: &str, src: &[u8]) -> bool {
-    if GoKind::of(node) == GoKind::SelectorExpression
-        && node
+    if GoKind::of(node) == GoKind::CallExpression
+        && let Some(function) = node.child_by_field_name("function")
+        && GoKind::of(function) == GoKind::SelectorExpression
+        && function
             .child_by_field_name("operand")
             .is_some_and(|o| text(o, src) == name)
     {
@@ -426,9 +491,31 @@ mod tests {
     }
 
     #[test]
-    fn receiver_var_and_literal_declarations_resolve() {
+    fn var_and_literal_declarations_resolve_but_receiver_does_not() {
         let src = "package p\nfunc (r *Repo) f() {\n\tvar a *Alpha\n\tb := &Beta{}\n\tif r != nil {\n\t\tr.x()\n\t}\n\tif a == nil {\n\t} else {\n\t}\n\tif b == nil {\n\t} else {\n\t}\n}\n";
-        assert_eq!(types(src), ["Repo", "Alpha", "Beta"]);
+        assert_eq!(types(src), ["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn field_read_is_not_a_use_but_method_call_is() {
+        let field = "package p\nfunc f(p *Pod) {\n\tif p != nil {\n\t\tx = p.Name\n\t}\n}\n";
+        assert!(types(field).is_empty());
+        let call = "package p\nfunc f(p *Pod) {\n\tif p != nil {\n\t\tx = p.Name()\n\t}\n}\n";
+        assert_eq!(types(call), ["Pod"]);
+    }
+
+    #[test]
+    fn untyped_redeclaration_shadows_an_outer_typed_name() {
+        // `err` is an untyped `:=` result in the outer block; the typed `var err` sits in a
+        // later, nested block and must not leak backwards.
+        let src = "package p\nfunc f() {\n\ta, err := g()\n\tif err != nil {\n\t\th()\n\t} else {\n\t}\n\t{\n\t\tvar err *StatusError\n\t\tif err != nil {\n\t\t\terr.Error()\n\t\t}\n\t}\n}\n";
+        assert_eq!(types(src), ["StatusError"]);
+    }
+
+    #[test]
+    fn typed_parameter_is_shadowed_by_an_untyped_short_declaration() {
+        let src = "package p\nfunc f(svc *Svc) {\n\tsvc, ok := lookup()\n\tif svc == nil {\n\t} else {\n\t}\n}\n";
+        assert!(types(src).is_empty());
     }
 
     #[test]
