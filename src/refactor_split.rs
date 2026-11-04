@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::arch_model::ArchModel;
+use crate::arch_model::{ArchModel, PackageNode};
 use crate::architecture_checks::find_cycles;
 use crate::import_graph::ImportGraph;
 use crate::refactor_core::exec::{self, EnvPolicy};
 use crate::refactor_core::txn;
+use crate::refactor_core::{guard, sha256_hex};
 
 /// Cap on any listed collection in a response; counts and a `truncated` flag accompany it.
 pub const LIST_CAP: usize = 50;
@@ -153,6 +153,98 @@ fn group_key(package: &str, partition: &[PartitionGroup], idx: usize) -> String 
     }
 }
 
+/// Which new groups the calls between `package` and the other end of an import edge touch.
+/// `importer` is true when the other end imports `package` (its calls go into `package`).
+fn touched_groups(
+    model: &ArchModel,
+    package: &str,
+    partition: &[PartitionGroup],
+    owner: &BTreeMap<String, usize>,
+    other: &str,
+    importer: bool,
+) -> BTreeSet<String> {
+    let prefix = format!("{other}::");
+    model
+        .call_edges
+        .iter()
+        .filter(|c| c.resolved)
+        .filter_map(|c| {
+            let (near, far) = if importer {
+                (&c.from, &c.to)
+            } else {
+                (&c.to, &c.from)
+            };
+            near.starts_with(&prefix).then(|| owner.get(far)).flatten()
+        })
+        .map(|&i| group_key(package, partition, i))
+        .collect()
+}
+
+/// The import graph after the split, plus the set of packages that imported `package`.
+/// Edges touching `package` are narrowed to the groups the call edges reach, falling back to
+/// every new package when there is no call evidence.
+fn build_after_graph(
+    model: &ArchModel,
+    package: &str,
+    partition: &[PartitionGroup],
+    owner: &BTreeMap<String, usize>,
+    before: &ImportGraph,
+) -> (ImportGraph, BTreeSet<String>) {
+    let all_keys: BTreeSet<String> = owner
+        .values()
+        .map(|&i| group_key(package, partition, i))
+        .collect();
+    let mut after = ImportGraph {
+        nodes: before
+            .nodes
+            .iter()
+            .filter(|n| *n != package)
+            .cloned()
+            .collect(),
+        ..ImportGraph::default()
+    };
+    after.nodes.extend(all_keys.iter().cloned());
+    let mut importers = BTreeSet::new();
+    for e in &before.edges {
+        let (importer, exporter) = (e.to == package, e.from == package);
+        if !importer && !exporter {
+            after.edges.push(e.clone());
+            continue;
+        }
+        let other = if importer { &e.from } else { &e.to };
+        if importer {
+            importers.insert(e.from.clone());
+        }
+        let touched = touched_groups(model, package, partition, owner, other, importer);
+        for k in if touched.is_empty() {
+            &all_keys
+        } else {
+            &touched
+        } {
+            let mut edge = e.clone();
+            if importer {
+                edge.to = k.clone();
+            } else {
+                edge.from = k.clone();
+            }
+            after.edges.push(edge);
+        }
+    }
+    for c in model.call_edges.iter().filter(|c| c.resolved) {
+        if let (Some(&a), Some(&b)) = (owner.get(&c.from), owner.get(&c.to))
+            && a != b
+        {
+            after.edges.push(crate::import_graph::ImportEdge {
+                from: group_key(package, partition, a),
+                to: group_key(package, partition, b),
+                file: c.file.clone(),
+                line: c.line,
+            });
+        }
+    }
+    (after, importers)
+}
+
 /// What-if: re-runs import-cycle detection on the import graph with `package` split per
 /// `partition`. Importer edges are narrowed to the groups whose symbols the importer's
 /// call edges actually reach, falling back to every new package when there is no call
@@ -177,79 +269,7 @@ pub fn simulate_split(
     };
     let before = graph_of(model);
     let before_cycles = find_cycles(&before).len();
-
-    let all_keys: BTreeSet<String> = owner
-        .values()
-        .map(|&i| group_key(package, partition, i))
-        .collect();
-    let mut after = ImportGraph {
-        nodes: before
-            .nodes
-            .iter()
-            .filter(|n| *n != package)
-            .cloned()
-            .collect(),
-        ..ImportGraph::default()
-    };
-    after.nodes.extend(all_keys.iter().cloned());
-
-    let mut importers = BTreeSet::new();
-    for e in &before.edges {
-        if e.to == package {
-            importers.insert(e.from.clone());
-            let prefix = format!("{}::", e.from);
-            let reached: BTreeSet<String> = model
-                .call_edges
-                .iter()
-                .filter(|c| c.resolved && c.from.starts_with(&prefix))
-                .filter_map(|c| owner.get(&c.to))
-                .map(|&i| group_key(package, partition, i))
-                .collect();
-            let targets = if reached.is_empty() {
-                &all_keys
-            } else {
-                &reached
-            };
-            for t in targets {
-                let mut edge = e.clone();
-                edge.to = t.clone();
-                after.edges.push(edge);
-            }
-        } else if e.from == package {
-            let target_prefix = format!("{}::", e.to);
-            let sources: BTreeSet<String> = model
-                .call_edges
-                .iter()
-                .filter(|c| c.resolved && c.to.starts_with(&target_prefix))
-                .filter_map(|c| owner.get(&c.from))
-                .map(|&i| group_key(package, partition, i))
-                .collect();
-            let sources = if sources.is_empty() {
-                &all_keys
-            } else {
-                &sources
-            };
-            for k in sources {
-                let mut edge = e.clone();
-                edge.from = k.clone();
-                after.edges.push(edge);
-            }
-        } else {
-            after.edges.push(e.clone());
-        }
-    }
-    for c in model.call_edges.iter().filter(|c| c.resolved) {
-        if let (Some(&a), Some(&b)) = (owner.get(&c.from), owner.get(&c.to))
-            && a != b
-        {
-            after.edges.push(crate::import_graph::ImportEdge {
-                from: group_key(package, partition, a),
-                to: group_key(package, partition, b),
-                file: c.file.clone(),
-                line: c.line,
-            });
-        }
-    }
+    let (after, importers) = build_after_graph(model, package, partition, &owner, &before);
     let after_cycles = find_cycles(&after).len();
     let introduced = after_cycles.saturating_sub(before_cycles);
     let (importer_list, importer_list_truncated) = cap(importers.iter().cloned().collect());
@@ -542,20 +562,16 @@ fn new_plan_id() -> String {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    hex(&Sha256::digest(seed.as_bytes()))[..16].to_string()
+    sha256_hex(seed.as_bytes())[..16].to_string()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Rejects absolute paths and `..`: every edit must stay inside the repo root.
-fn safe_rel(rel: &str) -> Result<(), RefactorError> {
+/// Every edit must stay inside the repo root: no absolute paths, `..`, or symlink that leaves it.
+fn safe_rel(repo: &Path, rel: &str) -> Result<(), RefactorError> {
     let p = Path::new(rel);
-    if p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-    {
+    let outside = guard::check_plan_rel_path(rel).is_err()
+        || p.components().any(|c| matches!(c, Component::Prefix(_)))
+        || !guard::is_inside(repo, &repo.join(p));
+    if outside {
         return err(
             "path_outside_repo",
             format!("edit path '{rel}' is outside the repository root"),
@@ -609,76 +625,11 @@ pub fn plan_split(
         return err("infeasible", sim.blocker);
     }
     let pkg = &model.packages[package];
-    let rel = |f: &Path| -> String {
-        f.strip_prefix(repo)
-            .unwrap_or(f)
-            .to_string_lossy()
-            .to_string()
-    };
     let mut edits = vec![];
     let mut surface = vec![];
     for g in partition {
-        let mut files = BTreeSet::new();
-        for s in pkg.symbols.iter().filter(|s| {
-            g.symbols
-                .iter()
-                .any(|x| x == s.parent.as_deref().unwrap_or(&s.name))
-        }) {
-            files.insert(rel(&s.file));
-        }
-        for file in &files {
-            safe_rel(file)?;
-            if !file.ends_with(".go") {
-                return err(
-                    "unsupported",
-                    "split_package currently supports Go packages only",
-                );
-            }
-            let other: Vec<&str> = pkg
-                .symbols
-                .iter()
-                .filter(|s| rel(&s.file) == *file)
-                .map(|s| s.parent.as_deref().unwrap_or(&s.name))
-                .filter(|n| !g.symbols.iter().any(|x| x == n))
-                .collect();
-            if let Some(o) = other.first() {
-                return err(
-                    "file_straddles_groups",
-                    format!(
-                        "{file} also defines '{o}', which is outside group '{}'; file-level moves need whole files in one group",
-                        g.name
-                    ),
-                );
-            }
-            let src = repo.join(file);
-            let original = std::fs::read_to_string(&src).map_err(|e| RefactorError {
-                code: "io",
-                message: format!("reading {file}: {e}"),
-            })?;
-            let p = Path::new(file);
-            let dest = p
-                .parent()
-                .unwrap_or(Path::new(""))
-                .join(&g.name)
-                .join(p.file_name().unwrap());
-            let dest_s = dest.to_string_lossy().to_string();
-            if repo.join(&dest).exists() {
-                return err("dest_exists", format!("{dest_s} already exists"));
-            }
-            edits.push(PlannedEdit {
-                file: dest_s.clone(),
-                kind: "write".into(),
-                description: format!("move {file} to package {}", g.name),
-                content: Some(rewrite_go_package(&original, &g.name)),
-                original: None,
-            });
-            edits.push(PlannedEdit {
-                file: file.clone(),
-                kind: "delete".into(),
-                description: format!("remove {file} (moved to {dest_s})"),
-                content: None,
-                original: Some(original),
-            });
+        for file in group_files(pkg, repo, g) {
+            edits.extend(file_move_edits(pkg, repo, &file, g)?);
         }
         surface.push(format!(
             "symbols {:?} move to package {package}/{}",
@@ -708,6 +659,87 @@ pub fn plan_split(
     Ok(plan)
 }
 
+fn repo_rel(repo: &Path, f: &Path) -> String {
+    f.strip_prefix(repo)
+        .unwrap_or(f)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Repo-relative files that define any of the group's symbols.
+fn group_files(pkg: &PackageNode, repo: &Path, g: &PartitionGroup) -> BTreeSet<String> {
+    pkg.symbols
+        .iter()
+        .filter(|s| {
+            g.symbols
+                .iter()
+                .any(|x| x == s.parent.as_deref().unwrap_or(&s.name))
+        })
+        .map(|s| repo_rel(repo, &s.file))
+        .collect()
+}
+
+/// The write-to-new-package + delete-original edit pair for one whole-file move.
+fn file_move_edits(
+    pkg: &PackageNode,
+    repo: &Path,
+    file: &str,
+    g: &PartitionGroup,
+) -> Result<[PlannedEdit; 2], RefactorError> {
+    safe_rel(repo, file)?;
+    if !file.ends_with(".go") {
+        return err(
+            "unsupported",
+            "split_package currently supports Go packages only",
+        );
+    }
+    let other = pkg
+        .symbols
+        .iter()
+        .filter(|s| repo_rel(repo, &s.file) == file)
+        .map(|s| s.parent.as_deref().unwrap_or(&s.name))
+        .find(|n| !g.symbols.iter().any(|x| x == n));
+    if let Some(o) = other {
+        return err(
+            "file_straddles_groups",
+            format!(
+                "{file} also defines '{o}', which is outside group '{}'; file-level moves need whole files in one group",
+                g.name
+            ),
+        );
+    }
+    let original = std::fs::read_to_string(repo.join(file)).map_err(|e| RefactorError {
+        code: "io",
+        message: format!("reading {file}: {e}"),
+    })?;
+    let p = Path::new(file);
+    let dest = p
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(&g.name)
+        .join(p.file_name().unwrap());
+    let dest_s = dest.to_string_lossy().to_string();
+    if repo.join(&dest).exists() {
+        return err("dest_exists", format!("{dest_s} already exists"));
+    }
+    Ok([
+        PlannedEdit {
+            file: dest_s.clone(),
+            kind: "write".into(),
+            description: format!("move {file} to package {}", g.name),
+            content: Some(rewrite_go_package(&original, &g.name)),
+            original: None,
+        },
+        PlannedEdit {
+            file: file.to_string(),
+            kind: "delete".into(),
+            description: format!("remove {file} (moved to {dest_s})"),
+            content: None,
+            original: Some(original),
+        },
+    ])
+}
+
 /// Rewrites `alias.Sym` selectors in files importing `package` so moved symbols point at
 /// their new sub-package, adding the new import and dropping the old one if it went unused.
 /// Textual (regex) rewriting: a selector inside a string or comment is rewritten too, and
@@ -732,7 +764,7 @@ fn importer_edits(
             .unwrap_or(file)
             .to_string_lossy()
             .to_string();
-        safe_rel(&rel_file)?;
+        safe_rel(repo, &rel_file)?;
         let Ok(original) = std::fs::read_to_string(repo.join(&rel_file)) else {
             continue;
         };
@@ -829,7 +861,7 @@ fn rewrite_go_package(src: &str, name: &str) -> String {
 fn lock_file(repo: &Path, rel: &str) -> Result<PathBuf, RefactorError> {
     Ok(state_dir(repo)?
         .join("locks")
-        .join(&hex(&Sha256::digest(rel.as_bytes()))[..32]))
+        .join(&sha256_hex(rel.as_bytes())[..32]))
 }
 
 fn acquire_locks(repo: &Path, plan: &RefactorPlan) -> Result<(), RefactorError> {
@@ -992,6 +1024,7 @@ fn apply_changes(repo: &Path, plan: &RefactorPlan) -> Vec<txn::Change> {
         .iter()
         .map(|e| txn::Change {
             path: repo.join(&e.file),
+            expect_sha256: None,
             op: if e.kind == "write" {
                 txn::Op::Put {
                     bytes: e.content.clone().unwrap_or_default().into_bytes(),
@@ -1010,6 +1043,7 @@ fn revert_changes(repo: &Path, plan: &RefactorPlan) -> Vec<txn::Change> {
         .iter()
         .map(|e| txn::Change {
             path: repo.join(&e.file),
+            expect_sha256: None,
             op: match &e.original {
                 Some(orig) => txn::Op::Put {
                     bytes: orig.clone().into_bytes(),
@@ -1062,7 +1096,7 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
         );
     }
     for e in &plan.edits {
-        safe_rel(&e.file)?;
+        safe_rel(repo, &e.file)?;
     }
     if head(repo)? != plan.staleness_token {
         return err(

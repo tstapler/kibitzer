@@ -347,7 +347,9 @@ mod tests {
             return;
         }
         let started = Instant::now();
-        let o = quick("setsid sleep 30 & echo done");
+        // The pause lets `setsid` leave the group before the shell exits; otherwise the group
+        // kill can reach `sleep` first and the pipe closes, so nothing is "still held open".
+        let o = quick("setsid sleep 30 & sleep 0.5; echo done");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "{:?}",

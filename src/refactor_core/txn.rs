@@ -96,6 +96,9 @@ pub enum Op {
 pub struct Change {
     pub path: PathBuf,
     pub op: Op,
+    /// When set, the bytes read for the backup must hash to this, closing the window between the
+    /// caller's staleness check and the swap.
+    pub expect_sha256: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,6 +203,7 @@ pub struct Pending {
     root: PathBuf,
     wal: Wal,
     settled: bool,
+    on_drop: OnDrop,
     // Field order matters: the file lock must release before the in-process mutex.
     _flock: PlansLock,
     _lock: MutexGuard<'static, ()>,
@@ -230,28 +234,19 @@ impl Pending {
     }
 }
 
-// A killed process runs no destructors; tests flip this to leave the log behind like one.
-#[cfg(test)]
-thread_local! {
-    static KILLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub fn simulate_kill(on: bool) {
-    KILLED.with(|k| k.set(on));
-}
-
-fn killed() -> bool {
+/// What dropping an unsettled [`Pending`] does. A killed process runs no destructors, so tests that
+/// simulate one pick `LeaveLog` to keep the on-disk log for [`recover`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnDrop {
+    Rollback,
     #[cfg(test)]
-    return KILLED.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    false
+    LeaveLog,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
         if !self.settled
-            && !killed()
+            && self.on_drop == OnDrop::Rollback
             && let Err(e) = rollback(&self.root, &self.wal)
         {
             eprintln!(
@@ -310,6 +305,17 @@ impl Session {
     /// Applies `changes` (absolute paths under the root). A failure before this returns rolls
     /// the tree back; afterwards the caller owns the decision.
     pub fn begin(self, plan_id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+        self.begin_with(plan_id, changes, rename, OnDrop::Rollback)
+    }
+
+    /// [`Session::begin`] with an explicit policy for the returned [`Pending`] being dropped.
+    pub fn begin_with(
+        self,
+        plan_id: &str,
+        changes: &[Change],
+        rename: Rename,
+        on_drop: OnDrop,
+    ) -> Result<Pending> {
         let root = self.root;
         let mut seen = BTreeSet::new();
         if let Some(c) = changes.iter().find(|c| !seen.insert(&c.path)) {
@@ -327,6 +333,7 @@ impl Session {
             root,
             wal,
             settled: false,
+            on_drop,
             _flock: self.flock,
             _lock: self.lock,
         };
@@ -432,6 +439,19 @@ fn resolved_rel(root: &Path, p: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Shell commands that undo the log by hand: copy each backup back, remove files the plan created.
+/// Printed when automatic recovery refuses, so the user is not left to reverse-engineer the log.
+fn manual_restore_commands(wal: &Wal) -> String {
+    wal.entries
+        .iter()
+        .map(|e| match &e.backup {
+            Some(b) => format!("  cp -p '{}' '{}'", b.display(), e.path.display()),
+            None => format!("  rm -f '{}'", e.path.display()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Crash recovery trusts nothing in the on-disk log: a hostile repo can plant one. Every path it
 /// names must stay inside the repo after symlinks are resolved and must not touch `.git` or
 /// `.kibitzer` (hooks and check commands are code execution). A crash during a change to a
@@ -442,9 +462,10 @@ fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
     let refuse = |p: &Path| {
         anyhow::anyhow!(
             "WAL names {} outside the repository or in .git/.kibitzer; refusing to roll back \
-             automatically (inspect {} and restore by hand, then delete the WAL)",
+             automatically; restore by hand, then delete {}:\n{}",
             p.display(),
-            backups.display()
+            wal_path(root).display(),
+            manual_restore_commands(wal)
         )
     };
     let allowed = |p: &Path| {
@@ -589,9 +610,15 @@ fn write_wal(root: &Path, plan_id: &str, changes: &[Change]) -> Result<Wal> {
             Ok(m) if m.is_file() => {
                 mode = Some(std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
                 let b = backup_dir(root).join(i.to_string());
+                let original = std::fs::read(&c.path)?;
+                if let Some(want) = &c.expect_sha256
+                    && &super::sha256_hex(&original) != want
+                {
+                    bail!("{} changed since the plan was made", c.path.display());
+                }
                 // Read + synced write (not `copy`): the log must never point at a backup that a
                 // power loss could leave empty.
-                write_synced(&b, &std::fs::read(&c.path)?)?;
+                write_synced(&b, &original)?;
                 Some(b)
             }
             Ok(_) => bail!("{} is not a regular file", c.path.display()),
@@ -672,11 +699,44 @@ mod tests {
     fn put(path: PathBuf, text: &str) -> Change {
         Change {
             path,
+            expect_sha256: None,
             op: Op::Put {
                 bytes: text.as_bytes().to_vec(),
                 mode_from: None,
             },
         }
+    }
+
+    /// Like [`begin`], but dropping the result (or unwinding through it) leaves the log, as a
+    /// killed process would.
+    fn begin_killed(root: &Path, id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+        session(root)?.begin_with(id, changes, rename, OnDrop::LeaveLog)
+    }
+
+    #[test]
+    fn a_file_changed_after_the_staleness_check_is_refused_and_left_alone() {
+        let root = scratch("toctou");
+        std::fs::write(root.join("a"), "edited-after-plan").unwrap();
+        let mut stale = put(root.join("a"), "new");
+        stale.expect_sha256 = Some(crate::refactor_core::sha256_hex(b"as-planned"));
+        let err = begin(&root, "p", &[stale], &real_rename).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("changed since the plan"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a")).unwrap(),
+            "edited-after-plan"
+        );
+        assert!(!wal_path(&root).exists(), "no log left behind");
+
+        let mut fresh = put(root.join("a"), "new");
+        fresh.expect_sha256 = Some(crate::refactor_core::sha256_hex(b"edited-after-plan"));
+        begin(&root, "p2", &[fresh], &real_rename)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
     }
 
     #[test]
@@ -688,6 +748,7 @@ mod tests {
             put(root.join("d/b"), "fresh"),
             Change {
                 path: root.join("gone"),
+                expect_sha256: None,
                 op: Op::Delete,
             },
         ];
@@ -744,10 +805,8 @@ mod tests {
         let root = scratch("crash");
         std::fs::write(root.join("a"), "old").unwrap();
         let changes = [put(root.join("a"), "new")];
-        let pending = begin(&root, "p9", &changes, &real_rename).unwrap();
-        simulate_kill(true);
+        let pending = begin_killed(&root, "p9", &changes, &real_rename).unwrap();
         drop(pending);
-        simulate_kill(false);
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
         assert!(wal_path(&root).exists());
         assert_eq!(recover(&root).unwrap().as_deref(), Some("p9"));
@@ -797,10 +856,10 @@ mod tests {
                 &[("0", "PAYLOAD")],
             );
             let err = recover(&root).unwrap_err();
-            assert!(
-                format!("{err:#}").contains("refusing to roll back"),
-                "{err:#}"
-            );
+            let msg = format!("{err:#}");
+            assert!(msg.contains("refusing to roll back"), "{msg}");
+            let restore = format!("cp -p '{}' '{}'", backup.display(), victim.display());
+            assert!(msg.contains(&restore), "missing restore command in: {msg}");
             assert!(
                 std::fs::read_to_string(&victim)
                     .unwrap()
@@ -961,6 +1020,7 @@ mod tests {
             put(root.join("sub/b"), "B-new"),
             Change {
                 path: root.join("gone"),
+                expect_sha256: None,
                 op: Op::Delete,
             },
         ];
@@ -972,11 +1032,9 @@ mod tests {
             }
             std::fs::rename(from, to)
         };
-        simulate_kill(true);
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = begin(&root, "p", &changes, &dies_on_second);
+            let _ = begin_killed(&root, "p", &changes, &dies_on_second);
         }));
-        simulate_kill(false);
         assert!(crashed.is_err());
         assert_eq!(
             std::fs::read_to_string(root.join("a")).unwrap(),
@@ -1003,10 +1061,9 @@ mod tests {
     fn the_next_transaction_recovers_an_orphan_before_doing_anything() {
         let root = scratch("orphan-then-begin");
         std::fs::write(root.join("a"), "old").unwrap();
-        let p1 = begin(&root, "p1", &[put(root.join("a"), "from-p1")], &real_rename).unwrap();
-        simulate_kill(true);
+        let p1 =
+            begin_killed(&root, "p1", &[put(root.join("a"), "from-p1")], &real_rename).unwrap();
         drop(p1);
-        simulate_kill(false);
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "from-p1");
         let p2 = session(&root).unwrap();
         assert_eq!(
@@ -1028,10 +1085,8 @@ mod tests {
         p.rollback().unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
         // A crash leaves the on-disk log, which recovery refuses to act on for `.kibitzer` paths.
-        let p = begin(&root, "p", &[put(target.clone(), "new")], &real_rename).unwrap();
-        simulate_kill(true);
+        let p = begin_killed(&root, "p", &[put(target.clone(), "new")], &real_rename).unwrap();
         drop(p);
-        simulate_kill(false);
         let err = recover(&root).unwrap_err();
         assert!(format!("{err:#}").contains("restore by hand"), "{err:#}");
         assert!(

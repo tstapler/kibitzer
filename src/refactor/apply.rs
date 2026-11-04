@@ -23,6 +23,10 @@ pub trait ApplyIo {
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
     /// Runs `cmd` in `dir`; returns `(success, combined output)`.
     fn run(&self, cmd: &str, dir: &Path) -> (bool, String);
+    /// What happens to the transaction if `apply` unwinds or bails before settling it.
+    fn on_drop(&self) -> txn::OnDrop {
+        txn::OnDrop::Rollback
+    }
 }
 
 pub struct RealIo;
@@ -253,6 +257,7 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
     for o in &outputs {
         changes.push(Change {
             path: o.dest.clone(),
+            expect_sha256: None,
             op: Op::Put {
                 bytes: o.body.clone().into_bytes(),
                 mode_from: Some(o.original.clone()),
@@ -261,12 +266,13 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
         if o.dest != o.original {
             changes.push(Change {
                 path: o.original.clone(),
+                expect_sha256: None,
                 op: Op::Delete,
             });
         }
     }
     let rename = |from: &Path, to: &Path| io.rename(from, to);
-    let pending = session.begin(&plan.id, &changes, &rename)?;
+    let pending = session.begin_with(&plan.id, &changes, &rename, io.on_drop())?;
     match verify(root, plan, io) {
         Ok(verification) => {
             pending.commit()?;

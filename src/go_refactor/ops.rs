@@ -255,6 +255,31 @@ struct Unit {
     decl: gs::TopDecl,
 }
 
+/// State of one partial move, shared by the phase helpers below.
+struct Mover {
+    dest_dir: String,
+    dest_import: String,
+    a_name: String,
+    a_import: String,
+    b_name: String,
+    units: Vec<Unit>,
+    moved: BTreeSet<(String, usize)>,
+    whole_files: BTreeSet<String>,
+    split_files: BTreeSet<String>,
+    files_with_moves: BTreeSet<String>,
+    moved_names: HashSet<String>,
+    remaining_names: HashSet<String>,
+}
+
+/// Edits collected while rewriting the source package's files, applied to the workspace after.
+#[derive(Default)]
+struct Rewrites {
+    need_a_import_in: BTreeSet<String>, // moved content needing an import of A
+    new_contents: Vec<(String, String)>, // dest path -> content
+    remaining_updates: Vec<(String, String)>,
+    importing_b: Vec<String>, // packages (import paths) that will import B
+}
+
 pub fn partial_move(
     ws: &mut Workspace,
     f: &mut Findings,
@@ -262,12 +287,44 @@ pub fn partial_move(
     dest_import: &str,
     sel: &Selection,
 ) {
+    let Some((a, dest_dir)) = resolve_endpoints(ws, f, from_dir, dest_import) else {
+        return;
+    };
+    f.from.push(a.import.clone());
+    f.to.push(dest_import.to_string());
+    let b_name = ws
+        .pkg_info(&dest_dir)
+        .map_or_else(|| derive_pkg_name(dest_import), |p| p.name.clone());
+    dir_hazards(ws, f, from_dir, false);
+    let Some(m) = Mover::select(ws, f, &a, from_dir, dest_import, dest_dir, b_name, sel) else {
+        return;
+    };
+    m.check_method_receivers(f);
+    for file in &m.files_with_moves {
+        if let Some(src) = ws.get(file) {
+            file_hazards(f, file, src, true);
+        }
+    }
+    let mut out = m.rewrite_sources(ws, f, &a);
+    f.affected_dirs.insert(from_dir.to_string());
+    f.affected_dirs.insert(m.dest_dir.clone());
+    m.rewrite_importers(ws, f, &mut out.importing_b);
+    m.preflight(ws, f, &out.importing_b);
+}
+
+/// Resolves the source package and the destination directory, blocking on the usual mistakes.
+fn resolve_endpoints(
+    ws: &Workspace,
+    f: &mut Findings,
+    from_dir: &str,
+    dest_import: &str,
+) -> Option<(PkgInfo, String)> {
     let Some(a) = ws.pkg_info(from_dir) else {
         f.block(BlockingDiagnostic::new(
             "no_such_package",
             format!("no Go package in directory `{from_dir}`"),
         ));
-        return;
+        return None;
     };
     let Some(dest_dir) = ws.dir_of_import(dest_import) else {
         f.block(BlockingDiagnostic::new(
@@ -277,32 +334,27 @@ pub fn partial_move(
                 ws.module
             ),
         ));
-        return;
+        return None;
     };
     if dest_dir == from_dir {
         f.block(BlockingDiagnostic::new(
             "same_package",
             "source and destination are the same package",
         ));
-        return;
+        return None;
     }
     if a.name == "main" {
         f.block(BlockingDiagnostic::new(
             "main_package",
             "package main cannot be a move source: nothing can import it",
         ));
-        return;
+        return None;
     }
-    f.from.push(a.import.clone());
-    f.to.push(dest_import.to_string());
-    let dest_info = ws.pkg_info(&dest_dir);
-    let b_name = dest_info
-        .as_ref()
-        .map_or_else(|| derive_pkg_name(dest_import), |p| p.name.clone());
-    dir_hazards(ws, f, from_dir, false);
+    Some((a, dest_dir))
+}
 
-    // 1. Choose units.
-    let mut units: Vec<Unit> = vec![];
+fn collect_units(ws: &Workspace, a: &PkgInfo) -> Vec<Unit> {
+    let mut units = vec![];
     for file in &a.files {
         let Some(src) = ws.get(file) else { continue };
         for (idx, decl) in gs::top_decls(src).into_iter().enumerate() {
@@ -313,178 +365,274 @@ pub fn partial_move(
             });
         }
     }
-    let mut moved: BTreeSet<(String, usize)> = BTreeSet::new();
-    let mut whole_files: BTreeSet<String> = BTreeSet::new();
-    match sel {
-        Selection::Files(bases) => {
-            for b in bases {
-                let p = join(from_dir, b);
-                if !a.files.contains(&p) {
-                    f.block(BlockingDiagnostic::new(
-                        "no_such_file",
-                        format!("{p} is not a file of package {}", a.import),
-                    ));
-                    continue;
-                }
-                whole_files.insert(p.clone());
-                for u in units.iter().filter(|u| u.file == p) {
-                    moved.insert((u.file.clone(), u.idx));
-                }
-            }
-        }
-        Selection::Decls(names) => {
-            let want: HashSet<&str> = names.iter().map(String::as_str).collect();
-            let mut found: HashSet<&str> = HashSet::new();
-            for u in units.iter().filter(|u| !is_test_file(&u.file)) {
-                if u.decl.names.iter().any(|n| want.contains(n.as_str())) {
-                    moved.insert((u.file.clone(), u.idx));
-                    for n in &u.decl.names {
-                        if let Some(w) = want.get(n.as_str()) {
-                            found.insert(w);
-                        }
-                    }
-                    if u.decl.names.iter().any(|n| !want.contains(n.as_str())) {
-                        f.warnings.push(format!(
-                            "{}:{}: grouped declaration moved whole ({})",
-                            u.file,
-                            u.decl.line,
-                            u.decl.names.join(", ")
-                        ));
-                    }
-                }
-            }
-            for n in names {
-                if !found.contains(n.as_str()) {
-                    f.block(BlockingDiagnostic::new(
-                        "no_such_decl",
-                        format!("`{n}` is not a top-level declaration in {}", a.import),
-                    ));
-                }
-            }
-            if !f.blockers.is_empty() {
-                return;
-            }
-            close_over_helpers(ws, f, &a, &units, &mut moved);
-        }
-    }
-    if !f.blockers.is_empty() {
-        return;
-    }
-    // A file whose every unit moved is a whole-file move.
-    let files_with_moves: BTreeSet<String> = moved.iter().map(|(file, _)| file.clone()).collect();
-    for file in &files_with_moves {
-        let total = units.iter().filter(|u| &u.file == file).count();
-        let n = moved.iter().filter(|(mf, _)| mf == file).count();
-        if n == total {
-            whole_files.insert(file.clone());
-        }
-    }
-    let split_files: BTreeSet<String> =
-        files_with_moves.difference(&whole_files).cloned().collect();
-    if moved.is_empty() {
-        f.block(BlockingDiagnostic::new(
-            "nothing_to_move",
-            "selection matched no declarations",
-        ));
-        return;
-    }
+    units
+}
 
-    // 2. Name sets.
-    let moved_units: Vec<&Unit> = units
-        .iter()
-        .filter(|u| moved.contains(&(u.file.clone(), u.idx)))
-        .collect();
-    let moved_names: HashSet<String> = moved_units
-        .iter()
-        .flat_map(|u| u.decl.names.iter().cloned())
-        .collect();
-    let remaining_names: HashSet<String> = units
-        .iter()
-        .filter(|u| !moved.contains(&(u.file.clone(), u.idx)))
-        .flat_map(|u| u.decl.names.iter().cloned())
-        .filter(|n| n != "init")
-        .collect();
+type UnitKey = (String, usize);
 
-    // 3. Method / receiver consistency (files mode).
-    for u in &units {
-        if u.decl.kind != DeclKind::Method {
+/// `Selection::Files`: every unit of each named file moves.
+fn select_files(
+    f: &mut Findings,
+    a: &PkgInfo,
+    from_dir: &str,
+    units: &[Unit],
+    bases: &[String],
+    moved: &mut BTreeSet<UnitKey>,
+    whole_files: &mut BTreeSet<String>,
+) {
+    for b in bases {
+        let p = join(from_dir, b);
+        if !a.files.contains(&p) {
+            f.block(BlockingDiagnostic::new(
+                "no_such_file",
+                format!("{p} is not a file of package {}", a.import),
+            ));
             continue;
         }
-        let recv = u.decl.recv.clone().unwrap_or_default();
-        let m = moved.contains(&(u.file.clone(), u.idx));
-        let recv_moved = moved_names.contains(&recv);
-        if m != recv_moved && !is_test_file(&u.file) {
-            f.block(
-                BlockingDiagnostic::new(
-                    "method_split",
-                    format!(
-                        "method on `{recv}` and type `{recv}` would end up in different packages"
-                    ),
-                )
-                .at(&u.file, Some(u.decl.line)),
-            );
+        whole_files.insert(p.clone());
+        for u in units.iter().filter(|u| u.file == p) {
+            moved.insert((u.file.clone(), u.idx));
+        }
+    }
+}
+
+/// `Selection::Decls`: units declaring a wanted name move (grouped declarations whole).
+fn select_decls(
+    f: &mut Findings,
+    a: &PkgInfo,
+    units: &[Unit],
+    names: &[String],
+    moved: &mut BTreeSet<UnitKey>,
+) {
+    let want: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let mut found: HashSet<&str> = HashSet::new();
+    for u in units.iter().filter(|u| !is_test_file(&u.file)) {
+        if u.decl.names.iter().any(|n| want.contains(n.as_str())) {
+            moved.insert((u.file.clone(), u.idx));
+            for n in &u.decl.names {
+                if let Some(w) = want.get(n.as_str()) {
+                    found.insert(w);
+                }
+            }
+            if u.decl.names.iter().any(|n| !want.contains(n.as_str())) {
+                f.warnings.push(format!(
+                    "{}:{}: grouped declaration moved whole ({})",
+                    u.file,
+                    u.decl.line,
+                    u.decl.names.join(", ")
+                ));
+            }
+        }
+    }
+    for n in names {
+        if !found.contains(n.as_str()) {
+            f.block(BlockingDiagnostic::new(
+                "no_such_decl",
+                format!("`{n}` is not a top-level declaration in {}", a.import),
+            ));
+        }
+    }
+}
+
+impl Mover {
+    /// Chooses the units to move and derives the name sets; `None` when blocked.
+    #[allow(clippy::too_many_arguments)]
+    fn select(
+        ws: &Workspace,
+        f: &mut Findings,
+        a: &PkgInfo,
+        from_dir: &str,
+        dest_import: &str,
+        dest_dir: String,
+        b_name: String,
+        sel: &Selection,
+    ) -> Option<Mover> {
+        let units = collect_units(ws, a);
+        let mut moved: BTreeSet<UnitKey> = BTreeSet::new();
+        let mut whole_files: BTreeSet<String> = BTreeSet::new();
+        match sel {
+            Selection::Files(bases) => {
+                select_files(f, a, from_dir, &units, bases, &mut moved, &mut whole_files)
+            }
+            Selection::Decls(names) => {
+                select_decls(f, a, &units, names, &mut moved);
+                if !f.blockers.is_empty() {
+                    return None;
+                }
+                close_over_helpers(ws, f, a, &units, &mut moved);
+            }
+        }
+        if !f.blockers.is_empty() {
+            return None;
+        }
+        // A file whose every unit moved is a whole-file move.
+        let files_with_moves: BTreeSet<String> =
+            moved.iter().map(|(file, _)| file.clone()).collect();
+        for file in &files_with_moves {
+            let total = units.iter().filter(|u| &u.file == file).count();
+            let n = moved.iter().filter(|(mf, _)| mf == file).count();
+            if n == total {
+                whole_files.insert(file.clone());
+            }
+        }
+        let split_files: BTreeSet<String> =
+            files_with_moves.difference(&whole_files).cloned().collect();
+        if moved.is_empty() {
+            f.block(BlockingDiagnostic::new(
+                "nothing_to_move",
+                "selection matched no declarations",
+            ));
+            return None;
+        }
+        let moved_names: HashSet<String> = units
+            .iter()
+            .filter(|u| moved.contains(&(u.file.clone(), u.idx)))
+            .flat_map(|u| u.decl.names.iter().cloned())
+            .collect();
+        let remaining_names: HashSet<String> = units
+            .iter()
+            .filter(|u| !moved.contains(&(u.file.clone(), u.idx)))
+            .flat_map(|u| u.decl.names.iter().cloned())
+            .filter(|n| n != "init")
+            .collect();
+        Some(Mover {
+            dest_dir,
+            dest_import: dest_import.to_string(),
+            a_name: a.name.clone(),
+            a_import: a.import.clone(),
+            b_name,
+            units,
+            moved,
+            whole_files,
+            split_files,
+            files_with_moves,
+            moved_names,
+            remaining_names,
+        })
+    }
+
+    fn is_moved(&self, u: &Unit) -> bool {
+        self.moved.contains(&(u.file.clone(), u.idx))
+    }
+
+    fn moved_units(&self) -> Vec<&Unit> {
+        self.units.iter().filter(|u| self.is_moved(u)).collect()
+    }
+
+    /// A method and its receiver type must end up in the same package.
+    fn check_method_receivers(&self, f: &mut Findings) {
+        for u in &self.units {
+            if u.decl.kind != DeclKind::Method {
+                continue;
+            }
+            let recv = u.decl.recv.clone().unwrap_or_default();
+            let recv_moved = self.moved_names.contains(&recv);
+            if self.is_moved(u) != recv_moved && !is_test_file(&u.file) {
+                f.block(
+                    BlockingDiagnostic::new(
+                        "method_split",
+                        format!(
+                            "method on `{recv}` and type `{recv}` would end up in different packages"
+                        ),
+                    )
+                    .at(&u.file, Some(u.decl.line)),
+                );
+            }
         }
     }
 
-    // 4. Hazards.
-    for file in &files_with_moves {
-        if let Some(src) = ws.get(file) {
-            file_hazards(f, file, src, true);
+    /// Rewrites each file of the source package, then applies the collected edits.
+    fn rewrite_sources(&self, ws: &mut Workspace, f: &mut Findings, a: &PkgInfo) -> Rewrites {
+        let mut out = Rewrites::default();
+        for file in &a.files {
+            let Some(src) = ws.get(file).map(str::to_string) else {
+                continue;
+            };
+            self.rewrite_file(ws, f, file, &src, &mut out);
         }
+        for (dest, content) in std::mem::take(&mut out.new_contents) {
+            ws.set(&dest, content);
+        }
+        for (file, content) in std::mem::take(&mut out.remaining_updates) {
+            ws.set(&file, content);
+        }
+        out
     }
-    // Remaining side: a generated or constrained *source* file we must edit.
 
-    // 5. Per-file edit lists.
-    let a_name = a.name.clone();
-    let a_import = a.import.clone();
-    let mut need_a_import_in: BTreeSet<String> = BTreeSet::new(); // moved content needing import of A
-    let mut new_contents: Vec<(String, String)> = vec![]; // dest path → content
-    let mut remaining_updates: Vec<(String, String)> = vec![];
-    let mut importing_b: Vec<String> = vec![]; // packages (import paths) that will import B
-
-    for file in &a.files {
-        let Some(src) = ws.get(file).map(str::to_string) else {
-            continue;
-        };
-        let ext_test = is_ext_test(file, &src);
-        let whole = whole_files.contains(file);
-        let split = split_files.contains(file);
-        let file_units: Vec<&Unit> = units.iter().filter(|u| &u.file == file).collect();
-        let is_moved_unit = |u: &Unit| moved.contains(&(u.file.clone(), u.idx));
-
+    fn rewrite_file(
+        &self,
+        ws: &mut Workspace,
+        f: &mut Findings,
+        file: &str,
+        src: &str,
+        out: &mut Rewrites,
+    ) {
+        let whole = self.whole_files.contains(file);
         // External test files consume A's API via qualifier; handled in the consumer pass.
-        if ext_test {
+        if is_ext_test(file, src) {
             if whole {
-                let dest = join(&dest_dir, base_of(file));
-                let content =
-                    gs::rewrite_package_clause(&src, &b_name).unwrap_or_else(|| src.clone());
+                let dest = join(&self.dest_dir, base_of(file));
+                let content = gs::rewrite_package_clause(src, &self.b_name)
+                    .unwrap_or_else(|| src.to_string());
                 ws.move_file(file, &dest, content);
                 f.path_map.push(PathMapping {
-                    from: file.clone(),
+                    from: file.to_string(),
                     to: dest,
                 });
             }
-            continue;
+            return;
         }
+        let file_units: Vec<&Unit> = self.units.iter().filter(|u| u.file == file).collect();
+        let (moved_edits, rest_edits, refs_b) = self.boundary_edits(f, file, src, &file_units, out);
+        if refs_b {
+            out.importing_b.push(self.a_import.clone());
+        }
+        if whole {
+            let mut content = apply_with_pkg_clause(f, file, src, moved_edits, &self.b_name);
+            if out.need_a_import_in.contains(file) {
+                content = add_import_or_block(f, file, &content, &self.a_import, None);
+            }
+            let dest = self.register_dest(ws, f, file);
+            ws.move_file(file, &dest, content);
+        } else if self.split_files.contains(file) {
+            let content = self.split_dest_content(ws, f, file, src, &file_units, &moved_edits, out);
+            let dest = self.register_dest(ws, f, file);
+            out.new_contents.push((dest, content));
+            let rest = self.split_rest_content(ws, f, file, src, &file_units, rest_edits, refs_b);
+            out.remaining_updates.push((file.to_string(), rest));
+        } else if !rest_edits.is_empty() {
+            let applied = gs::apply_edits(src, rest_edits);
+            let mut rest = edited_or_block(f, file, applied, src.to_string());
+            rest = add_import_or_block(f, file, &rest, &self.dest_import, None);
+            out.remaining_updates.push((file.to_string(), rest));
+        }
+    }
 
+    /// Qualifier edits for every reference that crosses the new package boundary:
+    /// `(edits inside moved units, edits in the remaining code, whether the rest now uses B)`.
+    fn boundary_edits(
+        &self,
+        f: &mut Findings,
+        file: &str,
+        src: &str,
+        file_units: &[&Unit],
+        out: &mut Rewrites,
+    ) -> (Vec<Edit>, Vec<Edit>, bool) {
         let mut moved_edits: Vec<Edit> = vec![];
         let mut rest_edits: Vec<Edit> = vec![];
         let mut refs_b = false;
-
-        // moved → remaining references
-        let remaining_refs: Vec<gs::IdentRef> = gs::unqualified_refs(&src, &remaining_names);
-        // remaining → moved references
-        let moved_refs: Vec<gs::IdentRef> = gs::unqualified_refs(&src, &moved_names);
+        let remaining_refs = gs::unqualified_refs(src, &self.remaining_names);
+        let moved_refs = gs::unqualified_refs(src, &self.moved_names);
         for r in remaining_refs.iter().chain(moved_refs.iter()) {
             let in_moved_unit = file_units
                 .iter()
-                .any(|u| is_moved_unit(u) && r.start >= u.decl.start && r.end <= u.decl.end);
+                .any(|u| self.is_moved(u) && r.start >= u.decl.start && r.end <= u.decl.end);
             // A reference inside a moved unit to a remaining name, or one outside the
             // moved units to a moved name, crosses the new package boundary.
             let crossing = if in_moved_unit {
-                remaining_names.contains(&r.name)
+                self.remaining_names.contains(&r.name)
             } else {
-                moved_names.contains(&r.name)
+                self.moved_names.contains(&r.name)
             };
             if !crossing {
                 continue;
@@ -507,11 +655,11 @@ pub fn partial_move(
                 continue;
             }
             let (q, bucket) = if in_moved_unit {
-                need_a_import_in.insert(file.clone());
-                (a_name.clone(), &mut moved_edits)
+                out.need_a_import_in.insert(file.to_string());
+                (self.a_name.clone(), &mut moved_edits)
             } else {
                 refs_b = true;
-                (b_name.clone(), &mut rest_edits)
+                (self.b_name.clone(), &mut rest_edits)
             };
             bucket.push(Edit {
                 start: r.start,
@@ -519,171 +667,195 @@ pub fn partial_move(
                 text: format!("{q}."),
             });
         }
+        (moved_edits, rest_edits, refs_b)
+    }
+
+    /// Records the file's destination path (blocking if it is taken) and returns it.
+    fn register_dest(&self, ws: &Workspace, f: &mut Findings, file: &str) -> String {
+        let dest = join(&self.dest_dir, base_of(file));
+        if ws.get(&dest).is_some() {
+            f.block(
+                BlockingDiagnostic::new("dest_file_exists", format!("{dest} already exists"))
+                    .at(&dest, None),
+            );
+        }
+        f.path_map.push(PathMapping {
+            from: file.to_string(),
+            to: dest.clone(),
+        });
+        dest
+    }
+
+    /// New destination file: package clause + the moved units (edits rebased) + needed imports.
+    #[allow(clippy::too_many_arguments)]
+    fn split_dest_content(
+        &self,
+        ws: &Workspace,
+        f: &mut Findings,
+        file: &str,
+        src: &str,
+        file_units: &[&Unit],
+        moved_edits: &[Edit],
+        out: &Rewrites,
+    ) -> String {
+        let mut body = String::new();
+        for u in file_units.iter().filter(|u| self.is_moved(u)) {
+            let local: Vec<Edit> = moved_edits
+                .iter()
+                .filter(|e| e.start >= u.decl.start && e.end <= u.decl.end)
+                .map(|e| Edit {
+                    start: e.start - u.decl.start,
+                    end: e.end - u.decl.start,
+                    text: e.text.clone(),
+                })
+                .collect();
+            body.push('\n');
+            let unit_src = &src[u.decl.start..u.decl.end];
+            let applied = gs::apply_edits(unit_src, local);
+            body.push_str(&edited_or_block(f, file, applied, unit_src.to_string()));
+            body.push('\n');
+        }
+        let mut content = format!("package {}\n{body}", self.b_name);
+        // Carry over the original imports, then keep only those still used.
+        for spec in gs::imports(src) {
+            let alias = match &spec.name {
+                gs::ImportName::Alias(x) => Some(x.clone()),
+                // Dot/blank imports can't be proven used, so they stay with the source file.
+                gs::ImportName::Dot | gs::ImportName::Blank => continue,
+                gs::ImportName::Implicit => None,
+            };
+            content = add_import_or_block(f, file, &content, &spec.path, alias.as_deref());
+        }
+        if out.need_a_import_in.contains(file) {
+            content = add_import_or_block(f, file, &content, &self.a_import, None);
+        }
+        let pruned = gs::prune_unused_imports(&content, &known_name_fn(ws));
+        edited_or_block(f, file, pruned, content)
+    }
+
+    /// Remaining file after a split: moved units dropped, references qualified.
+    #[allow(clippy::too_many_arguments)]
+    fn split_rest_content(
+        &self,
+        ws: &Workspace,
+        f: &mut Findings,
+        file: &str,
+        src: &str,
+        file_units: &[&Unit],
+        mut rest_edits: Vec<Edit>,
+        refs_b: bool,
+    ) -> String {
+        for u in file_units.iter().filter(|u| self.is_moved(u)) {
+            let mut end = u.decl.end;
+            if src[end..].starts_with('\n') {
+                end += 1;
+            }
+            rest_edits.push(Edit {
+                start: u.decl.start,
+                end,
+                text: String::new(),
+            });
+        }
+        let applied = gs::apply_edits(src, rest_edits);
+        let mut rest = edited_or_block(f, file, applied, src.to_string());
         if refs_b {
-            importing_b.push(a_import.clone());
+            rest = add_import_or_block(f, file, &rest, &self.dest_import, None);
         }
+        let pruned = gs::prune_unused_imports(&rest, &known_name_fn(ws));
+        edited_or_block(f, file, pruned, rest)
+    }
 
-        if whole {
-            let mut content = apply_with_pkg_clause(f, file, &src, moved_edits, &b_name);
-            if need_a_import_in.contains(file) {
-                content = add_import_or_block(f, file, &content, &a_import, None);
-            }
-            let dest = join(&dest_dir, base_of(file));
-            if ws.get(&dest).is_some() {
-                f.block(
-                    BlockingDiagnostic::new("dest_file_exists", format!("{dest} already exists"))
-                        .at(&dest, None),
-                );
-            }
-            f.path_map.push(PathMapping {
-                from: file.clone(),
-                to: dest.clone(),
-            });
-            ws.move_file(file, &dest, content);
-        } else if split {
-            // New destination file: package clause + the moved units, edits rebased.
-            let mut body = String::new();
-            for u in file_units.iter().filter(|u| is_moved_unit(u)) {
-                let local: Vec<Edit> = moved_edits
-                    .iter()
-                    .filter(|e| e.start >= u.decl.start && e.end <= u.decl.end)
-                    .map(|e| Edit {
-                        start: e.start - u.decl.start,
-                        end: e.end - u.decl.start,
-                        text: e.text.clone(),
-                    })
-                    .collect();
-                body.push('\n');
-                let unit_src = &src[u.decl.start..u.decl.end];
-                let applied = gs::apply_edits(unit_src, local);
-                body.push_str(&edited_or_block(f, file, applied, unit_src.to_string()));
-                body.push('\n');
-            }
-            let mut content = format!("package {b_name}\n{body}");
-            // Carry over the original imports, then keep only those still used.
-            for spec in gs::imports(&src) {
-                let alias = match &spec.name {
-                    gs::ImportName::Alias(x) => Some(x.clone()),
-                    // Dot/blank imports can't be proven used, so they stay with the source file.
-                    gs::ImportName::Dot | gs::ImportName::Blank => continue,
-                    gs::ImportName::Implicit => None,
-                };
-                content = add_import_or_block(f, file, &content, &spec.path, alias.as_deref());
-            }
-            if need_a_import_in.contains(file) {
-                content = add_import_or_block(f, file, &content, &a_import, None);
-            }
-            let kn = known_name_fn(ws);
-            let pruned = gs::prune_unused_imports(&content, &kn);
-            content = edited_or_block(f, file, pruned, content);
-            let dest = join(&dest_dir, base_of(file));
-            if ws.get(&dest).is_some() {
-                f.block(
-                    BlockingDiagnostic::new("dest_file_exists", format!("{dest} already exists"))
-                        .at(&dest, None),
-                );
-            }
-            f.path_map.push(PathMapping {
-                from: file.clone(),
-                to: dest.clone(),
-            });
-            new_contents.push((dest, content));
-            // Remaining file: drop moved units, qualify references.
-            for u in file_units.iter().filter(|u| is_moved_unit(u)) {
-                let mut end = u.decl.end;
-                if src[end..].starts_with('\n') {
-                    end += 1;
-                }
-                rest_edits.push(Edit {
-                    start: u.decl.start,
-                    end,
-                    text: String::new(),
-                });
-            }
-            let applied = gs::apply_edits(&src, rest_edits);
-            let mut rest = edited_or_block(f, file, applied, src.clone());
-            if refs_b {
-                rest = add_import_or_block(f, file, &rest, dest_import, None);
-            }
-            let kn = known_name_fn(ws);
-            let pruned = gs::prune_unused_imports(&rest, &kn);
-            rest = edited_or_block(f, file, pruned, rest);
-            remaining_updates.push((file.clone(), rest));
-        } else if !rest_edits.is_empty() {
-            let applied = gs::apply_edits(&src, rest_edits);
-            let mut rest = edited_or_block(f, file, applied, src.clone());
-            rest = add_import_or_block(f, file, &rest, dest_import, None);
-            remaining_updates.push((file.clone(), rest));
+    /// Importers of A elsewhere (including external tests, wherever they now live).
+    fn rewrite_importers(
+        &self,
+        ws: &mut Workspace,
+        f: &mut Findings,
+        importing_b: &mut Vec<String>,
+    ) {
+        for file in ws.files_containing(&format!("\"{}\"", self.a_import)) {
+            let Some(src) = ws.get(&file).map(str::to_string) else {
+                continue;
+            };
+            self.rewrite_importer(ws, f, &file, &src, importing_b);
         }
     }
-    for (dest, content) in new_contents {
-        ws.set(&dest, content);
-    }
-    for (file, content) in remaining_updates {
-        ws.set(&file, content);
-    }
-    f.affected_dirs.insert(from_dir.to_string());
-    f.affected_dirs.insert(dest_dir.clone());
 
-    // 6. Importers of A elsewhere (including external tests, wherever they now live).
-    let b_dir_import = dest_import.to_string();
-    for file in ws.files_containing(&format!("\"{a_import}\"")) {
-        let Some(src) = ws.get(&file).map(str::to_string) else {
-            continue;
-        };
-        let file_dir = dir_of(&file).to_string();
-        let specs: Vec<gs::ImportSpec> = gs::imports(&src)
+    /// The qualifier A is imported under in `src` and the one B will use, plus whether B needs
+    /// an explicit alias; `None` when the file is skipped or blocked.
+    fn importer_names(
+        &self,
+        ws: &Workspace,
+        f: &mut Findings,
+        file: &str,
+        src: &str,
+    ) -> Option<(String, String, bool)> {
+        let specs: Vec<gs::ImportSpec> = gs::imports(src)
             .into_iter()
-            .filter(|i| i.path == a_import)
+            .filter(|i| i.path == self.a_import)
             .collect();
         if specs.is_empty() {
-            continue;
+            return None;
         }
         let q = match &specs[0].name {
             gs::ImportName::Alias(x) => x.clone(),
             gs::ImportName::Dot => {
-                f.block(BlockingDiagnostic::new("dot_import", format!("dot import of {a_import}; cannot tell which names come from the moved declarations")).at(&file, Some(specs[0].line)));
-                continue;
+                f.block(BlockingDiagnostic::new("dot_import", format!("dot import of {}; cannot tell which names come from the moved declarations", self.a_import)).at(file, Some(specs[0].line)));
+                return None;
             }
-            gs::ImportName::Blank => continue,
-            gs::ImportName::Implicit => a_name.clone(),
+            gs::ImportName::Blank => return None,
+            gs::ImportName::Implicit => self.a_name.clone(),
         };
-        let b_alias_existing = gs::imports(&src)
+        let b_alias_existing = gs::imports(src)
             .into_iter()
-            .find(|i| i.path == b_dir_import);
+            .find(|i| i.path == self.dest_import);
         let mut alias_needed = false;
         let bq = match &b_alias_existing {
             Some(i) => match &i.name {
                 gs::ImportName::Alias(x) => x.clone(),
-                _ => b_name.clone(),
+                _ => self.b_name.clone(),
             },
-            None if b_name == q => {
+            None if self.b_name == q => {
                 // Same package name on both sides: import the new package under an alias.
                 alias_needed = true;
-                import_alias_for(dest_import)
+                import_alias_for(&self.dest_import)
             }
-            None => b_name.clone(),
+            None => self.b_name.clone(),
         };
         if b_alias_existing.is_none() {
-            let clash = gs::imports(&src)
-                .iter()
-                .any(|i| i.path != a_import && spec_name(ws, i).as_deref() == Some(bq.as_str()))
-                || gs::top_level_names(&src).contains(&bq)
+            let clash = gs::imports(src).iter().any(|i| {
+                i.path != self.a_import && spec_name(ws, i).as_deref() == Some(bq.as_str())
+            }) || gs::top_level_names(src).contains(&bq)
                 || bq == q;
             if clash {
                 f.block(
                     BlockingDiagnostic::new(
                         "import_name_collision",
                         format!(
-                            "importing {b_dir_import} as `{bq}` would collide with an existing name"
+                            "importing {} as `{bq}` would collide with an existing name",
+                            self.dest_import
                         ),
                     )
-                    .at(&file, None),
+                    .at(file, None),
                 );
-                continue;
+                return None;
             }
         }
-        match gs::rewrite_qualifier(&src, &q, &bq, Some(&moved_names)) {
+        Some((q, bq, alias_needed))
+    }
+
+    fn rewrite_importer(
+        &self,
+        ws: &mut Workspace,
+        f: &mut Findings,
+        file: &str,
+        src: &str,
+        importing_b: &mut Vec<String>,
+    ) {
+        let file_dir = dir_of(file).to_string();
+        let Some((q, bq, alias_needed)) = self.importer_names(ws, f, file, src) else {
+            return;
+        };
+        match gs::rewrite_qualifier(src, &q, &bq, Some(&self.moved_names)) {
             Err(gs::QualifierError::Shadowed(line)) => f.block(
                 BlockingDiagnostic::new(
                     "shadowed_package_name",
@@ -691,79 +863,101 @@ pub fn partial_move(
                         "`{q}` is also used as a local identifier; qualifier rewrite is ambiguous"
                     ),
                 )
-                .at(&file, Some(line)),
+                .at(file, Some(line)),
             ),
             Err(gs::QualifierError::Edit(e)) => f.block(
                 BlockingDiagnostic::new("invalid_edit", format!("could not apply edits: {e}"))
-                    .at(&file, None),
+                    .at(file, None),
             ),
             Ok(new_src) => {
                 if new_src == src {
-                    continue;
+                    return;
                 }
-                if gs::is_generated(&src) {
+                if gs::is_generated(src) {
                     f.warnings.push(format!(
                         "{file}: generated file edited in place; regenerate to keep it in sync"
                     ));
                 }
-                let out = {
-                    let added = add_import_or_block(
-                        f,
-                        &file,
-                        &new_src,
-                        &b_dir_import,
-                        alias_needed.then_some(bq.as_str()),
-                    );
-                    let pruned = gs::prune_unused_imports(&added, &known_name_fn(ws));
-                    edited_or_block(f, &file, pruned, added)
-                };
+                let added = add_import_or_block(
+                    f,
+                    file,
+                    &new_src,
+                    &self.dest_import,
+                    alias_needed.then_some(bq.as_str()),
+                );
+                let pruned = gs::prune_unused_imports(&added, &known_name_fn(ws));
+                let out = edited_or_block(f, file, pruned, added);
                 importing_b.push(ws.import_of_dir(&file_dir));
-                ws.set(&file, out);
+                ws.set(file, out);
                 f.affected_dirs.insert(file_dir);
             }
         }
     }
 
-    // 7. Pre-flight over the finished overlay.
-    let mut moved_by_kind: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for u in &moved_units {
-        let ext = ws
-            .get(&join(&dest_dir, base_of(&u.file)))
-            .is_some_and(|s| is_ext_test(&u.file, s));
-        moved_by_kind
-            .entry(if ext { "ext_test" } else { "pkg" }.to_string())
-            .or_default()
-            .extend(u.decl.names.iter().cloned());
-    }
-    // Destination state *before* this move (exclude the files we just placed).
-    symbol_conflicts(
-        ws,
-        f,
-        &dest_dir,
-        &b_name,
-        &moved_by_kind,
-        &new_dest_paths(&dest_dir, &whole_files, &split_files),
-    );
-
-    for imp in importing_b.iter().chain(std::iter::once(&a_import)) {
-        if !internal_ok(imp, dest_import) {
-            f.block(BlockingDiagnostic::new(
-                "internal_visibility",
-                format!("{imp} cannot import {dest_import} (internal/ boundary)"),
-            ));
+    /// Pre-flight over the finished overlay.
+    fn preflight(&self, ws: &Workspace, f: &mut Findings, importing_b: &[String]) {
+        let moved_units = self.moved_units();
+        let mut moved_by_kind: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for u in &moved_units {
+            let ext = ws
+                .get(&join(&self.dest_dir, base_of(&u.file)))
+                .is_some_and(|s| is_ext_test(&u.file, s));
+            moved_by_kind
+                .entry(if ext { "ext_test" } else { "pkg" }.to_string())
+                .or_default()
+                .extend(u.decl.names.iter().cloned());
         }
+        // Destination state *before* this move (exclude the files we just placed).
+        symbol_conflicts(
+            ws,
+            f,
+            &self.dest_dir,
+            &self.b_name,
+            &moved_by_kind,
+            &new_dest_paths(&self.dest_dir, &self.whole_files, &self.split_files),
+        );
+        self.check_internal_visibility(ws, f, importing_b);
+        string_references(
+            ws,
+            f,
+            &self.a_import,
+            Some((&self.a_name, &self.moved_names)),
+        );
+        check_cycles(ws, f, &[&self.a_import, &self.dest_import]);
+        surface(
+            f,
+            &self.a_import,
+            &self.dest_import,
+            &self.b_name,
+            &moved_units,
+        );
     }
-    for file in files_with_moves.iter() {
-        let dest = join(&dest_dir, base_of(file));
-        if let Some(src) = ws.get(&dest).or_else(|| ws.get(file)) {
+
+    fn check_internal_visibility(&self, ws: &Workspace, f: &mut Findings, importing_b: &[String]) {
+        for imp in importing_b.iter().chain(std::iter::once(&self.a_import)) {
+            if !internal_ok(imp, &self.dest_import) {
+                f.block(BlockingDiagnostic::new(
+                    "internal_visibility",
+                    format!(
+                        "{imp} cannot import {} (internal/ boundary)",
+                        self.dest_import
+                    ),
+                ));
+            }
+        }
+        for file in &self.files_with_moves {
+            let dest = join(&self.dest_dir, base_of(file));
+            let Some(src) = ws.get(&dest).or_else(|| ws.get(file)) else {
+                continue;
+            };
             for spec in gs::imports(src) {
-                if !internal_ok(dest_import, &spec.path) {
+                if !internal_ok(&self.dest_import, &spec.path) {
                     f.block(
                         BlockingDiagnostic::new(
                             "internal_visibility",
                             format!(
-                                "moved code imports {} which is not visible from {dest_import}",
-                                spec.path
+                                "moved code imports {} which is not visible from {}",
+                                spec.path, self.dest_import
                             ),
                         )
                         .at(file, Some(spec.line)),
@@ -772,9 +966,6 @@ pub fn partial_move(
             }
         }
     }
-    string_references(ws, f, &a_import, Some((&a_name, &moved_names)));
-    check_cycles(ws, f, &[&a_import, dest_import]);
-    surface(f, &a_import, dest_import, &b_name, &moved_units);
 }
 
 /// Distinct alias for importing `import` when its package name equals the importer's:
@@ -959,12 +1150,55 @@ pub fn rename_pkg(
     to_import: &str,
     name_override: Option<&str>,
 ) {
+    let Some((a, from_dir, to_dir)) = rename_preflight(ws, f, from_import, to_import) else {
+        return;
+    };
+    let new_name = rename_target_name(f, &a, from_import, to_import, name_override);
+    let Some(moved_files) = renamed_files(ws, f, &a, &to_dir, &new_name) else {
+        return;
+    };
+    for (old, new, content) in moved_files {
+        f.path_map.push(PathMapping {
+            from: old.clone(),
+            to: new.clone(),
+        });
+        ws.move_file(&old, &new, content);
+    }
+    f.path_map.insert(
+        0,
+        PathMapping {
+            from: from_dir,
+            to: to_dir.clone(),
+        },
+    );
+    f.path_map.push(PathMapping {
+        from: from_import.to_string(),
+        to: to_import.to_string(),
+    });
+    f.affected_dirs.insert(to_dir.clone());
+    // Every importer, wherever it now lives.
+    for file in ws.files_containing(&format!("\"{from_import}\"")) {
+        let Some(src) = ws.get(&file).map(str::to_string) else {
+            continue;
+        };
+        rename_importer(ws, f, &a, &file, &src, from_import, to_import, &new_name);
+    }
+    rename_post_checks(ws, f, &a, &to_dir, from_import, to_import);
+}
+
+/// Resolves both ends of the rename and blocks on the structural mistakes; `None` when blocked.
+fn rename_preflight(
+    ws: &Workspace,
+    f: &mut Findings,
+    from_import: &str,
+    to_import: &str,
+) -> Option<(PkgInfo, String, String)> {
     let Some(from_dir) = ws.dir_of_import(from_import) else {
         f.block(BlockingDiagnostic::new(
             "outside_module",
             format!("{from_import} is outside module {}", ws.module),
         ));
-        return;
+        return None;
     };
     let Some(to_dir) = ws.dir_of_import(to_import) else {
         f.block(BlockingDiagnostic::new(
@@ -974,14 +1208,14 @@ pub fn rename_pkg(
                 ws.module
             ),
         ));
-        return;
+        return None;
     };
     let Some(a) = ws.pkg_info(&from_dir).filter(|_| !from_dir.is_empty()) else {
         f.block(BlockingDiagnostic::new(
             "no_such_package",
             format!("no Go package at {from_import}"),
         ));
-        return;
+        return None;
     };
     f.from.push(from_import.to_string());
     f.to.push(to_import.to_string());
@@ -990,21 +1224,21 @@ pub fn rename_pkg(
             "same_package",
             "source and destination are the same",
         ));
-        return;
+        return None;
     }
     if a.name == "main" {
         f.block(BlockingDiagnostic::new(
             "main_package",
             "package main cannot be renamed: nothing can import it",
         ));
-        return;
+        return None;
     }
     if !ws.files_in_dir(&to_dir).is_empty() {
         f.block(BlockingDiagnostic::new(
             "dest_exists",
             format!("{to_import} already contains Go files; use move-files to merge"),
         ));
-        return;
+        return None;
     }
     let prefix = format!("{from_dir}/");
     if ws
@@ -1019,6 +1253,18 @@ pub fn rename_pkg(
     }
     dir_hazards(ws, f, &from_dir, true);
     string_references(ws, f, from_import, None);
+    Some((a, from_dir, to_dir))
+}
+
+/// The package name after the rename: the override, else re-derived when the old name was the
+/// path's default, else unchanged.
+fn rename_target_name(
+    f: &mut Findings,
+    a: &PkgInfo,
+    from_import: &str,
+    to_import: &str,
+    name_override: Option<&str>,
+) -> String {
     if let Some(n) = name_override
         && !crate::refactor_core::guard::is_go_ident(n)
     {
@@ -1027,11 +1273,21 @@ pub fn rename_pkg(
             format!("`{n}` is not a valid Go package name"),
         ));
     }
-    let new_name = match name_override {
+    match name_override {
         Some(n) => n.to_string(),
         None if a.name == derive_pkg_name(from_import) => derive_pkg_name(to_import),
         None => a.name.clone(),
-    };
+    }
+}
+
+/// `(old path, new path, content with the new package clause)` per file; `None` when blocked.
+fn renamed_files(
+    ws: &Workspace,
+    f: &mut Findings,
+    a: &PkgInfo,
+    to_dir: &str,
+    new_name: &str,
+) -> Option<Vec<(String, String, String)>> {
     let mut moved_files = vec![];
     for file in &a.files {
         let Some(src) = ws.get(file).map(str::to_string) else {
@@ -1054,140 +1310,158 @@ pub fn rename_pkg(
                 continue;
             }
         }
-        let content = gs::rewrite_package_clause(&src, &new_name).unwrap_or(src);
-        moved_files.push((file.clone(), join(&to_dir, base_of(file)), content));
+        let content = gs::rewrite_package_clause(&src, new_name).unwrap_or(src);
+        moved_files.push((file.clone(), join(to_dir, base_of(file)), content));
     }
-    if !f.blockers.is_empty() {
+    f.blockers.is_empty().then_some(moved_files)
+}
+
+/// Rewrites one importer's import path (and qualifier when the package name changes).
+#[allow(clippy::too_many_arguments)]
+fn rename_importer(
+    ws: &mut Workspace,
+    f: &mut Findings,
+    a: &PkgInfo,
+    file: &str,
+    src: &str,
+    from_import: &str,
+    to_import: &str,
+    new_name: &str,
+) {
+    let specs: Vec<gs::ImportSpec> = gs::imports(src)
+        .into_iter()
+        .filter(|i| i.path == from_import)
+        .collect();
+    if specs.is_empty() {
         return;
     }
-    for (old, new, content) in moved_files {
-        f.path_map.push(PathMapping {
-            from: old.clone(),
-            to: new.clone(),
-        });
-        ws.move_file(&old, &new, content);
+    if gs::imports(src).iter().any(|i| i.path == to_import) {
+        f.block(
+            BlockingDiagnostic::new(
+                "import_collision",
+                format!("file already imports {to_import}"),
+            )
+            .at(file, None),
+        );
+        return;
     }
-    f.path_map.insert(
-        0,
-        PathMapping {
-            from: from_dir.clone(),
-            to: to_dir.clone(),
-        },
-    );
-    f.path_map.push(PathMapping {
-        from: from_import.to_string(),
-        to: to_import.to_string(),
-    });
-    f.affected_dirs.insert(to_dir.clone());
+    let rewritten = gs::rewrite_import_path(src, from_import, to_import);
+    let mut out = edited_or_block(f, file, rewritten, src.to_string());
+    if a.name != new_name && specs.iter().all(|s| s.name == gs::ImportName::Implicit) {
+        match requalify(ws, f, a, file, &out, to_import, new_name) {
+            Some(o) => out = o,
+            None => return,
+        }
+    }
+    if gs::is_generated(src) {
+        f.warnings.push(format!(
+            "{file}: generated file edited in place; regenerate to keep it in sync"
+        ));
+    }
+    let importer = ws.import_of_dir(dir_of(file));
+    if !internal_ok(&importer, to_import) {
+        f.block(
+            BlockingDiagnostic::new(
+                "internal_visibility",
+                format!("{importer} cannot import {to_import} (internal/ boundary)"),
+            )
+            .at(file, specs.first().map(|s| s.line)),
+        );
+    }
+    f.affected_dirs.insert(dir_of(file).to_string());
+    ws.set(file, out);
+}
 
-    // Every importer, wherever it now lives.
-    let rename_name = a.name != new_name;
-    for file in ws.files_containing(&format!("\"{from_import}\"")) {
-        let Some(src) = ws.get(&file).map(str::to_string) else {
-            continue;
-        };
-        let specs: Vec<gs::ImportSpec> = gs::imports(&src)
-            .into_iter()
-            .filter(|i| i.path == from_import)
-            .collect();
-        if specs.is_empty() {
-            continue;
-        }
-        if gs::imports(&src).iter().any(|i| i.path == to_import) {
+/// Renames the package qualifier in `out`; `None` (after blocking) when that is ambiguous.
+fn requalify(
+    ws: &Workspace,
+    f: &mut Findings,
+    a: &PkgInfo,
+    file: &str,
+    out: &str,
+    to_import: &str,
+    new_name: &str,
+) -> Option<String> {
+    let renamed = match gs::rewrite_qualifier(out, &a.name, new_name, None) {
+        Ok(o) => o,
+        Err(gs::QualifierError::Shadowed(line)) => {
             f.block(
                 BlockingDiagnostic::new(
-                    "import_collision",
-                    format!("file already imports {to_import}"),
+                    "shadowed_package_name",
+                    format!(
+                        "`{}` is also used as a local identifier; qualifier rewrite is ambiguous",
+                        a.name
+                    ),
                 )
-                .at(&file, None),
+                .at(file, Some(line)),
             );
-            continue;
+            return None;
         }
-        let rewritten = gs::rewrite_import_path(&src, from_import, to_import);
-        let mut out = edited_or_block(f, &file, rewritten, src.clone());
-        if rename_name && specs.iter().all(|s| s.name == gs::ImportName::Implicit) {
-            match gs::rewrite_qualifier(&out, &a.name, &new_name, None) {
-                Ok(o) => out = o,
-                Err(gs::QualifierError::Shadowed(line)) => {
-                    f.block(BlockingDiagnostic::new("shadowed_package_name", format!("`{}` is also used as a local identifier; qualifier rewrite is ambiguous", a.name)).at(&file, Some(line)));
-                    continue;
-                }
-                Err(gs::QualifierError::Edit(e)) => {
-                    f.block(
-                        BlockingDiagnostic::new(
-                            "invalid_edit",
-                            format!("could not apply edits: {e}"),
-                        )
-                        .at(&file, None),
-                    );
-                    continue;
-                }
-            }
-            let clash = gs::imports(&out).iter().any(|i| {
-                i.path != to_import && spec_name(ws, i).as_deref() == Some(new_name.as_str())
-            });
-            if clash {
-                f.block(
-                    BlockingDiagnostic::new(
-                        "import_name_collision",
-                        format!("another import already uses the name `{new_name}`"),
-                    )
-                    .at(&file, None),
-                );
-                continue;
-            }
-        }
-        if gs::is_generated(&src) {
-            f.warnings.push(format!(
-                "{file}: generated file edited in place; regenerate to keep it in sync"
-            ));
-        }
-        let importer = ws.import_of_dir(dir_of(&file));
-        if !internal_ok(&importer, to_import) {
+        Err(gs::QualifierError::Edit(e)) => {
             f.block(
-                BlockingDiagnostic::new(
-                    "internal_visibility",
-                    format!("{importer} cannot import {to_import} (internal/ boundary)"),
-                )
-                .at(&file, specs.first().map(|s| s.line)),
+                BlockingDiagnostic::new("invalid_edit", format!("could not apply edits: {e}"))
+                    .at(file, None),
             );
+            return None;
         }
-        f.affected_dirs.insert(dir_of(&file).to_string());
-        ws.set(&file, out);
+    };
+    let clash = gs::imports(&renamed)
+        .iter()
+        .any(|i| i.path != to_import && spec_name(ws, i).as_deref() == Some(new_name));
+    if clash {
+        f.block(
+            BlockingDiagnostic::new(
+                "import_name_collision",
+                format!("another import already uses the name `{new_name}`"),
+            )
+            .at(file, None),
+        );
+        return None;
     }
-    // The moved files' own imports must stay visible from the new location.
-    for (_, new, _) in f
+    Some(renamed)
+}
+
+/// The moved files' own imports must stay visible from the new location; also detects cycles
+/// and records the public surface change.
+fn rename_post_checks(
+    ws: &Workspace,
+    f: &mut Findings,
+    a: &PkgInfo,
+    to_dir: &str,
+    from_import: &str,
+    to_import: &str,
+) {
+    let new_paths: Vec<String> = f
         .path_map
-        .clone()
         .iter()
         .filter(|m| m.to.ends_with(".go"))
-        .map(|m| (m.from.clone(), m.to.clone(), ()))
-    {
-        if let Some(src) = ws.get(&new) {
-            for spec in gs::imports(src) {
-                if !internal_ok(to_import, &spec.path) {
-                    f.block(
-                        BlockingDiagnostic::new(
-                            "internal_visibility",
-                            format!(
-                                "moved code imports {} which is not visible from {to_import}",
-                                spec.path
-                            ),
-                        )
-                        .at(&new, Some(spec.line)),
-                    );
-                }
+        .map(|m| m.to.clone())
+        .collect();
+    for new in new_paths {
+        let Some(src) = ws.get(&new) else { continue };
+        for spec in gs::imports(src) {
+            if !internal_ok(to_import, &spec.path) {
+                f.block(
+                    BlockingDiagnostic::new(
+                        "internal_visibility",
+                        format!(
+                            "moved code imports {} which is not visible from {to_import}",
+                            spec.path
+                        ),
+                    )
+                    .at(&new, Some(spec.line)),
+                );
             }
         }
     }
     check_cycles(ws, f, &[to_import]);
-    for u in gs::top_level_names(
-        &a.files
-            .iter()
-            .filter_map(|p| ws.get(&join(&to_dir, base_of(p))))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ) {
+    let moved_src = a
+        .files
+        .iter()
+        .filter_map(|p| ws.get(&join(to_dir, base_of(p))))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for u in gs::top_level_names(&moved_src) {
         if is_exported(&u) {
             f.surface_changes
                 .push(format!("{from_import}.{u} -> {to_import}.{u}"));

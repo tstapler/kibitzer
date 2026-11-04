@@ -337,3 +337,36 @@ directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-
 check was added; before it, 38 clean / 22 blocked). The four shadow blockers are the
 conservative-by-design case described above; they were not individually triaged for
 being true or false positives.
+
+### Re-run after the function-split / shared-guard refactor
+
+Behavior-preserving refactor (long functions split into phase helpers, shared path/symlink
+guard and `sha256_hex`, per-fixture golden reporting). `scripts/go-move-backtest.sh all` was run
+with a release binary built from the pre-change commit `5c86255` ("before") and from the
+refactor head ("after"), same corpus and same HEADs as the table above.
+
+Result: the two logs are identical after masking commit hashes (`diff` empty). All seven runs
+report `status: applied`, verify exit codes `{build: 0, vet: 0, test: 0}`, and the same
+`go build`/`go vet` before/after exit codes and diff sizes in both builds (vscode-viper `./...`
+fails with exit 1 both before and after, for the pre-existing reason described above). No
+regression in plan/apply correctness.
+
+**One intentional input change.** `refactor_split::safe_rel` now uses the shared
+`refactor_core::guard` validator, so it additionally rejects an empty edit path and a path that
+resolves outside the repo through a symlink (previously only absolute, `..` and prefix paths).
+Both report the existing `path_outside_repo` code. `scripts/go-move-backtest.sh` exercises the
+Go move engine, not `split_package`, so this hardening is covered by unit tests
+(`edit_paths_must_not_cross_a_symlink_out_of_the_repo`, the `guard` tests) rather than the
+backtest above. Policy still differs per engine on symlinks that stay inside the repo:
+`go_refactor` refuses any symlink crossing; `refactor` and `refactor_split` allow in-repo ones.
+
+**Hardening added after the first re-run.** `txn::Change` gained `expect_sha256`: the bytes read
+for the WAL backup must hash to the plan's `old_sha256`, so a file edited between the staleness
+check and the swap is refused (`changed since the plan was made`) instead of being backed up and
+overwritten. The WAL-recovery refusal now prints `cp`/`rm` commands to restore by hand. The
+backtest was re-run on this head: identical to the baseline again, 7 of 7 `applied`.
+The `cfg(test)` kill hook is no longer read inside `Pending::drop`: `Session::begin_with`
+takes an explicit `OnDrop` policy (`Rollback` in production; a test-only `LeaveLog` that mimics a
+killed process), stored on the `Pending`. `refactor::apply` obtains it from a defaulted
+`ApplyIo::on_drop()`, so the crash tests inject it through their fake IO instead of a
+thread-local. The backtest was re-run on this head: identical to the baseline, 7 of 7 `applied`.
