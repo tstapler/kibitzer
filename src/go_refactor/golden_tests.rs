@@ -465,7 +465,8 @@ fn policy_update_failure_restores_the_tree() {
             && !policy.steps.is_empty()
     );
     let before = checksums(&root);
-    apply_failing_write(&policy, &root, 0).unwrap_err();
+    let err = apply_failing_write(&policy, &root, 0).unwrap_err();
+    assert!(format!("{err:#}").contains("rolled back"), "{err:#}");
     assert_eq!(checksums(&root), before);
 }
 
@@ -477,7 +478,9 @@ fn real_write_failure_mid_apply_restores_earlier_writes() {
     // after earlier rewrites already landed.
     std::fs::write(root.join("util"), "not a directory").unwrap();
     let before = checksums(&root);
-    apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
+    let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
+    // Pre-flight refuses before any write, so there is nothing to roll back.
+    assert!(format!("{err:#}").contains("refusing to apply"), "{err:#}");
     assert_eq!(checksums(&root), before);
 }
 
@@ -860,6 +863,55 @@ fn boundary_crossing_declarations_are_blocked_with_specific_codes() {
     assert!(
         move_codes(&r, "lib/a.go", "example.com/m/util").contains(&"dest_file_exists".to_string())
     );
+
+    // An importer dot-imports the source package: which names are the moved ones is unknowable.
+    let r = scratch(
+        "dot-import",
+        &[
+            ("lib/a.go", "package lib\n\nfunc Moved() int { return 1 }\n"),
+            ("lib/keep.go", "package lib\n"),
+            (
+                "app/app.go",
+                "package app\n\nimport . \"example.com/m/lib\"\n\nfunc Run() int { return Moved() }\n",
+            ),
+        ],
+    );
+    assert!(move_codes(&r, "lib/a.go", "example.com/m/other").contains(&"dot_import".to_string()));
+
+    // An importer also uses the package name as a local identifier: the qualifier rewrite would
+    // be ambiguous.
+    let importer_with_local_named_lib = "package app\n\nimport \"example.com/m/lib\"\n\nfunc A() int { return lib.Moved() }\n\nfunc B() int {\n\tlib := 3\n\treturn lib\n}\n";
+    let r = scratch(
+        "shadowed-move",
+        &[
+            ("lib/a.go", "package lib\n\nfunc Moved() int { return 1 }\n"),
+            ("lib/keep.go", "package lib\n"),
+            ("app/app.go", importer_with_local_named_lib),
+        ],
+    );
+    assert!(
+        move_codes(&r, "lib/a.go", "example.com/m/other")
+            .contains(&"shadowed_package_name".to_string())
+    );
+
+    // Same guard on the rename path, where the package name changes (`lib` -> `core`).
+    let r = scratch(
+        "shadowed-rename",
+        &[
+            ("lib/a.go", "package lib\n\nfunc Moved() int { return 1 }\n"),
+            ("app/app.go", importer_with_local_named_lib),
+        ],
+    );
+    let before = checksums(&r);
+    let plan = plan_rename_pkg(&r, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+    assert_eq!(checksums(&r), before, "planning must not touch the tree");
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.code == "shadowed_package_name"),
+        "{:?}",
+        plan.blockers
+    );
 }
 
 #[test]
@@ -1175,10 +1227,23 @@ fn a_resealed_forged_sync_policy_plan_is_rejected_in_every_shape() {
 
 #[test]
 fn rollback_that_itself_fails_is_reported_as_a_dirty_tree() {
+    use std::os::unix::fs::PermissionsExt as _;
     let root = input_copy("base");
     let plan = base_move_plan(&root);
+    let before = checksums(&root);
+    let go_files: Vec<PathBuf> = before
+        .keys()
+        .filter(|k| k.ends_with(".go"))
+        .map(|k| root.join(k))
+        .collect();
+    let set_mode = |mode: u32| {
+        for f in &go_files {
+            let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode));
+        }
+    };
+    // Read-only originals make the restore copy fail, while the backups stay intact.
     let sabotage = |_: &Path, _: &Path| {
-        let _ = std::fs::remove_dir_all(root.join(".kibitzer/plans/.wal-backup"));
+        set_mode(0o444);
         Err(std::io::Error::other("injected"))
     };
     let result = apply_with(&plan, &root, &ApplyOptions::default(), &sabotage).unwrap();
@@ -1187,6 +1252,15 @@ fn rollback_that_itself_fails_is_reported_as_a_dirty_tree() {
         !result.restore_errors.is_empty(),
         "a failed rollback must be visible"
     );
+    // The log survives so the next start can retry.
+    assert!(
+        root.join(".kibitzer/plans/.wal").exists(),
+        "the WAL must be kept after a failed rollback"
+    );
+    set_mode(0o644);
+    crate::refactor_core::txn::session(&root).expect("a later session recovers the kept log");
+    assert!(!root.join(".kibitzer/plans/.wal").exists());
+    assert_eq!(checksums(&root), before, "recovery restores the tree");
 }
 
 #[cfg(unix)]
