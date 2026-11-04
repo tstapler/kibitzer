@@ -230,12 +230,12 @@ fn add_workspace_blockers(
 
 /// gofmt results for the originals (to learn whether each was already gofmt-clean) and the
 /// rewritten bodies: two gofmt runs for the whole plan.
-struct Formatted2 {
+struct FormattedPlan {
     basis: HashMap<String, Formatted>,
     content: HashMap<String, Formatted>,
 }
 
-fn format_all(ws: &Workspace, changed: &[String]) -> Formatted2 {
+fn format_all(ws: &Workspace, changed: &[String]) -> FormattedPlan {
     let mut bases: Vec<Source> = vec![];
     let mut contents: Vec<Source> = vec![];
     for path in changed {
@@ -250,7 +250,7 @@ fn format_all(ws: &Workspace, changed: &[String]) -> Formatted2 {
         }
         contents.push((path.as_str(), new));
     }
-    Formatted2 {
+    FormattedPlan {
         basis: gofmt_batch(&bases),
         content: gofmt_batch(&contents),
     }
@@ -261,7 +261,7 @@ fn step_for(
     ws: &Workspace,
     path: String,
     moved_origins: &BTreeSet<&String>,
-    fmt: &Formatted2,
+    fmt: &FormattedPlan,
     f: &mut Findings,
     gofmt_missing: &mut bool,
 ) -> Option<PlanStep> {
@@ -330,7 +330,7 @@ fn format_content(
     path: &str,
     basis: Option<&str>,
     content: &mut String,
-    fmt: &Formatted2,
+    fmt: &FormattedPlan,
     f: &mut Findings,
     gofmt_missing: &mut bool,
 ) {

@@ -350,3 +350,12 @@ report `status: applied`, verify exit codes `{build: 0, vet: 0, test: 0}`, and t
 `go build`/`go vet` before/after exit codes and diff sizes in both builds (vscode-viper `./...`
 fails with exit 1 both before and after, for the pre-existing reason described above). No
 regression in plan/apply correctness.
+
+**One intentional input change.** `refactor_split::safe_rel` now uses the shared
+`refactor_core::guard` validator, so it additionally rejects an empty edit path and a path that
+resolves outside the repo through a symlink (previously only absolute, `..` and prefix paths).
+Both report the existing `path_outside_repo` code. `scripts/go-move-backtest.sh` exercises the
+Go move engine, not `split_package`, so this hardening is covered by unit tests
+(`edit_paths_must_not_cross_a_symlink_out_of_the_repo`, the `guard` tests) rather than the
+backtest above. Policy still differs per engine on symlinks that stay inside the repo:
+`go_refactor` refuses any symlink crossing; `refactor` and `refactor_split` allow in-repo ones.

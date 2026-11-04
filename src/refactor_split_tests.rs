@@ -204,7 +204,10 @@ fn edit_paths_must_not_cross_a_symlink_out_of_the_repo() {
     let dir = fixture();
     let outside = fixture();
     std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
-    assert!(safe_rel(&dir, "link/x.go").is_err());
+    assert_eq!(
+        safe_rel(&dir, "link/x.go").unwrap_err().code,
+        "path_outside_repo"
+    );
 }
 
 /// Backtest driver (docs/refactor-tools.md): `KIBITZER_BACKTEST_REPO=<path> cargo test

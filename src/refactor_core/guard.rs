@@ -150,4 +150,41 @@ mod tests {
         );
         assert!(!is_inside(root, Path::new("/r/../etc/passwd")));
     }
+
+    #[test]
+    fn plan_rel_paths_reject_empty_absolute_and_parent_components() {
+        for bad in ["", "/x", "a/../b", "../x"] {
+            assert!(check_plan_rel_path(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_plan_rel_path("a/b.go").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_crossing_is_rejected_but_a_missing_tail_is_fine() {
+        let root = std::env::temp_dir().join(format!("kibitzer-guard-{}", std::process::id()));
+        let outside = root.join("outside");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(repo.join("real")).unwrap();
+        std::fs::write(repo.join("real/a.go"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        std::os::unix::fs::symlink(repo.join("real/a.go"), repo.join("real/alias.go")).unwrap();
+
+        assert!(
+            check_no_symlink_crossing(&repo, "link/x.go").is_err(),
+            "middle"
+        );
+        assert!(
+            check_no_symlink_crossing(&repo, "real/alias.go").is_err(),
+            "final"
+        );
+        assert!(check_no_symlink_crossing(&repo, "real/a.go").is_ok());
+        assert!(
+            check_no_symlink_crossing(&repo, "newdir/x.go").is_ok(),
+            "missing tail"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
