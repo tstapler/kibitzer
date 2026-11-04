@@ -17,6 +17,7 @@ mod daemon_lock;
 mod declaration_checks;
 mod declarations;
 mod dedup;
+mod encapsulate_variable;
 mod extract_class;
 mod false_positive;
 mod git_cmd;

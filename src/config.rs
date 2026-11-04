@@ -933,6 +933,7 @@ fn file_size_checks() -> Vec<Check> {
         native_check("go-file-size", Severity::Advisory, &["**/*.go"]),
         whole_repo_check("go-package-size", "package-size"),
         whole_repo_check("parameter-object", "parameter-object"),
+        whole_repo_check("go-encapsulate-variable", "encapsulate-variable"),
         native_check("typescript-file-size", Severity::Advisory, &["**/*.ts"]),
         native_check("tsx-file-size", Severity::Advisory, &["**/*.tsx"]),
         native_check(
