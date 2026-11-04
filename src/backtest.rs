@@ -229,13 +229,13 @@ pub fn default_cache_path() -> PathBuf {
 }
 
 /// Serializes every `run_backtest` call in this process against the others — needed
-/// because `DuplicateIndexIsolation` mutates a process-wide env var, and `cargo test`
+/// because `IndexIsolation` mutates a process-wide env var, and `cargo test`
 /// runs many `#[test]`s (several of which call `run_backtest`, and — since it's
 /// `pub(crate)` for exactly this reason — `duplicate_cross_file_checker`'s own direct
 /// `Checker::check()` test) concurrently in one process. A real `kibitzer check
 /// backtest` invocation is a one-shot CLI process with nothing else to serialize
 /// against, so this only ever matters under test.
-static DUPLICATE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// For the lifetime of one `run_backtest` call, redirects `duplicate-code-cross-file`'s
 /// persistent per-repo index to a scratch directory instead of the real one at
@@ -248,30 +248,38 @@ static DUPLICATE_INDEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// test in this crate that exercises `duplicate-code-cross-file` through its real
 /// `Checker::check()` path (not just `DuplicateIndex`'s internal methods directly) can
 /// reuse this same isolation instead of risking a write to the real cache dir.
-pub(crate) struct DuplicateIndexIsolation {
+pub(crate) struct IndexIsolation {
     _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<String>,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     dir: PathBuf,
 }
 
-impl DuplicateIndexIsolation {
+/// Every stateful checker's index-dir override with its own scratch subdirectory: both
+/// checkers name their file `<repo>-<hash>.json` with different JSON shapes, so a shared
+/// directory would have each one overwrite the other's index.
+const INDEX_DIR_ENVS: [(&str, &str); 2] = [
+    ("KIBITZER_DUPLICATE_INDEX_DIR", "duplicate"),
+    ("KIBITZER_SPECIAL_CASE_INDEX_DIR", "special-case"),
+];
+
+impl IndexIsolation {
     pub(crate) fn new() -> Self {
         // A single test panicking while holding this lock must not poison it for
         // every other test that acquires it afterward — same reasoning as
         // `plugin::test_support::with_xdg_data_home`.
-        let lock = DUPLICATE_INDEX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        const ENV: &str = "KIBITZER_DUPLICATE_INDEX_DIR";
-        let previous = std::env::var(ENV).ok();
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-backtest-duplicate-index-{}",
-            std::process::id()
-        ));
+        let lock = INDEX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = INDEX_DIR_ENVS
+            .iter()
+            .map(|(env, _)| (*env, std::env::var_os(env)))
+            .collect();
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-backtest-index-{}", std::process::id()));
         // SAFETY: `lock` serializes every `run_backtest` call in this process that
         // touches this var.
         unsafe {
-            std::env::set_var(ENV, &dir);
+            for (env, subdir) in INDEX_DIR_ENVS {
+                std::env::set_var(env, dir.join(subdir));
+            }
         }
         Self {
             _lock: lock,
@@ -281,17 +289,26 @@ impl DuplicateIndexIsolation {
     }
 }
 
-impl Drop for DuplicateIndexIsolation {
-    fn drop(&mut self) {
-        const ENV: &str = "KIBITZER_DUPLICATE_INDEX_DIR";
-        // SAFETY: see `DuplicateIndexIsolation::new`.
+impl IndexIsolation {
+    /// Idempotent; split from `Drop` so a test can assert the restored state while still
+    /// holding the lock.
+    fn restore(&mut self) {
+        // SAFETY: see `IndexIsolation::new`.
         unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var(ENV, value),
-                None => std::env::remove_var(ENV),
+            for (env, previous) in &self.previous {
+                match previous {
+                    Some(value) => std::env::set_var(env, value),
+                    None => std::env::remove_var(env),
+                }
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Drop for IndexIsolation {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -309,8 +326,8 @@ pub fn run_backtest(
     // Kept alive for the whole run: reconstructed snapshots aren't necessarily a
     // file's real current content, so replaying them through a stateful checker (e.g.
     // `duplicate-code-cross-file`) must never touch that checker's real persistent
-    // index — see `DuplicateIndexIsolation`'s doc comment.
-    let _index_isolation = DuplicateIndexIsolation::new();
+    // index — see `IndexIsolation`'s doc comment.
+    let _index_isolation = IndexIsolation::new();
 
     let mut checkers: Vec<Box<dyn crate::checker::Checker>> = Vec::new();
     let mut model_checkers: Vec<Box<dyn ArchModelChecker>> = Vec::new();
@@ -1068,22 +1085,36 @@ mod tests {
         write_transcript(&lines)
     }
 
-    /// The scratch dir `DuplicateIndexIsolation::new` derives for this process — asserted
+    /// The scratch dir `IndexIsolation::new` derives for this process — asserted
     /// against directly since it's cleaned up on drop and so can't be observed any other way.
     fn duplicate_index_scratch_dir() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "kibitzer-backtest-duplicate-index-{}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("kibitzer-backtest-index-{}", std::process::id()))
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn index_isolation_should_GiveEachCheckerItsOwnDir_And_RestoreEnvAndCleanUp_When_Restored() {
+        let mut isolation = IndexIsolation::new();
+        let dirs: Vec<_> = INDEX_DIR_ENVS
+            .iter()
+            .map(|(env, _)| PathBuf::from(std::env::var_os(env).expect("set under isolation")))
+            .collect();
+        assert_ne!(
+            dirs[0], dirs[1],
+            "checkers must not share an index directory"
+        );
+        std::fs::create_dir_all(&dirs[0]).unwrap();
+
+        // The lock is still held here, so no other test can touch these vars meanwhile.
+        isolation.restore();
+        for (env, previous) in &isolation.previous {
+            assert_eq!(std::env::var_os(env).as_ref(), previous.as_ref(), "{env}");
+        }
+        assert!(!duplicate_index_scratch_dir().exists());
     }
 
     #[test]
     fn backtest_isolates_the_duplicate_cross_file_index_and_still_finds_duplicates() {
-        assert!(
-            std::env::var("KIBITZER_DUPLICATE_INDEX_DIR").is_err(),
-            "sanity: no other test should be holding this var"
-        );
-
         let file = write_transcript_of_three_files_sharing_a_block();
         let report = run_backtest(
             &[file.path().to_path_buf()],
@@ -1093,14 +1124,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            std::env::var("KIBITZER_DUPLICATE_INDEX_DIR").is_err(),
-            "isolation env var must be restored once the run finishes"
-        );
-        assert!(
-            !duplicate_index_scratch_dir().exists(),
-            "scratch index dir must be cleaned up on drop"
-        );
         assert!(
             report
                 .findings

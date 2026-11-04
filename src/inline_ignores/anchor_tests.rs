@@ -22,6 +22,7 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("file-complexity", "x.go", go_three_complex_functions),
     ("duplicate-code", "x.go", go_triplicated_block),
     ("duplicate-code-cross-file", "c.go", cross_file_block),
+    ("introduce-special-case", "x.go", special_case_nil_check),
     ("go-ignored-error", "x.go", go_ignored_error),
     ("go-error-context", "x.go", go_error_context),
     ("go-type-switch-density", "x.go", go_type_switch),
@@ -178,6 +179,10 @@ fn cross_file_block() -> String {
     format!("package other\n\n{DO_WORK}")
 }
 
+fn special_case_nil_check() -> String {
+    "package p\n\ntype Svc struct{}\n\nfunc (s *Svc) Name() string { return \"n\" }\n\nfunc describe(svc *Svc) string {\n\tif svc == nil {\n\t\treturn \"none\"\n\t} else {\n\t\treturn svc.Name()\n\t}\n}\n".into()
+}
+
 fn go_ignored_error() -> String {
     "package main\n\nfunc f() (int, error) { return 0, nil }\n\nfunc g() {\n\tresult, _ := f()\n\t_ = result\n}\n".into()
 }
@@ -252,6 +257,17 @@ fn real_findings(check: &Check, path: &str, source: &str) -> Vec<Finding> {
         );
     }
     let checker = check.checker.as_deref().expect("per-file check");
+    // The sibling files seed the cross-run index so the third file crosses the threshold.
+    let _isolation = if check.name == "introduce-special-case" {
+        let isolation = crate::backtest::IndexIsolation::new();
+        for sibling in ["a.go", "b.go"] {
+            run_checker_configured(checker, Path::new(sibling), source, check.options.as_ref())
+                .unwrap_or_else(|e| panic!("{}: {e:#}", check.name));
+        }
+        Some(isolation)
+    } else {
+        None
+    };
     run_checker_configured(checker, Path::new(path), source, check.options.as_ref())
         .unwrap_or_else(|e| panic!("{}: {e:#}", check.name))
 }
