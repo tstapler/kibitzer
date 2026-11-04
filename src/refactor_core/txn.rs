@@ -11,12 +11,77 @@ use std::sync::MutexGuard;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// Serializes transactions in this process so one never rolls back another's live log. Two
-/// separate processes on one repo are not covered.
+/// Serializes transactions in this process so one never rolls back another's live log. Other
+/// processes are kept out by [`PlansLock`].
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const PLANS_DIR: &str = ".kibitzer/plans";
 const WAL_FILE: &str = ".wal";
 const BACKUP_DIR: &str = ".wal-backup";
+const LOCK_FILE: &str = ".lock";
+
+/// Cross-process advisory lock on a repo's plans dir (`flock` on [`LOCK_FILE`]), held for the life
+/// of a [`Session`] or [`Pending`] so a second process never recovers or clobbers a live log. The
+/// file is removed on release; an acquirer re-checks the path still names the file it locked.
+struct PlansLock {
+    root: PathBuf,
+    _file: std::fs::File,
+}
+
+impl PlansLock {
+    /// `Ok(None)` when another open file description holds the lock.
+    fn try_acquire(root: &Path) -> Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt as _;
+        ensure_plans_dir_is_real(root)?;
+        let path = plans_dir(root).join(LOCK_FILE);
+        // A releasing holder unlinks the file and its empty dirs, which can race with us.
+        for _ in 0..8 {
+            let opened = std::fs::create_dir_all(plans_dir(root))
+                .and_then(|()| crate::daemon_lock::open_lock_file(&path));
+            let file = match opened {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+            };
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+            let same_file = std::fs::symlink_metadata(&path).is_ok_and(|m| {
+                file.metadata()
+                    .is_ok_and(|f| (f.dev(), f.ino()) == (m.dev(), m.ino()))
+            });
+            if same_file {
+                return Ok(Some(Self {
+                    root: root.to_path_buf(),
+                    _file: file,
+                }));
+            }
+        }
+        bail!("could not lock {}", path.display())
+    }
+
+    fn acquire(root: &Path) -> Result<Self> {
+        Self::try_acquire(root)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "another kibitzer process is applying a refactor in this repository \
+                 ({} is locked); retry when it finishes",
+                plans_dir(root).join(LOCK_FILE).display()
+            )
+        })
+    }
+}
+
+impl Drop for PlansLock {
+    fn drop(&mut self) {
+        // Unlink while still locked (our fd closes after this), then tidy empty dirs.
+        let _ = std::fs::remove_file(plans_dir(&self.root).join(LOCK_FILE));
+        let _ = std::fs::remove_dir(plans_dir(&self.root));
+        let _ = std::fs::remove_dir(self.root.join(".kibitzer"));
+    }
+}
 
 pub enum Op {
     /// Write `bytes`. The file takes the permissions of `mode_from` (a moved file's old path),
@@ -74,17 +139,20 @@ impl From<WalRepr> for Wal {
                     path: l.original,
                     backup: Some(l.backup),
                     temp: Some(l.temp),
+                    mode: None,
                 }),
                 AnyEntry::Legacy(l) => {
                     entries.push(Entry {
                         path: l.original,
                         backup: Some(l.backup),
                         temp: None,
+                        mode: None,
                     });
                     entries.push(Entry {
                         path: l.dest,
                         backup: None,
                         temp: Some(l.temp),
+                        mode: None,
                     });
                 }
             }
@@ -104,6 +172,9 @@ struct Entry {
     backup: Option<PathBuf>,
     /// Temp file written beside `path` for a `Put`.
     temp: Option<PathBuf>,
+    /// Permission bits of the original, restored after the backup is copied back.
+    #[serde(default)]
+    mode: Option<u32>,
 }
 
 pub type Rename<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
@@ -129,6 +200,8 @@ pub struct Pending {
     root: PathBuf,
     wal: Wal,
     settled: bool,
+    // Field order matters: the file lock must release before the in-process mutex.
+    _flock: PlansLock,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -177,8 +250,15 @@ fn killed() -> bool {
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        if !self.settled && !killed() {
-            let _ = rollback(&self.root, &self.wal);
+        if !self.settled
+            && !killed()
+            && let Err(e) = rollback(&self.root, &self.wal)
+        {
+            eprintln!(
+                "kibitzer: rollback failed ({e:#}); the log stays in {}; the next kibitzer \
+                 refactor start retries it automatically",
+                wal_path(&self.root).display()
+            );
         }
     }
 }
@@ -187,6 +267,7 @@ impl Drop for Pending {
 /// its new file bodies against a tree no other transaction can change, then [`Session::begin`].
 pub struct Session {
     root: PathBuf,
+    flock: PlansLock,
     lock: MutexGuard<'static, ()>,
 }
 
@@ -195,9 +276,11 @@ pub fn session(root: &Path) -> Result<Session> {
     let lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let flock = PlansLock::acquire(root)?;
     recover_locked(root)?;
     Ok(Session {
         root: root.to_path_buf(),
+        flock,
         lock,
     })
 }
@@ -244,6 +327,7 @@ impl Session {
             root,
             wal,
             settled: false,
+            _flock: self.flock,
             _lock: self.lock,
         };
         match swap(&pending.wal, changes, rename) {
@@ -260,11 +344,19 @@ pub fn begin(root: &Path, plan_id: &str, changes: &[Change], rename: Rename) -> 
 }
 
 /// Rolls back a transaction a crashed process left half-done. Returns the interrupted plan id,
-/// or `None` when no log exists. Safe to call at every startup and before every transaction.
+/// or `None` when no log exists or another process holds the repo's transaction lock (its log is
+/// live, not orphaned). Safe to call at every startup and before every transaction.
 pub fn recover(root: &Path) -> Result<Option<String>> {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_plans_dir_is_real(root)?;
+    if !plans_dir(root).exists() {
+        return Ok(None);
+    }
+    let Some(_flock) = PlansLock::try_acquire(root)? else {
+        return Ok(None);
+    };
     recover_locked(root)
 }
 
@@ -387,32 +479,47 @@ fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
     Ok(())
 }
 
+/// Attempts every entry even after a failure; the log is kept unless all succeed.
 fn rollback(root: &Path, wal: &Wal) -> Result<()> {
-    for e in &wal.entries {
-        match &e.backup {
-            Some(b) => {
-                if let Some(parent) = e.path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(b, &e.path).with_context(|| {
-                    format!("restoring {} from {}", e.path.display(), b.display())
-                })?;
-                // The backups are deleted next; make the restored file durable first.
-                std::fs::File::open(&e.path)
-                    .and_then(|f| f.sync_all())
-                    .with_context(|| format!("syncing {}", e.path.display()))?;
-            }
-            None => ignore_missing(std::fs::remove_file(&e.path))?,
-        }
-        if let Some(t) = &e.temp {
-            ignore_missing(std::fs::remove_file(t))?;
-        }
-    }
+    let errors: Vec<String> = wal
+        .entries
+        .iter()
+        .filter_map(|e| restore_entry(e).err().map(|err| format!("{err:#}")))
+        .collect();
     for dir in wal.created_dirs.iter().rev() {
         // Non-empty or already gone: either way there is nothing of ours left to remove.
         let _ = std::fs::remove_dir(dir);
     }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
     cleanup(root)
+}
+
+fn restore_entry(e: &Entry) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    match &e.backup {
+        Some(b) => {
+            if let Some(parent) = e.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(b, &e.path)
+                .with_context(|| format!("restoring {} from {}", e.path.display(), b.display()))?;
+            if let Some(mode) = e.mode {
+                std::fs::set_permissions(&e.path, std::fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("restoring mode of {}", e.path.display()))?;
+            }
+            // The backups are deleted next; make the restored file durable first.
+            std::fs::File::open(&e.path)
+                .and_then(|f| f.sync_all())
+                .with_context(|| format!("syncing {}", e.path.display()))?;
+        }
+        None => ignore_missing(std::fs::remove_file(&e.path))?,
+    }
+    if let Some(t) = &e.temp {
+        ignore_missing(std::fs::remove_file(t))?;
+    }
+    Ok(())
 }
 
 /// The log is the commit point: drop it before the backups so a crash in between never leaves a
@@ -477,8 +584,10 @@ fn write_wal(root: &Path, plan_id: &str, changes: &[Change]) -> Result<Wal> {
     let mut created_dirs: Vec<PathBuf> = Vec::new();
     let mut entries = Vec::new();
     for (i, c) in changes.iter().enumerate() {
+        let mut mode = None;
         let backup = match std::fs::symlink_metadata(&c.path) {
             Ok(m) if m.is_file() => {
+                mode = Some(std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
                 let b = backup_dir(root).join(i.to_string());
                 // Read + synced write (not `copy`): the log must never point at a backup that a
                 // power loss could leave empty.
@@ -501,6 +610,7 @@ fn write_wal(root: &Path, plan_id: &str, changes: &[Change]) -> Result<Wal> {
             path: c.path.clone(),
             backup,
             temp,
+            mode,
         });
     }
     let wal = Wal {
@@ -959,6 +1069,72 @@ mod tests {
             .unwrap();
         assert!(err.downcast_ref::<RollbackFailed>().is_some(), "{err:#}");
         assert!(wal_path(&root).exists(), "log kept so recover can retry");
+    }
+
+    #[test]
+    fn rollback_restores_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("mode");
+        std::fs::write(root.join("run.sh"), "old").unwrap();
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let p = begin(&root, "p", &[put(root.join("run.sh"), "new")], &real_rename).unwrap();
+        // A same-mode put keeps 0755; clobber it to prove the restore sets the mode itself.
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        p.rollback().unwrap();
+        let mode = std::fs::metadata(root.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(std::fs::read_to_string(root.join("run.sh")).unwrap(), "old");
+    }
+
+    #[test]
+    fn rollback_attempts_every_entry_and_keeps_the_log_on_failure() {
+        let root = scratch("rb-all");
+        std::fs::write(root.join("a"), "A").unwrap();
+        std::fs::write(root.join("b"), "B").unwrap();
+        let changes = [put(root.join("a"), "A2"), put(root.join("b"), "B2")];
+        let p = begin(&root, "p", &changes, &real_rename).unwrap();
+        // Break the first entry's restore only (its backup vanishes).
+        std::fs::remove_file(root.join(".kibitzer/plans/.wal-backup/0")).unwrap();
+        let err = p.rollback().unwrap_err();
+        assert!(format!("{err:#}").contains("restoring"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b")).unwrap(),
+            "B",
+            "later entry restored"
+        );
+        assert!(wal_path(&root).exists(), "log kept for a retry");
+    }
+
+    #[test]
+    fn a_second_session_on_a_locked_root_errors_and_recover_skips_it() {
+        let root = scratch("flock");
+        std::fs::write(root.join("a"), "old").unwrap();
+        // A live transaction elsewhere: its log exists and its lock is held.
+        let held = PlansLock::acquire(&root).unwrap();
+        std::fs::write(
+            wal_path(&root),
+            r#"{"plan_id":"live","entries":[],"created_dirs":[]}"#,
+        )
+        .unwrap();
+        assert!(PlansLock::try_acquire(&root).unwrap().is_none());
+        let err = session(&root).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("another kibitzer process"),
+            "{err:#}"
+        );
+        assert_eq!(
+            recover(&root).unwrap(),
+            None,
+            "recovery must not touch a live log"
+        );
+        assert!(wal_path(&root).exists());
+        drop(held);
+        assert_eq!(recover(&root).unwrap().as_deref(), Some("live"));
     }
 
     #[test]
