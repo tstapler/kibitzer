@@ -267,17 +267,13 @@ impl IndexIsolation {
         // A single test panicking while holding this lock must not poison it for
         // every other test that acquires it afterward — same reasoning as
         // `plugin::test_support::with_xdg_data_home`.
-        let lock = INDEX_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = INDEX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = INDEX_DIR_ENVS
             .iter()
             .map(|(env, _)| (*env, std::env::var_os(env)))
             .collect();
-        let dir = std::env::temp_dir().join(format!(
-            "kibitzer-backtest-index-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kibitzer-backtest-index-{}", std::process::id()));
         // SAFETY: `lock` serializes every `run_backtest` call in this process that
         // touches this var.
         unsafe {
@@ -1092,10 +1088,7 @@ mod tests {
     /// The scratch dir `IndexIsolation::new` derives for this process — asserted
     /// against directly since it's cleaned up on drop and so can't be observed any other way.
     fn duplicate_index_scratch_dir() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "kibitzer-backtest-index-{}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("kibitzer-backtest-index-{}", std::process::id()))
     }
 
     #[test]
@@ -1106,7 +1099,10 @@ mod tests {
             .iter()
             .map(|(env, _)| PathBuf::from(std::env::var_os(env).expect("set under isolation")))
             .collect();
-        assert_ne!(dirs[0], dirs[1], "checkers must not share an index directory");
+        assert_ne!(
+            dirs[0], dirs[1],
+            "checkers must not share an index directory"
+        );
         std::fs::create_dir_all(&dirs[0]).unwrap();
 
         // The lock is still held here, so no other test can touch these vars meanwhile.

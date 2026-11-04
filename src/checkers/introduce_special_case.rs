@@ -89,11 +89,13 @@ impl Checker for IntroduceSpecialCaseChecker {
     }
 
     fn configure(&self, options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
-        let opts: Options = serde_json::from_value(options.clone())
-            .context("introduce-special-case options")?;
+        let opts: Options =
+            serde_json::from_value(options.clone()).context("introduce-special-case options")?;
         let min = opts.min_occurrences.unwrap_or(self.min_occurrences);
         if min < MIN_DISTINCT_FILES {
-            bail!("introduce-special-case: min_occurrences must be at least {MIN_DISTINCT_FILES}, got {min}");
+            bail!(
+                "introduce-special-case: min_occurrences must be at least {MIN_DISTINCT_FILES}, got {min}"
+            );
         }
         Ok(Some(Box::new(Self {
             min_occurrences: min,
@@ -166,7 +168,11 @@ const INDEX_VERSION: u32 = 1;
 
 impl Default for SpecialCaseIndex {
     fn default() -> Self {
-        Self { version: INDEX_VERSION, occurrences: HashMap::new(), files: HashMap::new() }
+        Self {
+            version: INDEX_VERSION,
+            occurrences: HashMap::new(),
+            files: HashMap::new(),
+        }
     }
 }
 
@@ -539,7 +545,8 @@ mod tests {
 
     #[test]
     fn bare_guard_clause_is_not_counted() {
-        let src = "package p\nfunc f(svc *Svc) {\n\tif svc == nil {\n\t\treturn\n\t}\n\tsvc.Run()\n}\n";
+        let src =
+            "package p\nfunc f(svc *Svc) {\n\tif svc == nil {\n\t\treturn\n\t}\n\tsvc.Run()\n}\n";
         assert!(types(src).is_empty());
     }
 
@@ -612,10 +619,19 @@ mod tests {
 
     #[test]
     fn threshold_boundary_and_distinct_files() {
-        let c = |line| NilCheck { type_name: "T".into(), line };
+        let c = |line| NilCheck {
+            type_name: "T".into(),
+            line,
+        };
         let mut idx = SpecialCaseIndex::default();
-        assert!(idx.reindex_and_find(Path::new("a.go"), &[c(1)], 3).is_empty());
-        assert!(idx.reindex_and_find(Path::new("b.go"), &[c(1)], 3).is_empty());
+        assert!(
+            idx.reindex_and_find(Path::new("a.go"), &[c(1)], 3)
+                .is_empty()
+        );
+        assert!(
+            idx.reindex_and_find(Path::new("b.go"), &[c(1)], 3)
+                .is_empty()
+        );
         let f = idx.reindex_and_find(Path::new("c.go"), &[c(7)], 3);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].line, 7);
@@ -627,16 +643,25 @@ mod tests {
 
     #[test]
     fn two_files_with_three_occurrences_fire_at_min_three_but_not_four() {
-        let c = |line| NilCheck { type_name: "T".into(), line };
+        let c = |line| NilCheck {
+            type_name: "T".into(),
+            line,
+        };
         let mut idx = SpecialCaseIndex::default();
         idx.reindex_and_find(Path::new("a.go"), &[c(1), c(2)], 3);
         assert_eq!(idx.reindex_and_find(Path::new("b.go"), &[c(1)], 3).len(), 1);
-        assert!(idx.reindex_and_find(Path::new("b.go"), &[c(1)], 4).is_empty());
+        assert!(
+            idx.reindex_and_find(Path::new("b.go"), &[c(1)], 4)
+                .is_empty()
+        );
     }
 
     #[test]
     fn removing_a_files_checks_drops_it_from_the_count() {
-        let c = |line| NilCheck { type_name: "T".into(), line };
+        let c = |line| NilCheck {
+            type_name: "T".into(),
+            line,
+        };
         let mut idx = SpecialCaseIndex::default();
         for f in ["a.go", "b.go", "c.go"] {
             idx.reindex_and_find(Path::new(f), &[c(1)], 3);
@@ -658,10 +683,21 @@ mod tests {
         let path = dir.join("idx.json");
         std::fs::write(&path, "not json").unwrap();
         assert!(SpecialCaseIndex::load(&path).occurrences.is_empty());
-        std::fs::write(&path, r#"{"occurrences":{"T":[["a.go",1]]},"files":{"a.go":["T"]}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"occurrences":{"T":[["a.go",1]]},"files":{"a.go":["T"]}}"#,
+        )
+        .unwrap();
         assert!(SpecialCaseIndex::load(&path).occurrences.is_empty());
         let mut idx = SpecialCaseIndex::default();
-        idx.reindex_and_find(Path::new("a.go"), &[NilCheck { type_name: "T".into(), line: 1 }], 3);
+        idx.reindex_and_find(
+            Path::new("a.go"),
+            &[NilCheck {
+                type_name: "T".into(),
+                line: 1,
+            }],
+            3,
+        );
         idx.save(&path).unwrap();
         assert_eq!(SpecialCaseIndex::load(&path).occurrences["T"].len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -669,14 +705,23 @@ mod tests {
 
     #[test]
     fn three_occurrences_in_one_file_do_not_fire() {
-        let c = |line| NilCheck { type_name: "T".into(), line };
+        let c = |line| NilCheck {
+            type_name: "T".into(),
+            line,
+        };
         let mut idx = SpecialCaseIndex::default();
-        assert!(idx.reindex_and_find(Path::new("a.go"), &[c(1), c(2), c(3)], 3).is_empty());
+        assert!(
+            idx.reindex_and_find(Path::new("a.go"), &[c(1), c(2), c(3)], 3)
+                .is_empty()
+        );
     }
 
     #[test]
     fn re_indexing_a_file_replaces_its_entries() {
-        let c = |line| NilCheck { type_name: "T".into(), line };
+        let c = |line| NilCheck {
+            type_name: "T".into(),
+            line,
+        };
         let mut idx = SpecialCaseIndex::default();
         idx.reindex_and_find(Path::new("a.go"), &[c(1)], 3);
         idx.reindex_and_find(Path::new("a.go"), &[c(2)], 3);
@@ -686,15 +731,27 @@ mod tests {
     #[test]
     fn configure_sets_threshold_and_rejects_malformed() {
         let base = IntroduceSpecialCaseChecker::default();
-        assert!(base.configure(&serde_json::json!({"min_occurrences": 5})).unwrap().is_some());
-        assert!(base.configure(&serde_json::json!({"min_occurrences": "x"})).is_err());
-        assert!(base.configure(&serde_json::json!({"min_occurrences": 1})).is_err());
+        assert!(
+            base.configure(&serde_json::json!({"min_occurrences": 5}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            base.configure(&serde_json::json!({"min_occurrences": "x"}))
+                .is_err()
+        );
+        assert!(
+            base.configure(&serde_json::json!({"min_occurrences": 1}))
+                .is_err()
+        );
         assert!(base.configure(&serde_json::json!({"bogus": 1})).is_err());
     }
 
     #[test]
     fn registered_and_reads_cross_run_state() {
-        assert!(crate::checker::reads_cross_run_state("introduce-special-case"));
+        assert!(crate::checker::reads_cross_run_state(
+            "introduce-special-case"
+        ));
         assert!(IntroduceSpecialCaseChecker::default().reads_cross_run_state());
     }
 
@@ -717,31 +774,45 @@ mod tests {
         let base = std::env::temp_dir().join(format!("kibitzer-isc-{}", std::process::id()));
         let repo = base.join("test").join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata/introduce-special-case/fires");
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/introduce-special-case/fires");
         let checker = IntroduceSpecialCaseChecker::default();
         let mut last = Vec::new();
         for name in ["a.go", "b.go", "c.go"] {
             let source = std::fs::read_to_string(fixtures.join(name)).unwrap();
             let tree = crate::test_support::parse_go(&source).unwrap();
-            let ctx = CheckContext { source: &source, tree: Some(&tree) };
+            let ctx = CheckContext {
+                source: &source,
+                tree: Some(&tree),
+            };
             last = checker.check(&repo.join(name), &ctx).unwrap();
         }
         let _ = std::fs::remove_dir_all(&base);
-        assert!(!last.is_empty(), "a repo under a `test/` parent must not be treated as tests");
+        assert!(
+            !last.is_empty(),
+            "a repo under a `test/` parent must not be treated as tests"
+        );
     }
 
     fn run_fixture(dir: &str, checker: &IntroduceSpecialCaseChecker) -> Vec<Vec<Finding>> {
         let _isolation = crate::backtest::IndexIsolation::new();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/introduce-special-case").join(dir);
-        let mut files: Vec<_> = std::fs::read_dir(root).unwrap().map(|e| e.unwrap().path()).collect();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/introduce-special-case")
+            .join(dir);
+        let mut files: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
         files.sort();
         files
             .iter()
             .map(|p| {
                 let source = std::fs::read_to_string(p).unwrap();
                 let tree = crate::test_support::parse_go(&source).unwrap();
-                let ctx = CheckContext { source: &source, tree: Some(&tree) };
+                let ctx = CheckContext {
+                    source: &source,
+                    tree: Some(&tree),
+                };
                 checker.check(p, &ctx).unwrap()
             })
             .collect()
@@ -769,7 +840,10 @@ mod tests {
 
     #[test]
     fn raising_min_occurrences_silences_the_fires_fixture() {
-        let strict = IntroduceSpecialCaseChecker { min_occurrences: 5, exclude_tests: true };
+        let strict = IntroduceSpecialCaseChecker {
+            min_occurrences: 5,
+            exclude_tests: true,
+        };
         let r = run_fixture("fires", &strict);
         assert!(r.iter().all(Vec::is_empty), "{r:?}");
     }
