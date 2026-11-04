@@ -9,16 +9,10 @@ use crate::checkers::file_size::is_generated;
 use crate::node_kind::GoKind;
 use crate::union_find;
 
-/// Fowler's Split Loop (*Refactoring* 2nd ed., p. 227): a loop body advancing two or more
-/// accumulators that don't feed each other is doing two jobs in one place.
-///
-/// Conservative v1, tuned for precision over recall (the fix is cheap once a human is
-/// pointed at the loop): accumulators are `x op= e`, `x++`/`x--`, `x = append(x, ...)` and
-/// `x[k] = e` on a plain local-or-outer identifier. Two accumulators are linked when one's
-/// update (its right-hand side, index key, or enclosing `if`/`switch` guard, following
-/// per-iteration locals declared in the body) mentions the other by plain identifier.
-/// Any mention of an accumulator outside those update statements (a call argument, a
-/// `break` guard, a nested loop or closure) makes the loop ambiguous, so it isn't flagged.
+/// Fowler's Split Loop: a loop body advancing two or more accumulators that don't feed each
+/// other is doing two jobs. Precision over recall: accumulators are `x op= e`, `x++`/`x--`,
+/// `x = append(x, ..)` and `x[k] = e`; they are linked by shared dependencies, guards and
+/// per-iteration inputs, and any mention outside the update statements suppresses the finding.
 pub struct SplitLoopChecker;
 
 impl Checker for SplitLoopChecker {
@@ -45,6 +39,9 @@ impl Checker for SplitLoopChecker {
         let tree = ctx
             .tree
             .context("split-loop-go checker requires a parsed tree")?;
+        if exceeds_depth(tree.root_node(), MAX_TREE_DEPTH) {
+            return Ok(Vec::new());
+        }
         let mut findings = Vec::new();
         visit(tree.root_node(), ctx.source.as_bytes(), &mut findings);
         Ok(findings)
@@ -53,6 +50,53 @@ impl Checker for SplitLoopChecker {
 
 inventory::submit! {
     crate::checker::CheckerFactory(|| vec![Box::new(SplitLoopChecker)])
+}
+
+/// The recursive walkers below would overflow the stack on pathologically nested input.
+const MAX_TREE_DEPTH: usize = 256;
+/// Bounds the quadratic `accounted` scan; larger loops are skipped, not flagged.
+const MAX_LOOP_BODY_NODES: usize = 5000;
+
+/// True when `root`'s subtree is deeper than `limit`. Iterative, so safe on any input.
+fn exceeds_depth(root: Node, limit: usize) -> bool {
+    let mut cursor = root.walk();
+    let mut depth = 0usize;
+    loop {
+        if cursor.goto_first_child() {
+            depth += 1;
+            if depth > limit {
+                return true;
+            }
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return false;
+            }
+            depth -= 1;
+        }
+    }
+}
+
+/// True when `root`'s subtree has more than `limit` nodes. Iterative.
+fn exceeds_node_count(root: Node, limit: usize) -> bool {
+    let mut cursor = root.walk();
+    let mut count = 1usize;
+    loop {
+        if cursor.goto_first_child() {
+            count += 1;
+        } else {
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return false;
+                }
+            }
+            count += 1;
+        }
+        if count > limit {
+            return true;
+        }
+    }
 }
 
 fn visit(node: Node, src: &[u8], out: &mut Vec<Finding>) {
@@ -72,10 +116,6 @@ fn visit(node: Node, src: &[u8], out: &mut Vec<Finding>) {
     for child in node.children(&mut cursor) {
         visit(child, src, out);
     }
-}
-
-fn text<'a>(node: Node, src: &'a [u8]) -> &'a str {
-    std::str::from_utf8(&src[node.start_byte()..node.end_byte()]).unwrap_or("")
 }
 
 /// One accumulator update: the accumulator name and the identifiers its update depends on.
@@ -114,6 +154,9 @@ struct BodyScan {
 /// (and so should be flagged), else `None`.
 fn independent_accumulators(for_node: Node, src: &[u8]) -> Option<Vec<String>> {
     let body = for_node.child_by_field_name("body")?;
+    if exceeds_node_count(body, MAX_LOOP_BODY_NODES) {
+        return None;
+    }
     let header_vars = header_variables(for_node, src);
 
     let mut scan = BodyScan::default();
@@ -285,7 +328,10 @@ fn collect_names(node: Node, src: &[u8], out: &mut BTreeSet<String>) {
 /// (`item.sum`) are `field_identifier`s and so are never matched.
 fn collect_identifiers(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
     if GoKind::of(node) == GoKind::Identifier {
-        out.push((text(node, src).to_string(), node.start_byte()));
+        out.push((
+            node.utf8_text(src).unwrap_or("").to_string(),
+            node.start_byte(),
+        ));
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -320,8 +366,7 @@ fn scan_statements(node: Node, src: &[u8], guards: &mut Vec<Guard>, scan: &mut B
                 .named_child(0)
                 .and_then(|target| accumulator_target(target, src))
             {
-                commit_update(scan, guards, node, name, deps);
-                mark_last_as_counter(scan);
+                commit_update(scan, guards, node, name, deps, true);
             }
             return;
         }
@@ -333,11 +378,9 @@ fn scan_statements(node: Node, src: &[u8], guards: &mut Vec<Guard>, scan: &mut B
             scan_guarded(node, &["initializer", "condition"], src, guards, scan);
             return;
         }
-        GoKind::ExpressionSwitchStatement | GoKind::ExpressionCase => {
-            scan_guarded(node, &["value"], src, guards, scan);
-            return;
-        }
-        GoKind::TypeSwitchStatement => {
+        GoKind::ExpressionSwitchStatement
+        | GoKind::ExpressionCase
+        | GoKind::TypeSwitchStatement => {
             scan_guarded(node, &["value"], src, guards, scan);
             return;
         }
@@ -433,6 +476,7 @@ fn commit_update(
     node: Node,
     name: String,
     mut deps: BTreeSet<String>,
+    counter: bool,
 ) {
     for g in guards {
         deps.extend(g.idents.iter().cloned());
@@ -444,17 +488,11 @@ fn commit_update(
         name,
         deps,
         branches,
-        counter: false,
+        counter,
     });
 }
 
 const TUPLE_PREFIX: &str = "#tuple@";
-
-fn mark_last_as_counter(scan: &mut BodyScan) {
-    if let Some(u) = scan.updates.last_mut() {
-        u.counter = true;
-    }
-}
 
 fn record_local(node: Node, src: &[u8], scan: &mut BodyScan) {
     let (bound, defs) = match GoKind::of(node) {
@@ -497,7 +535,7 @@ fn record_assignment(node: Node, src: &[u8], guards: &[Guard], scan: &mut BodySc
     };
     let op = node
         .child_by_field_name("operator")
-        .map(|o| text(o, src))
+        .map(|o| o.utf8_text(src).unwrap_or(""))
         .unwrap_or("=");
     if left.named_child_count() != 1 || right.named_child_count() != 1 {
         return;
@@ -513,7 +551,7 @@ fn record_assignment(node: Node, src: &[u8], guards: &[Guard], scan: &mut BodySc
     if is_plain && GoKind::of(lhs) == GoKind::Identifier {
         if is_self_append(rhs, &name, src) {
             deps.extend(rhs_idents);
-            commit_update(scan, guards, node, name, deps);
+            commit_update(scan, guards, node, name, deps, false);
         } else {
             // `t = sum * 2`: a derived value, not an accumulator shape. Track it so a later
             // `count += t` still links to `sum`.
@@ -527,16 +565,18 @@ fn record_assignment(node: Node, src: &[u8], guards: &[Guard], scan: &mut BodySc
     }
     // `x op= e` or `x[k] = e` / `x[k] op= e`.
     deps.extend(rhs_idents);
-    commit_update(scan, guards, node, name, deps);
-    if op != "=" && GoKind::of(lhs) == GoKind::Identifier && GoKind::of(rhs) == GoKind::IntLiteral {
-        mark_last_as_counter(scan);
-    }
+    let counter =
+        op != "=" && GoKind::of(lhs) == GoKind::Identifier && GoKind::of(rhs) == GoKind::IntLiteral;
+    commit_update(scan, guards, node, name, deps, counter);
 }
 
 /// `x` or `x[k]` (with `x` a plain identifier) → `(x, identifiers in the index key)`.
 fn accumulator_target(target: Node, src: &[u8]) -> Option<(String, BTreeSet<String>)> {
     match GoKind::of(target) {
-        GoKind::Identifier => Some((text(target, src).to_string(), BTreeSet::new())),
+        GoKind::Identifier => Some((
+            target.utf8_text(src).unwrap_or("").to_string(),
+            BTreeSet::new(),
+        )),
         GoKind::IndexExpression => {
             let operand = target.child_by_field_name("operand")?;
             if GoKind::of(operand) != GoKind::Identifier {
@@ -544,7 +584,7 @@ fn accumulator_target(target: Node, src: &[u8]) -> Option<(String, BTreeSet<Stri
             }
             let index = target.child_by_field_name("index");
             let deps = index.map(|i| identifier_set(i, src)).unwrap_or_default();
-            Some((text(operand, src).to_string(), deps))
+            Some((operand.utf8_text(src).unwrap_or("").to_string(), deps))
         }
         _ => None,
     }
@@ -556,11 +596,13 @@ fn is_self_append(rhs: Node, name: &str, src: &[u8]) -> bool {
     }
     let is_append = rhs
         .child_by_field_name("function")
-        .is_some_and(|f| text(f, src) == "append");
+        .is_some_and(|f| f.utf8_text(src).unwrap_or("") == "append");
     let first_arg_is_self = rhs
         .child_by_field_name("arguments")
         .and_then(|a| a.named_child(0))
-        .is_some_and(|a| GoKind::of(a) == GoKind::Identifier && text(a, src) == name);
+        .is_some_and(|a| {
+            GoKind::of(a) == GoKind::Identifier && a.utf8_text(src).unwrap_or("") == name
+        });
     is_append && first_arg_is_self
 }
 
@@ -570,14 +612,28 @@ mod tests {
 
     fn findings(body: &str) -> Vec<Finding> {
         let src = format!("package p\n\nfunc F(items []int) {{\n{body}\n}}\n");
-        crate::test_support::check_go_source(&SplitLoopChecker, &src).unwrap()
+        check(&src)
+    }
+
+    fn check(src: &str) -> Vec<Finding> {
+        crate::test_support::check_go_source(&SplitLoopChecker, src).unwrap()
+    }
+
+    /// `loop_line` is the 1-based line of `for` within a `findings` body (file line = +3).
+    fn assert_flagged(f: &[Finding], loop_line: usize, names: &str) {
+        assert_flagged_at(f, loop_line + 3, names);
+    }
+
+    fn assert_flagged_at(f: &[Finding], line: usize, names: &str) {
+        assert_eq!(f.len(), 1, "got: {f:?}");
+        assert_eq!(f[0].line, line, "got: {f:?}");
+        assert!(f[0].message.contains(&format!("({names})")), "got: {f:?}");
     }
 
     #[test]
     fn flags_two_independent_plus_equals_accumulators() {
         let f = findings("var a, b int\nfor _, v := range items {\n\ta += v\n\tb += len(items)\n}");
-        assert_eq!(f.len(), 1, "got: {f:?}");
-        assert!(f[0].message.contains("a, b"));
+        assert_flagged(&f, 2, "a, b");
         assert!(f[0].message.contains("Split Loop"));
     }
 
@@ -586,7 +642,7 @@ mod tests {
         let f = findings(
             "var xs, ys []int\nfor _, v := range items {\n\txs = append(xs, v)\n\tys = append(ys, len(items))\n}",
         );
-        assert_eq!(f.len(), 1, "got: {f:?}");
+        assert_flagged(&f, 2, "xs, ys");
     }
 
     #[test]
@@ -594,7 +650,7 @@ mod tests {
         let f = findings(
             "m := map[int]int{}\nn := map[int]int{}\nfor _, v := range items {\n\tm[v] = 1\n\tn[0] += 2\n}",
         );
-        assert_eq!(f.len(), 1, "got: {f:?}");
+        assert_flagged(&f, 3, "m, n");
     }
 
     #[test]
@@ -617,43 +673,99 @@ mod tests {
     }
 
     #[test]
+    fn follows_a_plain_assigned_local_to_its_source() {
+        let linked =
+            findings("var a, b, t int\nfor range items {\n\ta += x()\n\tt = a * 2\n\tb += t\n}");
+        assert!(linked.is_empty(), "got: {linked:?}");
+        let independent =
+            findings("var a, b, t int\nfor range items {\n\ta += x()\n\tt = y() * 2\n\tb += t\n}");
+        assert_flagged(&independent, 2, "a, b");
+    }
+
+    #[test]
     fn does_not_flag_when_one_update_is_guarded_by_the_other() {
-        let f = findings(
-            "var a, b int\nfor _, v := range items {\n\ta += v\n\tif a > 10 {\n\t\tb++\n\t}\n}",
+        let guarded = findings(
+            "var a, b int\nfor range items {\n\ta += x()\n\tif a > 10 {\n\t\tb += y()\n\t}\n}",
         );
-        assert!(f.is_empty(), "got: {f:?}");
+        assert!(guarded.is_empty(), "got: {guarded:?}");
+        let unrelated_guard = findings(
+            "var a, b int\nfor range items {\n\ta += x()\n\tif c() {\n\t\tb += y()\n\t}\n}",
+        );
+        assert_flagged(&unrelated_guard, 2, "a, b");
     }
 
     #[test]
     fn does_not_flag_accumulators_partitioned_by_an_if_else() {
-        let f = findings(
-            "var good, bad []int\nfor _, v := range items {\n\tif v > 0 {\n\t\tgood = append(good, v)\n\t} else {\n\t\tbad = append(bad, v)\n\t}\n}",
+        let partitioned = findings(
+            "var a, b int\nfor range items {\n\tif c() {\n\t\ta += x()\n\t} else {\n\t\tb += y()\n\t}\n}",
         );
-        assert!(f.is_empty(), "got: {f:?}");
+        assert!(partitioned.is_empty(), "got: {partitioned:?}");
+        let flat = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n}");
+        assert_flagged(&flat, 2, "a, b");
     }
 
     #[test]
     fn does_not_flag_accumulators_partitioned_by_a_switch() {
-        let f = findings(
-            "var a, b int\nfor _, v := range items {\n\tswitch v {\n\tcase 1:\n\t\ta++\n\tdefault:\n\t\tb++\n\t}\n}",
+        let partitioned = findings(
+            "var a, b int\nfor range items {\n\tswitch k() {\n\tcase 1:\n\t\ta += x()\n\tdefault:\n\t\tb += y()\n\t}\n}",
         );
-        assert!(f.is_empty(), "got: {f:?}");
+        assert!(partitioned.is_empty(), "got: {partitioned:?}");
+        let flat = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n}");
+        assert_flagged(&flat, 2, "a, b");
+    }
+
+    #[test]
+    fn does_not_flag_accumulators_partitioned_by_a_select() {
+        let partitioned = findings(
+            "var a, b int\nfor range items {\n\tselect {\n\tcase <-ch():\n\t\ta += x()\n\tdefault:\n\t\tb += y()\n\t}\n}",
+        );
+        assert!(partitioned.is_empty(), "got: {partitioned:?}");
+        let one_arm = findings(
+            "var a, b int\nfor range items {\n\ta += x()\n\tselect {\n\tcase <-ch():\n\t\tb += y()\n\tdefault:\n\t}\n}",
+        );
+        assert_flagged(&one_arm, 2, "a, b");
+    }
+
+    #[test]
+    fn does_not_flag_accumulators_partitioned_by_a_type_switch() {
+        let partitioned = findings(
+            "var a, b int\nfor range items {\n\tswitch k().(type) {\n\tcase int:\n\t\ta += x()\n\tdefault:\n\t\tb += y()\n\t}\n}",
+        );
+        assert!(partitioned.is_empty(), "got: {partitioned:?}");
     }
 
     #[test]
     fn does_not_flag_when_the_body_continues_early() {
-        let f = findings(
-            "var a, b int\nfor _, v := range items {\n\tif v < 0 {\n\t\tcontinue\n\t}\n\ta += v\n\tb += v * 2\n}",
+        let early = findings(
+            "var a, b int\nfor range items {\n\tif c() {\n\t\tcontinue\n\t}\n\ta += x()\n\tb += y()\n}",
         );
-        assert!(f.is_empty(), "got: {f:?}");
+        assert!(early.is_empty(), "got: {early:?}");
+        let no_exit = findings(
+            "var a, b int\nfor range items {\n\tif c() {\n\t\tlog()\n\t}\n\ta += x()\n\tb += y()\n}",
+        );
+        assert_flagged(&no_exit, 2, "a, b");
+    }
+
+    #[test]
+    fn does_not_flag_when_the_body_exits_with_goto() {
+        let early = findings(
+            "var a, b int\nfor range items {\n\tif c() {\n\t\tgoto done\n\t}\n\ta += x()\n\tb += y()\n}\ndone:\n\tlog()",
+        );
+        assert!(early.is_empty(), "got: {early:?}");
+        let no_exit = findings(
+            "var a, b int\nfor range items {\n\tif c() {\n\t\tlog()\n\t}\n\ta += x()\n\tb += y()\n}\ndone:\n\tlog()",
+        );
+        assert_flagged(&no_exit, 2, "a, b");
     }
 
     #[test]
     fn does_not_flag_accumulators_updated_under_the_same_guard() {
-        let f = findings(
-            "var a, b int\nfor _, v := range items {\n\tif v > 0 {\n\t\ta += v\n\t\tb++\n\t}\n}",
+        let guarded = findings(
+            "var a, b int\nfor range items {\n\tif c() {\n\t\ta += x()\n\t\tb += y()\n\t}\n}",
         );
-        assert!(f.is_empty(), "got: {f:?}");
+        assert!(guarded.is_empty(), "got: {guarded:?}");
+        let unguarded = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n}");
+        assert_flagged(&unguarded, 2, "a, b");
     }
 
     #[test]
@@ -674,15 +786,27 @@ mod tests {
 
     #[test]
     fn does_not_treat_range_variables_as_accumulators() {
-        // `i` and `v` are range variables; only `a` is an accumulator.
-        let f = findings("var a int\nfor i, v := range items {\n\ti += 1\n\tv += 1\n\ta += v\n}");
-        assert!(f.is_empty(), "got: {f:?}");
+        let range_var = findings("var a int\nfor _, v := range items {\n\tv += y()\n\ta += x()\n}");
+        assert!(range_var.is_empty(), "got: {range_var:?}");
+        let real_second = findings("var a, b int\nfor range items {\n\tb += y()\n\ta += x()\n}");
+        assert_flagged(&real_second, 2, "a, b");
     }
 
     #[test]
     fn does_not_treat_the_c_style_counter_as_an_accumulator() {
-        let f = findings("var a int\nfor i := 0; i < len(items); i++ {\n\ta += items[i]\n}");
-        assert!(f.is_empty(), "got: {f:?}");
+        let counter = findings("var a int\nfor i := 0; i < 3; i++ {\n\ti += y()\n\ta += x()\n}");
+        assert!(counter.is_empty(), "got: {counter:?}");
+        let real_second =
+            findings("var a, b int\nfor i := 0; i < 3; i++ {\n\tb += y()\n\ta += x()\n}");
+        assert_flagged(&real_second, 2, "a, b");
+    }
+
+    #[test]
+    fn does_not_treat_a_condition_only_loop_variable_as_an_accumulator() {
+        let cond = findings("var a, k int\nfor k < 10 {\n\tk += y()\n\ta += x()\n}");
+        assert!(cond.is_empty(), "got: {cond:?}");
+        let real_second = findings("var a, b, k int\nfor k < 10 {\n\tb += y()\n\ta += x()\n}");
+        assert_flagged(&real_second, 2, "a, b");
     }
 
     #[test]
@@ -696,10 +820,11 @@ mod tests {
 
     #[test]
     fn does_not_flag_when_an_accumulator_is_read_elsewhere_in_the_body() {
-        let f = findings(
-            "var a, b int\nfor _, v := range items {\n\ta += v\n\tb += v\n\tif a > 100 {\n\t\tbreak\n\t}\n}",
-        );
-        assert!(f.is_empty(), "got: {f:?}");
+        let read = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n\tuse(a)\n}");
+        assert!(read.is_empty(), "got: {read:?}");
+        let unrelated_read =
+            findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n\tuse(z)\n}");
+        assert_flagged(&unrelated_read, 2, "a, b");
     }
 
     #[test]
@@ -714,7 +839,82 @@ mod tests {
     fn ignores_field_selectors_named_like_an_accumulator() {
         // `item.a` is a field, not the accumulator `a` — so `b` doesn't depend on `a`.
         let src = "package p\n\ntype T struct{ a int }\n\nfunc F(items []T, other T) {\n\tvar a, b int\n\tfor _, it := range items {\n\t\ta += it.a\n\t\tb += other.a\n\t}\n}\n";
-        let f = crate::test_support::check_go_source(&SplitLoopChecker, src).unwrap();
-        assert_eq!(f.len(), 1, "got: {f:?}");
+        assert_flagged_at(&check(src), 7, "a, b");
+    }
+
+    #[test]
+    fn skips_generated_files() {
+        let body = "func F(items []int) {\n\tvar a, b int\n\tfor range items {\n\t\ta += x()\n\t\tb += y()\n\t}\n}\n";
+        let generated = format!("// Code generated by x. DO NOT EDIT.\n\npackage p\n\n{body}");
+        assert!(check(&generated).is_empty());
+        let handwritten = format!("package p\n\n{body}");
+        assert_flagged_at(&check(&handwritten), 5, "a, b");
+    }
+
+    #[test]
+    fn does_not_scan_closure_bodies() {
+        let in_closure = findings(
+            "var a, b int\nfor range items {\n\tfunc() {\n\t\ta += x()\n\t\tb += y()\n\t}()\n}",
+        );
+        assert!(in_closure.is_empty(), "got: {in_closure:?}");
+    }
+
+    #[test]
+    fn links_accumulators_fed_by_one_tuple_call() {
+        let tuple =
+            findings("var a, b int\nfor range items {\n\tp, q := f()\n\ta += p\n\tb += q\n}");
+        assert!(tuple.is_empty(), "got: {tuple:?}");
+        let separate = findings(
+            "var a, b int\nfor range items {\n\tp := f()\n\tq := g()\n\ta += p\n\tb += q\n}",
+        );
+        assert_flagged(&separate, 2, "a, b");
+    }
+
+    #[test]
+    fn links_an_accumulator_used_as_an_index_key() {
+        let keyed =
+            findings("var a int\nxs := []int{}\nfor range items {\n\ta += x()\n\txs[a] = y()\n}");
+        assert!(keyed.is_empty(), "got: {keyed:?}");
+        let constant_key =
+            findings("var a int\nxs := []int{}\nfor range items {\n\ta += x()\n\txs[0] = y()\n}");
+        assert_flagged(&constant_key, 3, "a, xs");
+    }
+
+    #[test]
+    fn an_indexed_increment_is_not_a_counter() {
+        let indexed = findings(
+            "var a int\nm := map[int]int{}\nfor range items {\n\ta += x()\n\tm[0] += 1\n}",
+        );
+        assert_flagged(&indexed, 3, "a, m");
+        let plain = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += 1\n}");
+        assert!(plain.is_empty(), "got: {plain:?}");
+    }
+
+    #[test]
+    fn decrement_statements_are_recorded_as_updates() {
+        // `b--` is a tally, but it must still account for `b` or `b += y()` looks read-elsewhere.
+        let f = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n\tb--\n}");
+        assert_flagged(&f, 2, "a, b");
+        let only_tallies = findings("var a, b int\nfor range items {\n\ta += x()\n\tb--\n}");
+        assert!(only_tallies.is_empty(), "got: {only_tallies:?}");
+    }
+
+    #[test]
+    fn deeply_nested_input_is_skipped_without_overflowing_the_stack() {
+        let depth = 5000;
+        let nested = format!("{}x(){}", "(".repeat(depth), ")".repeat(depth));
+        let f = findings(&format!(
+            "var a, b int\nfor range items {{\n\ta += {nested}\n\tb += y()\n}}"
+        ));
+        assert!(f.is_empty(), "got: {f:?}");
+    }
+
+    #[test]
+    fn oversized_loop_bodies_are_skipped() {
+        let stmts = "\ta += x()\n\tb += y()\n".repeat(1000);
+        let big = findings(&format!("var a, b int\nfor range items {{\n{stmts}}}"));
+        assert!(big.is_empty(), "got: {big:?}");
+        let small = findings("var a, b int\nfor range items {\n\ta += x()\n\tb += y()\n}");
+        assert_flagged(&small, 2, "a, b");
     }
 }
