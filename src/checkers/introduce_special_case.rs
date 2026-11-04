@@ -1,0 +1,512 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use tree_sitter::Node;
+
+use crate::checker::{CheckContext, Checker, Finding, Language};
+use crate::checkers::duplicate_cross_file_checker::{
+    discover_repo_root, index_path_in, save_json_atomic,
+};
+use crate::checkers::file_size::is_generated;
+use crate::checkers::is_test_file;
+use crate::node_kind::GoKind;
+
+/// Types that are nil-checked everywhere by Go convention; a null-object for them is
+/// never the right refactoring.
+const EXCLUDED_TYPES: &[&str] = &[
+    "error",
+    "context.Context",
+    "any",
+    "string",
+    "bool",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+    "float32",
+    "float64",
+    "byte",
+    "rune",
+];
+
+const DEFAULT_MIN_OCCURRENCES: usize = 3;
+const MIN_DISTINCT_FILES: usize = 2;
+
+/// Candidate surfacer for Fowler's Introduce Special Case: counts, per static type, the
+/// `if x == nil { ... } else { x.M() }` shape across the whole repo via a persistent
+/// per-repo index (the #28 `duplicate-code-cross-file` index plumbing, reused). Type
+/// resolution is syntactic (parameters, receivers, `var` declarations, `x := &T{}`), so
+/// a value whose type can't be read from its own function is not counted.
+pub struct IntroduceSpecialCaseChecker {
+    min_occurrences: usize,
+    exclude_tests: bool,
+}
+
+impl Default for IntroduceSpecialCaseChecker {
+    fn default() -> Self {
+        Self {
+            min_occurrences: DEFAULT_MIN_OCCURRENCES,
+            exclude_tests: true,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Options {
+    min_occurrences: Option<usize>,
+    exclude_tests: Option<bool>,
+}
+
+impl Checker for IntroduceSpecialCaseChecker {
+    fn name(&self) -> &str {
+        "introduce-special-case"
+    }
+
+    fn description(&self) -> &str {
+        "flags a type whose nil-check-then-branch pattern repeats across the repo — an Introduce Special Case candidate"
+    }
+
+    fn language(&self) -> Option<Language> {
+        Some(Language::Go)
+    }
+
+    fn file_globs(&self) -> &[&str] {
+        &["**/*.go"]
+    }
+
+    fn reads_cross_run_state(&self) -> bool {
+        true
+    }
+
+    fn configure(&self, options: &serde_json::Value) -> Result<Option<Box<dyn Checker>>> {
+        let opts: Options = serde_json::from_value(options.clone())
+            .context("introduce-special-case options")?;
+        let min = opts.min_occurrences.unwrap_or(self.min_occurrences);
+        if min < MIN_DISTINCT_FILES {
+            bail!("introduce-special-case: min_occurrences must be at least {MIN_DISTINCT_FILES}, got {min}");
+        }
+        Ok(Some(Box::new(Self {
+            min_occurrences: min,
+            exclude_tests: opts.exclude_tests.unwrap_or(self.exclude_tests),
+        })))
+    }
+
+    fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        if (self.exclude_tests && is_test_file(file)) || is_generated(ctx.source) {
+            return Ok(Vec::new());
+        }
+        let tree = ctx
+            .tree
+            .context("introduce-special-case checker requires a parsed tree")?;
+        let checks = extract_nil_checks(tree.root_node(), ctx.source.as_bytes());
+
+        let index_path = index_path_in(&special_case_index_dir(), &discover_repo_root(file));
+        let mut index = SpecialCaseIndex::load(&index_path);
+        let findings = index.reindex_and_find(file, &checks, self.min_occurrences);
+        index
+            .save(&index_path)
+            .with_context(|| format!("writing special-case index {}", index_path.display()))?;
+        Ok(findings)
+    }
+}
+
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(IntroduceSpecialCaseChecker::default())])
+}
+
+/// Redirects the index (see `backtest::IndexIsolation`).
+const INDEX_DIR_OVERRIDE_ENV: &str = "KIBITZER_SPECIAL_CASE_INDEX_DIR";
+
+fn special_case_index_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var(INDEX_DIR_OVERRIDE_ENV) {
+        return PathBuf::from(dir);
+    }
+    crate::cache::default_cache_path()
+        .parent()
+        .map(|dir| dir.join("special-case-index"))
+        .unwrap_or_else(|| std::env::temp_dir().join("kibitzer-special-case-index"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NilCheck {
+    type_name: String,
+    /// 1-indexed.
+    line: usize,
+}
+
+/// Same shape and failure semantics as `duplicate_cross_file_checker::DuplicateIndex`:
+/// last-writer-wins on concurrent saves, stale entries for deleted files are not pruned.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SpecialCaseIndex {
+    occurrences: HashMap<String, Vec<(String, usize)>>,
+    files: HashMap<String, Vec<String>>,
+}
+
+impl SpecialCaseIndex {
+    fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        save_json_atomic(self, path)
+    }
+
+    fn remove_file(&mut self, file_key: &str) {
+        let Some(types) = self.files.remove(file_key) else {
+            return;
+        };
+        for ty in types {
+            if let Some(list) = self.occurrences.get_mut(&ty) {
+                list.retain(|(f, _)| f != file_key);
+                if list.is_empty() {
+                    self.occurrences.remove(&ty);
+                }
+            }
+        }
+    }
+
+    fn reindex_and_find(&mut self, file: &Path, checks: &[NilCheck], min: usize) -> Vec<Finding> {
+        let file_key = file.to_string_lossy().into_owned();
+        self.remove_file(&file_key);
+        let mut types = Vec::new();
+        for c in checks {
+            self.occurrences
+                .entry(c.type_name.clone())
+                .or_default()
+                .push((file_key.clone(), c.line));
+            types.push(c.type_name.clone());
+        }
+        self.files.insert(file_key, types);
+
+        let mut findings = Vec::new();
+        for c in checks {
+            let all = &self.occurrences[&c.type_name];
+            let distinct: HashSet<&str> = all.iter().map(|(f, _)| f.as_str()).collect();
+            if all.len() < min || distinct.len() < MIN_DISTINCT_FILES {
+                continue;
+            }
+            findings.push(Finding {
+                line: c.line,
+                message: format!(
+                    "`{}` is nil-checked-then-branched {} times across {} files — repeated \
+                     nil-checks for one type are an Introduce Special Case candidate (a null \
+                     object callers needn't check)",
+                    c.type_name,
+                    all.len(),
+                    distinct.len()
+                ),
+            });
+        }
+        findings
+    }
+}
+
+type Env = HashMap<String, String>;
+
+/// Every qualifying nil-check in the file, typed by the enclosing function's own
+/// declarations. Qualifies when the `if` has an `else`, or is `x != nil` whose body calls
+/// a method on `x` — a bare guard-clause `if x == nil { return }` is not this smell.
+fn extract_nil_checks(root: Node, src: &[u8]) -> Vec<NilCheck> {
+    let mut out = Vec::new();
+    walk(root, src, &Env::new(), &mut out);
+    out.sort_by_key(|c| c.line);
+    out
+}
+
+fn is_func(node: Node) -> bool {
+    matches!(
+        GoKind::of(node),
+        GoKind::FunctionDeclaration | GoKind::MethodDeclaration | GoKind::FuncLiteral
+    )
+}
+
+fn walk(node: Node, src: &[u8], env: &Env, out: &mut Vec<NilCheck>) {
+    let scoped;
+    let env = if is_func(node) {
+        let mut e = env.clone();
+        for field in ["receiver", "parameters"] {
+            if let Some(list) = node.child_by_field_name(field) {
+                collect_decls(list, src, &mut e);
+            }
+        }
+        if let Some(body) = node.child_by_field_name("body") {
+            collect_decls(body, src, &mut e);
+        }
+        scoped = e;
+        &scoped
+    } else {
+        env
+    };
+    if GoKind::of(node) == GoKind::IfStatement
+        && let Some(check) = nil_check(node, src, env)
+    {
+        out.push(check);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk(child, src, env, out);
+    }
+}
+
+/// Records `name -> type` for parameters/`var` specs/`x := &T{}`. Nested function
+/// literals are skipped so their locals don't leak out. One flat map per function: a
+/// later redeclaration of the same name (shadowing) overwrites the earlier type.
+fn collect_decls(node: Node, src: &[u8], env: &mut Env) {
+    match GoKind::of(node) {
+        GoKind::ParameterDeclaration | GoKind::VarSpec => {
+            if let Some(ty) = node.child_by_field_name("type").and_then(|t| normalize_type(t, src)) {
+                let mut cursor = node.walk();
+                for name in node.children_by_field_name("name", &mut cursor) {
+                    env.insert(text(name, src), ty.clone());
+                }
+            }
+        }
+        GoKind::ShortVarDeclaration => {
+            let (Some(l), Some(r)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) else {
+                return;
+            };
+            let mut lc = l.walk();
+            let mut rc = r.walk();
+            for (name, value) in l.named_children(&mut lc).zip(r.named_children(&mut rc)) {
+                if GoKind::of(name) == GoKind::Identifier
+                    && let Some(ty) = literal_type(value, src)
+                {
+                    env.insert(text(name, src), ty);
+                }
+            }
+        }
+        _ if is_func(node) => return,
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_decls(child, src, env);
+    }
+}
+
+/// `&T{...}` / `T{...}` -> `T`.
+fn literal_type(value: Node, src: &[u8]) -> Option<String> {
+    let lit = if GoKind::of(value) == GoKind::UnaryExpression {
+        value.child_by_field_name("operand")?
+    } else {
+        value
+    };
+    if GoKind::of(lit) != GoKind::CompositeLiteral {
+        return None;
+    }
+    normalize_type(lit.child_by_field_name("type")?, src)
+}
+
+fn normalize_type(node: Node, src: &[u8]) -> Option<String> {
+    let raw = text(node, src);
+    let ty = raw.trim_start_matches('*');
+    let simple = ty
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && !ty.is_empty();
+    (simple && !EXCLUDED_TYPES.contains(&ty)).then(|| ty.to_string())
+}
+
+fn nil_check(if_stmt: Node, src: &[u8], env: &Env) -> Option<NilCheck> {
+    let cond = if_stmt.child_by_field_name("condition")?;
+    if GoKind::of(cond) != GoKind::BinaryExpression {
+        return None;
+    }
+    let op = text(cond.child_by_field_name("operator")?, src);
+    if op != "==" && op != "!=" {
+        return None;
+    }
+    let (l, r) = (
+        cond.child_by_field_name("left")?,
+        cond.child_by_field_name("right")?,
+    );
+    let ident = match (GoKind::of(l), GoKind::of(r)) {
+        (GoKind::Identifier, GoKind::Nil) => l,
+        (GoKind::Nil, GoKind::Identifier) => r,
+        _ => return None,
+    };
+    let name = text(ident, src);
+    let qualifies = if_stmt.child_by_field_name("alternative").is_some()
+        || (op == "!="
+            && if_stmt
+                .child_by_field_name("consequence")
+                .is_some_and(|body| calls_method_on(body, &name, src)));
+    if !qualifies {
+        return None;
+    }
+    Some(NilCheck {
+        type_name: env.get(&name)?.clone(),
+        line: if_stmt.start_position().row + 1,
+    })
+}
+
+fn calls_method_on(node: Node, name: &str, src: &[u8]) -> bool {
+    if GoKind::of(node) == GoKind::SelectorExpression
+        && node
+            .child_by_field_name("operand")
+            .is_some_and(|o| text(o, src) == name)
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|c| calls_method_on(c, name, src))
+}
+
+fn text(node: Node, src: &[u8]) -> String {
+    String::from_utf8_lossy(&src[node.start_byte()..node.end_byte()]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checks(src: &str) -> Vec<NilCheck> {
+        let tree = crate::test_support::parse_go(src).unwrap();
+        extract_nil_checks(tree.root_node(), src.as_bytes())
+    }
+
+    fn types(src: &str) -> Vec<String> {
+        checks(src).into_iter().map(|c| c.type_name).collect()
+    }
+
+    #[test]
+    fn eq_nil_with_else_resolves_param_type() {
+        let src = "package p\nfunc f(svc *Svc) string {\n\tif svc == nil {\n\t\treturn \"\"\n\t} else {\n\t\treturn svc.Name()\n\t}\n}\n";
+        assert_eq!(types(src), ["Svc"]);
+    }
+
+    #[test]
+    fn ne_nil_with_method_call_and_no_else_counts() {
+        let src = "package p\nfunc f(svc *Svc) {\n\tif svc != nil {\n\t\tsvc.Run()\n\t}\n}\n";
+        assert_eq!(types(src), ["Svc"]);
+    }
+
+    #[test]
+    fn bare_guard_clause_is_not_counted() {
+        let src = "package p\nfunc f(svc *Svc) {\n\tif svc == nil {\n\t\treturn\n\t}\n\tsvc.Run()\n}\n";
+        assert!(types(src).is_empty());
+    }
+
+    #[test]
+    fn error_and_context_are_excluded() {
+        let src = "package p\nfunc f(err error, ctx context.Context) {\n\tif err != nil {\n\t\terr.Error()\n\t} else {\n\t}\n\tif ctx == nil {\n\t} else {\n\t}\n}\n";
+        assert!(types(src).is_empty());
+    }
+
+    #[test]
+    fn unresolved_identifier_is_skipped() {
+        let src = "package p\nfunc f() {\n\tif mystery == nil {\n\t} else {\n\t}\n}\n";
+        assert!(types(src).is_empty());
+    }
+
+    #[test]
+    fn receiver_var_and_literal_declarations_resolve() {
+        let src = "package p\nfunc (r *Repo) f() {\n\tvar a *Alpha\n\tb := &Beta{}\n\tif r != nil {\n\t\tr.x()\n\t}\n\tif a == nil {\n\t} else {\n\t}\n\tif b == nil {\n\t} else {\n\t}\n}\n";
+        assert_eq!(types(src), ["Repo", "Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn threshold_boundary_and_distinct_files() {
+        let c = |line| NilCheck { type_name: "T".into(), line };
+        let mut idx = SpecialCaseIndex::default();
+        assert!(idx.reindex_and_find(Path::new("a.go"), &[c(1)], 3).is_empty());
+        assert!(idx.reindex_and_find(Path::new("b.go"), &[c(1)], 3).is_empty());
+        let f = idx.reindex_and_find(Path::new("c.go"), &[c(7)], 3);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].line, 7);
+        assert!(f[0].message.contains("`T`"));
+        assert!(f[0].message.contains("3 times"));
+        assert!(f[0].message.contains("Introduce Special Case"));
+    }
+
+    #[test]
+    fn three_occurrences_in_one_file_do_not_fire() {
+        let c = |line| NilCheck { type_name: "T".into(), line };
+        let mut idx = SpecialCaseIndex::default();
+        assert!(idx.reindex_and_find(Path::new("a.go"), &[c(1), c(2), c(3)], 3).is_empty());
+    }
+
+    #[test]
+    fn re_indexing_a_file_replaces_its_entries() {
+        let c = |line| NilCheck { type_name: "T".into(), line };
+        let mut idx = SpecialCaseIndex::default();
+        idx.reindex_and_find(Path::new("a.go"), &[c(1)], 3);
+        idx.reindex_and_find(Path::new("a.go"), &[c(2)], 3);
+        assert_eq!(idx.occurrences["T"], vec![("a.go".to_string(), 2)]);
+    }
+
+    #[test]
+    fn configure_sets_threshold_and_rejects_malformed() {
+        let base = IntroduceSpecialCaseChecker::default();
+        assert!(base.configure(&serde_json::json!({"min_occurrences": 5})).unwrap().is_some());
+        assert!(base.configure(&serde_json::json!({"min_occurrences": "x"})).is_err());
+        assert!(base.configure(&serde_json::json!({"min_occurrences": 1})).is_err());
+        assert!(base.configure(&serde_json::json!({"bogus": 1})).is_err());
+    }
+
+    #[test]
+    fn registered_and_reads_cross_run_state() {
+        assert!(crate::checker::reads_cross_run_state("introduce-special-case"));
+        assert!(IntroduceSpecialCaseChecker::default().reads_cross_run_state());
+    }
+
+    fn run_fixture(dir: &str, checker: &IntroduceSpecialCaseChecker) -> Vec<Vec<Finding>> {
+        let _isolation = crate::backtest::IndexIsolation::new();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/introduce-special-case").join(dir);
+        let mut files: Vec<_> = std::fs::read_dir(root).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        files
+            .iter()
+            .map(|p| {
+                let source = std::fs::read_to_string(p).unwrap();
+                let tree = crate::test_support::parse_go(&source).unwrap();
+                let ctx = CheckContext { source: &source, tree: Some(&tree) };
+                checker.check(p, &ctx).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fixture_fires_on_third_file() {
+        let r = run_fixture("fires", &IntroduceSpecialCaseChecker::default());
+        assert!(r[0].is_empty() && r[1].is_empty());
+        assert_eq!(r[2].len(), 1, "{r:?}");
+        assert!(r[2][0].message.contains("OrderService"));
+    }
+
+    #[test]
+    fn fixture_below_threshold_is_silent() {
+        let r = run_fixture("below-threshold", &IntroduceSpecialCaseChecker::default());
+        assert!(r.iter().all(Vec::is_empty), "{r:?}");
+    }
+
+    #[test]
+    fn fixture_distinct_types_is_silent() {
+        let r = run_fixture("distinct-types", &IntroduceSpecialCaseChecker::default());
+        assert!(r.iter().all(Vec::is_empty), "{r:?}");
+    }
+
+    #[test]
+    fn raising_min_occurrences_silences_the_fires_fixture() {
+        let strict = IntroduceSpecialCaseChecker { min_occurrences: 5, exclude_tests: true };
+        let r = run_fixture("fires", &strict);
+        assert!(r.iter().all(Vec::is_empty), "{r:?}");
+    }
+}

@@ -63,7 +63,7 @@ const NO_GIT_ROOT_FALLBACK: &str = "/kibitzer-no-git-root-fallback";
 /// without this, an unrelated pair of repos sharing a coincidental snippet would report
 /// as cross-file duplicates of each other. Falls back to [`NO_GIT_ROOT_FALLBACK`] when no
 /// `.git` is found anywhere above `file`.
-fn discover_repo_root(file: &Path) -> PathBuf {
+pub(crate) fn discover_repo_root(file: &Path) -> PathBuf {
     let mut dir = file.parent().unwrap_or(file);
     loop {
         if dir.join(".git").exists() {
@@ -104,6 +104,11 @@ fn duplicate_index_dir() -> PathBuf {
 /// is enough. A truncated, sanitized basename is kept as a prefix purely so the
 /// directory listing stays human-inspectable; only the hash suffix is load-bearing.
 fn index_path_for_repo(repo_root: &Path) -> PathBuf {
+    index_path_in(&duplicate_index_dir(), repo_root)
+}
+
+/// Shared with `introduce_special_case`, which keeps its own index in a different directory.
+pub(crate) fn index_path_in(dir: &Path, repo_root: &Path) -> PathBuf {
     let canonical = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -127,7 +132,20 @@ fn index_path_for_repo(repo_root: &Path) -> PathBuf {
     } else {
         format!("{readable}-{hash:016x}.json")
     };
-    duplicate_index_dir().join(name)
+    dir.join(name)
+}
+
+/// Temp-file-then-rename JSON write, shared with `introduce_special_case`.
+pub(crate) fn save_json_atomic<T: Serialize>(value: &T, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{n}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string(value)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Persistent, whole-repo reverse index from a duplicate-candidate window's exact
@@ -161,15 +179,7 @@ impl DuplicateIndex {
     /// reader's `load` always sees either the previous complete index or the new one —
     /// never a partial write from a crash or an interleaved concurrent `save`.
     fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("json.tmp.{}.{n}", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string(self)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        save_json_atomic(self, path)
     }
 
     /// Replaces `file`'s entries in the index with the windows freshly computed from
@@ -525,7 +535,7 @@ mod tests {
         // `DuplicateIndex`'s internal methods directly — the gap the review flagged:
         // without this, `index_path_for_repo`/`duplicate_index_dir()`'s non-override
         // branch had zero direct coverage.
-        let _isolation = crate::backtest::DuplicateIndexIsolation::new();
+        let _isolation = crate::backtest::IndexIsolation::new();
         let base = e2e_fixture_repo();
 
         assert!(run_checker(&base.join("pkg1/a.go")).is_empty());

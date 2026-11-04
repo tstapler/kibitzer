@@ -18,6 +18,7 @@ pub mod go_type_switch_density;
 pub mod hollow_qualifier_phrasing;
 mod import_preamble;
 pub mod inline_ignore;
+pub mod introduce_special_case;
 pub mod java_error_context;
 pub mod java_ignored_error;
 pub mod java_lost_exception_cause;
