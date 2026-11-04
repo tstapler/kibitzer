@@ -36,7 +36,9 @@ pub fn resolve_target(name: &str) -> Result<BacktestTarget> {
             rule_id: None,
         });
     }
-    if crate::checker::lookup(name).is_some() {
+    if crate::checker::lookup(name).is_some()
+        || crate::architecture_checks::lookup_model(name).is_some()
+    {
         return Ok(BacktestTarget {
             checker_names: vec![name.to_string()],
             rule_id: None,
@@ -1197,6 +1199,14 @@ mod tests {
         let all = resolve_target("all").unwrap();
         assert!(all.checker_names.is_empty());
         assert_eq!(all.rule_id, None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn resolve_target_should_Accept_When_NameIsAModelChecker() {
+        let target = resolve_target("feature-envy").unwrap();
+        assert_eq!(target.checker_names, vec!["feature-envy".to_string()]);
+        assert_eq!(target.rule_id, None);
     }
 
     #[test]
