@@ -29,6 +29,23 @@ impl Findings {
     }
 }
 
+/// A failed text edit is a planner bug: block with a diagnostic and keep `fallback` instead of
+/// panicking or writing a corrupt file.
+fn edited_or_block(
+    f: &mut Findings,
+    file: &str,
+    result: Result<String, gs::EditError>,
+    fallback: String,
+) -> String {
+    result.unwrap_or_else(|e| {
+        f.block(
+            BlockingDiagnostic::new("invalid_edit", format!("could not apply edits: {e}"))
+                .at(file, None),
+        );
+        fallback
+    })
+}
+
 /// `add_import` for the planner: a file we cannot safely edit becomes a blocking diagnostic and is
 /// left as it was, so the plan can never contain a half-made edit.
 fn add_import_or_block(
@@ -507,7 +524,7 @@ pub fn partial_move(
         }
 
         if whole {
-            let mut content = apply_with_pkg_clause(&src, moved_edits, &b_name);
+            let mut content = apply_with_pkg_clause(f, file, &src, moved_edits, &b_name);
             if need_a_import_in.contains(file) {
                 content = add_import_or_block(f, file, &content, &a_import, None);
             }
@@ -537,7 +554,9 @@ pub fn partial_move(
                     })
                     .collect();
                 body.push('\n');
-                body.push_str(&gs::apply_edits(&src[u.decl.start..u.decl.end], local));
+                let unit_src = &src[u.decl.start..u.decl.end];
+                let applied = gs::apply_edits(unit_src, local);
+                body.push_str(&edited_or_block(f, file, applied, unit_src.to_string()));
                 body.push('\n');
             }
             let mut content = format!("package {b_name}\n{body}");
@@ -555,7 +574,8 @@ pub fn partial_move(
                 content = add_import_or_block(f, file, &content, &a_import, None);
             }
             let kn = known_name_fn(ws);
-            content = gs::prune_unused_imports(&content, &kn);
+            let pruned = gs::prune_unused_imports(&content, &kn);
+            content = edited_or_block(f, file, pruned, content);
             let dest = join(&dest_dir, base_of(file));
             if ws.get(&dest).is_some() {
                 f.block(
@@ -580,15 +600,18 @@ pub fn partial_move(
                     text: String::new(),
                 });
             }
-            let mut rest = gs::apply_edits(&src, rest_edits);
+            let applied = gs::apply_edits(&src, rest_edits);
+            let mut rest = edited_or_block(f, file, applied, src.clone());
             if refs_b {
                 rest = add_import_or_block(f, file, &rest, dest_import, None);
             }
             let kn = known_name_fn(ws);
-            rest = gs::prune_unused_imports(&rest, &kn);
+            let pruned = gs::prune_unused_imports(&rest, &kn);
+            rest = edited_or_block(f, file, pruned, rest);
             remaining_updates.push((file.clone(), rest));
         } else if !rest_edits.is_empty() {
-            let mut rest = gs::apply_edits(&src, rest_edits);
+            let applied = gs::apply_edits(&src, rest_edits);
+            let mut rest = edited_or_block(f, file, applied, src.clone());
             rest = add_import_or_block(f, file, &rest, dest_import, None);
             remaining_updates.push((file.clone(), rest));
         }
@@ -661,7 +684,7 @@ pub fn partial_move(
             }
         }
         match gs::rewrite_qualifier(&src, &q, &bq, Some(&moved_names)) {
-            Err(line) => f.block(
+            Err(gs::QualifierError::Shadowed(line)) => f.block(
                 BlockingDiagnostic::new(
                     "shadowed_package_name",
                     format!(
@@ -669,6 +692,10 @@ pub fn partial_move(
                     ),
                 )
                 .at(&file, Some(line)),
+            ),
+            Err(gs::QualifierError::Edit(e)) => f.block(
+                BlockingDiagnostic::new("invalid_edit", format!("could not apply edits: {e}"))
+                    .at(&file, None),
             ),
             Ok(new_src) => {
                 if new_src == src {
@@ -687,7 +714,8 @@ pub fn partial_move(
                         &b_dir_import,
                         alias_needed.then_some(bq.as_str()),
                     );
-                    gs::prune_unused_imports(&added, &known_name_fn(ws))
+                    let pruned = gs::prune_unused_imports(&added, &known_name_fn(ws));
+                    edited_or_block(f, &file, pruned, added)
                 };
                 importing_b.push(ws.import_of_dir(&file_dir));
                 ws.set(&file, out);
@@ -836,8 +864,15 @@ fn surface(f: &mut Findings, from: &str, to: &str, to_name: &str, moved: &[&Unit
     }
 }
 
-fn apply_with_pkg_clause(src: &str, edits: Vec<Edit>, new_name: &str) -> String {
-    let edited = gs::apply_edits(src, edits);
+fn apply_with_pkg_clause(
+    f: &mut Findings,
+    file: &str,
+    src: &str,
+    edits: Vec<Edit>,
+    new_name: &str,
+) -> String {
+    let applied = gs::apply_edits(src, edits);
+    let edited = edited_or_block(f, file, applied, src.to_string());
     gs::rewrite_package_clause(&edited, new_name).unwrap_or(edited)
 }
 
@@ -1068,12 +1103,23 @@ pub fn rename_pkg(
             );
             continue;
         }
-        let mut out = gs::rewrite_import_path(&src, from_import, to_import);
+        let rewritten = gs::rewrite_import_path(&src, from_import, to_import);
+        let mut out = edited_or_block(f, &file, rewritten, src.clone());
         if rename_name && specs.iter().all(|s| s.name == gs::ImportName::Implicit) {
             match gs::rewrite_qualifier(&out, &a.name, &new_name, None) {
                 Ok(o) => out = o,
-                Err(line) => {
+                Err(gs::QualifierError::Shadowed(line)) => {
                     f.block(BlockingDiagnostic::new("shadowed_package_name", format!("`{}` is also used as a local identifier; qualifier rewrite is ambiguous", a.name)).at(&file, Some(line)));
+                    continue;
+                }
+                Err(gs::QualifierError::Edit(e)) => {
+                    f.block(
+                        BlockingDiagnostic::new(
+                            "invalid_edit",
+                            format!("could not apply edits: {e}"),
+                        )
+                        .at(&file, None),
+                    );
                     continue;
                 }
             }

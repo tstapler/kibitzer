@@ -197,7 +197,7 @@ fn compute_outputs(plan: &RefactorPlan) -> Result<Vec<Output>> {
                     old_path,
                     new_path,
                     alias.as_deref(),
-                )
+                )?
                 .with_context(|| format!("import {old_path} not found in {}", file.display()))?;
             }
             Edit::MoveFile { from, to } => {

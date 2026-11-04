@@ -13,33 +13,87 @@ pub struct Edit {
     pub text: String,
 }
 
-/// Applies non-overlapping edits. Two inserts at one offset keep their input order. Overlapping
-/// or out-of-range edits are a bug in the caller and panic with a clear message rather than
-/// producing a corrupt file.
-pub fn apply_edits(src: &str, edits: Vec<Edit>) -> String {
+/// Why a set of edits cannot be applied: a caller bug that must surface as a diagnostic rather
+/// than a corrupt file or a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    Overlap {
+        first: (usize, usize),
+        second: (usize, usize),
+    },
+    OutOfRange {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+    Inverted {
+        start: usize,
+        end: usize,
+    },
+    NotCharBoundary {
+        offset: usize,
+    },
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overlap { first, second } => write!(
+                f,
+                "overlapping edits {}..{} and {}..{}",
+                first.0, first.1, second.0, second.1
+            ),
+            Self::OutOfRange { start, end, len } => {
+                write!(f, "edit {start}..{end} is out of range (length {len})")
+            }
+            Self::Inverted { start, end } => write!(f, "edit {start}..{end} ends before it starts"),
+            Self::NotCharBoundary { offset } => {
+                write!(f, "edit offset {offset} is not on a character boundary")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+/// Applies non-overlapping edits. Two inserts at one offset keep their input order. Overlapping,
+/// inverted, out-of-range or mid-character edits are an [`EditError`]; nothing is applied then.
+pub fn apply_edits(src: &str, edits: Vec<Edit>) -> Result<String, EditError> {
     let mut ordered: Vec<(usize, Edit)> = edits.into_iter().enumerate().collect();
     ordered.sort_by_key(|(i, e)| (e.start, e.end, *i));
+    for (_, e) in &ordered {
+        if e.start > e.end {
+            return Err(EditError::Inverted {
+                start: e.start,
+                end: e.end,
+            });
+        }
+        if e.end > src.len() {
+            return Err(EditError::OutOfRange {
+                start: e.start,
+                end: e.end,
+                len: src.len(),
+            });
+        }
+        for offset in [e.start, e.end] {
+            if !src.is_char_boundary(offset) {
+                return Err(EditError::NotCharBoundary { offset });
+            }
+        }
+    }
     for w in ordered.windows(2) {
-        assert!(
-            w[0].1.end <= w[1].1.start,
-            "overlapping edits {}..{} and {}..{}",
-            w[0].1.start,
-            w[0].1.end,
-            w[1].1.start,
-            w[1].1.end
-        );
+        if w[0].1.end > w[1].1.start {
+            return Err(EditError::Overlap {
+                first: (w[0].1.start, w[0].1.end),
+                second: (w[1].1.start, w[1].1.end),
+            });
+        }
     }
     let mut out = src.to_string();
     for (_, e) in ordered.into_iter().rev() {
-        assert!(
-            e.end <= src.len(),
-            "edit {}..{} is out of range",
-            e.start,
-            e.end
-        );
         out.replace_range(e.start..e.end, &e.text);
     }
-    out
+    Ok(out)
 }
 
 pub fn parse(src: &str) -> Option<Tree> {
@@ -57,10 +111,21 @@ fn children<'t>(n: Node<'t>) -> Vec<Node<'t>> {
     n.children(&mut c).collect()
 }
 
+/// Pre-order visit of `n` and its descendants. Iterative: hostile, deeply nested source must not
+/// overflow the stack.
 fn walk<'t>(n: Node<'t>, f: &mut dyn FnMut(Node<'t>)) {
-    f(n);
-    for c in children(n) {
-        walk(c, f);
+    let mut cursor = n.walk();
+    'visit: loop {
+        f(cursor.node());
+        if cursor.goto_first_child() {
+            continue;
+        }
+        // The cursor is rooted at `n`, so it cannot climb or step sideways past it.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'visit;
+            }
+        }
     }
 }
 
@@ -94,14 +159,15 @@ pub fn rewrite_package_clause(src: &str, new_name: &str) -> Option<String> {
     } else {
         ""
     };
-    Some(apply_edits(
+    apply_edits(
         src,
         vec![Edit {
             start: id.start_byte(),
             end: id.end_byte(),
             text: format!("{new_name}{suffix}"),
         }],
-    ))
+    )
+    .ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +250,7 @@ pub fn imports(src: &str) -> Vec<ImportSpec> {
 }
 
 /// Rewrite `old` to `new` in every import path literal.
-pub fn rewrite_import_path(src: &str, old: &str, new: &str) -> String {
+pub fn rewrite_import_path(src: &str, old: &str, new: &str) -> Result<String, EditError> {
     let edits = imports(src)
         .into_iter()
         .filter(|i| i.path == old)
@@ -205,7 +271,7 @@ pub fn rewrite_import_path_aliased(
     old: &str,
     new: &str,
     alias: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, EditError> {
     let edits: Vec<Edit> = imports(src)
         .into_iter()
         .filter(|i| i.path == old)
@@ -221,11 +287,14 @@ pub fn rewrite_import_path_aliased(
             }
         })
         .collect();
-    (!edits.is_empty()).then(|| apply_edits(src, edits))
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    apply_edits(src, edits).map(Some)
 }
 
 /// Delete the import spec(s) for `path`.
-pub fn remove_import(src: &str, path: &str) -> String {
+pub fn remove_import(src: &str, path: &str) -> Result<String, EditError> {
     let mut edits = vec![];
     for i in imports(src).into_iter().filter(|i| i.path == path) {
         let (s, e) = i.sole_decl.unwrap_or((i.spec_start, i.spec_end));
@@ -248,13 +317,13 @@ pub fn remove_import(src: &str, path: &str) -> String {
             });
         }
     }
-    drop_empty_import_decls(&apply_edits(src, edits))
+    drop_empty_import_decls(&apply_edits(src, edits)?)
 }
 
 /// `import ()` left behind by removing the last spec is valid Go but noise; delete it.
-fn drop_empty_import_decls(src: &str) -> String {
+fn drop_empty_import_decls(src: &str) -> Result<String, EditError> {
     let Some(tree) = parse(src) else {
-        return src.to_string();
+        return Ok(src.to_string());
     };
     let mut edits = vec![];
     for d in children(tree.root_node())
@@ -290,6 +359,12 @@ impl std::fmt::Display for ImportSpliceError {
 }
 
 impl std::error::Error for ImportSpliceError {}
+
+impl From<EditError> for ImportSpliceError {
+    fn from(_: EditError) -> Self {
+        Self("the computed splice overlaps another edit")
+    }
+}
 
 /// Add `import [alias] "path"` unless an import of `path` already exists (then `Ok(src)`).
 /// Any situation where the splice point cannot be trusted is an `Err`, never a silent no-op:
@@ -332,7 +407,7 @@ pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> Result<String, 
                 end: close,
                 text: format!("{lead}\t{spec}\n"),
             }],
-        ));
+        )?);
     }
     if let Some(d) = decls.first() {
         // Single `import "x"`: widen into a group.
@@ -347,7 +422,7 @@ pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> Result<String, 
                 end: d.end_byte(),
                 text: format!("import (\n\t{existing}\n\t{spec}\n)"),
             }],
-        ));
+        )?);
     }
     let pc = children(root)
         .into_iter()
@@ -360,7 +435,7 @@ pub fn add_import(src: &str, path: &str, alias: Option<&str>) -> Result<String, 
             end: pc.end_byte(),
             text: format!("\n\nimport {spec}"),
         }],
-    ))
+    )?)
 }
 
 /// Package qualifiers used in the file: `x` in `x.Foo` (expression) and `x.T` (type).
@@ -410,21 +485,32 @@ pub fn reliable_import_name(spec: &ImportSpec, known_pkg_name: Option<&str>) -> 
 }
 
 /// Drop imports whose (reliably known) name is no longer referenced.
-pub fn prune_unused_imports(src: &str, known: &dyn Fn(&str) -> Option<String>) -> String {
+pub fn prune_unused_imports(
+    src: &str,
+    known: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, EditError> {
     let used = used_qualifiers(src);
     let mut out = src.to_string();
     for spec in imports(src) {
         if let Some(name) = reliable_import_name(&spec, known(&spec.path).as_deref())
             && !used.contains(&name)
         {
-            out = remove_import(&out, &spec.path);
+            out = remove_import(&out, &spec.path)?;
         }
     }
-    out
+    Ok(out)
+}
+
+/// Why [`rewrite_qualifier`] refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QualifierError {
+    /// The old name is also a local identifier, on this line.
+    Shadowed(usize),
+    Edit(EditError),
 }
 
 /// Rename the package qualifier `old` → `new` on selectors/qualified types whose member
-/// is in `members` (or all members when `None`). Returns `Err(line)` when `old` also
+/// is in `members` (or all members when `None`). Returns `Shadowed(line)` when `old` also
 /// appears as an ordinary identifier (a local shadowing the package), which the caller
 /// must treat as a blocker rather than guess.
 pub fn rewrite_qualifier(
@@ -432,7 +518,7 @@ pub fn rewrite_qualifier(
     old: &str,
     new: &str,
     members: Option<&HashSet<String>>,
-) -> Result<String, usize> {
+) -> Result<String, QualifierError> {
     let Some(tree) = parse(src) else {
         return Ok(src.to_string());
     };
@@ -487,9 +573,9 @@ pub fn rewrite_qualifier(
         }
     });
     if let Some(line) = shadow {
-        return Err(line);
+        return Err(QualifierError::Shadowed(line));
     }
-    Ok(apply_edits(src, edits))
+    apply_edits(src, edits).map_err(QualifierError::Edit)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -862,9 +948,13 @@ mod tests {
     #[test]
     fn import_rewrite_handles_single_grouped_alias() {
         let single = "package a\n\nimport \"x/old\"\n";
-        assert!(rewrite_import_path(single, "x/old", "x/new").contains("\"x/new\""));
+        assert!(
+            rewrite_import_path(single, "x/old", "x/new")
+                .unwrap()
+                .contains("\"x/new\"")
+        );
         let grouped = "package a\n\nimport (\n\t\"fmt\"\n\tal \"x/old\"\n)\n";
-        let out = rewrite_import_path(grouped, "x/old", "x/new");
+        let out = rewrite_import_path(grouped, "x/old", "x/new").unwrap();
         assert!(out.contains("al \"x/new\"") && out.contains("\"fmt\""));
     }
 
@@ -877,9 +967,9 @@ mod tests {
         );
         let bare = add_import("package a\n", "x/y", None).unwrap();
         assert!(bare.contains("import \"x/y\""));
-        let removed = remove_import(&added, "x/y");
+        let removed = remove_import(&added, "x/y").unwrap();
         assert!(!removed.contains("x/y"));
-        assert!(!remove_import(src, "fmt").contains("import"));
+        assert!(!remove_import(src, "fmt").unwrap().contains("import"));
     }
 
     #[test]
@@ -889,7 +979,10 @@ mod tests {
         let out = rewrite_qualifier(src, "old", "nu", Some(&members)).unwrap();
         assert!(out.contains("nu.Foo()") && out.contains("old.Bar()") && out.contains("nu.T"));
         let shadow = "package a\n\nfunc f(old int) { _ = old }\n";
-        assert_eq!(rewrite_qualifier(shadow, "old", "nu", None), Err(3));
+        assert_eq!(
+            rewrite_qualifier(shadow, "old", "nu", None),
+            Err(QualifierError::Shadowed(3))
+        );
     }
 
     #[test]
@@ -989,18 +1082,25 @@ mod tests {
     #[test]
     fn aliased_rewrite_leaves_prefix_paths_alone_and_reports_no_match() {
         let src = "package a\n\nimport (\n\t\"foo/bar/baz\"\n\t\"foo/bar\"\n)\n";
-        let out = rewrite_import_path_aliased(src, "foo/bar", "x/y", Some("bar")).unwrap();
+        let out = rewrite_import_path_aliased(src, "foo/bar", "x/y", Some("bar"))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             out,
             "package a\n\nimport (\n\t\"foo/bar/baz\"\n\tbar \"x/y\"\n)\n"
         );
-        assert_eq!(rewrite_import_path_aliased(src, "foo/ba", "x", None), None);
+        assert_eq!(
+            rewrite_import_path_aliased(src, "foo/ba", "x", None),
+            Ok(None)
+        );
     }
 
     #[test]
     fn aliased_rewrite_keeps_an_existing_name() {
         let src = "package a\n\nimport b \"foo/bar\"\n";
-        let out = rewrite_import_path_aliased(src, "foo/bar", "x/y", Some("bar")).unwrap();
+        let out = rewrite_import_path_aliased(src, "foo/bar", "x/y", Some("bar"))
+            .unwrap()
+            .unwrap();
         assert_eq!(out, "package a\n\nimport b \"x/y\"\n");
     }
 
@@ -1063,25 +1163,59 @@ mod tests {
             end: at,
             text: s.into(),
         };
-        assert_eq!(apply_edits("ab", vec![ins(1, "X"), ins(1, "Y")]), "aXYb");
-        let overlap = std::panic::catch_unwind(|| {
-            apply_edits(
-                "abcdef",
-                vec![
-                    Edit {
-                        start: 1,
-                        end: 4,
-                        text: String::new(),
-                    },
-                    Edit {
-                        start: 2,
-                        end: 3,
-                        text: String::new(),
-                    },
-                ],
-            )
-        });
-        assert!(overlap.is_err());
+        assert_eq!(
+            apply_edits("ab", vec![ins(1, "X"), ins(1, "Y")]).unwrap(),
+            "aXYb"
+        );
+        let del = |start: usize, end: usize| Edit {
+            start,
+            end,
+            text: String::new(),
+        };
+        assert_eq!(
+            apply_edits("abcdef", vec![del(1, 4), del(2, 3)]),
+            Err(EditError::Overlap {
+                first: (1, 4),
+                second: (2, 3)
+            })
+        );
+        assert_eq!(
+            apply_edits("ab", vec![del(1, 9)]),
+            Err(EditError::OutOfRange {
+                start: 1,
+                end: 9,
+                len: 2
+            })
+        );
+        assert_eq!(
+            apply_edits("abc", vec![del(2, 1)]),
+            Err(EditError::Inverted { start: 2, end: 1 })
+        );
+        assert_eq!(
+            apply_edits("é", vec![del(0, 1)]),
+            Err(EditError::NotCharBoundary { offset: 1 })
+        );
+    }
+
+    #[test]
+    fn walk_is_preorder_and_survives_pathological_nesting() {
+        let tree = parse("package a\nfunc f() { g(h()) }\n").unwrap();
+        let mut kinds = vec![];
+        walk(tree.root_node(), &mut |n| kinds.push(n.kind()));
+        assert_eq!(kinds[0], "source_file");
+        assert_eq!(kinds[1], "package_clause");
+        assert_eq!(kinds.iter().filter(|k| **k == "call_expression").count(), 2);
+
+        let depth = 200_000;
+        let src = format!(
+            "package a\nvar x = {}1{}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let tree = parse(&src).unwrap();
+        let mut visited = 0usize;
+        walk(tree.root_node(), &mut |_| visited += 1);
+        assert!(visited > depth);
     }
 
     #[test]

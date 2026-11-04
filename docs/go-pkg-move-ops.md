@@ -184,7 +184,7 @@ remaining gap. What replaces resolution:
 | `cycle_detected` | After the move, the source or destination package reaches itself through module-local imports (external `_test` packages are excluded, as in Go). Pre-existing cycles are reported too |
 | `symbol_conflict` / `symbol_conflict_external_test` | A moved top-level name already exists in the destination package, or in its `_test.go` files (`package dest_test` included) |
 | `import_collision` / `import_name_collision` | An importer already imports the new path, or the new import name collides with another import or top-level name |
-| `dest_exists`, `dest_file_exists`, `same_package`, `main_package`, `mixed_packages`, `no_such_package`, `no_such_file`, `no_such_decl`, `nothing_to_move`, `overlapping_clusters`, `multiple_source_packages` | Selection/destination errors |
+| `dest_exists`, `dest_file_exists`, `same_package`, `main_package`, `mixed_packages`, `no_such_package`, `no_such_file`, `no_such_decl`, `nothing_to_move`, `overlapping_clusters`, `multiple_source_packages`, `invalid_edit` | Selection/destination errors (`invalid_edit`: an internal edit set overlapped or fell out of range) |
 | `simulation_blocker` | The embedded feasibility-simulation result reports a blocker |
 | `format_failed` | A rewritten file does not parse (`gofmt` rejected it) |
 | `unsafe_import_edit` | A file needs an import added but its import group cannot be edited safely (syntax error, missing `)`, no package clause): the file is left as it was and the plan is blocked (`extract-decls/unsafe-import-splice`) |
