@@ -465,12 +465,9 @@ mod tests {
 
     #[test]
     fn is_envious_thresholds() {
-        for (foreign, local, expected) in [
-            (5, 10, true),
-            (5, 11, false),
-            (4, 0, false),
-            (5, 0, true),
-        ] {
+        for (foreign, local, expected) in
+            [(5, 10, true), (5, 11, false), (4, 0, false), (5, 0, true)]
+        {
             assert_eq!(is_envious(foreign, local), expected, "({foreign}, {local})");
         }
     }

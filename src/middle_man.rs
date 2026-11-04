@@ -18,8 +18,7 @@ use crate::config::ArchitectureConfig;
 
 const MIDDLE_MAN_MIN_METHODS: usize = 3;
 const MIDDLE_MAN_DELEGATION_RATIO: f64 = 0.8;
-const INTENTIONAL_DELEGATION_SUFFIXES: [&str; 4] =
-    ["Adapter", "Wrapper", "Proxy", "Decorator"];
+const INTENTIONAL_DELEGATION_SUFFIXES: [&str; 4] = ["Adapter", "Wrapper", "Proxy", "Decorator"];
 
 /// Types named like adapters/proxies delegate by design, so delegation checks skip them.
 pub(crate) fn is_intentional_delegation_type(name: &str) -> bool {
