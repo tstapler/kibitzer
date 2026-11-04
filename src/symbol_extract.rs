@@ -1517,9 +1517,9 @@ fn collect_address_of_literal_locals(
         && right.named_child_count() == 1
         && let Some(name) = left.named_child(0)
         && let Some(unary) = right.named_child(0)
-        && unary.kind() == "unary_expression"
+        && GoKind::of(unary) == GoKind::UnaryExpression
         && let Some(literal) = unary.child_by_field_name("operand")
-        && literal.kind() == "composite_literal"
+        && GoKind::of(literal) == GoKind::CompositeLiteral
         && let Some(ty) = literal
             .child_by_field_name("type")
             .and_then(|t| crate::god_class::simple_type_name(t, source))
