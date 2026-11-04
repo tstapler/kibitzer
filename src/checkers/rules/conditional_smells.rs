@@ -33,9 +33,22 @@ fn check_control_flags(decl: Node, src: &[u8], findings: &mut Vec<Finding>) {
     };
     let mut decls = Vec::new();
     collect_bool_decls(body, src, &mut decls);
+    if decls.is_empty() {
+        return;
+    }
+    // One pass over the body: per-name declaration counts and identifier occurrences, so the
+    // cost stays linear in the function size however many bool locals it declares.
+    let mut decl_counts: HashMap<&str, usize> = HashMap::new();
+    for (name, _) in &decls {
+        *decl_counts.entry(name.as_str()).or_default() += 1;
+    }
+    let mut occurrences: HashMap<&str, Vec<Node>> = HashMap::new();
+    collect_identifier_occurrences(body, src, &decl_counts, &mut occurrences);
     for (name, ident) in &decls {
-        let declared_once = decls.iter().filter(|(n, _)| n == name).count() == 1;
-        if declared_once && is_loop_exit_flag(body, name, *ident, src) {
+        let occ = occurrences
+            .get(name.as_str())
+            .map_or(&[][..], Vec::as_slice);
+        if decl_counts[name.as_str()] == 1 && is_loop_exit_flag(occ, *ident, src) {
             findings.push(Finding {
                 line: ident.start_position().row + 1,
                 message: format!(
@@ -104,10 +117,12 @@ fn is_bool_literal(node: Node) -> bool {
 /// in that same loop's condition — so a direct `break`/`return` could replace the flag.
 /// Occurrences inside a closure the declaration is not itself in disqualify the flag:
 /// a captured flag (goroutine, deferred func) is not a plain loop exit.
-fn is_loop_exit_flag(body: Node, name: &str, decl_ident: Node, src: &[u8]) -> bool {
-    let mut occurrences = Vec::new();
-    collect_named_identifiers(body, name, src, &mut occurrences);
-    occurrences.retain(|o| o.id() != decl_ident.id());
+fn is_loop_exit_flag(all_occurrences: &[Node], decl_ident: Node, src: &[u8]) -> bool {
+    let mut occurrences: Vec<Node> = all_occurrences
+        .iter()
+        .copied()
+        .filter(|o| o.id() != decl_ident.id())
+        .collect();
 
     let home_closure = enclosing_closure(decl_ident);
     if occurrences
@@ -142,7 +157,7 @@ fn is_loop_exit_flag(body: Node, name: &str, decl_ident: Node, src: &[u8]) -> bo
             decl_ident.end_byte() <= l.start_byte()
                 && writes.iter().all(|w| {
                     contains(*l, *w)
-                        && !inside_switch_or_select(*w, *l)
+                        && !inside_nested_breakable(*w, *l)
                         && exits_iteration_after(*w, *l)
                 })
         })
@@ -182,7 +197,8 @@ fn exits_iteration_after(write_ident: Node, loop_node: Node) -> bool {
                 sib = n.next_named_sibling();
             }
             let only_exit = later.len() == 1
-                && matches!(later[0].kind(), "break_statement" | "continue_statement");
+                && matches!(later[0].kind(), "break_statement" | "continue_statement")
+                && later[0].named_child_count() == 0; // a labeled break/continue targets another loop
             if !(later.is_empty() || (first && only_exit)) {
                 return false;
             }
@@ -196,9 +212,9 @@ fn exits_iteration_after(write_ident: Node, loop_node: Node) -> bool {
     true
 }
 
-/// A write inside a `switch`/`select` nested in the loop: a bare `break` there only leaves
-/// the switch/select, so "replace the flag with `break`" would be wrong advice.
-fn inside_switch_or_select(node: Node, loop_node: Node) -> bool {
+/// A write inside a `switch`/`select`/inner `for` nested in the loop: a bare `break` there only
+/// leaves that inner construct, so "replace the flag with `break`" would be wrong advice.
+fn inside_nested_breakable(node: Node, loop_node: Node) -> bool {
     let mut cur = node.parent();
     while let Some(n) = cur {
         if n.id() == loop_node.id() {
@@ -206,7 +222,10 @@ fn inside_switch_or_select(node: Node, loop_node: Node) -> bool {
         }
         if matches!(
             n.kind(),
-            "expression_switch_statement" | "type_switch_statement" | "select_statement"
+            "expression_switch_statement"
+                | "type_switch_statement"
+                | "select_statement"
+                | "for_statement"
         ) {
             return true;
         }
@@ -215,13 +234,21 @@ fn inside_switch_or_select(node: Node, loop_node: Node) -> bool {
     false
 }
 
-fn collect_named_identifiers<'t>(node: Node<'t>, name: &str, src: &[u8], out: &mut Vec<Node<'t>>) {
-    if node.kind() == "identifier" && node.utf8_text(src) == Ok(name) {
-        out.push(node);
+fn collect_identifier_occurrences<'t, 'n>(
+    node: Node<'t>,
+    src: &'n [u8],
+    wanted: &HashMap<&'n str, usize>,
+    out: &mut HashMap<&'n str, Vec<Node<'t>>>,
+) {
+    if node.kind() == "identifier"
+        && let Ok(text) = node.utf8_text(src)
+        && let Some((&name, _)) = wanted.get_key_value(text)
+    {
+        out.entry(name).or_default().push(node);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_named_identifiers(child, name, src, out);
+        collect_identifier_occurrences(child, src, wanted, out);
     }
 }
 
@@ -354,9 +381,6 @@ fn single_return_if(stmt: Node, cfg: &LangRuleConfig, src: &[u8]) -> Option<Stri
     {
         return None;
     }
-    if has_comment(stmt) {
-        return None;
-    }
     let condition = stmt.child_by_field_name("condition")?;
     let consequence = stmt.child_by_field_name("consequence")?;
     let container = (cfg.statement_container)(consequence);
@@ -365,7 +389,7 @@ fn single_return_if(stmt: Node, cfg: &LangRuleConfig, src: &[u8]) -> Option<Stri
         .named_children(&mut cursor)
         .filter(|c| !is_comment(*c));
     let ret = stmts.next().filter(|s| s.kind() == cfg.return_kind)?;
-    if stmts.next().is_some() || contains_call(condition, cfg) {
+    if stmts.next().is_some() || contains_call(condition, cfg) || has_comment(stmt) {
         return None;
     }
     let value = ret.named_child(0);
@@ -384,8 +408,11 @@ fn single_return_if(stmt: Node, cfg: &LangRuleConfig, src: &[u8]) -> Option<Stri
 
 /// A commented guard documents its own reason, so merging it would lose that explanation.
 fn has_comment(node: Node) -> bool {
+    if is_comment(node) {
+        return true;
+    }
     let mut cursor = node.walk();
-    is_comment(node) || node.children(&mut cursor).any(has_comment)
+    node.children(&mut cursor).any(has_comment)
 }
 
 fn contains_call(node: Node, cfg: &LangRuleConfig) -> bool {
@@ -434,11 +461,11 @@ mod tests {
     }
 
     #[test]
-    fn remove_control_flag_should_fire_when_nested_loop_sets_flag_read_by_outer_condition() {
+    fn remove_control_flag_should_not_fire_when_inner_loop_sets_flag_read_by_outer_condition() {
         let f = flag(
             "found := false\nfor !found {\n\tfor j := 0; j < 3; j++ {\n\t\tfound = true\n\t}\n}",
         );
-        assert_eq!(f.len(), 1);
+        assert!(f.is_empty(), "{f:?}");
     }
 
     #[test]
@@ -473,6 +500,28 @@ mod tests {
             "done := false\nfor !done {\n\tif x() {\n\t\tdone = true\n\t\tcontinue\n\t}\n\tg()\n}",
         );
         assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn remove_control_flag_should_not_fire_when_inner_loop_continue_follows_write() {
+        let f = flag(
+            "done := false\nfor !done {\n\tfor _, x := range xs {\n\t\tif x > 1 {\n\t\t\tdone = true\n\t\t\tcontinue\n\t\t}\n\t\tg(x)\n\t}\n}",
+        );
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn remove_control_flag_should_not_fire_when_write_is_followed_by_labeled_break() {
+        let f = flag(
+            "done := false\nouter:\nfor !done {\n\tfor {\n\t\tdone = true\n\t\tbreak outer\n\t}\n}",
+        );
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn remove_control_flag_should_not_fire_for_range_loop() {
+        let f = flag("done := false\nfor range xs {\n\tdone = true\n}\nuse(done)");
+        assert!(f.is_empty(), "{f:?}");
     }
 
     #[test]

@@ -23,6 +23,10 @@ Add its `name` to `disabled` in the repo's `.kibitzer/inspect.json`:
 }
 ```
 
+`disabled` works per checker, not per rule: to silence one `syntax-rules` rule (for example
+`consolidate-conditional`) use a `kibitzer:ignore <rule> -- <why>` comment; disabling
+`syntax-rules-<lang>` drops every rule in that language.
+
 This only removes a *default*. It has no effect on a check you added
 yourself — just delete it from `checks` instead.
 
