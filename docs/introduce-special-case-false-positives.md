@@ -19,8 +19,8 @@ the kibitzer cache, redirectable with `KIBITZER_SPECIAL_CASE_INDEX_DIR`.
 | `error` | Nil-checking an `error` is idiomatic Go; a null-object error is wrong. | Type excluded. |
 | `context.Context` | Same: nil-checks on contexts are convention. | Type excluded. |
 | Primitives (`string`, `int`, `bool`, ...) and `any` | A nil check on these says nothing about a missing domain object. | Types excluded. |
-| Test files (`*_test.go`, and files under `test/`, `tests/`, `testing/`, `spec/`) | Tests repeat nil-checks on fixtures by design. | Skipped by default (the shared `checkers::is_test_file`); set `exclude_tests: false` to include them. |
-| `vendor/` | Third-party code you don't own. | Excluded from the default scope (`!vendor/**`). |
+| Test files (`*_test.go`, and files under `test/`, `tests/`, `testing/`, `spec/`) | Tests repeat nil-checks on fixtures by design. | Skipped by default (the shared `checkers::is_test_file`, applied to the path below the repo root); set `exclude_tests: false` to include them. |
+| `vendor/` (top-level or nested) | Third-party code you don't own. | Excluded from the default scope (`!**/vendor/**`). |
 | Field access, not a call (`if x != nil { y = x.Name }`) | A selector on the checked identifier counts as a use, whether or not it is a method call. | Not filtered; known over-count. |
 | Same type name in different packages | Types are keyed by their written name (`Config`), so unrelated `Config` types add up. | Not filtered; known over-count. |
 | Parenthesized condition (`if (x == nil)`) | Not unwrapped. | Missed; known under-count. |
@@ -51,7 +51,8 @@ In `.kibitzer/inspect.json`:
 - `min_occurrences` (default `3`): occurrences per type needed to fire. The type must also
   appear in at least 2 distinct files regardless. Values below 2, or a non-integer, make
   `configure()` return an error.
-- `exclude_tests` (default `true`): skip `*_test.go`.
+- `exclude_tests` (default `true`): skip test files — `*_test.go` and anything under a
+  `test/`, `tests/`, `testing/` or `spec/` directory (below the repo root).
 
 ## Backtest results
 
@@ -61,8 +62,9 @@ index-dir env list in `backtest.rs`) are behavior-preserving, covered by the exi
 duplicate-code tests.
 
 **Transcript backtest** (`kibitzer check backtest introduce-special-case`): 4799
-transcripts, 97 Go snapshots checked, 0 findings. Each snapshot is indexed alone, so the
-2-file threshold can never be crossed; this shows silence on single edits, not recall.
+transcripts, 97 Go snapshots checked, 0 findings. The whole run shares one scratch index,
+so the threshold is reachable in principle; 97 snapshots of edited files is a small sample,
+so this shows silence on that sample, not recall.
 
 **Corpus run**, one `kibitzer check native introduce-special-case` per non-test `.go` file
 from `git ls-files`, fresh index (debug build). This run predates two later changes — the

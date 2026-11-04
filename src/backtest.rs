@@ -275,7 +275,7 @@ impl IndexIsolation {
             .map(|(env, _)| (*env, std::env::var_os(env)))
             .collect();
         let dir = std::env::temp_dir().join(format!(
-            "kibitzer-backtest-duplicate-index-{}",
+            "kibitzer-backtest-index-{}",
             std::process::id()
         ));
         // SAFETY: `lock` serializes every `run_backtest` call in this process that
@@ -1093,12 +1093,13 @@ mod tests {
     /// against directly since it's cleaned up on drop and so can't be observed any other way.
     fn duplicate_index_scratch_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "kibitzer-backtest-duplicate-index-{}",
+            "kibitzer-backtest-index-{}",
             std::process::id()
         ))
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn index_isolation_should_GiveEachCheckerItsOwnDir_And_RestoreEnvAndCleanUp_When_Restored() {
         let mut isolation = IndexIsolation::new();
         let dirs: Vec<_> = INDEX_DIR_ENVS

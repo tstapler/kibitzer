@@ -884,7 +884,7 @@ fn go_exception_checks() -> Vec<Check> {
         native_check(
             "introduce-special-case",
             Severity::Advisory,
-            &["**/*.go", "!vendor/**"],
+            &["**/*.go", "!**/vendor/**"],
         ),
         native_check(
             "go-encapsulate-collection",

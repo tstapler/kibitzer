@@ -102,7 +102,10 @@ impl Checker for IntroduceSpecialCaseChecker {
     }
 
     fn check(&self, file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
-        if (self.exclude_tests && is_test_file(file)) || is_generated(ctx.source) {
+        let repo_root = discover_repo_root(file);
+        // Judged below the repo root, so a checkout living under e.g. `~/test/` isn't all "tests".
+        let in_repo = file.strip_prefix(&repo_root).unwrap_or(file);
+        if (self.exclude_tests && is_test_file(in_repo)) || is_generated(ctx.source) {
             return Ok(Vec::new());
         }
         let tree = ctx
@@ -110,12 +113,16 @@ impl Checker for IntroduceSpecialCaseChecker {
             .context("introduce-special-case checker requires a parsed tree")?;
         let checks = extract_nil_checks(tree.root_node(), ctx.source.as_bytes());
 
-        let index_path = index_path_in(&special_case_index_dir(), &discover_repo_root(file));
+        let index_path = index_path_in(&special_case_index_dir(), &repo_root);
         let mut index = SpecialCaseIndex::load(&index_path);
+        let was_indexed = index.files.contains_key(file.to_string_lossy().as_ref());
         let findings = index.reindex_and_find(file, &checks, self.min_occurrences);
-        index
-            .save(&index_path)
-            .with_context(|| format!("writing special-case index {}", index_path.display()))?;
+        // Hook latency: skip rewriting the whole index for a file that never had entries.
+        if was_indexed || !checks.is_empty() {
+            index
+                .save(&index_path)
+                .with_context(|| format!("writing special-case index {}", index_path.display()))?;
+        }
         Ok(findings)
     }
 }
@@ -189,7 +196,9 @@ impl SpecialCaseIndex {
                 .push((file_key.clone(), c.line));
             types.push(c.type_name.clone());
         }
-        self.files.insert(file_key, types);
+        if !types.is_empty() {
+            self.files.insert(file_key, types);
+        }
 
         let mut findings = Vec::new();
         for c in checks {
@@ -465,6 +474,39 @@ mod tests {
     fn registered_and_reads_cross_run_state() {
         assert!(crate::checker::reads_cross_run_state("introduce-special-case"));
         assert!(IntroduceSpecialCaseChecker::default().reads_cross_run_state());
+    }
+
+    #[test]
+    fn default_scope_excludes_top_level_and_nested_vendor_dirs() {
+        let check = crate::config::default_checks()
+            .into_iter()
+            .find(|c| c.name == "introduce-special-case")
+            .unwrap();
+        let in_scope = |p: &str| crate::glob::matches_scope(p, &check.scope);
+        assert!(in_scope("pkg/a.go"));
+        assert!(!in_scope("vendor/x/a.go"));
+        assert!(!in_scope("third/vendor/x/a.go"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn check_should_StillFire_When_RepoRootSitsUnderATestNamedDir() {
+        let _isolation = crate::backtest::IndexIsolation::new();
+        let base = std::env::temp_dir().join(format!("kibitzer-isc-{}", std::process::id()));
+        let repo = base.join("test").join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/introduce-special-case/fires");
+        let checker = IntroduceSpecialCaseChecker::default();
+        let mut last = Vec::new();
+        for name in ["a.go", "b.go", "c.go"] {
+            let source = std::fs::read_to_string(fixtures.join(name)).unwrap();
+            let tree = crate::test_support::parse_go(&source).unwrap();
+            let ctx = CheckContext { source: &source, tree: Some(&tree) };
+            last = checker.check(&repo.join(name), &ctx).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!last.is_empty(), "a repo under a `test/` parent must not be treated as tests");
     }
 
     fn run_fixture(dir: &str, checker: &IntroduceSpecialCaseChecker) -> Vec<Vec<Finding>> {
