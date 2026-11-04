@@ -261,11 +261,9 @@ fn truncation_respects_char_boundaries() {
 fn crash_mid_transaction(dir: &Path, id: &str, changes: &[txn::Change]) {
     let pending = txn::session(dir)
         .unwrap()
-        .begin(id, changes, &txn::real_rename)
+        .begin_with(id, changes, &txn::real_rename, txn::OnDrop::LeaveLog)
         .unwrap();
-    txn::simulate_kill(true);
     drop(pending);
-    txn::simulate_kill(false);
 }
 
 #[test]

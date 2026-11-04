@@ -365,6 +365,8 @@ for the WAL backup must hash to the plan's `old_sha256`, so a file edited betwee
 check and the swap is refused (`changed since the plan was made`) instead of being backed up and
 overwritten. The WAL-recovery refusal now prints `cp`/`rm` commands to restore by hand. The
 backtest was re-run on this head: identical to the baseline again, 7 of 7 `applied`.
-Not done from the original follow-up list: moving the `cfg(test)` kill hook out of
-`Pending::drop` (the tests drive it through `apply` paths and a panic unwind, so a seam would
-have to be threaded through `ApplyOptions`; left as a separate change).
+The `cfg(test)` kill hook is no longer read inside `Pending::drop`: `Session::begin_with`
+takes an explicit `OnDrop` policy (`Rollback` in production; a test-only `LeaveLog` that mimics a
+killed process), stored on the `Pending`. `refactor::apply` obtains it from a defaulted
+`ApplyIo::on_drop()`, so the crash tests inject it through their fake IO instead of a
+thread-local. The backtest was re-run on this head: identical to the baseline, 7 of 7 `applied`.

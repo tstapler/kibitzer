@@ -203,6 +203,7 @@ pub struct Pending {
     root: PathBuf,
     wal: Wal,
     settled: bool,
+    on_drop: OnDrop,
     // Field order matters: the file lock must release before the in-process mutex.
     _flock: PlansLock,
     _lock: MutexGuard<'static, ()>,
@@ -233,28 +234,19 @@ impl Pending {
     }
 }
 
-// A killed process runs no destructors; tests flip this to leave the log behind like one.
-#[cfg(test)]
-thread_local! {
-    static KILLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub fn simulate_kill(on: bool) {
-    KILLED.with(|k| k.set(on));
-}
-
-fn killed() -> bool {
+/// What dropping an unsettled [`Pending`] does. A killed process runs no destructors, so tests that
+/// simulate one pick `LeaveLog` to keep the on-disk log for [`recover`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnDrop {
+    Rollback,
     #[cfg(test)]
-    return KILLED.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    false
+    LeaveLog,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
         if !self.settled
-            && !killed()
+            && self.on_drop == OnDrop::Rollback
             && let Err(e) = rollback(&self.root, &self.wal)
         {
             eprintln!(
@@ -313,6 +305,17 @@ impl Session {
     /// Applies `changes` (absolute paths under the root). A failure before this returns rolls
     /// the tree back; afterwards the caller owns the decision.
     pub fn begin(self, plan_id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+        self.begin_with(plan_id, changes, rename, OnDrop::Rollback)
+    }
+
+    /// [`Session::begin`] with an explicit policy for the returned [`Pending`] being dropped.
+    pub fn begin_with(
+        self,
+        plan_id: &str,
+        changes: &[Change],
+        rename: Rename,
+        on_drop: OnDrop,
+    ) -> Result<Pending> {
         let root = self.root;
         let mut seen = BTreeSet::new();
         if let Some(c) = changes.iter().find(|c| !seen.insert(&c.path)) {
@@ -330,6 +333,7 @@ impl Session {
             root,
             wal,
             settled: false,
+            on_drop,
             _flock: self.flock,
             _lock: self.lock,
         };
@@ -703,6 +707,12 @@ mod tests {
         }
     }
 
+    /// Like [`begin`], but dropping the result (or unwinding through it) leaves the log, as a
+    /// killed process would.
+    fn begin_killed(root: &Path, id: &str, changes: &[Change], rename: Rename) -> Result<Pending> {
+        session(root)?.begin_with(id, changes, rename, OnDrop::LeaveLog)
+    }
+
     #[test]
     fn a_file_changed_after_the_staleness_check_is_refused_and_left_alone() {
         let root = scratch("toctou");
@@ -795,10 +805,8 @@ mod tests {
         let root = scratch("crash");
         std::fs::write(root.join("a"), "old").unwrap();
         let changes = [put(root.join("a"), "new")];
-        let pending = begin(&root, "p9", &changes, &real_rename).unwrap();
-        simulate_kill(true);
+        let pending = begin_killed(&root, "p9", &changes, &real_rename).unwrap();
         drop(pending);
-        simulate_kill(false);
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
         assert!(wal_path(&root).exists());
         assert_eq!(recover(&root).unwrap().as_deref(), Some("p9"));
@@ -1024,11 +1032,9 @@ mod tests {
             }
             std::fs::rename(from, to)
         };
-        simulate_kill(true);
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = begin(&root, "p", &changes, &dies_on_second);
+            let _ = begin_killed(&root, "p", &changes, &dies_on_second);
         }));
-        simulate_kill(false);
         assert!(crashed.is_err());
         assert_eq!(
             std::fs::read_to_string(root.join("a")).unwrap(),
@@ -1055,10 +1061,9 @@ mod tests {
     fn the_next_transaction_recovers_an_orphan_before_doing_anything() {
         let root = scratch("orphan-then-begin");
         std::fs::write(root.join("a"), "old").unwrap();
-        let p1 = begin(&root, "p1", &[put(root.join("a"), "from-p1")], &real_rename).unwrap();
-        simulate_kill(true);
+        let p1 =
+            begin_killed(&root, "p1", &[put(root.join("a"), "from-p1")], &real_rename).unwrap();
         drop(p1);
-        simulate_kill(false);
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "from-p1");
         let p2 = session(&root).unwrap();
         assert_eq!(
@@ -1080,10 +1085,8 @@ mod tests {
         p.rollback().unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
         // A crash leaves the on-disk log, which recovery refuses to act on for `.kibitzer` paths.
-        let p = begin(&root, "p", &[put(target.clone(), "new")], &real_rename).unwrap();
-        simulate_kill(true);
+        let p = begin_killed(&root, "p", &[put(target.clone(), "new")], &real_rename).unwrap();
         drop(p);
-        simulate_kill(false);
         let err = recover(&root).unwrap_err();
         assert!(format!("{err:#}").contains("restore by hand"), "{err:#}");
         assert!(
