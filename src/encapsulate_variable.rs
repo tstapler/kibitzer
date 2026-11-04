@@ -4,9 +4,10 @@
 //!
 //! `ArchModel::field_accesses` only records a method's accesses on its *own* receiver, so
 //! it can never hold a cross-package write; the checker derives those edges itself from
-//! each package's files (`extract_cross_package_writes_for_file`) and applies the rules to
-//! both sets. Skipped on purpose: lowercase fields, same-package writes, reads, types whose
-//! name ends in a `DTO_SUFFIXES` entry (conventionally public-and-mutable), and test files.
+//! each package's files (`extract_cross_package_writes_for_file`). Skipped on purpose:
+//! lowercase fields, same-package writes, reads, types whose name ends in a `DTO_SUFFIXES`
+//! entry (conventionally public-and-mutable), types declared in an `api`/`apis` package
+//! path segment (API objects filled by conversion/defaulting code), and test files.
 //! Known ceilings: `pkg.Var.Field = v` and writes through values not syntactically typed
 //! (call results, interface values) are not seen. See
 //! `docs/go-encapsulate-variable-false-positives.md`.
@@ -20,7 +21,7 @@ use crate::config::ArchitectureConfig;
 /// First nine are the required default allowlist; the rest were added after the Kubernetes
 /// backtest showed API/data-shaped types dominating the findings
 /// (`docs/go-encapsulate-variable-false-positives.md`).
-const DTO_SUFFIXES: [&str; 17] = [
+const DTO_SUFFIXES: [&str; 18] = [
     "Config",
     "Options",
     "Opts",
@@ -38,6 +39,7 @@ const DTO_SUFFIXES: [&str; 17] = [
     "Info",
     "Record",
     "Row",
+    "Entry",
 ];
 
 pub struct EncapsulateVariableChecker;
@@ -48,12 +50,7 @@ impl ArchModelChecker for EncapsulateVariableChecker {
     }
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
-        let edges: Vec<FieldAccessEdge> = model
-            .field_accesses
-            .iter()
-            .cloned()
-            .chain(cross_package_write_edges(model))
-            .collect();
+        let edges = cross_package_write_edges(model);
         drop_inline_ignored(findings_for_edges(&edges, &model.repo_root))
     }
 }
@@ -163,6 +160,11 @@ fn drop_inline_ignored(findings: Vec<ArchFinding>) -> Vec<ArchFinding> {
     kept
 }
 
+/// API-object packages (`k8s.io/api/...`, `pkg/apis/...`) are filled by design.
+fn is_api_package(pkg_path: &str) -> bool {
+    pkg_path.split('/').any(|seg| seg == "api" || seg == "apis")
+}
+
 fn finding_for_edge(edge: &FieldAccessEdge) -> Option<ArchFinding> {
     let (caller_pkg, caller_symbol) = split_id(&edge.from)?;
     let (field_pkg, owner_field) = split_id(&edge.to)?;
@@ -173,7 +175,7 @@ fn finding_for_edge(edge: &FieldAccessEdge) -> Option<ArchFinding> {
     if !field_name.chars().next().is_some_and(char::is_uppercase) {
         return None;
     }
-    if DTO_SUFFIXES.iter().any(|s| type_name.ends_with(s)) {
+    if DTO_SUFFIXES.iter().any(|s| type_name.ends_with(s)) || is_api_package(field_pkg) {
         return None;
     }
     Some(ArchFinding {
@@ -236,6 +238,21 @@ mod tests {
                 "{ty}"
             );
         }
+    }
+
+    #[test]
+    fn types_declared_in_api_packages_are_not_flagged() {
+        for pkg in ["k8s.io/api/core/v1", "pkg/apis/apps", "api"] {
+            let to = format!("{pkg}::Pod.Name");
+            assert!(
+                run(&[edge("b::U.M", &to, AccessKind::Write)]).is_empty(),
+                "{pkg}"
+            );
+        }
+        assert_eq!(
+            run(&[edge("b::U.M", "pkg/rapid::Pod.Name", AccessKind::Write)]).len(),
+            1
+        );
     }
 
     #[test]

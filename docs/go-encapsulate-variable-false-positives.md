@@ -54,6 +54,26 @@ apply to them. caddy and casbin were run in addition.
 | caddyserver/caddy | 80 | 25 shown (every other line) all in `caddyconfig/httpcaddyfile`: the Caddyfile adapter filling `caddytls.*`/`caddyhttp.*` JSON-config structs (`ACMEIssuer.Challenges`, `Server.AutoHTTPS`, `TLS.Automation`, ...) — config-builder pattern, judged false positives from the finding text. Lines 26+ not read. |
 | casbin/casbin | 10 | All 10 in `util_log.go`: `Enforcer` filling `log.LogEntry` fields (`Subject`, `Object`, `RuleCount`, `Error`, ...) — a plain log record, judged false positive. |
 
+### Run 3 — structural exemptions (release build)
+
+Decision: keep the check in `default_checks()` (the item requires it) and cut the dominant
+noise structurally rather than ship the ~85% estimated false-positive rate from run 2. Added
+the `Entry` suffix and an exemption for types declared under an `api`/`apis` path segment.
+
+| Repo | Run 2 | Run 3 |
+|------|-------|-------|
+| kubernetes/kubernetes | 997 | 287 |
+| casbin/casbin | 10 | 0 |
+| caddyserver/caddy | 80 | 80 |
+
+The run-3 Kubernetes findings were not re-triaged, so their true-positive rate is unknown.
+caddy's builder-package pattern (`caddyconfig/httpcaddyfile`) is deliberately not exempted;
+suppress with `kibitzer:ignore` or file a follow-up for a configurable scope.
+
+Extractor limits: locals are keyed by bare name per function without block scoping, closure
+parameters are not collected, and for promoted fields the reported type is the one named on
+the local, not the embedded declarer.
+
 On these two repos no finding looked like a real encapsulation gap; that is a reading of the
 text, not of the code, so treat "0 true positives" as unverified. Candidate follow-up: a
 suffix for record types (`Entry`) and/or a package-scope exemption for builder packages.

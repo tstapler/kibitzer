@@ -73,5 +73,13 @@ fn same_package_write_is_not_reported() {
         "package a\n\nfunc F(x *T) {\n\tx.Field = 1\n}\n\nfunc G() {\n\tt := &T{}\n\tt.Field = 2\n}\n",
     )
     .unwrap();
-    assert!(!run(&dir).contains(FINDING));
+    // Positive control: the same run must still report a genuine cross-package write.
+    std::fs::write(
+        dir.join("b/b.go"),
+        "package b\n\nimport \"example.com/m/a\"\n\nfunc F(x *a.T) {\n\tx.Field = 1\n}\n",
+    )
+    .unwrap();
+    let output = run(&dir);
+    assert_eq!(output.matches(FINDING).count(), 1, "{output}");
+    assert!(!output.contains("use.go"), "{output}");
 }
