@@ -38,6 +38,7 @@ pub fn resolve_target(name: &str) -> Result<BacktestTarget> {
     }
     if crate::checker::lookup(name).is_some()
         || crate::architecture_checks::lookup_model(name).is_some()
+        || crate::architecture_checks::lookup(name).is_some_and(|c| c.needs_model())
     {
         return Ok(BacktestTarget {
             checker_names: vec![name.to_string()],
@@ -57,7 +58,8 @@ pub fn resolve_target(name: &str) -> Result<BacktestTarget> {
         });
     }
     Err(anyhow::anyhow!(
-        "no checker or syntax rule named '{name}' — run `kibitzer check list` for checkers"
+        "no checker or syntax rule named '{name}' — run `kibitzer check list` for native \
+         checkers; model-based checkers (e.g. feature-envy) run via `kibitzer check architecture`"
     ))
 }
 
@@ -1206,6 +1208,14 @@ mod tests {
     fn resolve_target_should_Accept_When_NameIsAModelChecker() {
         let target = resolve_target("feature-envy").unwrap();
         assert_eq!(target.checker_names, vec!["feature-envy".to_string()]);
+        assert_eq!(target.rule_id, None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn resolve_target_should_Accept_When_NameIsAnImportGraphCheckerNeedingTheModel() {
+        let target = resolve_target("parameter-object").unwrap();
+        assert_eq!(target.checker_names, vec!["parameter-object".to_string()]);
         assert_eq!(target.rule_id, None);
     }
 

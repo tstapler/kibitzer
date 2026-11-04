@@ -1,15 +1,8 @@
 //! Fowler's **Feature Envy** → **Move Function** / **Move Field**: a method that reaches into
-//! another type's data far more than its own is a candidate to move to that type
-//! (Tsantalis & Chatzigeorgiou, "Identification of Move Method Refactoring Opportunities",
-//! IEEE TSE 2009; ATFD from Lanza & Marinescu, as used by `god_class.rs`).
-//!
-//! Foreign *field* accesses come from `god_class`'s ATFD walker (syntactically-typed locals
-//! only — no type inference, same ceiling as `GodClassChecker`). Foreign *calls* come from
-//! `ArchModel::call_edges`. Own accesses are `ArchModel::field_accesses` from the method.
-//! Go only (via `methods_by_type`). Opt-in through `model_registry()`, not `default_checks()`.
-//!
-//! Skipped on purpose: test files, `*Adapter`/`*Wrapper`/`*Proxy`/`*Decorator` types, pure
-//! delegations, and methods with too few total accesses to carry a ratio.
+//! another type's data far more than its own (Tsantalis & Chatzigeorgiou, IEEE TSE 2009).
+//! Foreign field accesses come from `god_class`'s ATFD walker, foreign calls from
+//! `ArchModel::call_edges`, own accesses from `ArchModel::field_accesses`. Go only; opt-in via
+//! `model_registry()`. Skips test files, delegation-named types, pure delegations, tiny methods.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,15 +13,15 @@ use crate::architecture_checks::{ArchFinding, ArchModelChecker, methods_by_type}
 use crate::checkers::is_test_file;
 use crate::config::ArchitectureConfig;
 use crate::god_class::{FileCache, collect_foreign_field_accesses, find_method_node};
+use crate::middle_man::is_intentional_delegation_type;
 
 /// Minimum foreign share of all of a method's counted accesses.
 const FEATURE_ENVY_RATIO_THRESHOLD: f64 = 0.33;
 /// Minimum foreign accesses before flagging; noise guard for tiny methods. Raised from 3
-/// after the public-corpus backtest (see `decisions/validation.md`).
+/// after the public-corpus backtest (see `project_plans/feature-envy-detection/decisions/validation.md`).
 const FEATURE_ENVY_MIN_FOREIGN: usize = 5;
 /// Minimum foreign + own accesses before a method is evaluated at all.
 const FEATURE_ENVY_MIN_TOTAL: usize = 4;
-const INTENTIONAL_DELEGATION_SUFFIXES: [&str; 4] = ["Adapter", "Wrapper", "Proxy", "Decorator"];
 
 pub struct FeatureEnvyChecker;
 
@@ -181,10 +174,7 @@ fn feature_envy_findings_for_package(
     let mut findings = Vec::new();
 
     for (type_name, ids) in methods_by_type(pkg) {
-        if INTENTIONAL_DELEGATION_SUFFIXES
-            .iter()
-            .any(|suffix| type_name.ends_with(suffix))
-        {
+        if is_intentional_delegation_type(type_name) {
             continue;
         }
         for id in ids {
@@ -255,10 +245,6 @@ fn pick_variant(c: &MethodCounts) -> Option<Variant> {
     let foreign_fn: usize = merged.values().sum();
     let foreign_fld: usize = c.field_counts.values().sum();
 
-    // Zero-own methods have ratio 1.0 by definition; require real foreign volume.
-    if c.local == 0 && foreign_fn < FEATURE_ENVY_MIN_FOREIGN {
-        return None;
-    }
     if is_envious(foreign_fld, c.local) {
         Some(Variant {
             label: "move-field",
@@ -368,10 +354,14 @@ mod tests {
     }
 
     fn call(model: &mut ArchModel, from: &str, to: &str) {
+        call_edge(model, from, to, true);
+    }
+
+    fn call_edge(model: &mut ArchModel, from: &str, to: &str, resolved: bool) {
         model.call_edges.push(CallEdge {
             from: from.to_string(),
             to: to.to_string(),
-            resolved: true,
+            resolved,
             file: PathBuf::new(),
             line: 0,
         });
@@ -390,7 +380,14 @@ mod tests {
         )
     }
 
-    const CALC_LINE: usize = 6;
+    /// 1-based line of the `Calc` func declaration in `source`.
+    fn calc_line(source: &str) -> usize {
+        source
+            .lines()
+            .position(|l| l.starts_with("func (o Order) Calc"))
+            .expect("source declares Calc")
+            + 1
+    }
 
     fn run(
         dir_tag: &str,
@@ -401,7 +398,7 @@ mod tests {
         let dir = crate::test_support::unique_temp_dir(dir_tag);
         let file = dir.join(file_name);
         std::fs::write(&file, source).unwrap();
-        let mut model = model_of(vec![symbol("Order", "Calc", &file, CALC_LINE)]);
+        let mut model = model_of(vec![symbol("Order", "Calc", &file, calc_line(source))]);
         setup(&mut model);
         FeatureEnvyChecker.check(&model, &ArchitectureConfig::default())
     }
@@ -418,7 +415,9 @@ mod tests {
 
     #[test]
     fn flags_move_function_candidate_with_canonical_message() {
-        let findings = run("fe-fn", "order.go", &go_source(3), |m| {
+        let source = go_source(3);
+        let line = calc_line(&source);
+        let findings = run("fe-fn", "order.go", &source, |m| {
             own_access(m, "pkg::Order.Calc", 1);
             call(m, "pkg::Order.Calc", "pkg::Customer.Rate");
             call(m, "pkg::Order.Calc", "pkg::Customer.Base");
@@ -426,10 +425,11 @@ mod tests {
         assert_eq!(findings.len(), 1);
         let msg = &findings[0].message;
         assert!(
-            msg.starts_with("[feature-envy:move-function] pkg::Order.Calc (order.go:6)")
-                || msg.contains("order.go:6)"),
+            msg.starts_with("[feature-envy:move-function] pkg::Order.Calc"),
             "{msg}"
         );
+        // repo_root is empty in this model, so the location is the absolute temp path.
+        assert!(msg.contains(&format!("/order.go:{line}):")), "{msg}");
         assert!(
             msg.contains(
                 "5 foreign accesses (5 to pkg::Customer) vs 1 own (ratio 0.83, threshold 0.33); \
@@ -437,7 +437,42 @@ mod tests {
             ),
             "{msg}"
         );
-        assert_eq!(findings[0].line, Some(CALC_LINE));
+        assert_eq!(findings[0].line, Some(line));
+    }
+
+    #[test]
+    fn extra_call_edges_do_not_demote_a_move_field_candidate() {
+        let findings = run("fe-fld-calls", "order.go", &go_source(5), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+            call(m, "pkg::Order.Calc", "pkg::Customer.Rate");
+            call(m, "pkg::Order.Calc", "pkg::Customer.Base");
+        });
+        assert_eq!(findings.len(), 1);
+        let msg = &findings[0].message;
+        assert!(msg.starts_with("[feature-envy:move-field]"), "{msg}");
+        assert!(msg.contains("5 foreign field accesses"), "{msg}");
+    }
+
+    #[test]
+    fn unresolved_call_edges_are_not_counted() {
+        let findings = run("fe-unres", "order.go", &go_source(3), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+            call_edge(m, "pkg::Order.Calc", "pkg::Customer.Rate", false);
+            call_edge(m, "pkg::Order.Calc", "pkg::Customer.Base", false);
+        });
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn is_envious_thresholds() {
+        for (foreign, local, expected) in [
+            (5, 10, true),
+            (5, 11, false),
+            (4, 0, false),
+            (5, 0, true),
+        ] {
+            assert_eq!(is_envious(foreign, local), expected, "({foreign}, {local})");
+        }
     }
 
     #[test]
@@ -467,23 +502,47 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_pure_delegation_adapter_type_and_low_total() {
+    fn suppresses_pure_delegation() {
         let delegating = run("fe-deleg", "order.go", &go_source(5), |m| {
             own_access(m, "pkg::Order.Calc", 1);
             m.packages.get_mut("pkg").unwrap().symbols[0].is_pure_delegation = true;
         });
         assert!(delegating.is_empty());
+    }
 
-        let adapter = run("fe-adapter", "order.go", &go_source(5), |m| {
-            own_access(m, "pkg::OrderAdapter.Calc", 1);
+    /// Re-homes the `Calc` symbol under `type_name` with one own access.
+    fn run_as_type(tag: &str, type_name: &str) -> Vec<ArchFinding> {
+        run(tag, "order.go", &go_source(5), |m| {
+            let id = format!("pkg::{type_name}.Calc");
+            own_access(m, &id, 1);
             let sym = &mut m.packages.get_mut("pkg").unwrap().symbols[0];
-            sym.parent = Some("OrderAdapter".to_string());
-            sym.id = "pkg::OrderAdapter.Calc".to_string();
-        });
-        assert!(adapter.is_empty());
+            sym.parent = Some(type_name.to_string());
+            sym.id = id;
+        })
+    }
 
-        // 3 foreign + 0 own = total 3 < MIN_TOTAL (MIN_FOREIGN=5 now subsumes it).
-        let tiny = run("fe-tiny", "order.go", &go_source(3), |_| {});
+    #[test]
+    fn suppresses_every_intentional_delegation_suffix() {
+        for suffix in ["Adapter", "Wrapper", "Proxy", "Decorator"] {
+            let findings = run_as_type(&format!("fe-sfx-{suffix}"), &format!("Order{suffix}"));
+            assert!(findings.is_empty(), "Order{suffix} should be skipped");
+        }
+    }
+
+    #[test]
+    fn does_not_suppress_types_that_merely_resemble_a_delegation_suffix() {
+        for type_name in ["Wrapped", "Adaptive"] {
+            let findings = run_as_type(&format!("fe-near-{type_name}"), type_name);
+            assert_eq!(findings.len(), 1, "{type_name} must still be flagged");
+        }
+    }
+
+    #[test]
+    fn below_min_foreign_with_own_signal_is_suppressed() {
+        // 3 foreign + 1 own: total 4 passes MIN_TOTAL, so MIN_FOREIGN=5 is what suppresses it.
+        let tiny = run("fe-tiny", "order.go", &go_source(3), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+        });
         assert!(tiny.is_empty());
     }
 
@@ -568,7 +627,7 @@ mod tests {
         )
         .unwrap();
         let mut model = model_of(vec![
-            symbol("Order", "Calc", &long, CALC_LINE),
+            symbol("Order", "Calc", &long, calc_line(&long_src)),
             symbol("Other", "Tiny", &short, 5),
         ]);
         own_access(&mut model, "pkg::Order.Calc", 1);
