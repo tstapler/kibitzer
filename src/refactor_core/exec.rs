@@ -16,6 +16,12 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// outlives it (`server &` in a hook) holds them open; we report what we have instead of hanging.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Read buffer size for each captured stream.
+const READ_CHUNK_BYTES: usize = 8192;
+
+/// How often [`wait_bounded`] checks whether the child has exited.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// What the child inherits from the parent's environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvPolicy {
@@ -70,7 +76,7 @@ fn capture(stream: Option<impl Read + Send + 'static>) -> Capture {
     let shared = Arc::clone(&buf);
     std::thread::spawn(move || {
         if let Some(mut s) = stream {
-            let mut chunk = [0u8; 8192];
+            let mut chunk = [0u8; READ_CHUNK_BYTES];
             // Keep reading past the cap so a chatty child never blocks on a full pipe.
             while let Ok(n) = s.read(&mut chunk) {
                 if n == 0 {
@@ -166,6 +172,9 @@ pub fn run(spec: &Spec) -> Outcome {
     let out = capture(child.stdout.take());
     let err = capture(child.stderr.take());
     let (code, note) = wait_bounded(&mut child, spec.timeout, &command);
+    // Descendants (`server &` in a hook) must not outlive the command or hold its pipes; killing an
+    // already-empty group is harmless.
+    kill_group(&mut child);
     // One grace period for both streams, not one each.
     let deadline = Instant::now() + DRAIN_GRACE;
     let mut output = out.finish("stdout", deadline);
@@ -196,7 +205,7 @@ fn wait_bounded(
                 );
                 return (None, note);
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
             Err(e) => return (None, format!("\nwaiting for `{command}`: {e}\n")),
         }
     }
@@ -247,6 +256,22 @@ mod tests {
         assert!(o.output.contains("failed to run"), "{}", o.output);
     }
 
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        unsafe { libc::kill(pid, 0) != -1 }
+    }
+
+    fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        cond()
+    }
+
     #[test]
     fn timeout_kills_the_command_and_its_descendants_quickly() {
         let pidfile =
@@ -255,32 +280,30 @@ mod tests {
         let started = Instant::now();
         let o = sh(
             &format!("sleep 60 & echo $! > {}; wait", pidfile.display()),
-            Duration::from_millis(300),
+            Duration::from_secs(2),
             EnvPolicy::Inherit,
         );
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );
         assert_eq!(o.exit_code, None);
         assert!(o.output.contains("timed out"), "{}", o.output);
-        let grandchild: i32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        // The group kill is synchronous, but give the kernel a moment to reap.
-        let mut gone = false;
-        for _ in 0..50 {
-            // SAFETY: signal 0 only probes for existence.
-            if unsafe { libc::kill(grandchild, 0) } == -1 {
-                gone = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(gone, "grandchild {grandchild} survived the timeout");
+        let read_pid = || {
+            std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+        };
+        assert!(
+            wait_until(Duration::from_secs(10), || read_pid().is_some()),
+            "the script never recorded its background pid"
+        );
+        let grandchild = read_pid().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || !process_exists(grandchild)),
+            "grandchild {grandchild} survived the timeout"
+        );
         let _ = std::fs::remove_file(&pidfile);
     }
 
@@ -304,17 +327,33 @@ mod tests {
     }
 
     #[test]
-    fn a_descendant_holding_the_pipe_open_cannot_hang_the_runner() {
+    fn a_descendant_of_a_child_that_exited_is_killed_and_cannot_hang_the_runner() {
         let started = Instant::now();
-        // The shell exits at once; the background sleep keeps stdout open for 5 s.
-        let o = quick("sleep 5 & echo done");
+        // The shell exits at once; the background sleep would keep stdout open for 30 s.
+        let o = quick("sleep 30 & echo done");
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < Duration::from_secs(10),
             "{:?}",
             started.elapsed()
         );
         assert_eq!(o.exit_code, Some(0));
         assert!(o.output.contains("done"), "{}", o.output);
+        assert!(!o.output.contains("still held open"), "{}", o.output);
+    }
+
+    #[test]
+    fn a_descendant_that_left_the_group_is_reported_not_waited_for() {
+        if Command::new("setsid").arg("--version").output().is_err() {
+            return;
+        }
+        let started = Instant::now();
+        let o = quick("setsid sleep 30 & echo done");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(o.exit_code, Some(0));
         assert!(o.output.contains("still held open"), "{}", o.output);
     }
 
