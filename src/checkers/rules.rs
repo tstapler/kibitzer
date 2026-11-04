@@ -12,6 +12,8 @@ use crate::node_kind::{
 };
 use crate::scope::{FileKind, ScopeMap, Spread};
 
+mod conditional_smells;
+
 /// A function/method body spanning more lines than this is flagged by `long-function`.
 const LONG_FUNCTION_LINES: usize = 40;
 /// A function/method body whose control-flow nesting depth exceeds this is flagged by
@@ -64,6 +66,10 @@ const MAGIC_LITERAL_LOCAL_MIN_OCCURRENCES: usize = 4;
 const IDENTIFIER_LIKE_MAX_LEN: usize = 40;
 /// An `if`/`return`/ternary expression whose operator/call nesting depth reaches this is flagged.
 const EXTRACT_VARIABLE_NESTING_THRESHOLD: usize = 5;
+
+/// An `if`/ternary condition with at least this many logical operators is flagged by
+/// `decompose-conditional`; see `docs/syntax-rules.md`.
+const DECOMPOSE_CONDITIONAL_THRESHOLD: usize = 5;
 
 /// Method name suffixes whose calls follow the alternating key-value convention:
 ///   receiver.Method(message, key1, val1, key2, val2, …)
@@ -188,6 +194,24 @@ pub const CATALOG: &[RuleMeta] = &[
         id: "extract-variable",
         category: "readability",
         description: "An if/return/ternary expression nests 10+ binary/logical operators and function calls — Fowler's Extract Variable.",
+        default_severity: Severity::Advisory,
+    },
+    RuleMeta {
+        id: "decompose-conditional",
+        category: "readability",
+        description: "An if/ternary condition chains 5+ logical operators (&&/||/and/or) or ternaries — Fowler's Decompose Conditional.",
+        default_severity: Severity::Advisory,
+    },
+    RuleMeta {
+        id: "consolidate-conditional",
+        category: "design",
+        description: "2+ consecutive if statements each returning the same value with no else — Fowler's Consolidate Conditional Expression (Go).",
+        default_severity: Severity::Advisory,
+    },
+    RuleMeta {
+        id: "remove-control-flag",
+        category: "design",
+        description: "Boolean local written only with true/false inside a loop and read only in that loop's condition — Fowler's Remove Control Flag (Go).",
         default_severity: Severity::Advisory,
     },
 ];
@@ -1521,7 +1545,7 @@ impl Checker for SyntaxRulesChecker {
     }
 
     fn description(&self) -> &str {
-        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal, extract-variable (see docs/syntax-rules.md)"
+        "native syntactic rule catalog: long-function, deep-nesting, long-parameter-list, flag-argument, unreachable-code, replace-magic-literal, extract-variable, decompose-conditional, consolidate-conditional, remove-control-flag (see docs/syntax-rules.md)"
     }
 
     fn language(&self) -> Option<Language> {
@@ -1575,6 +1599,15 @@ impl Checker for SyntaxRulesChecker {
             return Ok(findings);
         }
         walk_dense_expressions(tree.root_node(), &cfg, src, &mut findings);
+        // After the generated-file guard on purpose: generated Go is full of repeated returns.
+        if self.lang == Language::Go {
+            conditional_smells::walk_go_conditional_smells(
+                tree.root_node(),
+                &cfg,
+                src,
+                &mut findings,
+            );
+        }
         let mut collector = LiteralCollector::default();
         walk_literals(tree.root_node(), &cfg, src, &mut collector);
         let mut excluded = resolve_excluded_constants(tree.root_node(), src, &collector.bound);
@@ -2214,8 +2247,21 @@ fn walk_dense_expressions(
     findings: &mut Vec<Finding>,
 ) {
     let dense = if is_branching_node(node, cfg) {
-        node.child_by_field_name("condition")
-            .map(|condition| ("condition", condition))
+        let condition = node.child_by_field_name("condition");
+        if let Some(condition) = condition {
+            let decisions = condition_decision_count(condition, cfg);
+            if decisions >= DECOMPOSE_CONDITIONAL_THRESHOLD {
+                findings.push(Finding {
+                    line: node.start_position().row + 1,
+                    message: format!(
+                        "[decompose-conditional] condition chains {decisions} logical operators/ternaries \
+                         (at or over {DECOMPOSE_CONDITIONAL_THRESHOLD}) — consider Fowler's Decompose Conditional \
+                         (https://refactoring.com/catalog/decomposeConditional.html)"
+                    ),
+                });
+            }
+        }
+        condition.map(|condition| ("condition", condition))
     } else if node.kind() == cfg.return_kind {
         Some(("return", node))
     } else {
@@ -2238,6 +2284,32 @@ fn walk_dense_expressions(
     for child in node.children(&mut cursor) {
         walk_dense_expressions(child, cfg, src, findings);
     }
+}
+
+/// Counts `&&`/`||`/`and`/`or` operators and ternaries in a condition, unlike
+/// `expression_nesting` which collapses a flat same-operator run to one level — a long
+/// flat chain is exactly what `decompose-conditional` targets. Skips closures/literals.
+// SEAM(typed-node-kind-migration): cfg fields stay &str, cross-grammar-shared, not migrated this pass — see ADR-001.
+fn condition_decision_count(node: Node, cfg: &LangRuleConfig) -> usize {
+    if cfg.density_boundary_kinds.contains(&node.kind()) {
+        return 0;
+    }
+    let is_logical = cfg.operator_kinds.contains(&node.kind())
+        && node
+            .child_by_field_name("operator")
+            .is_some_and(|op| LOGICAL_OPERATORS.contains(&op.kind()));
+    let is_ternary = Some(node.kind()) == cfg.ternary_kind;
+    // A nested ternary is its own branching node in `walk_dense_expressions`; counting its
+    // insides here too would report one smell twice.
+    if is_ternary {
+        return 1;
+    }
+    let own = usize::from(is_logical || is_ternary);
+    let mut cursor = node.walk();
+    own + node
+        .children(&mut cursor)
+        .map(|child| condition_decision_count(child, cfg))
+        .sum::<usize>()
 }
 
 /// An `if`/`elif`/ternary node, i.e. one carrying its own `condition` field that
@@ -4936,6 +5008,151 @@ mod tests {
             .into_iter()
             .filter(|f| f.message.contains("[extract-variable]"))
             .collect()
+    }
+
+    fn decompose_findings(
+        lang: Language,
+        ts_lang: tree_sitter::Language,
+        src: &str,
+    ) -> Vec<Finding> {
+        check_full(lang, ts_lang, src)
+            .into_iter()
+            .filter(|f| f.message.contains("[decompose-conditional]"))
+            .collect()
+    }
+
+    fn go_decompose(body: &str) -> Vec<Finding> {
+        decompose_findings(
+            Language::Go,
+            tree_sitter_go::LANGUAGE.into(),
+            &format!("package m\nfunc f() bool {{\n{body}\n\treturn false\n}}\n"),
+        )
+    }
+
+    #[test]
+    fn decompose_conditional_should_fire_when_condition_has_five_logical_operators() {
+        let f = go_decompose("\tif a && b && c && d && e && g {\n\t\treturn true\n\t}");
+        assert_eq!(f.len(), 1);
+        assert!(f[0].message.contains("5 logical"));
+    }
+
+    #[test]
+    fn decompose_conditional_should_count_mixed_and_nested_operators() {
+        let f = go_decompose("\tif (a || b) && (c || d) && (e || g) {\n\t\treturn true\n\t}");
+        assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn decompose_conditional_should_not_fire_below_threshold() {
+        assert!(go_decompose("\tif a && b && c && d && e {\n\t\treturn true\n\t}").is_empty());
+    }
+
+    #[test]
+    fn decompose_conditional_should_not_fire_on_comparisons_or_err_guard() {
+        assert!(go_decompose("\tif x > 0 {\n\t\treturn true\n\t}").is_empty());
+        assert!(go_decompose("\tif err != nil {\n\t\treturn true\n\t}").is_empty());
+    }
+
+    #[test]
+    fn decompose_conditional_should_not_fire_on_return_expression() {
+        assert!(go_decompose("\treturn a && b && c && d && e && g").is_empty());
+    }
+
+    #[test]
+    fn decompose_conditional_should_fire_for_python_and_or() {
+        let f = decompose_findings(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f():\n    if a and b and c or d or e or g:\n        return 1\n",
+        );
+        assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn decompose_conditional_should_fire_for_typescript_logical_chain() {
+        let f = decompose_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  if (a && b && c && d || e || g) {\n    return 1;\n  }\n}\n",
+        );
+        assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn description_and_catalog_include_all_three_conditional_rules() {
+        let desc = SyntaxRulesChecker::new(Language::Go)
+            .description()
+            .to_string();
+        for id in [
+            "decompose-conditional",
+            "consolidate-conditional",
+            "remove-control-flag",
+        ] {
+            assert!(desc.contains(id), "{id} missing from description");
+            assert!(
+                CATALOG.iter().any(|m| m.id == id),
+                "{id} missing from CATALOG"
+            );
+        }
+    }
+
+    const GO_SMELLS_BODY: &str = "func f(a, b, c bool) bool {\n\tif a {\n\t\treturn true\n\t}\n\tif b {\n\t\treturn true\n\t}\n\tdone := false\n\tfor !done {\n\t\tif c {\n\t\t\tdone = true\n\t\t}\n\t}\n\treturn false\n}\n";
+
+    #[test]
+    fn go_conditional_smells_fire_through_check_full() {
+        let src = format!("package m\n{GO_SMELLS_BODY}");
+        let f = check_full(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
+        for id in ["[consolidate-conditional]", "[remove-control-flag]"] {
+            assert!(
+                f.iter().any(|f| f.message.contains(id)),
+                "{id} missing: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_only_conditional_rules_do_not_fire_for_python_or_typescript() {
+        let py = check_full(
+            Language::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            "def f(a, b):\n    if a:\n        return 1\n    if b:\n        return 1\n    return 0\n",
+        );
+        let ts = check_full(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f(a, b) {\n  if (a) { return 1; }\n  if (b) { return 1; }\n  return 0;\n}\n",
+        );
+        for f in py.iter().chain(ts.iter()) {
+            assert!(
+                !f.message.contains("consolidate-conditional")
+                    && !f.message.contains("remove-control-flag"),
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decompose_conditional_should_count_nested_ternary_once() {
+        let f = decompose_findings(
+            Language::TypeScript,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "function f() {\n  if (a ? (b && c && d && e && g && h) : k) {\n    return 1;\n  }\n}\n",
+        );
+        assert!(f.len() <= 1, "{f:?}");
+    }
+
+    #[test]
+    fn conditional_smells_skip_generated_go_files() {
+        let src = format!(
+            "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage m\n{GO_SMELLS_BODY}"
+        );
+        let f = check_full(Language::Go, tree_sitter_go::LANGUAGE.into(), &src);
+        assert!(
+            f.iter()
+                .all(|f| !f.message.contains("consolidate-conditional")
+                    && !f.message.contains("remove-control-flag")),
+            "{f:?}"
+        );
     }
 
     #[test]
