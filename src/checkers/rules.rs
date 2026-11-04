@@ -198,7 +198,7 @@ pub const CATALOG: &[RuleMeta] = &[
     },
     RuleMeta {
         id: "decompose-conditional",
-        category: "complexity",
+        category: "readability",
         description: "An if/ternary condition chains 5+ logical operators (&&/||/and/or) or ternaries — Fowler's Decompose Conditional.",
         default_severity: Severity::Advisory,
     },
