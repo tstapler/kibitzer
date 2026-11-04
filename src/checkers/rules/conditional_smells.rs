@@ -118,7 +118,7 @@ fn is_bool_literal(node: Node) -> bool {
 /// Occurrences inside a closure the declaration is not itself in disqualify the flag:
 /// a captured flag (goroutine, deferred func) is not a plain loop exit.
 fn is_loop_exit_flag(all_occurrences: &[Node], decl_ident: Node, src: &[u8]) -> bool {
-    let mut occurrences: Vec<Node> = all_occurrences
+    let occurrences: Vec<Node> = all_occurrences
         .iter()
         .copied()
         .filter(|o| o.id() != decl_ident.id())
