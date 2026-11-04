@@ -283,8 +283,8 @@ fn walk(node: Node, src: &[u8], env: &Env, out: &mut Vec<NilCheck>) {
     }
 }
 
-/// Names a `for`/`switch` header introduces (initializer, range vars, type-switch alias);
-/// none of them is typed, so each only shadows an outer typed name.
+/// Names a `for`/`switch` header introduces. Range variables and a type-switch alias are
+/// untyped (they only shadow an outer typed name); initializers go through `declare_stmt`.
 fn declare_header(node: Node, src: &[u8], env: &mut Env) {
     if let Some(init) = node.child_by_field_name("initializer") {
         declare_stmt(init, src, env);
@@ -359,13 +359,14 @@ fn declare_params(list: Node, src: &[u8], env: &mut Env) {
         match GoKind::of(param) {
             GoKind::ParameterDeclaration => declare_typed(param, src, env),
             // `svc ...*Svc` is a slice, so the name is shadowed but not typed.
-            GoKind::VariadicParameterDeclaration => shadow_receiver_names(param, src, env),
+            GoKind::VariadicParameterDeclaration => shadow_param_names(param, src, env),
             _ => {}
         }
     }
 }
 
-fn shadow_receiver_names(param: Node, src: &[u8], env: &mut Env) {
+/// Shadows a parameter's names without typing them.
+fn shadow_param_names(param: Node, src: &[u8], env: &mut Env) {
     let mut names = param.walk();
     for name in param.children_by_field_name("name", &mut names) {
         bind(env, text(name, src), None);
@@ -376,10 +377,7 @@ fn shadow_receiver_names(param: Node, src: &[u8], env: &mut Env) {
 fn shadow_receiver(list: Node, src: &[u8], env: &mut Env) {
     let mut cursor = list.walk();
     for param in list.children(&mut cursor) {
-        let mut names = param.walk();
-        for name in param.children_by_field_name("name", &mut names) {
-            bind(env, text(name, src), None);
-        }
+        shadow_param_names(param, src, env);
     }
 }
 
@@ -571,6 +569,13 @@ mod tests {
     fn range_variable_shadows_a_typed_parameter() {
         let src = "package p\nfunc f(p *Pod, all []*Pod) {\n\tfor _, p := range all {\n\t\tif p != nil {\n\t\t\tp.Run()\n\t\t}\n\t}\n}\n";
         assert!(types(src).is_empty());
+    }
+
+    #[test]
+    fn range_assignment_does_not_shadow_a_typed_parameter() {
+        // `=` assigns the existing `p`; only `:=` declares a new one.
+        let src = "package p\nfunc f(p *Pod, all []*Pod) {\n\tfor _, p = range all {\n\t\tif p != nil {\n\t\t\tp.Run()\n\t\t}\n\t}\n}\n";
+        assert_eq!(types(src), ["Pod"]);
     }
 
     #[test]
