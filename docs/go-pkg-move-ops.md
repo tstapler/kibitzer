@@ -359,3 +359,12 @@ Go move engine, not `split_package`, so this hardening is covered by unit tests
 (`edit_paths_must_not_cross_a_symlink_out_of_the_repo`, the `guard` tests) rather than the
 backtest above. Policy still differs per engine on symlinks that stay inside the repo:
 `go_refactor` refuses any symlink crossing; `refactor` and `refactor_split` allow in-repo ones.
+
+**Hardening added after the first re-run.** `txn::Change` gained `expect_sha256`: the bytes read
+for the WAL backup must hash to the plan's `old_sha256`, so a file edited between the staleness
+check and the swap is refused (`changed since the plan was made`) instead of being backed up and
+overwritten. The WAL-recovery refusal now prints `cp`/`rm` commands to restore by hand. The
+backtest was re-run on this head: identical to the baseline again, 7 of 7 `applied`.
+Not done from the original follow-up list: moving the `cfg(test)` kill hook out of
+`Pending::drop` (the tests drive it through `apply` paths and a panic unwind, so a seam would
+have to be threaded through `ApplyOptions`; left as a separate change).
