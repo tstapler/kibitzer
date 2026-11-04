@@ -70,7 +70,7 @@ scratch directories in `backtest.rs`) are behavior-preserving, covered by the ex
 duplicate-code tests.
 
 **Transcript backtest**, `kibitzer check backtest introduce-special-case` (final build):
-4803 transcripts, 97 Go snapshots checked, 0 findings. The whole run shares one scratch
+4805 transcripts, 97 Go snapshots checked, 0 findings. The whole run shares one scratch
 index, so the threshold is reachable in principle; 97 snapshots of edited files is a small
 sample, so this shows silence on that sample, not recall.
 
@@ -91,7 +91,7 @@ scope. Three builds, same repos, same checkout:
 |---|---|---|
 | 1. first implementation (flat per-function declarations, any `x.Field` counts, no vendor or `test/` scope) | 14361 → 124 (30) | 746 → 3 (2) |
 | 2. `2eaf6cd` (+ vendor scope, `test/` dirs treated as tests) | 9975 → 46 (13) | 746 → 3 (2) |
-| 3. `96e8a8b` (+ block scoping, method calls only, receiver untyped) | 9975 → 9 (4) | 746 → 3 (2) |
+| 3. `96e8a8b` (+ block scoping, method calls only, receiver untyped); `c899421` (+ range/switch/variadic shadowing) produces identical output | 9975 → 9 (4) | 746 → 3 (2) |
 
 What removed findings, by type, between builds 2 and 3 (every build-2 finding was read in
 source): `v1.Pod` 11 → 1 and `v1.Node` 6 → 0 and `api.Pod` 1, `api.PodTemplateSpec` 3,
