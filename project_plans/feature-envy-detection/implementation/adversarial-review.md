@@ -1,0 +1,42 @@
+# Adversarial Review: feature-envy-detection
+
+**Date**: 2026-11-03
+**Verdict**: CONCERNS
+
+## Blockers
+
+- [ ] **Same-package type key format mismatch breaks Move Function dominant-type identification and threshold check** — `foreign_field_accesses_per_type` accumulates bare type names for same-package foreign types (e.g., `"Customer"`) because `foreign_type_of` in `god_class.rs` returns `local_type.to_string()` when the type name contains no `.` (lines 406–418 of `src/god_class.rs`). But `foreign_call_counts_per_type` always produces qualified keys (`edge.to.rsplit_once('.')` on a `"pkg::Type.Method"` value → `"pkg::Type"`). When the dominant foreign type is in the same package, the merge step in `feature_envy_findings_for_package` will produce two separate map entries — `"Customer" → 2` and `"pkg::Customer" → 3` — instead of one `"pkg::Customer" → 5` entry. Consequences: (a) `dominant_type` picks `"pkg::Customer"` with count 3 instead of 5, so the finding message reports a wrong access count; (b) the threshold test for Move Function uses split counts, so a method with 2+3 same-package-type accesses (threshold would pass at total=5) will only see the 3-call side pass `MIN_FOREIGN`, while the combined total is never computed correctly. Cross-package type keys resolve correctly on both sides (both produce `"pkg::TypeName"`), so this only affects intra-package feature envy — which is the most common and most actionable case. Recommendation: normalize both maps to the same key format before merging. For field_counts, prepend `"{package_path}::"` to bare names (the same package prefix already available from `PackageNode.path`). Confirm the fix against the GWT example in Story 2.1.2 (`"pkg::Pricer"`) and the GWT example in Story 2.1.1 (`"Customer"` in a same-package scenario).
+
+## Concerns
+
+- [ ] **`SymbolNode.is_pure_delegation` suppression omitted despite explicit pitfall recommendation** — `pitfalls.md`'s action-item table row 1 says: "Suppress by name suffix *and* by detecting single-expression delegation (reuse `SymbolNode.is_pure_delegation`)." The plan implements only the name-suffix half. A wrapper type named `httpRequestHandler`, `grpcTransport`, or anything else that delegates to a single field without advertising it in its type name will fire at ratio 1.0 on every method body. `SymbolNode.is_pure_delegation` is already pre-computed by `symbol_extract.rs` during model build at zero extra cost — skipping a method where `sym.is_pure_delegation` is `true` requires one boolean check. Recommendation: add `if sym.is_pure_delegation { continue; }` in the per-method loop in `feature_envy_findings_for_package`.
+
+- [ ] **Zero-own-access pure utility helpers pass `MIN_TOTAL` and fire — `methods_with_own_signal` pre-filter absent** — `pitfalls.md` §3 says: "Both `MIN_FOREIGN` and `MIN_TOTAL` are needed: `MIN_FOREIGN` alone does not catch a method with 6 foreign accesses and 0 own accesses that is in fact a pure utility helper." With `FEATURE_ENVY_MIN_TOTAL = 4`, a pure utility helper with 6 foreign accesses and 0 own (total = 6 ≥ 4) passes both guards and fires at ratio = 1.0. `pitfalls.md` explicitly recommends the `methods_with_own_signal` pattern from `architecture_checks.rs:867` as a pre-filter: skip a method if `ArchModel.field_accesses` has no `from == method_id` entry *and* `call_edges` has no intra-type call for the method. The plan's Risk Control table acknowledges this case ("Zero-own-access ratio inflation … `FEATURE_ENVY_MIN_TOTAL` guard: skip methods with `foreign + local < FEATURE_ENVY_MIN_TOTAL`") but `MIN_TOTAL` doesn't cover this — a method with 6 foreign and 0 own has total = 6, which exceeds 4. Recommendation: add a pre-filter that skips methods where `local_field_access_count` returns 0 and the method has no resolved outgoing calls to its own type. This matches what `methods_with_own_signal` does in `LcomChecker`.
+
+- [ ] **Missing FileCache stale-tree regression test** — `pitfalls.md` §4 says explicitly: "The regression test at `god_class.rs` lines 529–562 is the reference fixture. Feature Envy should have an identical regression test." The four test cases in Phase 4 (Story 4.1.1) cover threshold logic and suppression, but none exercises `FileCache` with two files where the second is shorter than the first. The stale-tree panic (`byte-index-out-of-bounds`) is easy to silently introduce and hard to catch without this specific regression. Recommendation: add a fifth test case modeled on `file_cache_parses_a_second_shorter_file_correctly_after_a_longer_first_one` in `src/feature_envy.rs` tests.
+
+- [ ] **`New*` constructor false positives accepted without documentation** — `pitfalls.md` §1 says: "The suppression path must handle `New*` and constructor-shaped methods explicitly, or accept they fire." The plan's Risk Control table claims "`New*` functions caught by `FEATURE_ENVY_MIN_FOREIGN` ≥ 3 (constructors rarely have 3+ distinct foreign field accesses)." This assumption doesn't hold for `New*` functions with 3+ parameters: `NewOrder(customer *Customer, pricer *Pricer, logger *Logger)` that sets each one's fields in the initializer body will access 3+ distinct foreign field pairs and fire. The `MIN_FOREIGN = 3` threshold is below PMD's `ATFD > 5` (which was itself calibrated against this pattern). The plan accepts this risk without documenting it in the checker's doc comment or the Non-goals section. Recommendation: either add `New*` prefix suppression to `feature_envy_findings_for_package` (a one-line check on `sym.name.starts_with("New")`), or explicitly document the known FP class in the checker's module-level doc comment and in the Non-goals section so the backtest triage team knows to expect it.
+
+## Minors
+
+- `walk_selectors_on_typed_locals` is promoted to `pub(crate)` in Phase 1, but `feature_envy.rs` only calls `collect_foreign_field_accesses` directly — `walk_selectors_on_typed_locals` is `collect_foreign_field_accesses`'s private implementation detail. Promoting it unnecessarily widens the crate's internal API. Only `collect_foreign_field_accesses` needs promotion.
+
+- Architecture research doc (`research/architecture.md` line 153) describes `FEATURE_ENVY_MIN_FOREIGN = 3` as "conservative relative to PMD's `ATFD > 5`." The relationship is backwards: 3 < 5, so this threshold is more aggressive (fires more) than PMD, not more conservative. The reasoning in the plan summary reflects this confusion. The threshold value is a defensible choice, but the stated rationale misrepresents it.
+
+- Test-helper packages (`testutil/`, `testing/`, `fake/` subdirectories) that aren't `_test.go` files are not suppressed. `pitfalls.md` §1 identifies this as a known FP class: "a shared test-helper package that isn't itself a `_test.go` file won't be caught." This is distinct from the `is_test_file` guard the plan implements. The impact depends on corpus composition — record it in the validation artifact (Phase 5) rather than blocking.
+
+---
+
+## Re-Review: Blocker Check (2026-11-03, iteration 2)
+
+**Blocker under review**: Same-package type key format mismatch — `foreign_field_accesses_per_type` returned bare names (e.g., `"Customer"`) while `foreign_call_counts_per_type` returned qualified names (`"pkg::Customer"`), causing the merge to split counts and break dominant-type identification.
+
+**Required fix**: normalize `field_counts` keys to fully qualified form before merging; add a GWT test for same-package type normalization.
+
+**Findings**:
+
+- **Task 2.2.1c** — RESOLVED. Plan.md step 3b now includes an explicit bullet "**Normalize `field_counts` keys** (required)" that specifies qualifying any bare key (no `::`) to `"{pkg}::{key}"` using the method's own package name before merging with `call_counts`. Cross-package keys (already containing `::`) pass through unchanged. The rationale and mechanism are stated inline.
+
+- **Task 4.1.1a** — RESOLVED. A fifth test case "**Same-package foreign type key normalization**" has been added. It specifies a method with 3 field accesses (bare `"Customer"`) plus 2 call-counts (`"pkg::Customer"`) plus 1 local access; asserts they merge to 5 under `"pkg::Customer"`; and explicitly states that the finding is absent without normalization, making the test load-bearing.
+
+**Verdict**: RESOLVED. The blocker is closed. The original CONCERNS from iteration 1 remain open (is_pure_delegation suppression, zero-own-access pre-filter, FileCache regression test, New* constructor documentation) and must be addressed or accepted before shipping.
