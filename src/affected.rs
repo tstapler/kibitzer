@@ -390,7 +390,7 @@ fn detect_package_clause_changes(
 /// Inverts `edges` (`from -> to`) into `to -> {from}` — the reverse adjacency
 /// `reverse_bfs` walks. A `BTreeSet` value both dedupes multi-edge pairs (two import
 /// statements between the same two packages) and gives deterministic iteration order.
-fn build_reverse_adjacency(edges: &[ImportEdge]) -> BTreeMap<&str, BTreeSet<&str>> {
+pub(crate) fn build_reverse_adjacency(edges: &[ImportEdge]) -> BTreeMap<&str, BTreeSet<&str>> {
     let mut map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for edge in edges {
         map.entry(edge.to.as_str())
@@ -405,7 +405,7 @@ fn build_reverse_adjacency(edges: &[ImportEdge]) -> BTreeMap<&str, BTreeSet<&str
 /// always included in the result — a changed package is always "affected," even with no
 /// importers at all. Terminates on a cyclic import graph (an explicit `visited` set is
 /// carried from the first step, not bolted on after the fact).
-fn reverse_bfs(
+pub(crate) fn reverse_bfs(
     adjacency: &BTreeMap<&str, BTreeSet<&str>>,
     seeds: &BTreeSet<String>,
 ) -> BTreeSet<String> {

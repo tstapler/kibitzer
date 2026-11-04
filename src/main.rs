@@ -56,6 +56,7 @@ mod run_context;
 mod schema;
 mod scope;
 mod single_call_site_delegation;
+mod split_sim;
 mod status;
 mod symbol_extract;
 mod task_stop;
@@ -332,6 +333,28 @@ enum ArchitectureAction {
         /// The base ref (branch, tag, or SHA) to diff the working tree against.
         #[arg(long)]
         base: String,
+    },
+    /// Read-only what-if for splitting one Go package into several: reports import cycles
+    /// the split would create, identifiers that would need exporting, callers to rewrite,
+    /// hard blockers (init(), build tags, cgo, shared unexported state), and before/after
+    /// distinct-package reverse-dependency counts. Abstains (with a reason) rather than
+    /// guessing when the model can't support an answer. Advisory, not a gate: exits 0 even
+    /// for an infeasible split. See also `kibitzer check go-package-focus`.
+    ///
+    /// `--partition NAME=file1.go,file2.go` (repeat per part; file names must not contain
+    /// `,` or `=`). Files are repo-root-relative or relative to the package directory.
+    SplitSim {
+        /// Package key as it appears in the model (the Go import path).
+        package: String,
+        /// One part: `NAME=file1.go,file2.go`. Repeat for each part (at least two).
+        #[arg(long = "partition", required = true)]
+        partitions: Vec<String>,
+        /// Directory to model (the Go module root); partition files are relative to it.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// `json` (machine-readable) or `text`.
+        #[arg(long, default_value = "json")]
+        format: String,
     },
 }
 
@@ -715,6 +738,12 @@ fn main() -> Result<ExitCode> {
             }
             ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
             ArchitectureAction::Affected { path, base } => run_affected(&path, &base),
+            ArchitectureAction::SplitSim {
+                package,
+                partitions,
+                path,
+                format,
+            } => run_split_sim(&path, &package, &partitions, &format),
         },
         Command::Go { action } => match action {
             GoAction::BuildCost { dir } => run_go_build_cost(&dir),
@@ -1016,6 +1045,29 @@ fn run_affected(path: &Path, base: &str) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `kibitzer architecture split-sim`: see `split_sim`. Builds the model with private symbols
+/// included — the exported-surface delta and shared-state detection need them.
+fn run_split_sim(
+    path: &Path,
+    package: &str,
+    partitions: &[String],
+    format: &str,
+) -> Result<ExitCode> {
+    let specs = split_sim::parse_partition_flags(partitions)?;
+    let repo_root = path.to_path_buf();
+    let files = check::walk_and_collect_files(&repo_root)
+        .with_context(|| format!("walking {}", repo_root.display()))?;
+    let model = check::build_arch_model_for_check(&repo_root, &files, true)
+        .with_context(|| format!("building architecture model for {}", repo_root.display()))?;
+    let result = split_sim::run(&model, package, &specs, &split_sim::SplitSimOpts::default());
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result)?),
+        "text" => print!("{}", split_sim::render_text(&result)),
+        other => anyhow::bail!("unknown --format '{other}' (expected json or text)"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Covers every language `duplicate-code` (single-file) covers — see

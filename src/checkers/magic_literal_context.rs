@@ -65,14 +65,15 @@ pub(super) fn structural_exclusions(
     for occ in occurrences.values().flatten() {
         let node = occ.node;
         let numeric = numeric_kinds.contains(&occ.kind);
+        // Test *files* skip strings only (numerics there get a raised floor instead); a Rust
+        // `cfg(test)` region skips both, so its fixtures don't count toward production totals.
         let skip = in_attribute(node)
             || (numeric && in_numeric_data_row(node, numeric_kinds, &mut row_verdicts))
-            || (!numeric
-                && test_strings.is_some_and(|in_test_file| {
-                    in_test_file
-                        || *file_is_cfg_test.get_or_insert_with(|| root_is_cfg_test(node, src))
-                        || in_cfg_test_item(node, src)
-                }));
+            || test_strings.is_some_and(|in_test_file| {
+                (in_test_file && !numeric)
+                    || *file_is_cfg_test.get_or_insert_with(|| root_is_cfg_test(node, src))
+                    || in_cfg_test_item(node, src)
+            });
         if skip {
             excluded.insert(node.id());
         }
@@ -510,5 +511,27 @@ mod tests {
         assert_eq!(count(Language::Go, "api.pb.go", &src), 0);
         let hand_written = src.replace("Code generated", "Hand written");
         assert_eq!(count(Language::Go, "api.go", &hand_written), 1);
+    }
+
+    #[test]
+    fn rust_numerics_should_NotCount_When_InsideCfgTestItem() {
+        let body = "    let a = 1e-12;\n    let b = 1e-12;\n    let c = 1e-12;\n";
+        let prod = format!("fn f() {{\n{body}}}\n");
+        let test = format!("#[cfg(test)]\nmod t {{\n    fn f() {{\n{body}    }}\n}}\n");
+        assert_eq!(count(Language::Rust, "a.rs", &prod), 1);
+        assert_eq!(count(Language::Rust, "a.rs", &test), 0);
+        // Two production uses plus one in tests must not cross the threshold of 3.
+        let mixed = format!("fn f() {{\n    let a = 1e-12;\n    let b = 1e-12;\n}}\n{test}");
+        assert_eq!(count(Language::Rust, "a.rs", &mixed), 0);
+    }
+
+    #[test]
+    fn rust_half_and_format_placeholders_should_NotBeFlagged() {
+        assert_eq!(
+            count(Language::Rust, "a.rs", &repeated(Language::Rust, "0.5", 5)),
+            0
+        );
+        let fmt = "fn f(p: u8) {\n    let a = format!(\"{p}\");\n    let b = format!(\"{p}\");\n    let c = format!(\"{p}\");\n}\n";
+        assert_eq!(count(Language::Rust, "a.rs", fmt), 0);
     }
 }

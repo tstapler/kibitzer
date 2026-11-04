@@ -1,0 +1,78 @@
+{
+  "package": "ex.com/ss/lib",
+  "abstained": null,
+  "feasible": false,
+  "parts": {
+    "P1": [
+      "lib/a.go"
+    ],
+    "P2": [
+      "lib/b.go"
+    ]
+  },
+  "cycles": [],
+  "exported_surface_delta": {
+    "must_export": [],
+    "already_exported": [],
+    "part_local_unexported": []
+  },
+  "callers_to_rewrite": [],
+  "blockers": [
+    {
+      "kind": "method_separated_from_receiver_type",
+      "severity": "hard",
+      "file": "lib/b.go",
+      "line": 3,
+      "part": "P2",
+      "detail": "method ex.com/ss/lib::Store.Inc is in a different part than its receiver type ex.com/ss/lib::Store (lib/a.go)"
+    },
+    {
+      "kind": "shared_unexported_state",
+      "severity": "hard",
+      "file": "lib/b.go",
+      "line": 4,
+      "part": "P2",
+      "detail": "unexported field Store.mu (declared in part P1) is accessed from part P2"
+    },
+    {
+      "kind": "shared_unexported_state",
+      "severity": "hard",
+      "file": "lib/b.go",
+      "line": 5,
+      "part": "P2",
+      "detail": "unexported field Store.n (declared in part P1) is accessed from part P2"
+    }
+  ],
+  "reverse_dep_impact": {
+    "before": {
+      "node": "ex.com/ss/lib",
+      "direct": 0,
+      "transitive": 0,
+      "transitive_packages": []
+    },
+    "after": [
+      {
+        "node": "ex.com/ss/lib#P1",
+        "direct": 0,
+        "transitive": 0,
+        "transitive_packages": []
+      },
+      {
+        "node": "ex.com/ss/lib#P2",
+        "direct": 0,
+        "transitive": 0,
+        "transitive_packages": []
+      }
+    ]
+  },
+  "coverage": {
+    "private_symbols_skipped": 0,
+    "generated_files_skipped": 0,
+    "unresolved_call_sites_in_package": 2,
+    "notes": [
+      "Shared-state detection is syntactic (unexported fields accessed across parts, package-level locks); sharing through parameters, interface fields or unexported types is not detected.",
+      "Package-level var/const uses are found by identifier match, not name resolution; a shadowing local is miscounted.",
+      "Every part is assumed to become a new package path; importers are attributed to the parts whose symbols they call, and importers with no attributable use are assumed to need every part."
+    ]
+  }
+}

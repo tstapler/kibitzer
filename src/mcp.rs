@@ -168,6 +168,17 @@ struct GetArchitectureNodeRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+struct SplitSimRequest {
+    /// Directory to model (the Go module root); partition files are relative to it.
+    path: String,
+    /// Package key as it appears in the architecture model (the Go import path).
+    package: String,
+    /// The proposed parts: at least two `{name, files}` objects covering every file of the
+    /// package exactly once. File names are relative to `path` or to the package directory.
+    partitions: Vec<crate::split_sim::PartitionSpec>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct ListRefactorOperationsRequest {
     /// Any path inside the repo to query (the repo root or a subdirectory).
     path: String,
@@ -1442,6 +1453,35 @@ impl KibitzerServer {
     }
 
     #[tool(
+        description = "Read-only what-if for splitting one Go package into several: given a \
+                        partition of its files, returns JSON with import cycles the split would \
+                        create (production vs test-only), identifiers that must be exported, \
+                        callers to rewrite, hard blockers (init(), build tags, cgo, shared \
+                        unexported state), before/after distinct-package reverse-dependency \
+                        counts, and coverage diagnostics. Abstains with a reason instead of \
+                        guessing. Advisory: shared-state detection is syntactic and may miss \
+                        indirect sharing. Edits nothing."
+    )]
+    async fn split_sim(&self, req: Parameters<SplitSimRequest>) -> String {
+        let req = req.0;
+        // `path` is the Go module root itself (same contract as the CLI), deliberately not
+        // walked up to the enclosing repo root like the other tools.
+        let repo_root = PathBuf::from(&req.path);
+        let model = match self.load_model_off_stack(repo_root, true).await {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
+        };
+        let result = crate::split_sim::run(
+            &model,
+            &req.package,
+            &req.partitions,
+            &crate::split_sim::SplitSimOpts::default(),
+        );
+        serde_json::to_string(&result)
+            .unwrap_or_else(|e| json_error(format!("error serializing response: {e}")))
+    }
+
+    #[tool(
         description = "Rank mechanical refactors worth considering (currently split_package for \
                         packages in an import cycle) — read-only. JSON ({suggestions, abstained, \
                         truncated}); each suggestion carries evidence, feasibility from a \
@@ -1770,7 +1810,9 @@ impl ServerHandler for KibitzerServer {
                  model instead of a whole-repo report, use list_architecture_symbols (a \
                  paginated, filtered symbol slice), get_architecture_node (one package or \
                  symbol by exact reference), or list_callers/list_callees (function-level \
-                 call-graph traversal, Go/TS/JS only) — all four return JSON, not prose. If a \
+                 call-graph traversal, Go/TS/JS only) — all four return JSON, not prose. To check \
+                 whether a proposed Go package split is feasible before editing anything, call \
+                 split_sim. If a \
                  check fires on an edit that didn't actually introduce the problem it claims, \
                  call report_false_positive instead of just noting it in the transcript. To \
                  dismiss a finding you judged acceptable, add a `kibitzer:ignore <rule> -- \
@@ -3325,6 +3367,12 @@ mod tests {
     }
 
     #[test]
+    fn split_sim_tool_is_registered_in_the_router() {
+        let tools = KibitzerServer::tool_router().list_all();
+        assert!(tools.iter().any(|t| t.name == "split_sim"));
+    }
+
+    #[test]
     fn list_architecture_symbols_tool_description_mentions_json_and_contrasts_assessment() {
         let router = KibitzerServer::tool_router();
         let tools = router.list_all();
@@ -3335,6 +3383,28 @@ mod tests {
         let desc = tool.description.as_ref().expect("has a description");
         assert!(desc.contains("JSON"), "got: {desc}");
         assert!(desc.contains("architecture_assessment"), "got: {desc}");
+    }
+
+    #[tokio::test]
+    async fn split_sim_tool_returns_json_for_a_fixture_split() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/split-sim/cycle-creating"
+        );
+        let server = KibitzerServer::new();
+        let output = server
+            .split_sim(Parameters(SplitSimRequest {
+                path: path.to_string(),
+                package: "ex.com/ss/lib".to_string(),
+                partitions: serde_json::from_str(
+                    r#"[{"name":"P1","files":["a.go"]},{"name":"P2","files":["b.go"]}]"#,
+                )
+                .unwrap(),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(json["feasible"], false, "got: {json}");
+        assert_eq!(json["cycles"][0]["severity"], "production", "got: {json}");
     }
 
     #[tokio::test]
