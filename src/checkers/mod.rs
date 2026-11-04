@@ -29,6 +29,7 @@ pub mod primitive_obsession;
 pub mod repetitive_sentences;
 pub mod rules;
 pub mod sentence_length_uniformity;
+pub mod split_loop;
 pub mod test_no_assertion;
 
 /// True for common test-file naming conventions across supported languages. Expects a

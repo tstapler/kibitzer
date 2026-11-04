@@ -23,6 +23,7 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("duplicate-code", "x.go", go_triplicated_block),
     ("duplicate-code-cross-file", "c.go", cross_file_block),
     ("go-ignored-error", "x.go", go_ignored_error),
+    ("split-loop-go", "x.go", go_split_loop),
     ("go-error-context", "x.go", go_error_context),
     ("go-type-switch-density", "x.go", go_type_switch),
     ("go-encapsulate-collection", "x.go", go_slice_getter),
@@ -180,6 +181,10 @@ fn cross_file_block() -> String {
 
 fn go_ignored_error() -> String {
     "package main\n\nfunc f() (int, error) { return 0, nil }\n\nfunc g() {\n\tresult, _ := f()\n\t_ = result\n}\n".into()
+}
+
+fn go_split_loop() -> String {
+    "package main\n\nfunc f(items []int) {\n\tvar a, b int\n\tfor _, v := range items {\n\t\ta += v\n\t\tb += len(items)\n\t}\n\t_, _ = a, b\n}\n".into()
 }
 
 fn go_error_context() -> String {

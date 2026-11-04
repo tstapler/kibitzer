@@ -881,6 +881,7 @@ fn go_exception_checks() -> Vec<Check> {
         native_check("go-ignored-error", Severity::Advisory, &["**/*.go"]),
         native_check("go-error-context", Severity::Advisory, &["**/*.go"]),
         native_check("go-type-switch-density", Severity::Advisory, &["**/*.go"]),
+        native_check("split-loop-go", Severity::Advisory, &["**/*.go"]),
         native_check(
             "go-encapsulate-collection",
             Severity::Advisory,
