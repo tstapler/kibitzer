@@ -129,12 +129,71 @@ fn is_loop_exit_flag(body: Node, name: &str, decl_ident: Node, src: &[u8]) -> bo
         let loops = enclosing_loops_with_condition_containing(*read);
         candidates.retain(|c| loops.iter().any(|l| l.id() == c.id()));
     }
-    candidates.iter().any(|l| {
-        decl_ident.end_byte() <= l.start_byte()
-            && writes
-                .iter()
-                .all(|w| contains(*l, *w) && !inside_switch_or_select(*w, *l))
-    })
+    // One written value only: a flag reset and re-set each iteration (`again = false` ...
+    // `again = true`) is a repeat-until-stable idiom, not an early exit.
+    let single_value = writes
+        .iter()
+        .filter_map(|w| literal_written(*w, src))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == 1;
+    single_value
+        && candidates.iter().any(|l| {
+            decl_ident.end_byte() <= l.start_byte()
+                && writes.iter().all(|w| {
+                    contains(*l, *w)
+                        && !inside_switch_or_select(*w, *l)
+                        && exits_iteration_after(*w, *l)
+                })
+        })
+}
+
+fn literal_written<'a>(ident: Node, src: &'a [u8]) -> Option<&'a str> {
+    let assign = ident.parent()?.parent()?;
+    assign
+        .child_by_field_name("right")
+        .and_then(sole_named_child)?
+        .utf8_text(src)
+        .ok()
+}
+
+/// True when nothing runs after the flag write in its iteration except a `break`/`continue`
+/// — otherwise a direct `break` would skip code the flag version still executes.
+fn exits_iteration_after(write_ident: Node, loop_node: Node) -> bool {
+    let Some(mut cur) = write_ident
+        .parent()
+        .and_then(|p| p.parent())
+        .filter(|a| a.kind() == "assignment_statement")
+    else {
+        return false;
+    };
+    let mut first = true;
+    while cur.id() != loop_node.id() {
+        let Some(parent) = cur.parent() else {
+            return false;
+        };
+        if matches!(parent.kind(), "block" | "statement_list") {
+            let mut later = Vec::new();
+            let mut sib = cur.next_named_sibling();
+            while let Some(n) = sib {
+                if !is_comment(n) {
+                    later.push(n);
+                }
+                sib = n.next_named_sibling();
+            }
+            let only_exit = later.len() == 1
+                && matches!(later[0].kind(), "break_statement" | "continue_statement");
+            if !(later.is_empty() || (first && only_exit)) {
+                return false;
+            }
+            if first && only_exit {
+                return true;
+            }
+        }
+        first = false;
+        cur = parent;
+    }
+    true
 }
 
 /// A write inside a `switch`/`select` nested in the loop: a bare `break` there only leaves
@@ -392,6 +451,28 @@ mod tests {
     fn remove_control_flag_should_not_fire_when_flag_read_inside_loop_body() {
         let f = flag("done := false\nfor !done {\n\tif done {\n\t\tbreak\n\t}\n\tdone = true\n}");
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn remove_control_flag_should_not_fire_when_flag_is_reset_and_set_each_iteration() {
+        let f = flag(
+            "again := true\nfor again {\n\tagain = false\n\tif x() {\n\t\tagain = true\n\t}\n}",
+        );
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn remove_control_flag_should_not_fire_when_code_runs_after_the_write() {
+        let f = flag("done := false\nfor !done {\n\tif x() {\n\t\tdone = true\n\t}\n\tg()\n}");
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn remove_control_flag_should_fire_when_write_is_followed_only_by_continue() {
+        let f = flag(
+            "done := false\nfor !done {\n\tif x() {\n\t\tdone = true\n\t\tcontinue\n\t}\n\tg()\n}",
+        );
+        assert_eq!(f.len(), 1);
     }
 
     #[test]
