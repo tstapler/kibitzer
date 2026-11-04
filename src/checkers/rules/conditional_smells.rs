@@ -1,6 +1,6 @@
 //! Go conditional-logic smells for `SyntaxRulesChecker`: `remove-control-flag` and
 //! `consolidate-conditional` (`decompose-conditional` is cross-grammar and lives beside
-//! `extract-variable` in `walk_dense_expressions`). See `docs/conditional-logic-smells.md`.
+//! `extract-variable` in `walk_dense_expressions`). See `docs/syntax-rules.md`.
 
 use super::*;
 
@@ -218,11 +218,16 @@ fn loop_condition(for_stmt: Node) -> Option<Node> {
         match child.kind() {
             "for_clause" => return child.child_by_field_name("condition"),
             "range_clause" => return None,
+            "comment" => {}
             _ if Some(child.id()) != body_id => return Some(child),
             _ => {}
         }
     }
     None
+}
+
+fn is_comment(node: Node) -> bool {
+    node.kind() == "comment"
 }
 
 fn contains(outer: Node, inner: Node) -> bool {
@@ -242,7 +247,7 @@ fn check_block_for_duplicate_returns(
     let mut cursor = container.walk();
     let mut after_comment = false;
     for stmt in container.named_children(&mut cursor) {
-        if stmt.kind().contains("comment") {
+        if is_comment(stmt) {
             after_comment = true;
             continue;
         }
@@ -299,7 +304,7 @@ fn single_return_if(stmt: Node, cfg: &LangRuleConfig, src: &[u8]) -> Option<Stri
     let mut cursor = container.walk();
     let mut stmts = container
         .named_children(&mut cursor)
-        .filter(|c| !c.kind().contains("comment"));
+        .filter(|c| !is_comment(*c));
     let ret = stmts.next().filter(|s| s.kind() == cfg.return_kind)?;
     if stmts.next().is_some() || contains_call(condition, cfg) {
         return None;
@@ -321,7 +326,7 @@ fn single_return_if(stmt: Node, cfg: &LangRuleConfig, src: &[u8]) -> Option<Stri
 /// A commented guard documents its own reason, so merging it would lose that explanation.
 fn has_comment(node: Node) -> bool {
     let mut cursor = node.walk();
-    node.kind().contains("comment") || node.children(&mut cursor).any(has_comment)
+    is_comment(node) || node.children(&mut cursor).any(has_comment)
 }
 
 fn contains_call(node: Node, cfg: &LangRuleConfig) -> bool {

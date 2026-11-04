@@ -68,7 +68,7 @@ const IDENTIFIER_LIKE_MAX_LEN: usize = 40;
 const EXTRACT_VARIABLE_NESTING_THRESHOLD: usize = 5;
 
 /// An `if`/ternary condition with at least this many logical operators is flagged by
-/// `decompose-conditional`; confirmed by the backtest in `docs/conditional-logic-smells.md`.
+/// `decompose-conditional`; see `docs/syntax-rules.md`.
 const DECOMPOSE_CONDITIONAL_THRESHOLD: usize = 5;
 
 /// Method name suffixes whose calls follow the alternating key-value convention:
@@ -5063,7 +5063,7 @@ mod tests {
     }
 
     #[test]
-    fn decompose_conditional_should_fire_for_typescript_ternary_chain() {
+    fn decompose_conditional_should_fire_for_typescript_logical_chain() {
         let f = decompose_findings(
             Language::TypeScript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
