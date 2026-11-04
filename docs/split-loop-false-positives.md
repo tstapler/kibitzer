@@ -1,4 +1,22 @@
-# split-loop-go: known false positives
+# split-loop-go: opt-in check and known false positives
+
+`split-loop-go` is **opt-in**: it is not in `default_checks()` because the corpus backtest
+measured ~92% false positives (`project_plans/split-loop-check/backtest-results.md`).
+Enable it per repo by adding it to `.kibitzer/inspect.json`'s `checks` array (the general
+pattern is in `docs/suppressing-checks.md`):
+
+```json
+{
+  "checks": [
+    {
+      "name": "split-loop-go",
+      "checker": "split-loop-go",
+      "severity": "advisory",
+      "scope": ["**/*.go"]
+    }
+  ]
+}
+```
 
 `split-loop-go` flags a Go `for` loop whose body advances two or more accumulators that
 don't reference each other. Measured on a labeled corpus sample, most findings are false

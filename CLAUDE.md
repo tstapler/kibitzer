@@ -15,8 +15,7 @@ this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 `duplicate-code-cross-file`, `parameter-object` (`docs/parameter-object-false-positives.md`), `file-complexity`, `inline-ignore` (reports
 malformed `kibitzer:ignore` directives; the directives themselves are applied to
 every checker's findings, see `docs/suppressing-checks.md`), the Go-specific
-`go-blank-imports`/`go-ignored-error`/`go-error-context`, `split-loop-go`
-(`docs/split-loop-false-positives.md`), and the mechanical
+`go-blank-imports`/`go-ignored-error`/`go-error-context`, and the mechanical
 markdown-prose checks `repetitive-sentence-structure`/`missing-paragraph-break`
 (see `docs/prose-checks.md`, which also covers five backtested-but-opt-in
 prose checks and how to wire in Vale for configurable, project-specific
