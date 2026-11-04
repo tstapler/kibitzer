@@ -54,4 +54,24 @@ fn ignore_directive_at_the_write_site_suppresses_the_finding() {
     );
     let output = run(&dir);
     assert!(!output.contains(FINDING), "{output}");
+
+    let undirected = module(
+        "ev-not-ignored",
+        "package b\n\nimport \"example.com/m/a\"\n\nfunc F(x *a.T) {\n\tx.Field = 1\n}\n",
+    );
+    assert!(
+        run(&undirected).contains(FINDING),
+        "same body without the directive must fire"
+    );
+}
+
+#[test]
+fn same_package_write_is_not_reported() {
+    let dir = module("ev-same-pkg", "package b\n");
+    std::fs::write(
+        dir.join("a/use.go"),
+        "package a\n\nfunc F(x *T) {\n\tx.Field = 1\n}\n\nfunc G() {\n\tt := &T{}\n\tt.Field = 2\n}\n",
+    )
+    .unwrap();
+    assert!(!run(&dir).contains(FINDING));
 }

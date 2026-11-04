@@ -48,8 +48,12 @@ impl ArchModelChecker for EncapsulateVariableChecker {
     }
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
-        let mut edges = model.field_accesses.clone();
-        edges.extend(cross_package_write_edges(model));
+        let edges: Vec<FieldAccessEdge> = model
+            .field_accesses
+            .iter()
+            .cloned()
+            .chain(cross_package_write_edges(model))
+            .collect();
         drop_inline_ignored(findings_for_edges(&edges, &model.repo_root))
     }
 }
@@ -60,6 +64,7 @@ fn cross_package_write_edges(model: &ArchModel) -> Vec<FieldAccessEdge> {
         .values()
         .flat_map(|pkg| pkg.files.iter().map(move |file| (pkg, file)))
         .filter(|(_, file)| file.extension().is_some_and(|e| e == "go"))
+        .filter(|(_, file)| !is_test_file(file.strip_prefix(&model.repo_root).unwrap_or(file)))
         .flat_map(|(pkg, file)| cross_package_write_edges_in_file(model, &pkg.path, file))
         .collect()
 }
@@ -108,7 +113,10 @@ fn findings_for_edges(edges: &[FieldAccessEdge], repo_root: &std::path::Path) ->
 }
 
 /// Architecture checks bypass the per-file inline-ignore pass, so honor
-/// `kibitzer:ignore encapsulate-variable` at the write site here.
+/// `kibitzer:ignore encapsulate-variable` at the write site here (required by the item's
+/// AC-9). Checker-local on purpose, not a dispatcher change: other architecture checks
+/// deliberately don't take directives. Always `Advisory` and a default context — it only
+/// matches directives, never changes severity.
 fn drop_inline_ignored(findings: Vec<ArchFinding>) -> Vec<ArchFinding> {
     use crate::inline_ignores::{IgnoreTarget, InlineIgnoreContext, apply_inline_ignores};
     use std::collections::BTreeMap;
@@ -233,6 +241,16 @@ mod tests {
     #[test]
     fn cross_package_read_is_not_flagged() {
         assert!(run(&[edge("b::U.M", "a::T.Field", AccessKind::Read)]).is_empty());
+    }
+
+    #[test]
+    fn default_allowlist_keeps_the_nine_required_suffixes() {
+        for s in [
+            "Config", "Options", "Opts", "Params", "Args", "Request", "Response", "Settings",
+            "Result",
+        ] {
+            assert!(DTO_SUFFIXES.contains(&s), "{s} dropped from DTO_SUFFIXES");
+        }
     }
 
     #[test]

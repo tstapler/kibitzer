@@ -42,10 +42,15 @@ Not established: a full-corpus true-positive rate. Remaining noise is "filling a
 another API package"; a per-package scope (e.g. skip declaring packages named `*/api/*`,
 `*/apis/*`) is a candidate follow-up, not done here.
 
-### Second corpus repos (same build, run-2 allowlist)
+### Second corpus repo and extra Go repos (same build, run-2 allowlist)
+
+`docs/backtest-repos.md` lists only two Go repos: kubernetes and `stapler-squad`;
+`BurntSushi/ripgrep` and the other corpus repos are not Go, so this Go-only check does not
+apply to them. caddy and casbin were run in addition.
 
 | Repo | Findings | Reading |
 |------|----------|---------|
+| tstapler/stapler-squad (corpus) | 107 | Types by count: `BacklogItemUpdate` 21, `ReviewItem` 18, `Rule` 15, `PipelineModeContentFields` 9, `ProfileDefaults` 8, `ItemSourceUpdate` 6, ... — update/input/payload structs filled by callers, i.e. mostly data-shaped types; individual findings were not opened, so true-positive count is unknown. |
 | caddyserver/caddy | 80 | 25 shown (every other line) all in `caddyconfig/httpcaddyfile`: the Caddyfile adapter filling `caddytls.*`/`caddyhttp.*` JSON-config structs (`ACMEIssuer.Challenges`, `Server.AutoHTTPS`, `TLS.Automation`, ...) — config-builder pattern, judged false positives from the finding text. Lines 26+ not read. |
 | casbin/casbin | 10 | All 10 in `util_log.go`: `Enforcer` filling `log.LogEntry` fields (`Subject`, `Object`, `RuleCount`, `Error`, ...) — a plain log record, judged false positive. |
 
