@@ -1,6 +1,7 @@
 # split-loop-go backtest results
 
-Build: release binary at commit `61b414c`. Findings below are as-run; labels are one
+Build: release binary at commit `61b414c`; counts re-confirmed identical (34 findings,
+29,516 files) after the sdd:6-verify fixes. Findings below are as-run; labels are one
 reviewer's reading of the loop body (not a second opinion).
 
 ## 1. Transcript backtest (AC 7)

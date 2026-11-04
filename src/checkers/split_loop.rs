@@ -56,17 +56,17 @@ inventory::submit! {
 }
 
 fn visit(node: Node, src: &[u8], out: &mut Vec<Finding>) {
-    if GoKind::of(node) == GoKind::ForStatement {
-        if let Some(names) = independent_accumulators(node, src) {
-            out.push(Finding {
-                line: node.start_position().row + 1,
-                message: format!(
-                    "[split-loop-go] loop advances independent accumulators ({}) — \
-                     Fowler's Split Loop: consider one loop per accumulator group",
-                    names.join(", ")
-                ),
-            });
-        }
+    if GoKind::of(node) == GoKind::ForStatement
+        && let Some(names) = independent_accumulators(node, src)
+    {
+        out.push(Finding {
+            line: node.start_position().row + 1,
+            message: format!(
+                "[split-loop-go] loop advances independent accumulators ({}) — \
+                 Fowler's Split Loop: consider one loop per accumulator group",
+                names.join(", ")
+            ),
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -78,8 +78,7 @@ fn text<'a>(node: Node, src: &'a [u8]) -> &'a str {
     std::str::from_utf8(&src[node.start_byte()..node.end_byte()]).unwrap_or("")
 }
 
-/// One accumulator update: the accumulator name, the identifiers its update depends on,
-/// and the source span the update statement (plus its guards) accounts for.
+/// One accumulator update: the accumulator name and the identifiers its update depends on.
 struct Update {
     name: String,
     deps: BTreeSet<String>,
@@ -111,8 +110,8 @@ struct BodyScan {
     has_early_exit: bool,
 }
 
-/// Names of the independent accumulator groups' representatives when `for_node` should be
-/// flagged, else `None`.
+/// Names of every accumulator in the loop when `for_node` has 2+ independent groups
+/// (and so should be flagged), else `None`.
 fn independent_accumulators(for_node: Node, src: &[u8]) -> Option<Vec<String>> {
     let body = for_node.child_by_field_name("body")?;
     let header_vars = header_variables(for_node, src);
@@ -458,29 +457,33 @@ fn mark_last_as_counter(scan: &mut BodyScan) {
 }
 
 fn record_local(node: Node, src: &[u8], scan: &mut BodyScan) {
-    let (names, defs) = match GoKind::of(node) {
+    let (bound, defs) = match GoKind::of(node) {
         GoKind::ShortVarDeclaration => (
-            node.child_by_field_name("left"),
+            node.child_by_field_name("left")
+                .map(|n| identifier_set(n, src))
+                .unwrap_or_default(),
             node.child_by_field_name("right"),
         ),
-        _ => (
-            node.child_by_field_name("name"),
-            node.child_by_field_name("value"),
-        ),
+        _ => {
+            // `var a, b int` repeats the `name` field once per declared identifier.
+            let mut cursor = node.walk();
+            let bound = node
+                .children_by_field_name("name", &mut cursor)
+                .flat_map(|n| identifier_set(n, src))
+                .collect();
+            (bound, node.child_by_field_name("value"))
+        }
     };
     let mut def_idents = defs.map(|d| identifier_set(d, src)).unwrap_or_default();
-    if let Some(n) = names {
-        let bound = identifier_set(n, src);
-        if bound.len() > 1 {
-            // `a, b := f()`: one call feeds both, so they are projections of one value.
-            def_idents.insert(format!("{TUPLE_PREFIX}{}", node.start_byte()));
-        }
-        for name in bound {
-            scan.locals
-                .entry(name)
-                .or_default()
-                .extend(def_idents.iter().cloned());
-        }
+    if bound.len() > 1 {
+        // `a, b := f()`: one call feeds both, so they are projections of one value.
+        def_idents.insert(format!("{TUPLE_PREFIX}{}", node.start_byte()));
+    }
+    for name in bound {
+        scan.locals
+            .entry(name)
+            .or_default()
+            .extend(def_idents.iter().cloned());
     }
     scan.accounted.push((node.start_byte(), node.end_byte()));
 }
@@ -657,6 +660,14 @@ mod tests {
     fn does_not_flag_parallel_projections_of_the_same_element() {
         let f = findings(
             "var xs, ys []int\nfor _, v := range items {\n\txs = append(xs, v)\n\tys = append(ys, v+1)\n}",
+        );
+        assert!(f.is_empty(), "got: {f:?}");
+    }
+
+    #[test]
+    fn multi_name_var_declarations_are_all_body_locals() {
+        let f = findings(
+            "var a int\nfor _, v := range items {\n\tvar x, y int\n\tx += v\n\ty += v\n\ta += v\n}",
         );
         assert!(f.is_empty(), "got: {f:?}");
     }

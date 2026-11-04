@@ -114,3 +114,13 @@ Naming the accumulator groups in the message lets the user immediately assess ap
 | Multi-assignment `a, b = f()` creates phantom accumulators | Low | Explicitly skip multi-LHS assignments |
 | Performance on large files (deep walk for every loop) | Low | `walk_preorder` is O(n) in tree nodes; existing checkers already do this |
 | Kotlin positional-field grammar misses augmented assignments | Medium | Implement Kotlin phase after Go is stable; verify via `to_sexp()` before shipping |
+
+## Implementation deviation (recorded at sdd:6-verify)
+
+The shipped checker is more conservative than the plan's direct-RHS-mention + union-find
+design. Added to cut false positives, per the item's "precision over recall" scope note:
+early-exit bailout, unaccounted-use bailout, guard-identifier linking, if/else and switch
+partition linking, same-guard linking, shared-input linking, tuple-assignment linking, and
+skipping pure `x++`/`x += 1` counters. Consequence: plan test 5 (`sum += price; count += 1`)
+is now *not* flagged, and "two independent appends" is flagged only when they draw on
+different inputs. Corpus precision is still low (see `backtest-results.md`).
