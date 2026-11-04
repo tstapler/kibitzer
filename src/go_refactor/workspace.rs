@@ -115,8 +115,10 @@ impl Workspace {
                         }
                         Err(err) => self.unreadable.push(format!("{child_rel}: {err}")),
                     }
-                } else if let Some(ext) = name.rsplit('.').next()
-                    && NATIVE_EXTS.contains(&ext)
+                } else if Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| NATIVE_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
                 {
                     self.native_dirs.insert(rel.to_string());
                 } else if !(name.ends_with(".md") || name == "OWNERS" || name.starts_with('.')) {
@@ -337,6 +339,26 @@ mod tests {
         ] {
             assert_eq!(internal_ok(importer, target), ok, "{importer} -> {target}");
         }
+    }
+
+    #[test]
+    fn only_real_native_extensions_mark_a_dir_native() {
+        let root = std::env::temp_dir().join(format!("kibitzer-ws-native-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, file) in [
+            ("dotless", "c"),
+            ("dotless_h", "h"),
+            ("upper_s", "asm.S"),
+            ("lower_c", "x.c"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join(file), "").unwrap();
+        }
+        std::fs::write(root.join("go.mod"), "module m\n").unwrap();
+        let ws = Workspace::load(&root).unwrap();
+        let native: Vec<&str> = ws.native_dirs.iter().map(String::as_str).collect();
+        assert_eq!(native, ["lower_c", "upper_s"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

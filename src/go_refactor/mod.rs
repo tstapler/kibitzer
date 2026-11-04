@@ -41,6 +41,8 @@ pub struct CommonArgs {
     repo: PathBuf,
     /// Write the changes (default: print the plan and change nothing). Runs `go build/vet/test`
     /// in the repo afterwards, which executes its test code: only use on repos you trust.
+    /// Exit codes: 0 ok, 2 plan has blockers, 3 apply rolled back cleanly, 4 rollback itself
+    /// failed (tree may be dirty; the next run recovers the log).
     #[arg(long)]
     apply: bool,
     /// Write the plan JSON here instead of stdout.
@@ -278,6 +280,13 @@ fn emit(value: &impl serde::Serialize, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Exit status: the plan carries blocking diagnostics (nothing was written).
+const EXIT_BLOCKED: u8 = 2;
+/// Exit status: apply failed verification or a write and was rolled back cleanly.
+const EXIT_ROLLED_BACK: u8 = 3;
+/// Exit status: apply failed and the rollback itself failed; the tree may be dirty.
+const EXIT_ROLLBACK_FAILED: u8 = 4;
+
 pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
     let RefactorAction::Go { action } = action;
     let sim_of = |c: &CommonArgs| -> Result<Option<serde_json::Value>> {
@@ -333,7 +342,7 @@ pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
         return Ok(if plan.blockers.is_empty() {
             ExitCode::SUCCESS
         } else {
-            ExitCode::from(2)
+            ExitCode::from(EXIT_BLOCKED)
         });
     }
     let result = apply_plan(
@@ -348,9 +357,9 @@ pub fn run_refactor(action: RefactorAction) -> Result<ExitCode> {
     emit(&result, common.out.as_deref())?;
     Ok(if !result.restore_errors.is_empty() {
         // A rollback that itself failed leaves the tree dirty: distinguish it from a clean one.
-        ExitCode::from(4)
+        ExitCode::from(EXIT_ROLLBACK_FAILED)
     } else if result.status == ApplyStatus::RolledBack {
-        ExitCode::from(3)
+        ExitCode::from(EXIT_ROLLED_BACK)
     } else {
         ExitCode::SUCCESS
     })
