@@ -21,6 +21,11 @@ jobs:
         with:
           components: clippy, rustfmt, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      # The refactor tests verify every applied golden tree with `go build/vet/test`. Without a
+      # Go toolchain those paths would silently skip, so the tests fail instead when CI is set.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,covgate,ripgrep
@@ -30,6 +35,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
         run: cargo build --workspace
+      - name: go refactor golden tests run go build/vet/test
+        # --nocapture shows the test's own summary line; the grep fails the step if it is absent.
+        run: |
+          go version
+          cargo test --bin kibitzer go_refactor::golden_tests::golden_cases -- --nocapture 2>&1 | tee golden.log
+          grep -E '^golden: [0-9]+ applied cases, [0-9]+ verified with go build/vet/test' golden.log
       - name: node-kind migration completeness gate
         run: scripts/check-node-kind-completeness.sh
       - name: test with coverage

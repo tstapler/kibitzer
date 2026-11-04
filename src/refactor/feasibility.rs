@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::{BlockingReason, FeasibilityReport, RefactorOperation, Warning, go_syntax};
+use super::{BlockingReason, FeasibilityReport, RefactorOperation, Warning};
 use crate::arch_model::{ArchModel, looks_generated};
+use crate::go_syntax;
 
 /// An operation resolved against the model: absolute moved-file set plus what remains.
 pub(crate) struct Resolved {
@@ -189,10 +190,10 @@ fn scan_moved_files(r: &Resolved) -> (Vec<BlockingReason>, Vec<Warning>) {
     let mut generated = Vec::new();
     for f in &r.moved {
         let Some(src) = read(f) else { continue };
-        if go_syntax::imports_c(&src) {
+        if go_syntax::imports_cgo(&src) {
             blocking.push(BlockingReason::CgoPackage { file: f.clone() });
         }
-        if go_syntax::has_build_constraint(&src) {
+        if go_syntax::has_build_constraint(&f.to_string_lossy(), &src) {
             tagged.push(f.clone());
         }
         if looks_generated(&src) {

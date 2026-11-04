@@ -484,6 +484,7 @@ mod apply_tests {
         let (dir, plan) = plan_for("apply-orphan", &files, &op("a", "b", &["a/a1.go"]));
         // Simulate a kill after the first rename: the process dies without cleanup.
         let wal_dir = dir.join(".kibitzer/plans");
+        crate::refactor_core::txn::simulate_kill(true);
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct Crash;
             impl ApplyIo for Crash {
@@ -497,6 +498,7 @@ mod apply_tests {
             }
             let _ = apply_plan(&dir, &plan, &Crash);
         }));
+        crate::refactor_core::txn::simulate_kill(false);
         assert!(crashed.is_err());
         assert!(wal_dir.join(".wal").exists(), "WAL survives the crash");
         assert!(dir.join("b/a1.go").exists(), "tree is partially applied");
@@ -604,11 +606,11 @@ mod apply_tests {
     #[test]
     fn is_inside_should_Reject_When_PathUsesDotDot() {
         let root = crate::test_support::unique_temp_dir("inside-dotdot");
-        assert!(crate::refactor::apply::is_inside(
+        assert!(crate::refactor_core::guard::is_inside(
             &root,
             &root.join("a/b.go")
         ));
-        assert!(!crate::refactor::apply::is_inside(
+        assert!(!crate::refactor_core::guard::is_inside(
             &root,
             &root.join("../../etc/x")
         ));
@@ -620,7 +622,7 @@ mod apply_tests {
         let root = crate::test_support::unique_temp_dir("inside-link");
         let outside = crate::test_support::unique_temp_dir("inside-outside");
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        assert!(!crate::refactor::apply::is_inside(
+        assert!(!crate::refactor_core::guard::is_inside(
             &root,
             &root.join("link/x.go")
         ));
@@ -638,8 +640,8 @@ mod apply_tests {
             "plan_id": "x",
             "created_dirs": [],
             "entries": [{
-                "original": victim, "backup": plans.join(".wal-backup/0"),
-                "dest": victim, "temp": dir.join("t.go.tmp")
+                "path": victim, "backup": plans.join(".wal-backup/0"),
+                "temp": dir.join("t.go.tmp")
             }]
         });
         std::fs::write(plans.join(".wal"), wal.to_string()).unwrap();
@@ -649,5 +651,80 @@ mod apply_tests {
             "got {err:#}"
         );
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+    }
+
+    #[test]
+    fn apply_should_Refuse_The_Second_Apply_Of_The_Same_Plan_As_Stale() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-twice", &files, &op("a", "b", &["a/a1.go"]));
+        apply_plan(&dir, &plan, &RealIo).unwrap();
+        let after_first = std::fs::read_to_string(dir.join("b/a1.go")).unwrap();
+        let err = apply_plan(&dir, &plan, &RealIo).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stale plan")
+                || format!("{err:#}").contains("already exists"),
+            "second apply must be refused, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b/a1.go")).unwrap(),
+            after_first
+        );
+    }
+
+    #[test]
+    fn apply_should_Recover_An_Orphan_Before_Judging_Staleness() {
+        let files = base_files();
+        let (dir, plan) = plan_for("apply-orphan-first", &files, &op("a", "b", &["a/a1.go"]));
+        // A killed apply leaves the tree half-moved and the log behind.
+        crate::refactor_core::txn::simulate_kill(true);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            struct Crash;
+            impl ApplyIo for Crash {
+                fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+                    std::fs::rename(from, to)?;
+                    panic!("simulated crash");
+                }
+                fn run(&self, _: &str, _: &Path) -> (bool, String) {
+                    (true, String::new())
+                }
+            }
+            let _ = apply_plan(&dir, &plan, &Crash);
+        }));
+        crate::refactor_core::txn::simulate_kill(false);
+        // The same plan, applied again: recovery must run first, so it is judged against the
+        // restored tree and succeeds instead of failing "stale" against the half-applied one.
+        apply_plan(&dir, &plan, &RealIo).unwrap();
+        assert!(dir.join("b/a1.go").exists() && !dir.join("a/a1.go").exists());
+    }
+
+    #[test]
+    fn apply_should_Refuse_A_Package_Name_The_File_Cannot_Take() {
+        let files = base_files();
+        let (dir, mut plan) = plan_for("apply-name-mismatch", &files, &op("a", "b", &["a/a1.go"]));
+        for e in &mut plan.edits {
+            if let Edit::ReplacePackageDecl { new_name, .. } = e {
+                // The file's clause is not `_test`, so the shared rewriter cannot produce this.
+                *new_name = "bee_test".into();
+            }
+        }
+        resign(&mut plan);
+        let err = apply_plan(&dir, &plan, &RealIo).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("would not become"),
+            "got: {err:#}"
+        );
+        assert_tree_unchanged(&dir, &files);
+    }
+
+    #[test]
+    fn verification_failure_output_returned_to_clients_is_capped() {
+        let big = "x".repeat(200 * 1024);
+        let capped = crate::refactor::apply::cap_output(&big);
+        assert!(capped.len() < 70 * 1024, "{}", capped.len());
+        assert!(capped.contains("output truncated"));
+        assert_eq!(crate::refactor::apply::cap_output("short"), "short");
+        // Multi-byte text must be cut on a character boundary.
+        let multi = "é".repeat(100 * 1024);
+        assert!(crate::refactor::apply::cap_output(&multi).is_char_boundary(0));
     }
 }

@@ -1,0 +1,8 @@
+{
+  "input": "hazards",
+  "operation": "move_files",
+  "src": [
+    "lib/cgo.go"
+  ],
+  "dest_pkg": "example.com/m/other"
+}

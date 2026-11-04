@@ -1,0 +1,47 @@
+{
+  "plan_id": "dc113deb4db4156eec325593872d8539af9fa1d7f442bc880f7eade3ad5c6692",
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/wire"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/gobby.go",
+        "old_sha256": "24fe1302d48d0f83d6f0d30deb4395395f6e4b30deeb2b82a30bbd2e02d5b8f9",
+        "new_path": "wire/gobby.go",
+        "new_content": "package wire\n\nimport \"encoding/gob\"\n\n// Thing is registered with gob under its package-qualified name.\ntype Thing struct{ N int }\n\n// RegisterAll registers wire types.\nfunc RegisterAll() { gob.Register(Thing{}) }\n"
+      },
+      "reason": "moved from lib/gobby.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "path_keyed_registration",
+      "message": "`gob.Register` depends on the package path/name at run time; the move would change what it observes",
+      "file": "lib/gobby.go",
+      "line": 9
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Thing -> example.com/m/wire.Thing (now `wire.Thing`)",
+    "example.com/m/lib.RegisterAll -> example.com/m/wire.RegisterAll (now `wire.RegisterAll`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/gobby.go",
+      "to": "wire/gobby.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./wire"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "input": "plain",
+  "operation": "move_files",
+  "src": [
+    "lib/util.go"
+  ],
+  "dest_pkg": "example.com/m/util",
+  "simulation": {
+    "feasible": false,
+    "blockers": [
+      {
+        "message": "simulator: moving this set forms a cycle via example.com/m/app"
+      }
+    ]
+  }
+}

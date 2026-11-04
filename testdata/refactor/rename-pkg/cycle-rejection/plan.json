@@ -1,0 +1,62 @@
+{
+  "plan_id": "28f3b098d70377dfb40b63a9e6d7ed46fa7fb0fb2aaf06e74464a08c912c2c6e",
+  "operation": "rename_pkg",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/b"
+  ],
+  "to": [
+    "example.com/m/c"
+  ],
+  "steps": [
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "a/a.go",
+        "old_sha256": "53cc3818dd0caa492d05ec32b14c701e618cfe42e8102da3f4b3d3b5652a0464",
+        "new_path": "a/a.go",
+        "new_content": "package a\n\nimport \"example.com/m/c\"\n\nfunc A() int { return c.B() }\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "b/b.go",
+        "old_sha256": "3328d510df4de557930a13e7f4244d993b469445eafa4b14d0a234cdaa7be8a8",
+        "new_path": "c/b.go",
+        "new_content": "package c\n\nimport \"example.com/m/a\"\n\nfunc B() int { return a.A() }\n"
+      },
+      "reason": "moved from b/b.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "cycle_detected",
+      "message": "import cycle: example.com/m/c -> example.com/m/a -> example.com/m/c"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/b.B -> example.com/m/c.B"
+  ],
+  "path_map": [
+    {
+      "from": "b",
+      "to": "c"
+    },
+    {
+      "from": "b/b.go",
+      "to": "c/b.go"
+    },
+    {
+      "from": "example.com/m/b",
+      "to": "example.com/m/c"
+    }
+  ],
+  "affected_packages": [
+    "./a",
+    "./c"
+  ]
+}

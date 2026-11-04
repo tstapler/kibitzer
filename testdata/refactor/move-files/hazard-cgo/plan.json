@@ -1,0 +1,45 @@
+{
+  "plan_id": "cbdb90a4202d524d1ab6cc86aef985fcfee2dfc2ae561ae91271d733aa97e772",
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/cgo.go",
+        "old_sha256": "30436ae48ea22ac2d6074a6f68d8857a84672ea8538bf4fd1e081974ef7ab287",
+        "new_path": "other/cgo.go",
+        "new_content": "package other\n\n// #include <stdlib.h>\nimport \"C\"\n\n// Cgo calls into C.\nfunc Cgo() int { return int(C.abs(-1)) }\n"
+      },
+      "reason": "moved from lib/cgo.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "cgo",
+      "message": "file imports \"C\"; its preamble and sibling C sources cannot be moved safely",
+      "file": "lib/cgo.go"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Cgo -> example.com/m/other.Cgo (now `other.Cgo`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/cgo.go",
+      "to": "other/cgo.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./other"
+  ]
+}

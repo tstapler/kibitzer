@@ -243,3 +243,66 @@ fn truncation_respects_char_boundaries() {
     truncate_at_boundary(&mut s, 4000);
     assert!(s.len() <= 4000 && s.chars().all(|c| c == 'é'));
 }
+
+/// A killed process leaves its transaction log and a half-applied tree behind.
+fn crash_mid_transaction(dir: &Path, id: &str, changes: &[txn::Change]) {
+    let pending = txn::session(dir)
+        .unwrap()
+        .begin(id, changes, &txn::real_rename)
+        .unwrap();
+    txn::simulate_kill(true);
+    drop(pending);
+    txn::simulate_kill(false);
+}
+
+#[test]
+fn a_crashed_apply_is_recovered_before_the_next_apply_judges_the_tree() {
+    let dir = fixture();
+    let p = plan(&dir);
+    crash_mid_transaction(&dir, &p.plan_id, &apply_changes(&dir, &p));
+    assert!(
+        !run_git_out(&dir, &["status", "--porcelain"]).is_empty(),
+        "the crash left a half-applied (dirty) tree"
+    );
+    assert!(dir.join(".kibitzer/plans/.wal").exists());
+    // Without recovery first this would be refused as `dirty_tree` and stay stuck forever.
+    let out = apply(&dir, &p.plan_id).unwrap();
+    assert!(out.applied, "{out:?}");
+    assert!(dir.join("a/ypart/y.go").is_file() && !dir.join("a/y.go").exists());
+    assert!(
+        !dir.join(".kibitzer/plans/.wal").exists(),
+        "log cleared on commit"
+    );
+}
+
+#[test]
+fn a_crashed_revert_is_rolled_back_and_the_revert_then_completes() {
+    let dir = fixture();
+    let p = plan(&dir);
+    assert!(apply(&dir, &p.plan_id).unwrap().applied);
+    crash_mid_transaction(
+        &dir,
+        &format!("revert-{}", p.plan_id),
+        &revert_changes(&dir, &p),
+    );
+    assert!(
+        dir.join("a/y.go").is_file(),
+        "the crashed revert had already written"
+    );
+    // The next revert recovers first, so the plan's edits are back in their applied state and
+    // the "modified since apply" check passes instead of misreading the half-reverted files.
+    revert(&dir, &p.plan_id).unwrap();
+    assert!(dir.join("a/y.go").is_file() && !dir.join("a/ypart").exists());
+    assert!(run_git_out(&dir, &["status", "--porcelain"]).is_empty());
+    assert!(!dir.join(".kibitzer/plans/.wal").exists());
+}
+
+#[test]
+fn txn_error_keeps_a_failed_rollback_distinct_from_plain_io() {
+    let failed = anyhow::Error::new(txn::RollbackFailed {
+        cause: "boom".into(),
+        rollback: "disk gone".into(),
+    });
+    assert_eq!(txn_error(failed).code, "rollback_failed");
+    assert_eq!(txn_error(anyhow::anyhow!("plain")).code, "io");
+}

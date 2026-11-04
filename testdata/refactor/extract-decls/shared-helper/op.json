@@ -1,0 +1,9 @@
+{
+  "input": "base",
+  "operation": "extract_decls",
+  "from": "example.com/m/lib",
+  "decls": [
+    "Foo"
+  ],
+  "to": "example.com/m/greet"
+}

@@ -1,0 +1,8 @@
+{
+  "input": "cycle",
+  "operation": "move_files",
+  "src": [
+    "lib/b.go"
+  ],
+  "dest_pkg": "example.com/m/other"
+}

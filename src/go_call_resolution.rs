@@ -48,7 +48,11 @@ pub fn parse_module_path(go_mod_src: &str) -> Option<String> {
     go_mod_src
         .lines()
         .find_map(|line| line.trim().strip_prefix("module "))
-        .map(|rest| rest.trim().to_string())
+        .map(|rest| {
+            // `module "example.com/m" // comment` is valid go.mod.
+            let path = rest.split("//").next().unwrap_or(rest);
+            path.trim().trim_matches('"').to_string()
+        })
         .filter(|s| !s.is_empty())
 }
 

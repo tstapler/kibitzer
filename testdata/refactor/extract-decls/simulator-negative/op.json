@@ -1,0 +1,18 @@
+{
+  "input": "plain",
+  "operation": "extract_decls",
+  "from": "example.com/m/lib",
+  "decls": [
+    "Util",
+    "Widget"
+  ],
+  "to": "example.com/m/util",
+  "simulation": {
+    "feasible": false,
+    "blockers": [
+      {
+        "message": "simulator: moving this set forms a cycle via example.com/m/app"
+      }
+    ]
+  }
+}

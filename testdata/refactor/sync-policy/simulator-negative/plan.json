@@ -1,0 +1,36 @@
+{
+  "plan_id": "89fbca970ad1c243428223d232533779cb2db21390a75cac97fea69a18ae71f9",
+  "operation": "sync_policy",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/util"
+  ],
+  "steps": [],
+  "blockers": [
+    {
+      "code": "simulation_blocker",
+      "message": "simulator: moving this set forms a cycle via example.com/m/app"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "util/util.go"
+    }
+  ],
+  "affected_packages": [],
+  "simulation_result": {
+    "feasible": false,
+    "blockers": [
+      {
+        "message": "simulator: moving this set forms a cycle via example.com/m/app"
+      }
+    ]
+  }
+}

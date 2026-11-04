@@ -1,0 +1,73 @@
+=== .kibitzer/inspect.json ===
+{
+  "checks": [
+    {
+      "name": "file-complexity",
+      "scope": [
+        "lib/**",
+        "app/**"
+      ]
+    }
+  ],
+  "architecture": {
+    "components": [
+      {
+        "name": "lib",
+        "paths": [
+          "lib"
+        ]
+      },
+      {
+        "name": "util-tests",
+        "paths": [
+          "lib/util_test.go"
+        ]
+      }
+    ]
+  }
+}
+
+=== app/app.go ===
+package app
+
+import (
+	"fmt"
+
+	"example.com/m/lib"
+	"example.com/m/util"
+)
+
+// Run prints things.
+func Run() {
+	w := util.Widget{N: 1}
+	fmt.Println(lib.Foo(), util.Util(), w.Double())
+}
+
+=== go.mod ===
+module example.com/m
+
+go 1.21
+
+=== lib/lib.go ===
+package lib
+
+import "example.com/m/util"
+
+// Foo returns a greeting.
+func Foo() string { return helper() + util.Util() }
+
+func helper() string { return "hi" }
+
+=== util/util.go ===
+package util
+
+import "strings"
+
+// Util upper-cases.
+func Util() string { return strings.ToUpper("x") }
+
+// Widget doubles.
+type Widget struct{ N int }
+
+func (w Widget) Double() int { return w.N * 2 }
+

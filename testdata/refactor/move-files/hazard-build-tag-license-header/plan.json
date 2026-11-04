@@ -1,0 +1,45 @@
+{
+  "plan_id": "c2711325693d8a27c8a6d5b24e9984ab424de9e64da93568d8c971c7e97cdeb5",
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/licensed.go",
+        "old_sha256": "3539424d3db711ff517092abc677423cb5e8478f465477751094c88d6c7b262e",
+        "new_path": "other/licensed.go",
+        "new_content": "/*\nCopyright 2020 Someone.\n\nLicensed under X.\n*/\n\n//go:build linux\n\npackage other\n\n// Licensed is tagged behind a license header.\nfunc Licensed() int { return 4 }\n"
+      },
+      "reason": "moved from lib/licensed.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "build_constraint",
+      "message": "file has a build constraint; partial moves cannot be verified across tag sets",
+      "file": "lib/licensed.go"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Licensed -> example.com/m/other.Licensed (now `other.Licensed`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/licensed.go",
+      "to": "other/licensed.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./other"
+  ]
+}

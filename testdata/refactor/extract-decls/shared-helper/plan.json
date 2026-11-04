@@ -1,0 +1,25 @@
+{
+  "plan_id": "b66539b5ee0b1f1d15e50eb6c7f70f8840af0f25ea1539285a3548f3f3952c90",
+  "operation": "extract_decls",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/greet"
+  ],
+  "steps": [],
+  "blockers": [
+    {
+      "code": "shared_helper",
+      "message": "unexported `helper` is used by both moved and remaining code; it would need to be exported (v1 does not export)",
+      "file": "lib/lib_test.go",
+      "line": 6
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [],
+  "affected_packages": []
+}

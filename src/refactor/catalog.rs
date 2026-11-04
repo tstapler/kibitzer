@@ -4,14 +4,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 
 use super::feasibility::{self, Resolved};
 use super::{
     AvailableOperation, Edit, OperationKind, RefactorOperation, RefactorPlan, TouchedFile,
-    go_syntax,
 };
 use crate::arch_model::ArchModel;
+use crate::go_syntax::{self, ImportName};
+use crate::refactor_core::sha256_hex;
 
 fn is_test_file(path: &Path) -> bool {
     path.file_name()
@@ -34,7 +34,7 @@ pub fn list_operations_for_package(model: &ArchModel, package: &str) -> Vec<Avai
     let has_cgo = sources
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
-        .any(|src| go_syntax::imports_c(&src));
+        .any(|src| go_syntax::imports_cgo(&src));
     if sources.len() < 2 || has_cgo {
         return Vec::new();
     }
@@ -55,11 +55,7 @@ pub fn list_operations_for_package(model: &ArchModel, package: &str) -> Vec<Avai
 
 fn module_name(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("go.mod")).ok()?;
-    text.lines().find_map(|l| {
-        l.trim()
-            .strip_prefix("module ")
-            .map(|m| m.trim().to_string())
-    })
+    crate::go_call_resolution::parse_module_path(&text)
 }
 
 /// `(module path, module dir)` of the nearest `go.mod` above `start`, within the repo.
@@ -112,13 +108,6 @@ fn target_package_name(op: &RefactorOperation, dir: &Path) -> String {
 
 fn read_file(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Plans a MoveFiles/ExtractPackage operation. Errors when the operation is infeasible or
@@ -205,9 +194,15 @@ fn import_edits(
 ) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
     for file in feasibility::importer_files(model, op, r).into_keys() {
-        let sites = go_syntax::find_imports(&read_file(&file)?, &op.source_package);
-        let Some(site) = sites.first() else { continue };
-        let alias = (old_name != new_name && !site.has_alias && !old_name.is_empty())
+        let src = read_file(&file)?;
+        let Some(site) = go_syntax::imports(&src)
+            .into_iter()
+            .find(|i| i.path == op.source_package)
+        else {
+            continue;
+        };
+        let has_alias = site.name != ImportName::Implicit;
+        let alias = (old_name != new_name && !has_alias && !old_name.is_empty())
             .then(|| old_name.to_string());
         edits.push(Edit::ReplaceImportPath {
             file,

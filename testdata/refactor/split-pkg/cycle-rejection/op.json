@@ -1,0 +1,13 @@
+{
+  "input": "cycle",
+  "operation": "split_pkg",
+  "pkg": "example.com/m/lib",
+  "clusters": [
+    {
+      "to": "example.com/m/other",
+      "files": [
+        "b.go"
+      ]
+    }
+  ]
+}

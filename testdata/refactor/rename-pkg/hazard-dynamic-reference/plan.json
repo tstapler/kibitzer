@@ -1,0 +1,31 @@
+{
+  "plan_id": "b08ae1cfd5da3a8849442b0a854a74a1d0d3b5dc9d27794491bc5cd6fceb9f55",
+  "operation": "rename_pkg",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/core"
+  ],
+  "steps": [],
+  "blockers": [
+    {
+      "code": "import_path_string",
+      "message": "string literal \"example.com/m/lib\" names the package or a moved symbol; it would go stale (reflection/plugin/config reference)",
+      "file": "app/app.go",
+      "line": 5
+    },
+    {
+      "code": "path_keyed_registration",
+      "message": "`gob.Register` depends on the package path/name at run time; the move would change what it observes",
+      "file": "lib/gobby.go",
+      "line": 9
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [],
+  "affected_packages": []
+}

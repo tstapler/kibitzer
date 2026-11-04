@@ -1,0 +1,32 @@
+{
+  "plan_id": "72c4f1db00f1f5cc4fcdd7048400651b32c55a66f8ee37e3eaefa19e57a998be",
+  "operation": "sync_policy",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other/internal/util"
+  ],
+  "steps": [],
+  "blockers": [
+    {
+      "code": "internal_visibility",
+      "message": "example.com/m/lib cannot import example.com/m/other/internal/util (internal/ boundary)"
+    },
+    {
+      "code": "internal_visibility",
+      "message": "example.com/m/app cannot import example.com/m/other/internal/util (internal/ boundary)"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "other/internal/util/util.go"
+    }
+  ],
+  "affected_packages": []
+}

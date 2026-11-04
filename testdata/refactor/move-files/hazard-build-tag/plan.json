@@ -1,0 +1,45 @@
+{
+  "plan_id": "4befd93e05d903dabb8d2e282c443f4b4662a6ef2072081deaf319d39e57b2ae",
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/tagged.go",
+        "old_sha256": "e74e459a7e1488c59d4d1cf2544236abbea5058dedcf02a4d0346f75992dd746",
+        "new_path": "other/tagged.go",
+        "new_content": "//go:build linux\n\npackage other\n\n// Tagged is Linux only.\nfunc Tagged() int { return 2 }\n"
+      },
+      "reason": "moved from lib/tagged.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "build_constraint",
+      "message": "file has a build constraint; partial moves cannot be verified across tag sets",
+      "file": "lib/tagged.go"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Tagged -> example.com/m/other.Tagged (now `other.Tagged`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/tagged.go",
+      "to": "other/tagged.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./other"
+  ]
+}

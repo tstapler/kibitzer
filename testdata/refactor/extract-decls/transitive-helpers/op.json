@@ -1,0 +1,9 @@
+{
+  "input": "helpers",
+  "operation": "extract_decls",
+  "from": "example.com/m/lib",
+  "decls": [
+    "Hash"
+  ],
+  "to": "example.com/m/hashing"
+}

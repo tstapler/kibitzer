@@ -1,0 +1,45 @@
+{
+  "plan_id": "8031d129d00c43c1281873ca8edeba3814e06be98c10faa1445eeec020efb5dd",
+  "operation": "move_files",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other"
+  ],
+  "steps": [
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/reg.go",
+        "old_sha256": "b1e25d7075ebbf618396b2fc4103b4663624eeb15e69aa246e522d8bc6deb4e5",
+        "new_path": "other/reg.go",
+        "new_content": "package other\n\nvar registry = map[string]int{}\n\nfunc init() { registry[\"x\"] = 1 }\n\n// Registered reports the registry size.\nfunc Registered() int { return len(registry) }\n"
+      },
+      "reason": "moved from lib/reg.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "init_registration",
+      "message": "file declares init(); moving it changes which importers trigger the registration",
+      "file": "lib/reg.go"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Registered -> example.com/m/other.Registered (now `other.Registered`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/reg.go",
+      "to": "other/reg.go"
+    }
+  ],
+  "affected_packages": [
+    "./lib",
+    "./other"
+  ]
+}

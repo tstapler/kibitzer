@@ -1,0 +1,47 @@
+{
+  "plan_id": "d1a2598134585cab6255f0d2ad82e3065a80222bc8a947805e50185bd385988c",
+  "operation": "extract_decls",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/hashing"
+  ],
+  "steps": [
+    {
+      "kind": "create_file",
+      "transform": {
+        "new_path": "hashing/lib.go",
+        "new_content": "package hashing\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\nconst seed = 7\n\n// Hash mixes s with the package seed.\nfunc Hash(s string) string {\n\treturn fmt.Sprint(mix(strings.ToLower(s)))\n}\n\nfunc mix(s string) int { return len(s) * seed }\n"
+      },
+      "reason": "new file holding extracted declarations"
+    },
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "lib/lib.go",
+        "old_sha256": "4447621087ce01c4919ba6133ad5b88c6e41e50f91c337494be40c02211597f1",
+        "new_path": "lib/lib.go",
+        "new_content": "package lib\n\n// Other stays in lib.\nfunc Other() int { return 1 }\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    }
+  ],
+  "blockers": [],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Hash -> example.com/m/hashing.Hash (now `hashing.Hash`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/lib.go",
+      "to": "hashing/lib.go"
+    }
+  ],
+  "affected_packages": [
+    "./hashing",
+    "./lib"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "input": "plain",
+  "operation": "split_pkg",
+  "pkg": "example.com/m/lib",
+  "clusters": [
+    {
+      "to": "example.com/m/util",
+      "files": [
+        "util.go"
+      ]
+    }
+  ],
+  "simulation": {
+    "feasible": false,
+    "blockers": [
+      {
+        "message": "simulator: moving this set forms a cycle via example.com/m/app"
+      }
+    ]
+  }
+}

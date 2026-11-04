@@ -1,0 +1,10 @@
+{
+  "input": "badimport",
+  "operation": "extract_decls",
+  "from": "example.com/m/lib",
+  "decls": [
+    "Util",
+    "Widget"
+  ],
+  "to": "example.com/m/util"
+}

@@ -1,0 +1,28 @@
+{
+  "plan_id": "d2302cc70e612f020ad8616d571926d0e583547ffedf56a8699c2fd344856831",
+  "operation": "sync_policy",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/other"
+  ],
+  "steps": [],
+  "blockers": [
+    {
+      "code": "cycle_detected",
+      "message": "import cycle: example.com/m/lib -> example.com/m/other -> example.com/m/lib"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [],
+  "path_map": [
+    {
+      "from": "lib/b.go",
+      "to": "other/b.go"
+    }
+  ],
+  "affected_packages": []
+}

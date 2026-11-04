@@ -1,0 +1,74 @@
+{
+  "plan_id": "6a874b6b62cd10fbeaafefb9b9206b80b3bcd6e12159c4b95554d324b78df691",
+  "operation": "split_pkg",
+  "repo_root": "<repo>",
+  "module": "example.com/m",
+  "from": [
+    "example.com/m/lib"
+  ],
+  "to": [
+    "example.com/m/util"
+  ],
+  "steps": [
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "app/app.go",
+        "old_sha256": "942bec19b93d5f5776874c875b96dc5c9758604fc94cce48bc7768a728dc5439",
+        "new_path": "app/app.go",
+        "new_content": "package app\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/m/lib\"\n\t\"example.com/m/util\"\n)\n\n// Run prints things.\nfunc Run() {\n\tw := util.Widget{N: 1}\n\tfmt.Println(lib.Foo(), util.Util(), w.Double())\n}\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "rewrite_file",
+      "transform": {
+        "old_path": "lib/lib.go",
+        "old_sha256": "7af54395ec7a9fb63efce7602ac917ad3295415d56eacc5c912c82b3470553c0",
+        "new_path": "lib/lib.go",
+        "new_content": "package lib\n\nimport \"example.com/m/util\"\n\n// Foo returns a greeting.\nfunc Foo() string { return helper() + util.Util() }\n\nfunc helper() string { return \"hi\" }\n"
+      },
+      "reason": "import/qualifier/declaration rewrite"
+    },
+    {
+      "kind": "move_file",
+      "transform": {
+        "old_path": "lib/util.go",
+        "old_sha256": "cf5e07c06135c7a2f3b74411d0f188a79eed7116882dccb06eb04a94dd23d20c",
+        "new_path": "util/util.go",
+        "new_content": "package util\n\nimport \"strings\"\n\n// Util upper-cases.\nfunc Util() string { return strings.ToUpper(\"x\") }\n\n// Widget doubles.\ntype Widget struct{ N int }\n\nfunc (w Widget) Double() int { return w.N * 2 }\n"
+      },
+      "reason": "moved from lib/util.go"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "simulation_blocker",
+      "message": "simulator: moving this set forms a cycle via example.com/m/app"
+    }
+  ],
+  "warnings": [],
+  "surface_changes": [
+    "example.com/m/lib.Util -> example.com/m/util.Util (now `util.Util`)",
+    "example.com/m/lib.Widget -> example.com/m/util.Widget (now `util.Widget`)"
+  ],
+  "path_map": [
+    {
+      "from": "lib/util.go",
+      "to": "util/util.go"
+    }
+  ],
+  "affected_packages": [
+    "./app",
+    "./lib",
+    "./util"
+  ],
+  "simulation_result": {
+    "feasible": false,
+    "blockers": [
+      {
+        "message": "simulator: moving this set forms a cycle via example.com/m/app"
+      }
+    ]
+  }
+}

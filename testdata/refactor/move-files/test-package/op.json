@@ -1,0 +1,9 @@
+{
+  "input": "base",
+  "operation": "move_files",
+  "src": [
+    "lib/util.go",
+    "lib/util_test.go"
+  ],
+  "dest_pkg": "example.com/m/util"
+}
