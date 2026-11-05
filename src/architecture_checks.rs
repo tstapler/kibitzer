@@ -618,7 +618,7 @@ pub trait ArchModelChecker {
 }
 
 pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
-    vec![
+    let mut checkers: Vec<Box<dyn ArchModelChecker>> = vec![
         Box::new(InstabilityChecker),
         Box::new(DipConcreteCouplingChecker),
         Box::new(LcomChecker),
@@ -629,12 +629,11 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::middle_man::MiddleManChecker),
         Box::new(crate::encapsulate_variable::EncapsulateVariableChecker),
         Box::new(crate::remove_setting_method::RemoveSettingMethodChecker),
-        Box::new(crate::hierarchy_cleanup::CollapseHierarchyChecker),
-        Box::new(crate::hierarchy_cleanup::ExtractSuperclassChecker),
-        Box::new(crate::hierarchy_cleanup::RemoveSubclassChecker),
         Box::new(crate::feature_envy::FeatureEnvyChecker),
         Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
-    ]
+    ];
+    checkers.extend(crate::hierarchy_cleanup::checkers());
+    checkers
 }
 
 pub fn lookup_model(name: &str) -> Option<Box<dyn ArchModelChecker>> {

@@ -556,7 +556,7 @@ fn classify_node(
     };
 
     let returns_constant = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
-        && returns_constant_body(node, language);
+        && returns_constant_body(node, language, source);
     let (is_abstract, declares_fields) = if symbol_kind == SymbolKind::Type {
         class_shape(node, language, source)
     } else {
@@ -602,8 +602,10 @@ const LITERAL_KINDS: &[&str] = &[
     "null",
 ];
 
-fn is_constant_literal(n: Node) -> bool {
+fn is_constant_literal(n: Node, source: &str) -> bool {
     match n.kind() {
+        // kotlin-ng parses `true`/`false`/`null` as plain identifiers.
+        "identifier" => matches!(node_text(n, source), "true" | "false" | "null"),
         "string_literal" | "string" => {
             let mut c = n.walk();
             !n.children(&mut c)
@@ -614,16 +616,16 @@ fn is_constant_literal(n: Node) -> bool {
             !n.children(&mut c)
                 .any(|k| k.kind() == "template_substitution")
         }
-        k => LITERAL_KINDS.contains(&k),
+        k => LITERAL_KINDS.contains(&k) || is_signed_number(n),
     }
 }
 
-fn type_extends_capable(language: Language) -> bool {
+pub(crate) fn type_extends_capable(language: Language) -> bool {
     type_relation_supports(language) && language != Language::Go
 }
 
 /// Parameterless body that is exactly `return <literal>` (or Kotlin `= <literal>`).
-fn returns_constant_body(node: Node, language: Language) -> bool {
+fn returns_constant_body(node: Node, language: Language, source: &str) -> bool {
     if !type_extends_capable(language) {
         return false;
     }
@@ -646,12 +648,12 @@ fn returns_constant_body(node: Node, language: Language) -> bool {
         }
     }
     if !matches!(body.kind(), "block" | "statement_block") {
-        return is_constant_literal(body);
+        return is_constant_literal(body, source);
     }
     let mut cursor = body.walk();
     let stmts: Vec<Node> = body
         .named_children(&mut cursor)
-        .filter(|c| c.kind() != "comment")
+        .filter(|c| !c.kind().contains("comment"))
         .collect();
     let [stmt] = stmts.as_slice() else {
         return false;
@@ -661,7 +663,66 @@ fn returns_constant_body(node: Node, language: Language) -> bool {
     {
         return false;
     }
-    stmt.named_child(0).is_some_and(is_constant_literal)
+    stmt.named_child(0)
+        .is_some_and(|e| is_constant_literal(e, source))
+}
+
+fn is_numeric_literal(n: Node) -> bool {
+    let k = n.kind();
+    k.ends_with("integer_literal")
+        || k.ends_with("floating_point_literal")
+        || k == "number"
+        || k == "number_literal"
+}
+
+/// `-1` / `+1`: a sign applied directly to a numeric literal.
+fn is_signed_number(n: Node) -> bool {
+    n.kind() == "unary_expression"
+        && n.named_child_count() == 1
+        && n.child(0).is_some_and(|op| matches!(op.kind(), "-" | "+"))
+        && n.named_child(0).is_some_and(is_numeric_literal)
+}
+
+/// A constructor-like member: Java/TS/JS constructor, Kotlin secondary constructor or `init`.
+fn is_constructor_member(member: Node, source: &str) -> bool {
+    match member.kind() {
+        "constructor_declaration" | "secondary_constructor" | "anonymous_initializer" => true,
+        "method_definition" => member
+            .child_by_field_name("name")
+            .is_some_and(|n| node_text(n, source) == "constructor"),
+        _ => false,
+    }
+}
+
+/// TS parameter property: `constructor(private a: T, readonly b: U)` declares a field.
+fn declares_parameter_property(ctor: Node) -> bool {
+    let Some(params) = ctor.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut c = params.walk();
+    params.named_children(&mut c).any(|p| {
+        matches!(p.kind(), "required_parameter" | "optional_parameter") && {
+            let mut pc = p.walk();
+            p.children(&mut pc)
+                .any(|k| matches!(k.kind(), "accessibility_modifier" | "readonly"))
+        }
+    })
+}
+
+/// True if the subtree assigns `this.<name> = ...`.
+fn assigns_this_member(node: Node, source: &str) -> bool {
+    if matches!(node.kind(), "assignment_expression" | "assignment")
+        && node.child_by_field_name("left").is_some_and(|l| {
+            node_text(l, source)
+                .strip_prefix("this.")
+                .is_some_and(|rest| rest.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        })
+    {
+        return true;
+    }
+    let mut c = node.walk();
+    node.children(&mut c)
+        .any(|k| assigns_this_member(k, source))
 }
 
 /// `(is_abstract, declares_fields)` for a class declaration.
@@ -689,7 +750,8 @@ fn class_shape(node: Node, language: Language, source: &str) -> (bool, bool) {
                     | "public_field_definition"
                     | "field_definition"
                     | "property_declaration"
-            )
+            ) || (is_constructor_member(k, source)
+                && (declares_parameter_property(k) || assigns_this_member(k, source)))
         })
     });
     if language == Language::Kotlin
@@ -3651,5 +3713,157 @@ func f(int, string) {}
         );
         assert!(find_by_name(&ts, "A").declares_fields);
         assert!(!find_by_name(&ts, "B").declares_fields);
+    }
+
+    #[test]
+    fn returns_constant_accepts_each_literal_kind() {
+        let java = |ret: &str, ty: &str| format!("class A {{ {ty} f() {{ return {ret}; }} }}");
+        for (ret, ty) in [
+            ("true", "boolean"),
+            ("null", "Object"),
+            ("'c'", "char"),
+            ("0x1F", "int"),
+            ("1.5", "double"),
+            ("-1", "int"),
+            ("-1.5", "double"),
+        ] {
+            let src = java(ret, ty);
+            assert!(
+                find_by_name(&extract(Language::Java, &src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+        for ret in ["'s'", "1", "-1"] {
+            let src = format!("class A {{ f() {{ return {ret} }} }}");
+            assert!(
+                find_by_name(&extract(Language::TypeScript, &src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+        for ret in ["true", "\"s\"", "-1"] {
+            let src = format!("class A {{\n  fun f() = {ret}\n}}\n");
+            assert!(
+                find_by_name(&extract(Language::Kotlin, &src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn returns_constant_ignores_comments_and_rejects_other_shapes() {
+        let positives = [
+            (Language::Java, "class A { int f() { /* c */ return 1; } }"),
+            (Language::TypeScript, "class A { f() { /* c */ return 1 } }"),
+            (
+                Language::Kotlin,
+                "class A {\n  fun f(): Int { /* c */ return 1 }\n}\n",
+            ),
+        ];
+        for (lang, src) in positives {
+            assert!(
+                find_by_name(&extract(lang, src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+        let negatives = [
+            (Language::Java, "class A { void f() { return; } }"),
+            (Language::Java, "class A { int f() { return !true; } }"),
+            (Language::TypeScript, "class A { f() { return } }"),
+            (Language::TypeScript, "class A { f(x) { return 1 } }"),
+            (Language::TypeScript, "class A { f() { g(); return 1 } }"),
+            (Language::Kotlin, "class A {\n  fun f(x: Int) = 1\n}\n"),
+            (
+                Language::Kotlin,
+                "class A {\n  fun f(): Int { g(); return 1 }\n}\n",
+            ),
+        ];
+        for (lang, src) in negatives {
+            assert!(
+                !find_by_name(&extract(lang, src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_shape_sees_fields_hidden_in_constructors() {
+        let cases = [
+            (
+                Language::TypeScript,
+                "class A { constructor(private a: string) {} }",
+                true,
+            ),
+            (
+                Language::TypeScript,
+                "class A { constructor(readonly a: string) {} }",
+                true,
+            ),
+            (
+                Language::TypeScript,
+                "class A { constructor(public a?: string) {} }",
+                true,
+            ),
+            (
+                Language::TypeScript,
+                "class A { constructor(a: string) {} }",
+                false,
+            ),
+            (
+                Language::TypeScript,
+                "class A { constructor(a: string) { this.a = a } }",
+                true,
+            ),
+            (
+                Language::JavaScript,
+                "class A { constructor(a) { this.a = a } }",
+                true,
+            ),
+            (
+                Language::JavaScript,
+                "class A { constructor(a) { g(a) } }",
+                false,
+            ),
+            (
+                Language::JavaScript,
+                "class A { constructor(a) { this.a.b = a } }",
+                false,
+            ),
+            (Language::JavaScript, "class A { x = 1 }", true),
+            (Language::Java, "class A { A(int a) { this.a = a; } }", true),
+            (Language::Java, "class A { A(int a) { g(a); } }", false),
+            (
+                Language::Kotlin,
+                "class A {\n  constructor(a: Int) { this.a = a }\n}\n",
+                true,
+            ),
+            (
+                Language::Kotlin,
+                "class A {\n  init { this.a = 1 }\n}\n",
+                true,
+            ),
+            (Language::Kotlin, "class A {\n  init { g() }\n}\n", false),
+        ];
+        for (lang, src, expected) in cases {
+            assert_eq!(
+                find_by_name(&extract(lang, src, "p"), "A").declares_fields,
+                expected,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_shape_abstract_is_java_kotlin_only_and_ts_abstract_class_is_not_a_type() {
+        let java = extract(Language::Java, "abstract class A { }\nclass B { }", "p");
+        assert!(find_by_name(&java, "A").is_abstract && !find_by_name(&java, "B").is_abstract);
+        let ts = extract(
+            Language::TypeScript,
+            "abstract class A { }\nclass B { }",
+            "p",
+        );
+        assert!(!find_by_name(&ts, "B").is_abstract);
+        assert!(ts.iter().all(|s| s.name != "A" || !s.is_abstract), "{ts:?}");
+        let js = extract(Language::JavaScript, "class A { }", "p");
+        assert!(!find_by_name(&js, "A").is_abstract);
     }
 }
