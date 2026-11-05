@@ -566,7 +566,7 @@ pub(crate) fn start_dir(start: &Path) -> PathBuf {
 /// file for a worktree), falling back to `start`'s own directory when neither is found
 /// anywhere above it. Unlike `find_config`, this never fails to produce a root — architecture
 /// queries (`list_architecture_symbols`, `get_architecture_node`, call-graph traversal) only
-/// need *a* directory to walk for source files, not a real `.claude/inspect.json`.
+/// need *a* directory to walk for source files, not a real `.kibitzer/inspect.json`.
 pub fn find_repo_root(start: &Path) -> PathBuf {
     let start = start_dir(start);
     let mut dir = start.clone();
@@ -665,26 +665,32 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     loop {
         let candidate = resolve_config_path(&dir);
         if candidate.is_file() {
-            let raw = std::fs::read_to_string(&candidate)
-                .with_context(|| format!("reading {}", candidate.display()))?;
-            let config: Config = serde_json::from_str(&raw).with_context(|| {
-                format!(
-                    "parsing {} (kibitzer {}, resolved from {})",
-                    candidate.display(),
-                    env!("CARGO_PKG_VERSION"),
-                    std::env::current_exe()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| "<unknown>".to_string())
-                )
-            })?;
-            validate(&config, &candidate)?;
-            return Ok(Some((config, dir)));
+            return Ok(Some((read_config(&candidate)?, dir)));
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
             None => return Ok(None),
         }
     }
+}
+
+/// Reads, parses and validates exactly the config file at `path` — no walk, no fallback.
+/// Shared by the upward walk and `--config` so both report the same diagnostics.
+pub fn read_config(path: &Path) -> Result<Config> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let config: Config = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing {} (kibitzer {}, resolved from {})",
+            path.display(),
+            env!("CARGO_PKG_VERSION"),
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string())
+        )
+    })?;
+    validate(&config, path)?;
+    Ok(config)
 }
 
 /// The config file path `find_config(start)` will read, or the `CONFIG_DIR` path under `start`
@@ -749,10 +755,10 @@ fn whole_repo_check(name: &str, architecture_checker: &str) -> Check {
 }
 
 /// The built-in catalog that runs everywhere by default, pylint-style — no
-/// `.claude/inspect.json` required. Every native per-file checker that doesn't need
+/// `.kibitzer/inspect.json` required. Every native per-file checker that doesn't need
 /// repo-specific setup (an architecture model, a `command` a project must supply): this
 /// repo's own non-dogfood check list, plus the `comment-quality-<lang>` family
-/// (`src/comment_quality.rs`) added once it landed. A local `.claude/inspect.json`
+/// (`src/comment_quality.rs`) added once it landed. A local `.kibitzer/inspect.json`
 /// overlays these via `merge_checks`: `disabled` turns a default off by name, and a
 /// `checks` entry reusing a default's `name` replaces it outright. See
 /// docs/suppressing-checks.md.
@@ -775,13 +781,39 @@ pub fn default_checks() -> Vec<Check> {
         .chain(syntax_rules_checks())
         .chain(comment_quality_checks())
         .chain(prose_checks())
+        .chain(claude_kb_checks())
         .collect()
+}
+
+/// Authoring checks for Claude Code's own `.claude/{skills,agents,commands}` trees
+/// (docs/claude-skill-checks.md). All Advisory: a finding mixes lint-claude-kb's error and
+/// warn tiers, and a `Check` carries one severity. The dangling-symlink check is
+/// batch-only so its findings land on the symlink path, not on whichever `.md` was edited.
+fn claude_kb_checks() -> Vec<Check> {
+    let scope = &["**/.claude/**/*.md"];
+    let link_scope = &[
+        "**/.claude/skills/**",
+        "**/.claude/agents/**",
+        "**/.claude/commands/**",
+    ];
+    vec![
+        native_check("claude-skill-frontmatter", Severity::Advisory, scope),
+        native_check("claude-skill-xref", Severity::Advisory, scope),
+        Check {
+            triggers: vec!["batch".to_string()],
+            ..native_check(
+                "claude-skill-dangling-symlink",
+                Severity::Advisory,
+                link_scope,
+            )
+        },
+    ]
 }
 
 /// Mechanical markdown-prose checks. `ai-vocabulary-density`, `filler-phrase-density`,
 /// `formulaic-ai-openers`, `sentence-length-uniformity`, `em-dash-overuse`, and
 /// `hollow-qualifier-phrasing` are registered (via `inventory::submit!` in their own
-/// modules, so `kibitzer check native <name>`/an explicit `.claude/inspect.json` entry can
+/// modules, so `kibitzer check native <name>`/an explicit `.kibitzer/inspect.json` entry can
 /// still reach them) but deliberately NOT included here: each carries a real risk of
 /// flagging legitimate domain/technical writing, so they're opt-in per repo rather than
 /// on by default.
@@ -1039,33 +1071,75 @@ fn merge_checks(defaults: Vec<Check>, local: &Config) -> Vec<Check> {
     merged
 }
 
-/// Like `find_config`, but never returns "nothing to do": when no `.claude/inspect.json`
-/// exists above `start`, this returns the built-in `default_checks()` catalog (pylint-
-/// style — checks run out of the box) rather than an empty check list, with `start`'s
-/// own directory standing in for the repo root. When a local config *does* exist, its
-/// `checks`/`disabled` overlay the defaults (see `merge_checks`) and its `architecture`
-/// section passes through unchanged — architecture components/dependency rules are
-/// inherently repo-specific and have no sensible default.
+/// Where a [`find_effective_config_with`] result's local config came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// A config file was read (found by the upward walk, or given explicitly).
+    File(PathBuf),
+    /// No config file anywhere above `start`: built-in defaults only.
+    Defaults,
+}
+
+/// One-line notice prepended to MCP output when [`ConfigSource::Defaults`] was used, so a
+/// default-only report isn't mistaken for a repo-tuned one.
+pub const DEFAULTS_NOTE: &str = "note: no .kibitzer/inspect.json found; using built-in defaults";
+
+/// Overlays a local config's `checks`/`disabled` on the built-in `defaults`; its
+/// `architecture` section passes through unchanged.
+fn overlay_local(defaults: Vec<Check>, local: Config) -> Config {
+    Config {
+        checks: merge_checks(defaults, &local),
+        architecture: local.architecture,
+        affected: local.affected,
+        disabled: Vec::new(),
+        allow_write_tools: local.allow_write_tools,
+    }
+}
+
+/// Like `find_config`, but never returns "nothing to do": when no `.kibitzer/inspect.json`
+/// (or deprecated `.claude/inspect.json`) exists above `start`, this returns the built-in
+/// `default_checks()` catalog (pylint-style — checks run out of the box) rather than an
+/// empty check list, with `start`'s own directory standing in for the repo root. When a
+/// local config *does* exist, its `checks`/`disabled` overlay the defaults (see
+/// `merge_checks`) and its `architecture` section passes through unchanged — architecture
+/// components/dependency rules are inherently repo-specific and have no sensible default.
 ///
 /// Callers that specifically need to know whether a real config file exists (e.g. to
-/// report "no architecture model configured") should use `find_config` directly instead.
+/// report "no architecture model configured", or the `allow_write_tools` gate) should use
+/// `find_config` directly instead; callers that need the source use
+/// [`find_effective_config_with`].
 pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
+    find_effective_config_with(None, start).map(|(config, root, _)| (config, root))
+}
+
+/// [`find_effective_config`] plus an optional explicit `config_override` file, and the
+/// [`ConfigSource`] actually used. With an override, the file is loaded directly (the walk
+/// is skipped, a missing/invalid file is an error, not a silent fallback) and overlaid on
+/// the defaults; the repo root is then `start`'s nearest `.git` root, so a config kept
+/// outside the analyzed repo still analyzes that repo.
+pub fn find_effective_config_with(
+    config_override: Option<&Path>,
+    start: &Path,
+) -> Result<(Config, PathBuf, ConfigSource)> {
     let defaults: Vec<Check> = default_checks()
         .into_iter()
         .chain(crate::plugin::registered_plugin_checks())
         .collect();
+    if let Some(path) = config_override {
+        let local = read_config(path)?;
+        return Ok((
+            overlay_local(defaults, local),
+            find_repo_root(start),
+            ConfigSource::File(path.to_path_buf()),
+        ));
+    }
     match find_config(start)? {
         Some((local, root)) => {
-            let checks = merge_checks(defaults, &local);
+            let file = resolve_config_path(&root);
             Ok((
-                Config {
-                    checks,
-                    architecture: local.architecture,
-                    affected: local.affected,
-                    disabled: Vec::new(),
-                    allow_write_tools: local.allow_write_tools,
-                },
+                overlay_local(defaults, local),
                 root,
+                ConfigSource::File(file),
             ))
         }
         None => Ok((
@@ -1077,6 +1151,7 @@ pub fn find_effective_config(start: &Path) -> Result<(Config, PathBuf)> {
                 allow_write_tools: false,
             },
             start_dir(start),
+            ConfigSource::Defaults,
         )),
     }
 }
@@ -1516,7 +1591,7 @@ mod tests {
 
     #[test]
     fn default_config_flags_repeated_literal_with_no_inspect_json() {
-        // `default_checks()` is what a repo with no `.claude/inspect.json` gets — this
+        // `default_checks()` is what a repo with no `.kibitzer/inspect.json` gets — this
         // exercises `replace-magic-literal` through the actual config-layer dispatch
         // (`Check::checker` -> `checker::run_checker_configured`) rather than calling
         // `SyntaxRulesChecker::check()` directly the way `rules.rs`'s own module tests do.
@@ -1586,6 +1661,127 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "markdown-link-integrity")
         );
+    }
+
+    #[test]
+    fn find_effective_config_with_reports_defaults_source_when_no_config() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_dir("source-defaults");
+        let (_, _, source) = find_effective_config_with(None, &dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(source, ConfigSource::Defaults);
+    }
+
+    #[test]
+    fn find_effective_config_with_reports_file_source_when_config_found() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_dir("source-file");
+        std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+        std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
+        let (_, root, source) = find_effective_config_with(None, &dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(root, dir);
+        assert_eq!(
+            source,
+            ConfigSource::File(dir.join(".kibitzer/inspect.json"))
+        );
+    }
+
+    #[test]
+    fn find_effective_config_with_override_uses_that_file_not_the_walk() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo = tmp_dir("override-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cfg_dir = tmp_dir("override-cfg");
+        let cfg = cfg_dir.join("elsewhere.json");
+        std::fs::write(
+            &cfg,
+            r#"{"checks": [{"name": "only-mine", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+
+        let (config, root, source) = find_effective_config_with(Some(&cfg), &repo).unwrap();
+        let missing = find_effective_config_with(Some(&cfg_dir.join("nope.json")), &repo);
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&cfg_dir).ok();
+
+        assert_eq!(root, repo);
+        assert_eq!(source, ConfigSource::File(cfg));
+        assert!(config.checks.iter().any(|c| c.name == "only-mine"));
+        assert!(
+            missing.is_err(),
+            "an explicit missing config must error, not fall back"
+        );
+    }
+
+    #[test]
+    fn find_effective_config_with_reports_legacy_file_as_source() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_dir("source-legacy");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        let (_, root, source) = find_effective_config_with(None, &dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(root, dir);
+        assert_eq!(source, ConfigSource::File(dir.join(".claude/inspect.json")));
+    }
+
+    #[test]
+    fn find_effective_config_with_override_beats_an_in_repo_config() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo = tmp_dir("override-precedence-repo");
+        std::fs::create_dir_all(repo.join(".kibitzer")).unwrap();
+        std::fs::write(
+            repo.join(".kibitzer/inspect.json"),
+            r#"{"checks": [{"name": "in-repo", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+        let cfg = tmp_dir("override-precedence-cfg").join("c.json");
+        std::fs::write(
+            &cfg,
+            r#"{"checks": [{"name": "override-only", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+
+        let (config, _, _) = find_effective_config_with(Some(&cfg), &repo).unwrap();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(cfg.parent().unwrap()).ok();
+
+        assert!(config.checks.iter().any(|c| c.name == "override-only"));
+        assert!(!config.checks.iter().any(|c| c.name == "in-repo"));
+    }
+
+    #[test]
+    fn find_effective_config_with_override_errors_name_the_path() {
+        let dir = tmp_dir("override-errors");
+        let missing = dir.join("missing.json");
+        let malformed = dir.join("bad.json");
+        std::fs::write(&malformed, "{not json").unwrap();
+        let invalid = dir.join("unknown-component.json");
+        std::fs::write(
+            &invalid,
+            r#"{"architecture": {"dependency_rules": [{"component": "ghost"}]}}"#,
+        )
+        .unwrap();
+
+        for path in [&missing, &malformed, &invalid] {
+            let err = format!(
+                "{:#}",
+                find_effective_config_with(Some(path), &dir).unwrap_err()
+            );
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

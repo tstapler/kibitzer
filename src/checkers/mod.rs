@@ -1,4 +1,8 @@
 pub mod ai_vocabulary_density;
+pub mod claude_skill_common;
+pub mod claude_skill_dangling_symlink;
+pub mod claude_skill_frontmatter;
+pub mod claude_skill_xref;
 pub mod comment_quality;
 pub mod complexity;
 pub mod duplicate_code;

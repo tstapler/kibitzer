@@ -75,6 +75,7 @@ const fn meta_rule(id: &'static str, owner: OwnerMatch) -> RuleInfo {
 /// The per-language checker families that own several rule ids each.
 const COMMENT_QUALITY: OwnerMatch = OwnerMatch::Prefix("comment-quality");
 const SYNTAX_RULES: OwnerMatch = OwnerMatch::Prefix("syntax-rules");
+const CLAUDE_SKILL: OwnerMatch = OwnerMatch::Prefix("claude-skill");
 
 /// The one rule table: ids that appear as `[id]` message prefixes, who owns them, and which
 /// are meta. Advisory only: it feeds the unknown-rule suggestion and the unused-ignore rerun
@@ -95,6 +96,18 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("decompose-conditional", SYNTAX_RULES),
     rule("consolidate-conditional", SYNTAX_RULES),
     rule("remove-control-flag", SYNTAX_RULES),
+    rule("name-mismatch", CLAUDE_SKILL),
+    rule("missing-description", CLAUDE_SKILL),
+    rule("name-too-long", CLAUDE_SKILL),
+    rule("name-invalid-chars", CLAUDE_SKILL),
+    rule("name-xml-tag", CLAUDE_SKILL),
+    rule("description-too-long", CLAUDE_SKILL),
+    rule("description-xml-tag", CLAUDE_SKILL),
+    rule("broken-frontmatter-key", CLAUDE_SKILL),
+    rule("unknown-frontmatter-key", CLAUDE_SKILL),
+    rule("invalid-skill-location", CLAUDE_SKILL),
+    rule("broken-skill-ref", CLAUDE_SKILL),
+    rule("dangling-symlink", CLAUDE_SKILL),
     rule("file-size", OwnerMatch::Suffix("file-size")),
     rule("single-call-site-delegation", OwnerMatch::Unowned),
     rule("god-class", OwnerMatch::Unowned),
@@ -102,6 +115,7 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("isp-fat-interface", OwnerMatch::Unowned),
     rule("remove-middle-man", OwnerMatch::Unowned),
     rule("encapsulate-variable", OwnerMatch::Unowned),
+    rule("remove-setting-method", OwnerMatch::Unowned),
     rule("unreferenced-private-symbol", OwnerMatch::Unowned),
     rule("test-no-assertion", OwnerMatch::Prefix("test-no-assertion")),
     rule("go-type-switch-density", OwnerMatch::SameName),

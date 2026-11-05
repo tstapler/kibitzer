@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
-use crate::config::{Check, Severity, find_effective_config};
+use crate::config::{Check, Severity, find_effective_config_with};
 use crate::inline_ignores::sanitize::{display_path, strip_unsafe_with_paths};
 use crate::inline_ignores::{InlineIgnoreMode, batch_syntax_hint};
 
@@ -114,9 +114,15 @@ pub fn run_batch(
     trigger: &str,
     mode: InlineIgnoreMode,
     deny_blocking_suppression: bool,
+    config_override: Option<&Path>,
 ) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) =
-        run_batch_collect(&dir, trigger, mode, deny_blocking_suppression)?;
+    let (any_blocking_failure, lines) = run_batch_collect(
+        &dir,
+        trigger,
+        mode,
+        deny_blocking_suppression,
+        config_override,
+    )?;
     for line in &lines {
         println!("{line}");
     }
@@ -136,8 +142,9 @@ fn run_batch_collect(
     trigger: &str,
     mode: InlineIgnoreMode,
     deny_blocking_suppression: bool,
+    config_override: Option<&Path>,
 ) -> Result<(bool, Vec<String>)> {
-    let (config, repo_root) = find_effective_config(dir)?;
+    let (config, repo_root, _source) = find_effective_config_with(config_override, dir)?;
 
     let arch_config = config.architecture.clone();
     let (file_checks, repo_checks): (Vec<Check>, Vec<Check>) =
@@ -176,9 +183,29 @@ fn run_batch_collect(
         lines.extend(report_lines(&repo_root, &result));
     }
 
-    for file in &files {
+    // Dangling symlinks never reach `files`; hand them only to checks whose checker opts in.
+    let inspecting: Vec<Check> = file_checks
+        .iter()
+        .filter(|c| {
+            c.checker
+                .as_deref()
+                .is_some_and(crate::check::inspects_unreadable_paths)
+        })
+        .cloned()
+        .collect();
+    let dangling = if inspecting.is_empty() {
+        Vec::new()
+    } else {
+        crate::check::dangling_claude_symlinks(dir)
+    };
+    let targets = files
+        .iter()
+        .map(|f| (f, &file_checks[..]))
+        .chain(dangling.iter().map(|f| (f, &inspecting[..])));
+
+    for (file, checks_for_file) in targets {
         let results = run_checks_for_trigger(
-            &file_checks,
+            checks_for_file,
             trigger,
             &repo_root,
             file,
@@ -191,7 +218,7 @@ fn run_batch_collect(
             Vec::new()
         } else {
             crate::inline_post_pass::run_audit(
-                &file_checks,
+                checks_for_file,
                 file,
                 &results,
                 &run_ctx,
@@ -306,6 +333,34 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn run_batch_config_override_applies_a_config_kept_outside_the_repo() {
+        let dir = tmp_dir("config-override-repo");
+        write_zero_match_only_component_deps_fixture(&dir);
+        let external = tmp_dir("config-override-external").join("inspect.json");
+        std::fs::rename(dir.join(".kibitzer/inspect.json"), &external).unwrap();
+
+        let (_, without) =
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false, None).unwrap();
+        let (_, with) = run_batch_collect(
+            &dir,
+            "manual",
+            InlineIgnoreMode::Apply,
+            false,
+            Some(&external),
+        )
+        .unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(external.parent().unwrap()).ok();
+
+        assert!(
+            !without.iter().any(|l| l.contains("[component]")),
+            "{without:#?}"
+        );
+        assert!(with.iter().any(|l| l.contains("[component]")), "{with:#?}");
+    }
+
     /// The end-to-end regression test for the batch/CI path's counterpart to the
     /// `f1a45a9` MCP-tool fix: before this fix, `run_batch`/`run_batch_collect` derived
     /// `any_blocking_failure` and the `[BLOCKING]`/`[advisory]` print prefix from
@@ -319,7 +374,7 @@ mod tests {
         write_zero_match_only_component_deps_fixture(&dir);
 
         let (any_blocking_failure, lines) =
-            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false).unwrap();
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false, None).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 
@@ -354,7 +409,7 @@ mod tests {
         write_real_component_deps_violation_fixture(&dir);
 
         let (any_blocking_failure, lines) =
-            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false).unwrap();
+            run_batch_collect(&dir, "manual", InlineIgnoreMode::Apply, false, None).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
 

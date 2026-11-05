@@ -979,6 +979,7 @@ fn known_rule_should_AcceptRulesCheckersAndMeta_When_Queried() {
     assert!(known_rule("syntax-rules-rust"));
     assert!(known_rule("ignore-syntax"));
     assert!(known_rule("remove-middle-man"));
+    assert!(known_rule("remove-setting-method"));
     assert!(!known_rule("made-up-rule"));
 }
 

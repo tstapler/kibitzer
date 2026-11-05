@@ -27,6 +27,7 @@ into `~/code/github.com/<owner>/<repo>` per the repo-placement convention in
 | `microsoft/vscode-docs`  | Markdown (prose) | VS Code's public docs. |
 | `rust-lang/book`         | Markdown (prose) | The Rust Book — well-edited, idiomatic technical prose; another low-noise counterpoint. |
 | `rust-lang/rustc-dev-guide` | Markdown (prose) | Smaller, clean technical prose corpus. |
+| `tstapler/dotfiles`      | Markdown (Claude skills) | 500+ skill/agent/command files under `.claude/`; the only corpus entry with a large skill tree, and the baseline `lint-claude-kb` findings the `claude-skill-*` checks must reproduce (`docs/claude-skill-checks-backtest.md`). Already local at `~/dotfiles`, not cloned by the script. |
 
 `stapler-squad` is not cloned by the script — it's already present locally (e.g.
 `~/Programming/stapler-squad`, or a `~/.stapler-squad/workspaces/*/worktrees/*` worktree

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use crate::arch_model::{ModelLevel, PruneConfig, build_model, collect_repo_files};
+use crate::arch_model::{ArchModel, ModelLevel, PruneConfig, build_model, collect_repo_files};
 use crate::checker::Language;
 use crate::config::find_config;
 
@@ -19,6 +19,27 @@ use crate::config::find_config;
 /// case up front, before doing any parsing.
 fn has_supported_extension(path: &Path) -> bool {
     Language::for_path(path).is_some_and(Language::has_symbol_extraction)
+}
+
+/// First few package keys of `model`, so a scope that matched nothing shows what it was
+/// matched against (the glob applies to these keys, not to import paths).
+fn package_key_hint(model: &ArchModel) -> String {
+    const SHOWN: usize = 5;
+    let keys: Vec<&str> = model
+        .packages
+        .keys()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let more = if model.packages.len() > SHOWN {
+        ", …"
+    } else {
+        ""
+    };
+    format!(" (model package keys: {}{more})", keys.join(", "))
 }
 
 /// Runs `kibitzer architecture export`. Always exits `ExitCode::SUCCESS` on a successful
@@ -52,8 +73,9 @@ pub fn run_export(
         let filtered = model.filtered(std::slice::from_ref(scope_glob), ModelLevel::Code);
         if filtered.packages.is_empty() && !model.packages.is_empty() {
             println!(
-                "no packages matched scope \"{scope_glob}\" under {}; nothing to export",
-                path.display()
+                "no packages matched scope \"{scope_glob}\" under {}; nothing to export{}",
+                path.display(),
+                package_key_hint(&model)
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -240,6 +262,90 @@ mod tests {
     }
 
     #[test]
+    fn scope_mismatch_hint_truncates_after_five_package_keys() {
+        let dir = tmp_dir("hint-truncation");
+        for i in 0..7 {
+            write_fixture(&dir, &format!("pkg{i}/mod.py"), "def f():\n    pass\n");
+        }
+        let out = dir.join("arch.json");
+        let output = run_kibitzer(&[
+            "architecture",
+            "export",
+            "--path",
+            dir.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--scope",
+            "nonexistent/**",
+        ]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(", …)"), "got {stdout:?}");
+        let keys = stdout.split("model package keys: ").nth(1).unwrap();
+        assert_eq!(
+            keys.split(", ").filter(|k| k.starts_with("pkg")).count(),
+            5,
+            "{stdout:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_config_flag_is_rejected_outside_affected_and_parses_in_both_positions() {
+        let dir = tmp_dir("arch-config-flag");
+        let cfg = dir.join("c.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        let c = cfg.to_str().unwrap();
+        let d = dir.to_str().unwrap();
+
+        let out_path = dir.join("o.json");
+        let o = out_path.to_str().unwrap();
+        let export = run_kibitzer(&[
+            "architecture",
+            "export",
+            "--path",
+            d,
+            "--out",
+            o,
+            "--config",
+            c,
+        ]);
+        assert!(!export.status.success());
+        assert!(String::from_utf8_lossy(&export.stderr).contains("only used by"));
+
+        // Both positions must reach the config loader (a bad path fails there, not in clap).
+        let missing = dir.join("missing.json");
+        let m = missing.to_str().unwrap();
+        for args in [
+            vec![
+                "architecture",
+                "affected",
+                "--path",
+                d,
+                "--base",
+                "HEAD",
+                "--config",
+                m,
+            ],
+            vec![
+                "architecture",
+                "--config",
+                m,
+                "affected",
+                "--path",
+                d,
+                "--base",
+                "HEAD",
+            ],
+        ] {
+            let out = run_kibitzer(&args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && stderr.contains("missing.json"),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
     fn run_export_reports_no_packages_matched_scope_and_exits_zero() {
         let dir = tmp_dir("no-packages-matched-scope");
         write_fixture(&dir, "web/ui/widget.py", "def widget():\n    pass\n");
@@ -268,6 +374,12 @@ mod tests {
         assert!(
             stdout.contains(&expected),
             "expected stdout to contain {expected:?}, got {stdout:?}"
+        );
+        assert!(
+            stdout.contains("(model package keys: ")
+                && stdout.contains("server/api")
+                && stdout.contains("web/ui"),
+            "expected the hint to list the model's package keys, got {stdout:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
