@@ -57,11 +57,28 @@ scratch git repo containing `.claude/skills/ghost -> ../nowhere`.
 live session's transcript vanished mid-scan; a rerun succeeded. Only 56-74 snapshots means this
 is weak evidence about per-edit noise, not a clean bill.
 
+## Whole-tree `kibitzer run`
+
+A plain `kibitzer run` over `~/dotfiles` or `~/dotfiles/.claude` with every default check times
+out (280s / 250s). To get whole-tree output through the real runner, `kibitzer run` was pointed at
+a scratch dir holding a symlink `.claude -> ~/dotfiles/.claude` and a `.kibitzer/inspect.json`
+whose `disabled` list names every other registered checker (`kibitzer check list`). It finished
+with exit 0. Caveats: the scratch dir has no git, so the walker also entered
+`.claude/worktrees/agent-*` (nested repo copies, normally gitignored); those hits were excluded.
+A few architecture checks ignore `disabled` and still printed unrelated lines.
+
+Result, excluding `.claude/worktrees/`: 14 `broken-skill-ref`, 1 `description-too-long`,
+1 `invalid-skill-location`, 1 `unknown-frontmatter-key`, 5 `missing-description`, 0 dangling
+symlinks. The first four match the per-file loop above exactly.
+
+The 5 `missing-description` hits are a deliberate difference from `lint-claude-kb`: the files
+(`advanced-memory-architecture`, `basic-context-optimization`, `debug-lost-in-middle`,
+`edge-case-context-poisoning`, `multi-agent-coordination`) declare `description: ''`. The script
+counts the quotes as a value; native unquotes first, so an empty string is an empty
+description, which is as undiscoverable as a missing one.
+
 ## Not run
 
-- A whole-repo `kibitzer run` over `~/dotfiles` and over `~/dotfiles/.claude`: both hit a
-  timeout (280s and 250s) under all default checks, so no whole-repo `run` numbers exist. The
-  per-file `check native` loop above is what was measured.
 - `scripts/backtest-triage.py` tracking.
 - Known limitation: `claude-skill-xref` scans raw text, so a "`foo` skill" phrase inside a
   fenced code block is flagged, as `lint-claude-kb` also does. Not triaged for how often this
