@@ -125,6 +125,11 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
          end-to-end suppression is covered in tests/encapsulate_variable_cli.rs",
     ),
     (
+        "go-type-switch-clustering",
+        "whole-repo architecture check needing a multi-method model; end-to-end suppression is \
+         covered in tests/go_type_switch_clustering_cli.rs",
+    ),
+    (
         "claude-skill-xref",
         "resolves ids against an on-disk .claude/skills tree, which a single-file fixture lacks",
     ),
