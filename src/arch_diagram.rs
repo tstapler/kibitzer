@@ -227,6 +227,7 @@ mod tests {
             exported: true,
             parent: parent.map(str::to_string),
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,

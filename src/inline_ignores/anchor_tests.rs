@@ -125,6 +125,18 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
          end-to-end suppression is covered in tests/encapsulate_variable_cli.rs",
     ),
     (
+        "remove-subclass",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "extract-superclass",
+        "whole-repo architecture check needing a field-access model, not a single-file fixture",
+    ),
+    (
+        "collapse-hierarchy",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
         "go-type-switch-clustering",
         "whole-repo architecture check needing a multi-method model; end-to-end suppression is \
          covered in tests/go_type_switch_clustering_cli.rs",

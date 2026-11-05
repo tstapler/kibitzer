@@ -217,6 +217,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             used_as_value: false,
             params: params

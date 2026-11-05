@@ -86,6 +86,11 @@ pub struct SymbolNode {
     /// precedent as `ArchFinding::severity_override`).
     #[serde(default)]
     pub is_pure_delegation: bool,
+    /// True iff this `Method`/`Function`'s entire body is one `return <literal>` (number,
+    /// string, bool, nil/null/undefined). Same language scope and cache-compat stance as
+    /// `is_pure_delegation`; input to the `remove-subclass` checker.
+    #[serde(default)]
+    pub is_constant_return: bool,
     /// Receiver field a pure-delegation method routes through (`s.inner.Foo()` → `inner`).
     #[serde(default)]
     pub delegation_field: Option<String>,
@@ -1232,6 +1237,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -1376,6 +1382,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2147,6 +2154,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2161,6 +2169,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2199,6 +2208,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2238,6 +2248,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2512,6 +2523,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2531,6 +2543,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2584,6 +2597,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -2628,6 +2642,7 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,

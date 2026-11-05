@@ -415,6 +415,7 @@ fn go_type_declaration_symbols(
             exported,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
@@ -542,6 +543,11 @@ fn classify_node(
         None
     };
     let is_pure_delegation = delegating.is_some();
+    let is_constant_return = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+        && call_graph_supports(language)
+        && node
+            .child_by_field_name("body")
+            .is_some_and(is_single_literal_return);
     let delegation_field = delegating
         .filter(|_| symbol_kind == SymbolKind::Method)
         .and_then(|call| delegation_field_from_call(node, call, language, source));
@@ -561,6 +567,7 @@ fn classify_node(
         exported,
         parent,
         is_pure_delegation,
+        is_constant_return,
         delegation_field,
         params,
         used_as_value: false,
@@ -715,6 +722,53 @@ fn delegating_call(body: Node) -> Option<Node> {
             }
         }
         _ => None,
+    }
+}
+
+/// Literal leaf kinds across Go and TS/JS (verified via `to_sexp()`); `identifier` is
+/// excluded so `return nil`'s Go node (`nil`) counts but `return x` does not. Go's
+/// `true`/`false`/`nil` and TS's `true`/`false`/`null`/`undefined` are their own node kinds.
+const LITERAL_KINDS: &[&str] = &[
+    "int_literal",
+    "float_literal",
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "rune_literal",
+    "number",
+    "string",
+    "true",
+    "false",
+    "nil",
+    "null",
+    "undefined",
+];
+
+// SEAM(typed-node-kind-migration): `return_statement`/`expression_list`/`comment` are matched
+// by raw string across the Go and TS/JS grammars at once, so no single `<Lang>Kind` enum
+// covers them — see ADR-001.
+/// Body is exactly `return <one literal>`; multi-value returns and expressions are not.
+fn is_single_literal_return(body: Node) -> bool {
+    let stmts = body_statements(body);
+    let [stmt] = stmts.as_slice() else {
+        return false;
+    };
+    if stmt.kind() != "return_statement" {
+        return false;
+    }
+    let mut cursor = stmt.walk();
+    let values: Vec<Node> = stmt
+        .children(&mut cursor)
+        .filter(|c| c.is_named() && c.kind() != "comment")
+        .collect();
+    let is_literal = |n: &Node| LITERAL_KINDS.contains(&n.kind());
+    match values.as_slice() {
+        [v] if v.kind() == "expression_list" => {
+            let mut c2 = v.walk();
+            let exprs: Vec<Node> = v.children(&mut c2).filter(|c| c.is_named()).collect();
+            matches!(exprs.as_slice(), [e] if is_literal(e))
+        }
+        [v] => is_literal(v),
+        _ => false,
     }
 }
 
@@ -3188,6 +3242,81 @@ func f(int, string) {}
     fn params_empty_for_unsupported_languages() {
         let symbols = extract(Language::Python, "def f(a, b):\n    pass\n", "pkg");
         assert!(pairs(&symbols, "f").is_empty());
+    }
+
+    fn constant_return(language: Language, src: &str, name: &str) -> bool {
+        find_by_name(&extract(language, src, "pkg"), name).is_constant_return
+    }
+
+    #[test]
+    fn is_constant_return_true_for_go_literal_returns() {
+        for (label, ret) in [
+            ("int", "return 1"),
+            ("string", "return \"x\""),
+            ("bool", "return true"),
+            ("nil", "return nil"),
+            ("false", "return false"),
+            ("float", "return 1.5"),
+            ("rune", "return 'a'"),
+            ("raw string", "return `raw`"),
+            ("trailing comment", "return 1 // note"),
+        ] {
+            let src = format!("package pkg\n\nfunc (t *T) Kind() any {{\n\t{ret}\n}}\n");
+            assert!(constant_return(Language::Go, &src, "Kind"), "{label}");
+        }
+    }
+
+    #[test]
+    fn is_constant_return_false_for_go_non_constant_bodies() {
+        for (label, body) in [
+            ("identifier", "return x"),
+            ("call", "return f()"),
+            ("multi-value", "return 1, nil"),
+            ("expression", "return 1 + 2"),
+            ("two statements", "log()\n\treturn 1"),
+            ("empty", ""),
+            ("bare return", "return"),
+            ("negative literal", "return -1"),
+        ] {
+            let src = format!("package pkg\n\nfunc (t *T) Kind() any {{\n\t{body}\n}}\n");
+            assert!(!constant_return(Language::Go, &src, "Kind"), "{label}");
+        }
+    }
+
+    #[test]
+    fn is_constant_return_true_for_typescript_literals_and_false_otherwise() {
+        for ret in [
+            "return 1;",
+            "return 'a';",
+            "return true;",
+            "return null;",
+            "return undefined;",
+        ] {
+            let src = format!("class C {{ kind() {{ {ret} }} }}\n");
+            assert!(constant_return(Language::TypeScript, &src, "kind"), "{ret}");
+        }
+        for ret in [
+            "return this.x;",
+            "return f();",
+            "return;",
+            "return -1;",
+            "return `t`;",
+        ] {
+            let src = format!("class C {{ kind() {{ {ret} }} }}\n");
+            assert!(
+                !constant_return(Language::TypeScript, &src, "kind"),
+                "{ret}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_constant_return_false_for_rust_even_with_a_literal_body() {
+        assert!(!constant_return(
+            Language::Rust,
+            "fn thin() -> i32 { return 1; }\n",
+            "thin"
+        ));
     }
 
     #[test]

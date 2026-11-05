@@ -775,6 +775,7 @@ fn whole_repo_check(name: &str, architecture_checker: &str) -> Check {
 pub fn default_checks() -> Vec<Check> {
     core_checks()
         .into_iter()
+        .chain(hierarchy_checks())
         .chain(go_exception_checks())
         .chain(java_exception_checks())
         .chain(file_size_checks())
@@ -904,6 +905,15 @@ fn core_checks() -> Vec<Check> {
                 "**/*.bash",
             ],
         ),
+    ]
+}
+
+/// Language-agnostic type-hierarchy architecture checks (docs/hierarchy-cleanup-checks.md).
+fn hierarchy_checks() -> Vec<Check> {
+    vec![
+        whole_repo_check("remove-subclass", "remove-subclass"),
+        whole_repo_check("extract-superclass", "extract-superclass"),
+        whole_repo_check("collapse-hierarchy", "collapse-hierarchy"),
     ]
 }
 
