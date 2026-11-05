@@ -114,24 +114,32 @@ fn findings_for_package(
     });
     hits.into_iter()
         .take(MAX_FINDINGS_PER_PACKAGE)
-        .map(|(sim, a, b, shared)| ArchFinding {
-            file: Some(a.file.to_path_buf()),
-            line: Some(a.line),
-            message: format!(
-                "[extract-superclass] {}::{} and {}::{} share {:.0}% of their accessed fields \
-                 ({}) with no hierarchy relationship — consider extracting a common superclass \
-                 (Fowler, Extract Superclass)",
-                pkg.path,
-                a.name,
-                pkg.path,
-                b.name,
-                sim * 100.0,
-                shared.into_iter().collect::<Vec<_>>().join(", ")
-            ),
-            severity_override: None,
-            operation: None,
-        })
+        .map(|(sim, a, b, shared)| render_finding(&pkg.path, sim, a, b, &shared))
         .collect()
+}
+
+fn render_finding(
+    pkg_path: &str,
+    sim: f64,
+    a: &TypeFields,
+    b: &TypeFields,
+    shared: &BTreeSet<&str>,
+) -> ArchFinding {
+    ArchFinding {
+        file: Some(a.file.to_path_buf()),
+        line: Some(a.line),
+        message: format!(
+            "[extract-superclass] {pkg_path}::{} and {pkg_path}::{} share {:.0}% of their \
+             accessed fields ({}) with no hierarchy relationship — consider extracting a \
+             common superclass (Fowler, Extract Superclass)",
+            a.name,
+            b.name,
+            sim * 100.0,
+            shared.iter().copied().collect::<Vec<_>>().join(", ")
+        ),
+        severity_override: None,
+        operation: None,
+    }
 }
 
 #[cfg(test)]

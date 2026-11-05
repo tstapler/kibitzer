@@ -3,9 +3,9 @@
 //! [`COLLAPSE_HIERARCHY_UNIQUE_THRESHOLD`] of the subtype's methods are absent (by name) from
 //! the supertype. Names only, not signatures; direct parent only, not transitive.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::arch_model::ArchModel;
+use crate::arch_model::{ArchModel, PackageNode, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 use crate::hierarchy_checks::{methods_of, resolved_extends, type_index};
@@ -24,50 +24,59 @@ impl ArchModelChecker for CollapseHierarchyChecker {
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
         let types = type_index(model);
-        let mut findings = Vec::new();
-        for (sub_id, super_id) in resolved_extends(model, &types) {
-            let (sub_pkg, sub) = types[sub_id];
-            let (super_pkg, sup) = types[super_id];
-            let sub_methods = methods_of(model, sub_pkg, &sub.name);
-            // Same name in two files = build-tag variants of one type, not a hierarchy.
-            if sub.name == sup.name || sub_methods.len() < MIN_SUBTYPE_METHODS {
-                continue;
-            }
-            let inherited: HashSet<&str> = methods_of(model, super_pkg, &sup.name)
-                .iter()
-                .map(|m| m.name.as_str())
-                .collect();
-            let unique = sub_methods
-                .iter()
-                .filter(|m| !inherited.contains(m.name.as_str()))
-                .count();
-            let ratio = unique as f64 / sub_methods.len() as f64;
-            if ratio >= COLLAPSE_HIERARCHY_UNIQUE_THRESHOLD {
-                continue;
-            }
-            let edge = model
-                .type_edges
-                .iter()
-                .find(|e| e.from == sub_id && e.to == super_id);
-            findings.push(ArchFinding {
-                file: edge
-                    .map(|e| e.file.clone())
-                    .or_else(|| Some(sub.file.clone())),
-                line: edge.map(|e| e.line).or(Some(sub.line)),
-                message: format!(
-                    "[collapse-hierarchy] {sub_id} extends {super_id} but only {unique}/{} \
-                     ({:.0}%) of its methods are unique — consider collapsing the hierarchy \
-                     (Fowler, Collapse Hierarchy)",
-                    sub_methods.len(),
-                    ratio * 100.0
-                ),
-                severity_override: None,
-                operation: None,
-            });
-        }
+        let mut findings: Vec<ArchFinding> = resolved_extends(model, &types)
+            .into_iter()
+            .filter_map(|(sub_id, super_id)| finding_for_edge(model, &types, sub_id, super_id))
+            .collect();
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
     }
+}
+
+fn finding_for_edge(
+    model: &ArchModel,
+    types: &HashMap<&str, (&PackageNode, &SymbolNode)>,
+    sub_id: &str,
+    super_id: &str,
+) -> Option<ArchFinding> {
+    let (sub_pkg, sub) = types[sub_id];
+    let (super_pkg, sup) = types[super_id];
+    let sub_methods = methods_of(model, sub_pkg, &sub.name);
+    // Same name in two files = build-tag variants of one type, not a hierarchy.
+    if sub.name == sup.name || sub_methods.len() < MIN_SUBTYPE_METHODS {
+        return None;
+    }
+    let inherited: HashSet<&str> = methods_of(model, super_pkg, &sup.name)
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    let unique = sub_methods
+        .iter()
+        .filter(|m| !inherited.contains(m.name.as_str()))
+        .count();
+    let ratio = unique as f64 / sub_methods.len() as f64;
+    if ratio >= COLLAPSE_HIERARCHY_UNIQUE_THRESHOLD {
+        return None;
+    }
+    let edge = model
+        .type_edges
+        .iter()
+        .find(|e| e.from == sub_id && e.to == super_id);
+    Some(ArchFinding {
+        file: edge
+            .map(|e| e.file.clone())
+            .or_else(|| Some(sub.file.clone())),
+        line: edge.map(|e| e.line).or(Some(sub.line)),
+        message: format!(
+            "[collapse-hierarchy] {sub_id} extends {super_id} but only {unique}/{} \
+             ({:.0}%) of its methods are unique — consider collapsing the hierarchy \
+             (Fowler, Collapse Hierarchy)",
+            sub_methods.len(),
+            ratio * 100.0
+        ),
+        severity_override: None,
+        operation: None,
+    })
 }
 
 #[cfg(test)]
