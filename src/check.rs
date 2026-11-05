@@ -666,11 +666,16 @@ fn tolerates_unreadable_files(checker_name: &str) -> bool {
     crate::checker::lookup(checker_name).is_some_and(|c| c.tolerates_unreadable_files())
 }
 
+pub(crate) fn inspects_unreadable_paths(checker_name: &str) -> bool {
+    crate::checker::lookup(checker_name).is_some_and(|c| c.inspects_unreadable_paths())
+}
+
 fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<SourceCheck> {
     let checker_name = run.checker_name;
     let source = match crate::checker::read_native_source(file_path) {
         Ok(crate::checker::NativeSource::Text(source)) => source,
         Ok(crate::checker::NativeSource::TooLarge) => return Ok(SourceCheck::passing()),
+        Err(_) if inspects_unreadable_paths(checker_name) => String::new(),
         Err(_) if tolerates_unreadable_files(checker_name) => {
             return Ok(SourceCheck::passing());
         }
@@ -1629,6 +1634,39 @@ pub fn walk_and_collect_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+/// Symlinks whose target does not resolve, under `.claude/{skills,agents,commands}` of every
+/// `.claude` directory that holds one of `files` (or sits directly in `dir`). The ordinary
+/// walkers drop them (`canonicalize` fails), so only a checker that inspects unreadable
+/// paths ever sees them. Bounded to those trees so it costs no extra full-repo walk.
+pub fn dangling_claude_symlinks(dir: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vec![dir.join(".claude")];
+    for file in files {
+        if let Some(root) = file
+            .ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n == ".claude"))
+        {
+            roots.push(root.to_path_buf());
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    let mut out = Vec::new();
+    for root in roots {
+        for kind in ["skills", "agents", "commands"] {
+            let Ok(entries) = walk(&root.join(kind)) else {
+                continue;
+            };
+            out.extend(
+                entries
+                    .into_iter()
+                    .filter(|p| p.is_symlink() && !p.exists()),
+            );
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Files under `dir` git considers part of the work tree (tracked, or untracked and not

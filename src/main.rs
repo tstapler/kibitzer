@@ -597,8 +597,13 @@ fn main() -> Result<ExitCode> {
             CheckCommand::Native { name, file } => {
                 let checker = checker::lookup(&name)
                     .with_context(|| format!("no checker named '{name}' registered"))?;
-                let source = std::fs::read_to_string(&file)
-                    .with_context(|| format!("reading {}", file.display()))?;
+                let source = match std::fs::read_to_string(&file) {
+                    Ok(source) => source,
+                    Err(_) if checker.inspects_unreadable_paths() => String::new(),
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("reading {}", file.display()));
+                    }
+                };
                 let cache = checker::GrammarCache::new();
                 let tree = match checker.language() {
                     Some(language) => Some(cache.parse(language, &source)?),
