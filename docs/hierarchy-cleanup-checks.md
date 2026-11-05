@@ -28,13 +28,12 @@ Corpus (`kibitzer check architecture <name> <repo>`), final build:
 | Repo | remove-subclass | extract-superclass | collapse-hierarchy |
 |---|---|---|---|
 | kubernetes/kubernetes | 1 | 11 (after guards; 18 before) | 7 (41 before guards) |
-| tstapler/stapler-squad | 0 | 2 | 1 (before guard; see note) |
+| tstapler/stapler-squad | 0 | 2 | 1 |
 | apache/cassandra | 0 | 0 | 80 (213 before guards) |
 | microsoft/vscode | 3 | 0 | 0 |
 | ripgrep, deno, servo, nowinandroid | 0 | 0 | 0 |
 
-`extract-superclass` counts are from the first run's pre-fix output re-read after the guards
-removed the test-mock and build-tag-variant rows (rerun counts: kubernetes 11, stapler-squad 2).
+The 'before' numbers are from the first run (kubernetes only for extract-superclass), before the guards above.
 
 ### Triage (manual read of the findings; small n, judgement calls)
 
