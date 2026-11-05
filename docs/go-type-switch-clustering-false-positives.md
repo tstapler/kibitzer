@@ -1,54 +1,66 @@
 # go-type-switch-clustering: backtest and known false positives
 
 Advisory, Go-only, `batch` granularity. Fires when 2+ methods of one type each contain a
-`switch x.(type)` on the same subject string. Recommends *Replace Conditional with
-Polymorphism* when `ArchModel.type_edges` already links a case type (a hierarchy exists),
-otherwise *Replace Type Code with Subclasses*.
+`switch x.(type)` (2+ cases) on the same receiver-rooted subject. Recommends *Replace
+Conditional with Polymorphism* when `ArchModel.type_edges` links a case type (a hierarchy
+exists), otherwise *Replace Type Code with Subclasses*.
 
-## Backtest (2026-11-04, release build, exact subject matching)
+## Subject matching
+
+Only subjects rooted at the method's own receiver variable count (`r.kind`, `r`,
+`r.kind()`), with the receiver name normalized so `r.kind` and `c.kind` match across
+methods. Parameters and locals (`obj`, `v`) are skipped: two methods naming a parameter
+alike do not share a type-code field. Pinned by `same_parameter_name_does_not_cluster`.
+
+## Backtest (2026-11-04, release build)
 
 Command per repo: `kibitzer check architecture go-type-switch-clustering <repo>`
 (corpus from `docs/backtest-repos.md`; clones under `~/code/github.com/`).
 
-| Repo | Findings | Receiver-qualified subject (`x.field`, `x.f()`) | Bare identifier subject |
-|---|---|---|---|
-| kubernetes/kubernetes | 3 | 0 | 3 |
-| tstapler/stapler-squad | 1 | 0 | 1 |
-| golang/tools | 16 | 4 | 12 |
-| hashicorp/terraform | 8 | 6 | 2 |
-| cockroachdb/cockroach | 43 | 8 | 35 |
-| **Total** | **71** | **18** | **53** |
+| Repo | v1: any exact subject | Shipped: receiver-rooted only |
+|---|---|---|
+| kubernetes/kubernetes | 3 | 0 |
+| tstapler/stapler-squad | 1 | 0 |
+| golang/tools | 16 | 3 |
+| hashicorp/terraform | 8 | 4 |
+| cockroachdb/cockroach | 43 | 4 |
+| **Total** | **71** | **11** |
 
-(`go-type-switch-clustering` counts only; counted with `grep -c` on the saved output.)
+The v1 run matched bare parameter names as subjects; 53 of its 71 findings were of that
+shape, and the one such site read (kubernetes `pkg/scheduler/eventhandlers.go`, `obj`) was
+informer-callback arguments, not a type-code field. Review of the first draft flagged this,
+so the shipped checker drops them.
 
-`kibitzer check backtest go-type-switch-clustering` (transcript replay) was also run:
-2057 snapshots checked, 0 findings. Expected: it is an ArchModel (`batch`) checker, so
-single-file edit replay does not exercise it.
+`kibitzer check backtest go-type-switch-clustering` (transcript replay) was also run: 2057
+snapshots, 0 findings — expected, since this is a `batch` ArchModel checker and
+single-file edit replay doesn't exercise it.
 
-### True-positive floor
+### True-positive floor (AC 7)
 
-The AC-7 gate is "<2 true positives at exact matching ⇒ try strip-receiver normalization".
-The floor is met without normalization. Verified by reading source:
-`hashicorp/terraform` `internal/addrs/target_pattern.go` switches on the field `p.shape`
-in two `TargetPattern` methods (lines 83 and 155) — a genuine repeated type-code switch.
-The other receiver-qualified findings were classified by subject shape only, not read
-individually (INFERRED).
+Needs 2+ true positives at exact matching. Verified by grepping the source for the repeated
+switch on the same field (the finding's method list names the distinct methods):
 
-### False-positive class: coincidental parameter names
+- `hashicorp/terraform` `internal/addrs/move_endpoint_module.go`: `switch … e.relSubject.(type)`
+  at lines 84, 133, 171, 200 (and on `fromMatch`/`from` receivers elsewhere).
+- `hashicorp/terraform` `internal/lang/globalref/reference.go`: `r.ContainerAddr.(type)` at 73, 92.
+- `hashicorp/terraform` `internal/terraform/node_action_invoke.go`: `n.ActionInvocation.ActionTrigger.(type)` at 305, 321.
+- `golang/tools` `go/ssa/ssa.go`: `c.Value.(type)` at 1494, 1506.
+- `golang/tools` `gopls/.../completion`: `c.path[1].(type)` in keywords.go:83, snippet.go:70, statements.go:62.
 
-Bare-identifier subjects (`obj`, `n`, `v`, `e`) are usually *parameters*, not a shared
-field, so two methods that happen to name a parameter alike cluster spuriously. Verified
-example: `kubernetes/kubernetes` `pkg/scheduler/eventhandlers.go` (`Scheduler` on `obj`,
-lines 106/200/517/588) are informer-callback arguments, not a type-code field.
-The checker deliberately does not normalize receiver names or parameters (conservative, per
-AC-2); `same_parameter_name_is_not_normalized` pins the current behavior. Bare-identifier
-findings are therefore best treated as low-confidence.
+Five genuine clusters, so strip-receiver normalization was not needed to meet the floor
+(it is in the shipped code anyway). The remaining findings (cockroach `op.GetValue()`,
+`ex.machine.CurState()`, `hint.GetValue()`, `w.desc`; terraform `p.shape`) were not
+individually read.
+
+## Known limits
+
+- **Hierarchy detection is explicit-embedding only.** Go `type_edges` come from struct or
+  interface embedding, never structural satisfaction (`arch_model.rs`), so the common shape
+  (concrete types implementing an interface implicitly) yields *Type Code with Subclasses*
+  even when an interface already exists. Case types are matched by bare name, not by
+  package, so an unrelated same-named type can flip the recommendation.
+- Package-level variable subjects are skipped.
+- Cluster rule is "same subject in 2+ methods"; case-type overlap is not required.
 
 Suppress a single site with `kibitzer:ignore go-type-switch-clustering -- <why>` above the
 flagged line (see `docs/suppressing-checks.md`).
-
-## Follow-up (not done here)
-
-Consider down-ranking findings whose subject is a bare method parameter (53 of 71 above).
-Only one such site was read (the kubernetes example), so the true-positive rate within
-that group is unmeasured.

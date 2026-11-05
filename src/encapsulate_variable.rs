@@ -112,11 +112,11 @@ fn findings_for_edges(edges: &[FieldAccessEdge], repo_root: &std::path::Path) ->
     findings
 }
 
-/// Architecture checks bypass the per-file inline-ignore pass, so honor
-/// `kibitzer:ignore <checker_name>` at the finding site here (required by the item's
-/// AC-9). Checker-local on purpose, not a dispatcher change: other architecture checks
-/// deliberately don't take directives. Always `Advisory` and a default context — it only
-/// matches directives, never changes severity.
+/// Architecture checks bypass the per-file inline-ignore pass, so a checker that supports
+/// `kibitzer:ignore <checker_name>` calls this on its findings (shared by
+/// `encapsulate-variable` and `go-type-switch-clustering`; not a dispatcher change, so other
+/// architecture checks still don't take directives). Always `Advisory` with a default
+/// context — it only matches directives, never changes severity.
 pub(crate) fn drop_inline_ignored(
     findings: Vec<ArchFinding>,
     checker_name: &str,

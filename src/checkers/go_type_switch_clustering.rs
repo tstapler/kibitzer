@@ -4,9 +4,14 @@
 //! single switch but cannot see that the same switch recurs across methods. Go only.
 //! See `docs/go-type-switch-clustering-false-positives.md`.
 //!
-//! Subjects are compared as source text, with the method's own receiver variable
-//! normalized (`r.kind` and `c.kind` match when `r`/`c` are each method's receiver). Any
-//! other expression, including a parameter, must match exactly.
+//! Only receiver-rooted subjects count (`r.kind`, `r`, `r.kind()`): the method's own
+//! receiver variable is normalized so `r.kind` and `c.kind` match across methods. A
+//! parameter or local (`obj`, `v`) is skipped — two methods naming a parameter alike do not
+//! share a type-code field (the dominant false positive in the backtest).
+//!
+//! Recommendation limit: Go `type_edges` come from explicit embedding only, so
+//! "Polymorphism" means a case type embeds or is embedded; implicit interface satisfaction
+//! is invisible and usually yields "Subclasses".
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -60,7 +65,7 @@ fn is_go_non_test(file: &Path, model: &ArchModel) -> bool {
 }
 
 /// One `switch x.(type)` inside a method body.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TypeSwitchSite {
     package: String,
     owner_type: String,
@@ -117,11 +122,15 @@ fn collect_method_switches(
         return;
     };
     let owner_type = owner.split('[').next().unwrap_or(&owner).to_string();
-    let method_name = method
+    let Some(method_name) = method
         .child_by_field_name("name")
         .map(|n| node_text(n, source.as_bytes()))
-        .unwrap_or_default();
-    let receiver_var = go_receiver_var(method, source);
+    else {
+        return;
+    };
+    let Some(receiver_var) = go_receiver_var(method, source) else {
+        return;
+    };
     let Some(body) = method.child_by_field_name("body") else {
         return;
     };
@@ -135,11 +144,14 @@ fn collect_method_switches(
             continue;
         }
         let subject = node_text(subject, source.as_bytes());
+        let Some(normalized_subject) = normalize_subject(&subject, &receiver_var) else {
+            continue;
+        };
         out.push(TypeSwitchSite {
             package: package.to_string(),
             owner_type: owner_type.clone(),
             method: method_name.clone(),
-            normalized_subject: normalize_subject(&subject, receiver_var.as_deref()),
+            normalized_subject,
             subject,
             case_types: case_type_names(sw, source.as_bytes()),
             file: file.to_path_buf(),
@@ -158,14 +170,12 @@ fn go_receiver_var(method: Node, source: &str) -> Option<String> {
     Some(node_text(name, source.as_bytes())).filter(|n| n != "_")
 }
 
-/// `r` / `r.kind` -> `<recv>` / `<recv>.kind` when `r` is the method's receiver variable.
-fn normalize_subject(subject: &str, receiver_var: Option<&str>) -> String {
-    let Some(recv) = receiver_var else {
-        return subject.to_string();
-    };
+/// `r` / `r.kind` -> `<recv>` / `<recv>.kind`; `None` when the subject isn't rooted at the
+/// method's receiver variable.
+fn normalize_subject(subject: &str, recv: &str) -> Option<String> {
     match subject.strip_prefix(recv) {
-        Some(rest) if rest.is_empty() || rest.starts_with('.') => format!("<recv>{rest}"),
-        _ => subject.to_string(),
+        Some(rest) if rest.is_empty() || rest.starts_with('.') => Some(format!("<recv>{rest}")),
+        _ => None,
     }
 }
 
@@ -226,7 +236,10 @@ fn clusters(sites: Vec<TypeSwitchSite>) -> Vec<Cluster> {
             if methods.len() < MIN_CLUSTER_METHODS {
                 return None;
             }
-            let case_types = group.iter().flat_map(|s| s.case_types.clone()).collect();
+            let case_types = group
+                .iter()
+                .flat_map(|s| s.case_types.iter().cloned())
+                .collect();
             Some(Cluster {
                 owner_type: group[0].owner_type.clone(),
                 subject: group[0].subject.clone(),
@@ -465,9 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn same_parameter_name_is_not_normalized() {
+    fn same_parameter_name_does_not_cluster() {
         let a = "package pkg\n\nfunc (r *Renderer) Draw(v any) {\n\tswitch v.(type) {\n\tcase *Circle:\n\tcase *Square:\n\t}\n}\n";
-        let b = "package pkg\n\nfunc (c *Renderer) Area(w any) {\n\tswitch w.(type) {\n\tcase *Circle:\n\tcase *Square:\n\t}\n}\n";
+        let b = "package pkg\n\nfunc (r *Renderer) Area(v any) {\n\tswitch v.(type) {\n\tcase *Circle:\n\tcase *Square:\n\t}\n}\n";
         assert!(run("param", &[("a.go", a), ("b.go", b)], vec![]).is_empty());
     }
 
