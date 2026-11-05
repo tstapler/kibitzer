@@ -20,6 +20,13 @@ const MIDDLE_MAN_MIN_METHODS: usize = 3;
 const MIDDLE_MAN_DELEGATION_RATIO: f64 = 0.8;
 const INTENTIONAL_DELEGATION_SUFFIXES: [&str; 4] = ["Adapter", "Wrapper", "Proxy", "Decorator"];
 
+/// Types named like adapters/proxies delegate by design, so delegation checks skip them.
+pub(crate) fn is_intentional_delegation_type(name: &str) -> bool {
+    INTENTIONAL_DELEGATION_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
 pub struct MiddleManChecker;
 
 impl ArchModelChecker for MiddleManChecker {
@@ -89,10 +96,7 @@ fn finding_for_type(
     type_name: &str,
     methods: &[&SymbolNode],
 ) -> Option<ArchFinding> {
-    if INTENTIONAL_DELEGATION_SUFFIXES
-        .iter()
-        .any(|suffix| type_name.ends_with(suffix))
-    {
+    if is_intentional_delegation_type(type_name) {
         return None;
     }
     let total = methods.len();

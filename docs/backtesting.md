@@ -14,6 +14,7 @@ exists to answer two questions before a checker ships or changes:
 ```sh
 kibitzer check backtest primitive-obsession
 kibitzer check backtest replace-magic-literal   # a syntax-rules rule id: replays every syntax-rules-<lang> checker, keeps that rule's findings
+kibitzer check backtest feature-envy            # a model checker (whole-repo architecture model), replayed like any other
 kibitzer check backtest all --only-new
 kibitzer check backtest duplicate-code --transcripts-dir ~/.claude/projects
 ```
