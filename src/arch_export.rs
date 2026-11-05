@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use crate::arch_model::{ModelLevel, PruneConfig, build_model, collect_repo_files};
+use crate::arch_model::{ArchModel, ModelLevel, PruneConfig, build_model, collect_repo_files};
 use crate::checker::Language;
 use crate::config::find_config;
 
@@ -19,6 +19,27 @@ use crate::config::find_config;
 /// case up front, before doing any parsing.
 fn has_supported_extension(path: &Path) -> bool {
     Language::for_path(path).is_some_and(Language::has_symbol_extraction)
+}
+
+/// First few package keys of `model`, so a scope that matched nothing shows what it was
+/// matched against (the glob applies to these keys, not to import paths).
+fn package_key_hint(model: &ArchModel) -> String {
+    const SHOWN: usize = 5;
+    let keys: Vec<&str> = model
+        .packages
+        .keys()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let more = if model.packages.len() > SHOWN {
+        ", …"
+    } else {
+        ""
+    };
+    format!(" (model package keys: {}{more})", keys.join(", "))
 }
 
 /// Runs `kibitzer architecture export`. Always exits `ExitCode::SUCCESS` on a successful
@@ -52,8 +73,9 @@ pub fn run_export(
         let filtered = model.filtered(std::slice::from_ref(scope_glob), ModelLevel::Code);
         if filtered.packages.is_empty() && !model.packages.is_empty() {
             println!(
-                "no packages matched scope \"{scope_glob}\" under {}; nothing to export",
-                path.display()
+                "no packages matched scope \"{scope_glob}\" under {}; nothing to export{}",
+                path.display(),
+                package_key_hint(&model)
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -268,6 +290,12 @@ mod tests {
         assert!(
             stdout.contains(&expected),
             "expected stdout to contain {expected:?}, got {stdout:?}"
+        );
+        assert!(
+            stdout.contains("(model package keys: ")
+                && stdout.contains("server/api")
+                && stdout.contains("web/ui"),
+            "expected the hint to list the model's package keys, got {stdout:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

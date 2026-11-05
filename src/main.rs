@@ -98,6 +98,9 @@ enum Command {
         /// Exit nonzero when any finding of a blocking check was suppressed inline.
         #[arg(long)]
         deny_blocking_suppression: bool,
+        /// Load config from this file instead of walking upward for `.kibitzer/inspect.json`.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
@@ -151,6 +154,11 @@ enum Command {
     /// Query the shared architecture model (packages, symbols, import edges) — export it
     /// as JSON, or render it as a diagram.
     Architecture {
+        /// Load config from this file instead of walking upward for `.kibitzer/inspect.json`.
+        /// Only subcommands that read config content use it (currently `affected`); the
+        /// rest already work without a config.
+        #[arg(long, value_name = "PATH", global = true)]
+        config: Option<PathBuf>,
         #[command(subcommand)]
         action: ArchitectureAction,
     },
@@ -477,6 +485,7 @@ fn main() -> Result<ExitCode> {
             trigger,
             no_inline_ignores,
             deny_blocking_suppression,
+            config,
         } => run::run_batch(
             dir,
             &trigger,
@@ -486,6 +495,7 @@ fn main() -> Result<ExitCode> {
                 inline_ignores::InlineIgnoreMode::Apply
             },
             deny_blocking_suppression,
+            config.as_deref(),
         ),
         Command::Hook => hook::run_hook(),
         Command::Mcp {
@@ -718,7 +728,7 @@ fn main() -> Result<ExitCode> {
         },
         Command::Status => status::run_status(),
         Command::Install { global, dry_run } => install::run_install(global, dry_run),
-        Command::Architecture { action } => match action {
+        Command::Architecture { config, action } => match action {
             ArchitectureAction::Export {
                 path,
                 scope,
@@ -739,7 +749,9 @@ fn main() -> Result<ExitCode> {
                 run_root_cause_clusters(&path, limit, top)
             }
             ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
-            ArchitectureAction::Affected { path, base } => run_affected(&path, &base),
+            ArchitectureAction::Affected { path, base } => {
+                run_affected(&path, &base, config.as_deref())
+            }
             ArchitectureAction::SplitSim {
                 package,
                 partitions,
@@ -1018,10 +1030,15 @@ fn run_hotspots(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
 /// *successful computation* (a narrowed list, an empty list, or the `__ALL__` bail-out
 /// are all valid answers); only a genuine failure to compute an answer at all (bad
 /// repo, git spawn failure, unresolvable `--base`) is non-zero.
-fn run_affected(path: &Path, base: &str) -> Result<ExitCode> {
-    let (config, repo_root) = match config::find_config(path)? {
-        Some((config, root)) => (config.affected, root),
-        None => (config::AffectedConfig::default(), path.to_path_buf()),
+fn run_affected(path: &Path, base: &str, config_override: Option<&Path>) -> Result<ExitCode> {
+    let (config, repo_root) = if let Some(file) = config_override {
+        let (cfg, _, _) = config::find_effective_config_with(Some(file), path)?;
+        (cfg.affected, config::find_repo_root(path))
+    } else {
+        match config::find_config(path)? {
+            Some((config, root)) => (config.affected, root),
+            None => (config::AffectedConfig::default(), path.to_path_buf()),
+        }
     };
     match affected::compute_affected(&repo_root, base, &config)? {
         affected::AffectedResult::Packages(packages) if packages.is_empty() => {
