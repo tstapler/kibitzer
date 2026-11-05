@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-use crate::arch_model::{ArchModel, PackageNode, SymbolNode};
+use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker, methods_by_type};
 use crate::checkers::is_test_file;
 use crate::config::ArchitectureConfig;
@@ -22,6 +22,56 @@ const FEATURE_ENVY_RATIO_THRESHOLD: f64 = 0.33;
 const FEATURE_ENVY_MIN_FOREIGN: usize = 5;
 /// Minimum foreign + own accesses before a method is evaluated at all.
 const FEATURE_ENVY_MIN_TOTAL: usize = 4;
+
+/// Receiver roles that orchestrate collaborators by design: reaching into several foreign
+/// types is their job, not envy. Every entry is a false-positive class measured in
+/// `project_plans/feature-envy-detection/decisions/validation.md`.
+const ORCHESTRATOR_SUFFIXES: [&str; 19] = [
+    "Repository",
+    "Storage",
+    "Store",
+    "Handler",
+    "Controller",
+    "Manager",
+    "Service",
+    "Registry",
+    "Listener",
+    "Reconciler",
+    "Runner",
+    "Executor",
+    "Generator",
+    "Collector",
+    "Builder",
+    "Scanner",
+    "Checker",
+    "Linker",
+    "Determiner",
+];
+
+/// Matches `OrderService` and a bare lowercase `reconciler`, but not `Restore` or `Servicer`.
+fn is_orchestrator_receiver(type_name: &str) -> bool {
+    ORCHESTRATOR_SUFFIXES
+        .iter()
+        .any(|suffix| type_name.ends_with(suffix) || type_name.eq_ignore_ascii_case(suffix))
+}
+
+/// True when `dominant` (`pkg::Type`) declares no methods anywhere in the model: a DTO / input
+/// record / result or summary struct. Reading one (a mapper copying a parameter record, a
+/// `GetStatistics` filling a result) is its purpose, and the type has no behavior to move
+/// logic onto. Parameters are the common case, but locally built records fail the same way.
+fn is_record_target(dominant: &str, model: &ArchModel) -> bool {
+    let (pkg_path, type_name) = dominant.rsplit_once("::").unwrap_or(("", dominant));
+    !type_has_methods(model, pkg_path, type_name)
+}
+
+fn type_has_methods(model: &ArchModel, pkg_path: &str, type_name: &str) -> bool {
+    model
+        .packages
+        .values()
+        .filter(|pkg| pkg.path == pkg_path)
+        .flat_map(|pkg| &pkg.symbols)
+        .any(|s| s.kind == SymbolKind::Method && s.parent.as_deref() == Some(type_name))
+}
 
 pub struct FeatureEnvyChecker;
 
@@ -174,7 +224,7 @@ fn feature_envy_findings_for_package(
     let mut findings = Vec::new();
 
     for (type_name, ids) in methods_by_type(pkg) {
-        if is_intentional_delegation_type(type_name) {
+        if is_intentional_delegation_type(type_name) || is_orchestrator_receiver(type_name) {
             continue;
         }
         for id in ids {
@@ -282,6 +332,9 @@ fn evaluate_method(
     } = pick_variant(c)?;
     let local = c.local;
     let (dominant, dominant_n) = dominant_type(&counts)?;
+    if is_record_target(dominant, model) {
+        return None;
+    }
     let ratio = foreign as f64 / (foreign + local) as f64;
     let rel = sym.file.strip_prefix(&model.repo_root).unwrap_or(&sym.file);
     Some(ArchFinding {
@@ -398,7 +451,11 @@ mod tests {
         let dir = crate::test_support::unique_temp_dir(dir_tag);
         let file = dir.join(file_name);
         std::fs::write(&file, source).unwrap();
-        let mut model = model_of(vec![symbol("Order", "Calc", &file, calc_line(source))]);
+        // `Customer` gets a method so it counts as a behavior-bearing type, not a record.
+        let mut model = model_of(vec![
+            symbol("Order", "Calc", &file, calc_line(source)),
+            symbol("Customer", "Rate", &file, 1),
+        ]);
         setup(&mut model);
         FeatureEnvyChecker.check(&model, &ArchitectureConfig::default())
     }
@@ -611,6 +668,61 @@ mod tests {
     }
 
     #[test]
+    fn suppresses_orchestrator_receivers_but_not_lookalikes() {
+        for suffix in ORCHESTRATOR_SUFFIXES {
+            let findings = run_as_type(&format!("fe-orch-{suffix}"), &format!("Order{suffix}"));
+            assert!(findings.is_empty(), "Order{suffix} should be skipped");
+        }
+        let bare = run_as_type("fe-orch-bare", "reconciler");
+        assert!(
+            bare.is_empty(),
+            "bare lowercase role name should be skipped"
+        );
+        for type_name in ["Restore", "Servicer"] {
+            let findings = run_as_type(&format!("fe-orch-near-{type_name}"), type_name);
+            assert_eq!(findings.len(), 1, "{type_name} must still be flagged");
+        }
+    }
+
+    fn drop_customer_methods(m: &mut ArchModel) {
+        m.packages
+            .get_mut("pkg")
+            .unwrap()
+            .symbols
+            .retain(|s| s.parent.as_deref() != Some("Customer"));
+    }
+
+    #[test]
+    fn suppresses_parameter_record_without_methods() {
+        let findings = run("fe-dto", "order.go", &go_source(5), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+            m.packages.get_mut("pkg").unwrap().symbols[0].params =
+                vec![("c".to_string(), "*Customer".to_string())];
+            drop_customer_methods(m);
+        });
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn suppresses_locally_built_record_without_methods() {
+        let findings = run("fe-record", "order.go", &go_source(5), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+            drop_customer_methods(m);
+        });
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn still_flags_parameter_type_that_has_methods() {
+        let findings = run("fe-param-behavior", "order.go", &go_source(5), |m| {
+            own_access(m, "pkg::Order.Calc", 1);
+            m.packages.get_mut("pkg").unwrap().symbols[0].params =
+                vec![("c".to_string(), "*Customer".to_string())];
+        });
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
     fn second_shorter_file_in_package_does_not_panic() {
         let dir = crate::test_support::unique_temp_dir("fe-stale");
         let long = dir.join("a_long.go");
@@ -626,6 +738,7 @@ mod tests {
         let mut model = model_of(vec![
             symbol("Order", "Calc", &long, calc_line(&long_src)),
             symbol("Other", "Tiny", &short, 5),
+            symbol("Customer", "Rate", &long, 1),
         ]);
         own_access(&mut model, "pkg::Order.Calc", 1);
         let findings = FeatureEnvyChecker.check(&model, &ArchitectureConfig::default());
