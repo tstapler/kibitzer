@@ -105,6 +105,7 @@ pub(crate) const RULES: &[RuleInfo] = &[
     rule("remove-subclass", OwnerMatch::Unowned),
     rule("extract-superclass", OwnerMatch::Unowned),
     rule("collapse-hierarchy", OwnerMatch::Unowned),
+    rule("remove-setting-method", OwnerMatch::Unowned),
     rule("unreferenced-private-symbol", OwnerMatch::Unowned),
     rule("test-no-assertion", OwnerMatch::Prefix("test-no-assertion")),
     rule("go-type-switch-density", OwnerMatch::SameName),

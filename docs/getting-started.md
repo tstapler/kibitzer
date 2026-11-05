@@ -38,6 +38,36 @@ defaults already cover what you need.
 > (kibitzer prints a one-time warning) — move it to `.kibitzer/inspect.json`
 > when convenient; there's no hard cutover date.
 
+### Config discovery
+
+Which config kibitzer uses, in priority order:
+
+1. **`--config <path>` / the MCP `config` argument** — if given, that file is
+   loaded and the walk below is skipped entirely. A missing or invalid file is
+   an error, not a silent fallback. The analyzed repo root is the nearest
+   `.git` entry above the target path (else the target directory), so the config
+   can live outside the repo you're analyzing (no file written into a repo you
+   only want to read). A relative path resolves against the process's working
+   directory (for MCP, the server's, not the client's).
+   Available on `kibitzer run`, `kibitzer architecture affected` (the other
+   `architecture` subcommands need no config and reject the flag), and the MCP
+   tools `list_checks`, `architecture_assessment` and `run_checks`. An explicit
+   config is trusted like a repo-local one: its `command` checks run via `sh -c`.
+2. **Walk upward from the target path.** In each directory, `.kibitzer/inspect.json`
+   wins; if only the deprecated `.claude/inspect.json` exists there it is used
+   with a one-time warning. If both exist, `.kibitzer/inspect.json` is used and
+   the legacy file is ignored (never merged). The first directory with either
+   file ends the walk.
+3. **No config found anywhere: built-in defaults.** The default checks run and
+   there are no `architecture.components`, so component dependency rules don't
+   apply. MCP `list_checks`, `architecture_assessment` and `run_checks` start
+   their output with `note: no .kibitzer/inspect.json found; using built-in
+   defaults` so the result isn't mistaken for a repo-tuned run.
+
+A found or explicit config *overlays* the defaults (see
+`docs/suppressing-checks.md`). `--config` never unlocks the MCP write tools:
+they stay gated on a walk-found config with `allow_write_tools` set.
+
 ## 3. Register the `PostToolUse` hook
 
 ```bash
