@@ -1,17 +1,7 @@
 //! Fowler's **Replace Conditional with Polymorphism** / **Replace Type Code with
 //! Subclasses**: the same `switch x.(type)` subject repeated across 2+ methods of one Go
-//! type. Builds on `go-type-switch-density` (#38's OCP proxy), which counts cases in a
-//! single switch but cannot see that the same switch recurs across methods. Go only.
-//! See `docs/go-type-switch-clustering-false-positives.md`.
-//!
-//! Only receiver-rooted subjects count (`r.kind`, `r`, `r.kind()`): the method's own
-//! receiver variable is normalized so `r.kind` and `c.kind` match across methods. A
-//! parameter or local (`obj`, `v`) is skipped — two methods naming a parameter alike do not
-//! share a type-code field (the dominant false positive in the backtest).
-//!
-//! Recommendation limit: Go `type_edges` come from explicit embedding only, so
-//! "Polymorphism" means a case type embeds or is embedded; implicit interface satisfaction
-//! is invisible and usually yields "Subclasses".
+//! type. Only receiver-rooted subjects count; see
+//! `docs/go-type-switch-clustering-false-positives.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -482,6 +472,77 @@ mod tests {
         let a = "package pkg\n\nfunc (r *Renderer) Draw(v any) {\n\tswitch v.(type) {\n\tcase *Circle:\n\tcase *Square:\n\t}\n}\n";
         let b = "package pkg\n\nfunc (r *Renderer) Area(v any) {\n\tswitch v.(type) {\n\tcase *Circle:\n\tcase *Square:\n\t}\n}\n";
         assert!(run("param", &[("a.go", a), ("b.go", b)], vec![]).is_empty());
+    }
+
+    fn one_method(recv: &str, name: &str, switch_head: &str, cases: &[&str]) -> String {
+        let body: String = cases.iter().map(|c| format!("\tcase {c}:\n")).collect();
+        format!("package pkg\n\nfunc {recv} {name}() {{\n\t{switch_head} {{\n{body}\t}}\n}}\n")
+    }
+
+    #[test]
+    fn single_case_switches_do_not_cluster() {
+        let a = one_method(
+            "(r *Renderer)",
+            "Draw",
+            "switch r.kind.(type)",
+            &["*Circle"],
+        );
+        let b = one_method(
+            "(r *Renderer)",
+            "Area",
+            "switch r.kind.(type)",
+            &["*Circle"],
+        );
+        assert!(run("onecase", &[("a.go", &a), ("b.go", &b)], vec![]).is_empty());
+    }
+
+    #[test]
+    fn same_field_on_different_receiver_types_does_not_cluster() {
+        let a = one_method(
+            "(r *Renderer)",
+            "Draw",
+            "switch r.kind.(type)",
+            &["*A", "*B"],
+        );
+        let b = one_method(
+            "(p *Printer)",
+            "Area",
+            "switch p.kind.(type)",
+            &["*A", "*B"],
+        );
+        assert!(run("owners", &[("a.go", &a), ("b.go", &b)], vec![]).is_empty());
+    }
+
+    #[test]
+    fn binding_form_and_method_call_subjects_cluster() {
+        let a = one_method(
+            "(r *Renderer)",
+            "Draw",
+            "switch v := r.kind.(type)",
+            &["*A", "*B"],
+        );
+        let b = one_method(
+            "(r Renderer)",
+            "Area",
+            "switch v := r.kind.(type)",
+            &["*A", "*B"],
+        );
+        let findings = run("bind", &[("a.go", &a), ("b.go", &b)], vec![]);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        let c = one_method(
+            "(r *Renderer)",
+            "Draw",
+            "switch r.Kind().(type)",
+            &["*A", "*B"],
+        );
+        let d = one_method(
+            "(r *Renderer)",
+            "Area",
+            "switch r.Kind().(type)",
+            &["*A", "*B"],
+        );
+        let findings = run("call", &[("a.go", &c), ("b.go", &d)], vec![]);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
     }
 
     #[test]
