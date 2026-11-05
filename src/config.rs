@@ -782,7 +782,33 @@ pub fn default_checks() -> Vec<Check> {
         .chain(syntax_rules_checks())
         .chain(comment_quality_checks())
         .chain(prose_checks())
+        .chain(claude_kb_checks())
         .collect()
+}
+
+/// Authoring checks for Claude Code's own `.claude/{skills,agents,commands}` trees
+/// (docs/claude-skill-checks.md). All Advisory: a finding mixes lint-claude-kb's error and
+/// warn tiers, and a `Check` carries one severity. The dangling-symlink check is
+/// batch-only so its findings land on the symlink path, not on whichever `.md` was edited.
+fn claude_kb_checks() -> Vec<Check> {
+    let scope = &["**/.claude/**/*.md"];
+    let link_scope = &[
+        "**/.claude/skills/**",
+        "**/.claude/agents/**",
+        "**/.claude/commands/**",
+    ];
+    vec![
+        native_check("claude-skill-frontmatter", Severity::Advisory, scope),
+        native_check("claude-skill-xref", Severity::Advisory, scope),
+        Check {
+            triggers: vec!["batch".to_string()],
+            ..native_check(
+                "claude-skill-dangling-symlink",
+                Severity::Advisory,
+                link_scope,
+            )
+        },
+    ]
 }
 
 /// Mechanical markdown-prose checks. `ai-vocabulary-density`, `filler-phrase-density`,
