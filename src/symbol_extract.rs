@@ -603,6 +603,7 @@ const LITERAL_KINDS: &[&str] = &[
 ];
 
 fn is_constant_literal(n: Node, source: &str) -> bool {
+    // Non-goal (typed-node-kind-migration): shared across Java/Kotlin/TS/JS grammars, so raw kind strings.
     match n.kind() {
         // kotlin-ng parses `true`/`false`/`null` as plain identifiers.
         "identifier" => matches!(node_text(n, source), "true" | "false" | "null"),
@@ -641,6 +642,7 @@ fn returns_constant_body(node: Node, language: Language, source: &str) -> bool {
     else {
         return false;
     };
+    // Non-goal (typed-node-kind-migration): shared across Java/Kotlin/TS/JS grammars, so raw kind strings.
     if body.kind() == "function_body" {
         match body.named_child(0) {
             Some(inner) if body.named_child_count() == 1 => body = inner,
@@ -677,6 +679,7 @@ fn is_numeric_literal(n: Node) -> bool {
 
 /// `-1` / `+1`: a sign applied directly to a numeric literal.
 fn is_signed_number(n: Node) -> bool {
+    // Non-goal (typed-node-kind-migration): shared across Java/Kotlin/TS/JS grammars, so raw kind strings.
     n.kind() == "unary_expression"
         && n.named_child_count() == 1
         && n.child(0).is_some_and(|op| matches!(op.kind(), "-" | "+"))
@@ -727,6 +730,7 @@ fn assigns_this_member(node: Node, source: &str) -> bool {
 
 /// `(is_abstract, declares_fields)` for a class declaration.
 fn class_shape(node: Node, language: Language, source: &str) -> (bool, bool) {
+    // Non-goal (typed-node-kind-migration): shared across Java/Kotlin/TS/JS grammars, so raw kind strings.
     if !type_extends_capable(language) || node.kind() != "class_declaration" {
         return (false, false);
     }
