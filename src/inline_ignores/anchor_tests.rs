@@ -92,6 +92,11 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("comment-quality-bash", "x.sh", || {
         "# This seamlessly handles requests.\nhandle() { :; }\n".into()
     }),
+    (
+        "claude-skill-frontmatter",
+        ".claude/skills/foo/SKILL.md",
+        || "---\nname: bar\ndescription: d\n---\n".into(),
+    ),
     ("repetitive-sentence-structure", "n.md", || {
         "# T\n\nThis is bad. This is worse. This is worst.\n".into()
     }),
@@ -118,6 +123,14 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
         "go-encapsulate-variable",
         "whole-repo architecture check needing a two-package model, not a single-file fixture; \
          end-to-end suppression is covered in tests/encapsulate_variable_cli.rs",
+    ),
+    (
+        "claude-skill-xref",
+        "resolves ids against an on-disk .claude/skills tree, which a single-file fixture lacks",
+    ),
+    (
+        "claude-skill-dangling-symlink",
+        "judges the path on disk (a symlink), not file contents, and reports at line 1 of the link",
     ),
     (
         "go-blank-imports",

@@ -183,9 +183,29 @@ fn run_batch_collect(
         lines.extend(report_lines(&repo_root, &result));
     }
 
-    for file in &files {
+    // Dangling symlinks never reach `files`; hand them only to checks whose checker opts in.
+    let inspecting: Vec<Check> = file_checks
+        .iter()
+        .filter(|c| {
+            c.checker
+                .as_deref()
+                .is_some_and(crate::check::inspects_unreadable_paths)
+        })
+        .cloned()
+        .collect();
+    let dangling = if inspecting.is_empty() {
+        Vec::new()
+    } else {
+        crate::check::dangling_claude_symlinks(dir)
+    };
+    let targets = files
+        .iter()
+        .map(|f| (f, &file_checks[..]))
+        .chain(dangling.iter().map(|f| (f, &inspecting[..])));
+
+    for (file, checks_for_file) in targets {
         let results = run_checks_for_trigger(
-            &file_checks,
+            checks_for_file,
             trigger,
             &repo_root,
             file,
@@ -198,7 +218,7 @@ fn run_batch_collect(
             Vec::new()
         } else {
             crate::inline_post_pass::run_audit(
-                &file_checks,
+                checks_for_file,
                 file,
                 &results,
                 &run_ctx,

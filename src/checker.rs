@@ -223,6 +223,13 @@ pub trait Checker {
         false
     }
 
+    /// Whether the runner should call [`check`](Checker::check) with an empty source for a
+    /// path it cannot read (a dangling symlink, say), instead of treating the read error
+    /// as a pass or a failure. True only for a checker whose subject is the path itself.
+    fn inspects_unreadable_paths(&self) -> bool {
+        false
+    }
+
     /// Whether a file that cannot be read as UTF-8 text is a pass rather than a failure.
     /// True only for a checker that runs on every walked file, binary ones included.
     fn tolerates_unreadable_files(&self) -> bool {
