@@ -892,6 +892,9 @@ fn go_exception_checks() -> Vec<Check> {
             &["**/*.go"],
         ),
         whole_repo_check("go-encapsulate-variable", "encapsulate-variable"),
+        whole_repo_check("remove-subclass", "remove-subclass"),
+        whole_repo_check("extract-superclass", "extract-superclass"),
+        whole_repo_check("collapse-hierarchy", "collapse-hierarchy"),
         native_check(
             "go-bulk-fetch-linear-scan",
             Severity::Advisory,
