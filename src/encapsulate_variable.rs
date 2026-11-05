@@ -51,7 +51,10 @@ impl ArchModelChecker for EncapsulateVariableChecker {
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
         let edges = cross_package_write_edges(model);
-        drop_inline_ignored(findings_for_edges(&edges, &model.repo_root))
+        drop_inline_ignored(
+            findings_for_edges(&edges, &model.repo_root),
+            "encapsulate-variable",
+        )
     }
 }
 
@@ -110,11 +113,14 @@ fn findings_for_edges(edges: &[FieldAccessEdge], repo_root: &std::path::Path) ->
 }
 
 /// Architecture checks bypass the per-file inline-ignore pass, so honor
-/// `kibitzer:ignore encapsulate-variable` at the write site here (required by the item's
+/// `kibitzer:ignore <checker_name>` at the finding site here (required by the item's
 /// AC-9). Checker-local on purpose, not a dispatcher change: other architecture checks
 /// deliberately don't take directives. Always `Advisory` and a default context — it only
 /// matches directives, never changes severity.
-fn drop_inline_ignored(findings: Vec<ArchFinding>) -> Vec<ArchFinding> {
+pub(crate) fn drop_inline_ignored(
+    findings: Vec<ArchFinding>,
+    checker_name: &str,
+) -> Vec<ArchFinding> {
     use crate::inline_ignores::{IgnoreTarget, InlineIgnoreContext, apply_inline_ignores};
     use std::collections::BTreeMap;
 
@@ -144,7 +150,7 @@ fn drop_inline_ignored(findings: Vec<ArchFinding>) -> Vec<ArchFinding> {
             IgnoreTarget {
                 file: &file,
                 source: &source,
-                checker_name: "encapsulate-variable",
+                checker_name,
                 severity: crate::config::Severity::Advisory,
             },
             &ctx,

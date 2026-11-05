@@ -892,6 +892,7 @@ fn go_exception_checks() -> Vec<Check> {
             &["**/*.go"],
         ),
         whole_repo_check("go-encapsulate-variable", "encapsulate-variable"),
+        whole_repo_check("go-type-switch-clustering", "go-type-switch-clustering"),
         native_check(
             "go-bulk-fetch-linear-scan",
             Severity::Advisory,

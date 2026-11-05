@@ -629,6 +629,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::middle_man::MiddleManChecker),
         Box::new(crate::encapsulate_variable::EncapsulateVariableChecker),
         Box::new(crate::feature_envy::FeatureEnvyChecker),
+        Box::new(crate::checkers::go_type_switch_clustering::TypeSwitchClusteringChecker),
         Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
     ]
 }
