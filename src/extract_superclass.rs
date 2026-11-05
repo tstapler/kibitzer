@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
+use crate::checkers::is_test_file;
 use crate::config::ArchitectureConfig;
 use crate::extract_class::{MIN_METHODS_FOR_CLUSTERING, method_field_sets};
 use crate::jaccard::jaccard;
@@ -59,6 +60,7 @@ fn type_fields<'a>(model: &'a ArchModel, pkg: &'a PackageNode) -> Vec<TypeFields
         .symbols
         .iter()
         .filter(|s| s.kind == SymbolKind::Type)
+        .filter(|s| !is_test_file(s.file.strip_prefix(&model.repo_root).unwrap_or(&s.file)))
         .filter_map(|ty| {
             let sets = method_field_sets(model, pkg, &ty.name);
             if sets.len() < MIN_METHODS_FOR_CLUSTERING {
@@ -91,7 +93,9 @@ fn findings_for_package(
     let mut hits: Vec<(f64, &TypeFields, &TypeFields, BTreeSet<&str>)> = Vec::new();
     for (i, a) in types.iter().enumerate() {
         for b in &types[i + 1..] {
-            if related.contains(&(a.id, b.id)) {
+            // Same name in one package = build-tag variants of one type (e.g. `Mounter` in
+            // mount_linux.go / mount_unsupported.go), not two types.
+            if a.name == b.name || related.contains(&(a.id, b.id)) {
                 continue;
             }
             let shared: BTreeSet<&str> = a.fields.intersection(&b.fields).copied().collect();
@@ -223,6 +227,27 @@ mod tests {
             ))
             .is_empty()
         );
+    }
+
+    #[test]
+    fn ignores_same_named_types_from_build_tag_variants() {
+        let (mut syms, mut acc) = (vec![], vec![]);
+        add_type(&mut syms, &mut acc, "A", 4, &["id", "name"]);
+        let mut twin = syms.clone();
+        twin.retain(|s| s.parent.as_deref() == Some("A") || s.name == "A");
+        syms.extend(twin);
+        let mut m = model(syms, vec![]);
+        m.field_accesses = acc;
+        assert!(run(&m).is_empty());
+    }
+
+    #[test]
+    fn ignores_types_declared_in_test_files() {
+        let mut m = two_types(&["id", "name"], &["id", "name"], 4);
+        for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
+            s.file = PathBuf::from("/repo/pkg/a_test.go");
+        }
+        assert!(run(&m).is_empty());
     }
 
     #[test]

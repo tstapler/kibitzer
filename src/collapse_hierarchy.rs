@@ -11,6 +11,9 @@ use crate::config::ArchitectureConfig;
 use crate::hierarchy_checks::{methods_of, resolved_extends, type_index};
 
 const COLLAPSE_HIERARCHY_UNIQUE_THRESHOLD: f64 = 0.20;
+/// A subtype with 1-2 methods that all override its parent is the template-method pattern
+/// (backtest: 150+ such hits on cassandra), not a hollow hierarchy.
+const MIN_SUBTYPE_METHODS: usize = 3;
 
 pub struct CollapseHierarchyChecker;
 
@@ -26,7 +29,8 @@ impl ArchModelChecker for CollapseHierarchyChecker {
             let (sub_pkg, sub) = types[sub_id];
             let (super_pkg, sup) = types[super_id];
             let sub_methods = methods_of(model, sub_pkg, &sub.name);
-            if sub_methods.is_empty() {
+            // Same name in two files = build-tag variants of one type, not a hierarchy.
+            if sub.name == sup.name || sub_methods.len() < MIN_SUBTYPE_METHODS {
                 continue;
             }
             let inherited: HashSet<&str> = methods_of(model, super_pkg, &sup.name)
@@ -147,5 +151,11 @@ mod tests {
     #[test]
     fn ignores_subtype_with_no_methods() {
         assert!(run(&hierarchy(0, 0)).is_empty());
+    }
+
+    #[test]
+    fn boundary_subtype_below_minimum_method_count_is_skipped() {
+        assert!(run(&hierarchy(MIN_SUBTYPE_METHODS - 1, 0)).is_empty());
+        assert_eq!(run(&hierarchy(MIN_SUBTYPE_METHODS, 0)).len(), 1);
     }
 }
