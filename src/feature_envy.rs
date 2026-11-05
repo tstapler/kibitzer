@@ -26,7 +26,7 @@ const FEATURE_ENVY_MIN_TOTAL: usize = 4;
 /// Receiver roles that orchestrate collaborators by design: reaching into several foreign
 /// types is their job, not envy. Every entry is a false-positive class measured in
 /// `project_plans/feature-envy-detection/decisions/validation.md`.
-const ORCHESTRATOR_SUFFIXES: [&str; 19] = [
+const ORCHESTRATOR_SUFFIXES: [&str; 23] = [
     "Repository",
     "Storage",
     "Store",
@@ -46,6 +46,11 @@ const ORCHESTRATOR_SUFFIXES: [&str; 19] = [
     "Checker",
     "Linker",
     "Determiner",
+    // Configuration structs: `ApplyTo`/`Complete` copy their fields into a runtime config.
+    "Options",
+    "Config",
+    "Flags",
+    "Settings",
 ];
 
 /// Matches `OrderService` and a bare lowercase `reconciler`, but not `Restore` or `Servicer`.
@@ -682,6 +687,17 @@ mod tests {
             let findings = run_as_type(&format!("fe-orch-near-{type_name}"), type_name);
             assert_eq!(findings.len(), 1, "{type_name} must still be flagged");
         }
+    }
+
+    #[test]
+    fn service_receiver_reading_a_param_heavily_is_a_known_accepted_loss() {
+        // Mirrors stapler-squad `BacklogService.transitionWithGuard` (copies 5 fields of its
+        // `item` param into a guard input): a true positive lost by design, because the same
+        // shape is the dominant false positive for service/handler receivers.
+        let lost = run_as_type("fe-service-loss", "BacklogService");
+        assert!(lost.is_empty());
+        let kept = run_as_type("fe-plain-type", "Backlog");
+        assert_eq!(kept.len(), 1);
     }
 
     fn drop_customer_methods(m: &mut ArchModel) {

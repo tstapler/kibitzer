@@ -84,39 +84,48 @@ Command (debug build): `kibitzer check architecture feature-envy <dir>` on `stap
 | + rule 1 (param-only first cut, then any no-method record) + 7 original suffixes | 12 + 25 = 37 |
 | + rule 2 role suffixes above (shipped) | 2 + 8 = 10 |
 
-### Measured FP rate
+### Measured FP rate — target NOT met
 
-- **Intermediate build (37 findings, all judged, N=1, n=37 >= 32):** 7 TP, 30 FP = **81% FP**.
-  The record rule and the original six suffixes alone were not enough; the residual FPs were
-  reconcilers, generators, executors, listeners, runners and similar (9 from
-  `operationGenerator` alone).
-- **Shipped build (10 findings, all judged, n=10):** 7 TP (`StreamHub.deliver`,
-  `podWorkers.cleanupUnstartedPod`, `podWorkers.removeTerminatedWorker`, `ServicePortMap.Update`,
-  `cacheImpl.UpdateSnapshot`, `cacheImpl.updateNodeInfoSnapshotList`, `snapshotBackupData.restore`),
-  3 FP (`ChainFirer.Fire`, `callQueue.merge`, `ISCSIUtil.AttachDisk`) = **30% FP**.
+All judgments: one reviewer reading the first ~10-15 lines of each method; a TP needs a refactor a
+reviewer would plausibly accept.
 
-### Caveats (read before trusting the 30%)
+| Sample | Build | n | TP | FP | FP rate |
+|---|---|---|---|---|---|
+| squad + k8s pkg, all findings (N=1) | 7 original suffixes + no-method record rule | 37 | 7 | 30 | 81% |
+| squad + k8s pkg, all findings | + role suffixes (tuned on the row above) | 10 | 7 | 3 | 30% (in-sample, n<32) |
+| k8s `staging/` (22) + the 10 above | role suffixes, before `Options`/`Config` | 32 | 9 | 23 | 72% |
+| **Held-out**: `cli/cli`, `caddyserver/caddy`, `hashicorp/consul`, every 5th of 159 findings (`cat ho_cli ho_caddy ho_consul \| awk 'NR%5==1'`) | + `Options`/`Config`/`Flags`/`Settings` (shipped) | 32 | 0-2 | 30-32 | **>= 94%** |
 
-- **n=10, not >= 32.** The shipped build emits only 10 findings, so a sample of 32 is impossible;
-  the whole population was judged. The intermediate row is the n >= 32 measurement.
-- **In-sample.** The role suffixes were chosen from the FP classes seen in the 37-finding set and
-  then re-measured on the same corpus. The 30% figure is optimistic for unseen code; a hold-out
-  corpus (e.g. `apache/cassandra` is out of scope, Go only) was not run.
-- One reviewer, first ~12 lines of each method read (a few judged TP are generous: `UpdateSnapshot`,
-  `deliver`).
-- The checker stays opt-in.
+Commands: `kibitzer check architecture feature-envy <dir>` for each repo; counts cli 5, caddy 4,
+consul 150, cert-manager 0.
+
+**Conclusion: criterion 2 (FP <= 30% at n >= 32) is not met.** The 30% row has n=10 and its suffix
+list was fitted to that same corpus. On unseen repos the rate is >= 94%, almost entirely
+`hashicorp/consul` RPC/HTTP endpoint methods (`func (c *Catalog) Register(args *structs.RegisterRequest, ...)`,
+`HTTPHandlers.*`) whose dominant foreign type is a request struct *with* methods, so the
+no-method-record rule does not apply. Suffix lists cannot fix this honestly; the next lever is
+structural (a parameter that is a request/args value consumed in a handler-shaped method), which
+needs its own design. The checker must stay opt-in.
 
 ### Known true positives
 
 - `ServicePortMap.Update`, `updateNodeInfoSnapshotList`: still fire.
-- `transitionWithGuard`: lost. Receiver is `BacklogService` (suffix `Service`), the very
-  orchestrator class the item asked to suppress.
-- `recoverMissingSession`: lost. Its dominant type `HealthCheckResult` has no methods, i.e. it is
-  a result-struct filler, a class the item names as a false positive; the earlier TP label is
-  doubtful (it appends to `result.Issues`/`Actions`).
+- `transitionWithGuard` (receiver `BacklogService`): **lost, accepted.** It reads 5 fields of its
+  `item` param into a `BacklogItemTransitionInput` (`PlanApproved: item.PlanApproved, ...`). That
+  shape is exactly the service-receiver FP class (consul's endpoints are the same). Narrowing the
+  `Service` suffix by "reads a foreign type heavily" cannot separate them: every FP reads a
+  foreign type heavily. Pinned by
+  `service_receiver_reading_a_param_heavily_is_a_known_accepted_loss`.
+- `recoverMissingSession` (receiver `SessionHealthChecker`): **lost, accepted; the TP label is kept.**
+  Source: `result.IsHealthy = false; result.Issues = append(result.Issues, ...);
+  result.RecoveryAttempted = true; result.RecoverySuccess = true; result.Actions = append(...)`
+  mixed with `instance.Start(false)`, `instance.TmuxAlive()`. It loses to the `Checker` suffix
+  (and, if `HealthCheckResult` is dominant, to the no-method-record rule; which type was dominant
+  before the change was not re-verified). It is a real recovery routine on `Instance`-heavy state,
+  so this is a recall cost of the suffix rules, not a relabelled TP.
 
-### Other checks
+### Other checks (fresh run, this commit)
 
-`kibitzer check backtest feature-envy` exit 0 (4817 transcripts scanned, 0 findings as before);
-`cargo fmt --all --check`, `cargo clippy --all-targets` clean; `cargo test --workspace` all pass
-(after `cargo build --workspace`, which `plugin_contract` needs).
+`kibitzer check backtest feature-envy` exit 0 (4818 transcripts, 1999 snapshots); `cargo fmt --all
+--check` ok; `cargo clippy --all-targets` no warnings; `cargo test --workspace` all pass (after
+`cargo build --workspace`, which `plugin_contract` needs).
