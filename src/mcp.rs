@@ -17,7 +17,10 @@ use crate::arch_model::{
 use crate::check::{
     CheckResult, run_architecture_check, run_check, run_checks_for_trigger, walk_and_collect_files,
 };
-use crate::config::{Check, Severity, find_config, find_effective_config, find_repo_root};
+use crate::config::{
+    Check, ConfigSource, DEFAULTS_NOTE, Severity, find_config, find_effective_config_with,
+    find_repo_root,
+};
 use crate::glob::matches_scope;
 use crate::inline_ignores::sanitize::display_path;
 
@@ -38,6 +41,11 @@ struct RunChecksRequest {
     /// Trigger name (e.g. "PostToolUse" or "batch"); checks with no triggers always run.
     #[serde(default = "default_trigger")]
     trigger: String,
+    /// Optional explicit config file to use instead of walking up for `.kibitzer/inspect.json`
+    /// (lets a config live outside the repo being analyzed). Trusted like a repo-local config:
+    /// its `command` checks run. Does not affect the write-tool gate.
+    #[serde(default)]
+    config: Option<String>,
 }
 
 fn default_trigger() -> String {
@@ -48,6 +56,11 @@ fn default_trigger() -> String {
 struct ListChecksRequest {
     /// Any path inside the repo whose `.kibitzer/inspect.json` should be listed.
     path: String,
+    /// Optional explicit config file to use instead of walking up for `.kibitzer/inspect.json`
+    /// (lets a config live outside the repo being analyzed). Trusted like a repo-local config:
+    /// its `command` checks run. Does not affect the write-tool gate.
+    #[serde(default)]
+    config: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -64,6 +77,11 @@ struct ArchitectureAssessmentRequest {
     /// pass a narrower `scope` to render a subgraph.
     #[serde(default = "default_true")]
     include_diagram: bool,
+    /// Optional explicit config file to use instead of walking up for `.kibitzer/inspect.json`
+    /// (lets a config live outside the repo being analyzed). Trusted like a repo-local config:
+    /// its `command` checks run. Does not affect the write-tool gate.
+    #[serde(default)]
+    config: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -736,6 +754,14 @@ fn recommendation_for(check_name: &str) -> Option<&'static str> {
     }
 }
 
+/// `DEFAULTS_NOTE` plus a newline when the run used built-in defaults, else empty.
+fn defaults_note_prefix(source: &ConfigSource) -> String {
+    match source {
+        ConfigSource::Defaults => format!("{DEFAULTS_NOTE}\n"),
+        ConfigSource::File(_) => String::new(),
+    }
+}
+
 #[tool_router(router = tool_router)]
 impl KibitzerServer {
     pub fn new() -> Self {
@@ -751,8 +777,9 @@ impl KibitzerServer {
     )]
     async fn list_checks(&self, req: Parameters<ListChecksRequest>) -> String {
         let path = PathBuf::from(&req.0.path);
-        match find_effective_config(&path) {
-            Ok((config, root)) => {
+        let config_override = req.0.config.as_deref().map(Path::new);
+        match find_effective_config_with(config_override, &path) {
+            Ok((config, root, source)) => {
                 // Loaded once for the whole listing rather than once per check.
                 let registry =
                     crate::plugin::Registry::load(&crate::plugin::default_registry_path());
@@ -775,7 +802,8 @@ impl KibitzerServer {
                     })
                     .collect();
                 format!(
-                    "config root: {}\nchecks:\n{}",
+                    "{}config root: {}\nchecks:\n{}",
+                    defaults_note_prefix(&source),
                     root.display(),
                     names.join("\n")
                 )
@@ -829,7 +857,8 @@ impl KibitzerServer {
         req: Parameters<ArchitectureAssessmentRequest>,
     ) -> String {
         let path = PathBuf::from(&req.0.path);
-        let (config, repo_root) = match find_effective_config(&path) {
+        let config_override = req.0.config.as_deref().map(Path::new);
+        let (config, repo_root, source) = match find_effective_config_with(config_override, &path) {
             Ok(c) => c,
             Err(e) => return format!("error reading config: {e}"),
         };
@@ -970,7 +999,8 @@ impl KibitzerServer {
         }
 
         let mut output = format!(
-            "architecture assessment: {} finding(s) across {} file(s)\n",
+            "{}architecture assessment: {} finding(s) across {} file(s)\n",
+            defaults_note_prefix(&source),
             finding_count,
             files.len()
         );
@@ -1023,16 +1053,18 @@ impl KibitzerServer {
         let file_path = PathBuf::from(&req.0.file_path);
         let req_path = file_path.clone();
         let trigger = req.0.trigger;
+        let config_override = req.0.config.map(PathBuf::from);
         // Command-based checks can each block for up to `COMMAND_TIMEOUT` — run the
         // whole synchronous dispatch on a blocking-pool thread (the same pattern
         // `load_model_off_stack` uses for the whole-repo model build below) instead of
         // inline on this `async fn`'s stack, where it would tie up a tokio worker thread
         // with no `.await` point for the entire duration.
-        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CheckResult>> {
-            let (config, repo_root) = find_effective_config(&file_path)?;
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let (config, repo_root, source) =
+                find_effective_config_with(config_override.as_deref(), &file_path)?;
             let registry = crate::plugin::Registry::load(&crate::plugin::default_registry_path());
             let run_ctx = crate::run_context::RunContext::load(&repo_root)?;
-            run_checks_for_trigger(
+            let results = run_checks_for_trigger(
                 &config.checks,
                 &trigger,
                 &repo_root,
@@ -1040,12 +1072,17 @@ impl KibitzerServer {
                 None,
                 &registry,
                 &run_ctx,
-            )
+            )?;
+            Ok((results, source))
         })
         .await;
 
         match outcome {
-            Ok(Ok(results)) => render_run_checks_report(&results, &req_path),
+            Ok(Ok((results, source))) => format!(
+                "{}{}",
+                defaults_note_prefix(&source),
+                render_run_checks_report(&results, &req_path)
+            ),
             Ok(Err(e)) => format!("error running checks: {e}"),
             Err(e) => format!("run_checks task failed: {e}"),
         }
@@ -2065,6 +2102,7 @@ mod tests {
         let server = KibitzerServer::new();
         let output = server
             .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                config: None,
                 path: dir.display().to_string(),
                 scope: None,
                 include_diagram: true,
@@ -2252,6 +2290,7 @@ mod tests {
         let server = KibitzerServer::new();
         let output = server
             .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                config: None,
                 path: dir.display().to_string(),
                 scope: None,
                 include_diagram: false,
@@ -2365,6 +2404,7 @@ mod tests {
         let server = KibitzerServer::new();
         let output = server
             .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                config: None,
                 path: dir.display().to_string(),
                 scope: None,
                 include_diagram: false,
@@ -2393,6 +2433,7 @@ mod tests {
         let server = KibitzerServer::new();
         let output = server
             .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                config: None,
                 path: dir.display().to_string(),
                 scope: None,
                 include_diagram: true,
@@ -2435,6 +2476,7 @@ mod tests {
         let server = KibitzerServer::new();
         let output = server
             .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                config: None,
                 path: dir.display().to_string(),
                 scope: None,
                 include_diagram: false,
@@ -2511,6 +2553,7 @@ mod tests {
         let server = KibitzerServer::new();
         let output = server
             .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                config: None,
                 path: dir.display().to_string(),
                 scope: None,
                 include_diagram: false,
@@ -3781,6 +3824,7 @@ mod tests {
             std::fs::write(&path, source).unwrap();
             let server = KibitzerServer::new();
             let req = RunChecksRequest {
+                config: None,
                 file_path: path.display().to_string(),
                 trigger: "batch".to_string(),
             };
@@ -3797,6 +3841,139 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(control.contains("[flag-argument]"), "got: {control}");
         assert!(!covered.contains("[flag-argument]"), "got: {covered}");
+    }
+
+    mod defaults_note_tests {
+        use super::*;
+
+        const NOTE: &str = "note: no .kibitzer/inspect.json found; using built-in defaults";
+
+        #[tokio::test]
+        async fn list_checks_and_assessment_and_run_checks_note_defaults_when_no_config() {
+            let dir = tmp_dir("defaults-note");
+            let file = dir.join("a.md");
+            std::fs::write(&file, "# t\n").unwrap();
+            let server = KibitzerServer::new();
+
+            let listed = server
+                .list_checks(Parameters(ListChecksRequest {
+                    config: None,
+                    path: dir.display().to_string(),
+                }))
+                .await;
+            let assessed = server
+                .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                    config: None,
+                    path: dir.display().to_string(),
+                    scope: None,
+                    include_diagram: false,
+                }))
+                .await;
+            let ran = server
+                .run_checks(Parameters(RunChecksRequest {
+                    config: None,
+                    file_path: file.display().to_string(),
+                    trigger: "batch".into(),
+                }))
+                .await;
+            std::fs::remove_dir_all(&dir).ok();
+
+            for (tool, out) in [
+                ("list_checks", listed),
+                ("architecture_assessment", assessed),
+                ("run_checks", ran),
+            ] {
+                assert!(
+                    out.starts_with(NOTE),
+                    "{tool} output should start with the note, got:\n{out}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_config_param_suppresses_note_and_is_used() {
+            let dir = tmp_dir("config-param-repo");
+            let cfg_dir = tmp_dir("config-param-cfg");
+            let cfg = cfg_dir.join("c.json");
+            std::fs::write(
+                &cfg,
+                r#"{"checks": [{"name": "from-explicit-config", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+            )
+            .unwrap();
+
+            let listed = KibitzerServer::new()
+                .list_checks(Parameters(ListChecksRequest {
+                    config: Some(cfg.display().to_string()),
+                    path: dir.display().to_string(),
+                }))
+                .await;
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::remove_dir_all(&cfg_dir).ok();
+
+            assert!(!listed.contains(NOTE), "got:\n{listed}");
+            assert!(listed.contains("from-explicit-config"), "got:\n{listed}");
+        }
+
+        #[tokio::test]
+        async fn bad_config_param_errors_instead_of_falling_back_to_defaults() {
+            let dir = tmp_dir("bad-config-param");
+            let file = dir.join("a.md");
+            std::fs::write(&file, "# t\n").unwrap();
+            let bad = dir.join("missing.json").display().to_string();
+            let server = KibitzerServer::new();
+
+            let listed = server
+                .list_checks(Parameters(ListChecksRequest {
+                    config: Some(bad.clone()),
+                    path: dir.display().to_string(),
+                }))
+                .await;
+            let assessed = server
+                .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                    config: Some(bad.clone()),
+                    path: dir.display().to_string(),
+                    scope: None,
+                    include_diagram: false,
+                }))
+                .await;
+            let ran = server
+                .run_checks(Parameters(RunChecksRequest {
+                    config: Some(bad.clone()),
+                    file_path: file.display().to_string(),
+                    trigger: "batch".into(),
+                }))
+                .await;
+            std::fs::remove_dir_all(&dir).ok();
+
+            for (tool, out) in [
+                ("list_checks", listed),
+                ("architecture_assessment", assessed),
+                ("run_checks", ran),
+            ] {
+                assert!(out.contains("error") && out.contains(&bad), "{tool}: {out}");
+                assert!(
+                    !out.contains(NOTE),
+                    "{tool} must not fall back to defaults: {out}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn no_note_when_a_local_config_exists() {
+            let dir = tmp_dir("defaults-note-absent");
+            std::fs::create_dir_all(dir.join(".kibitzer")).unwrap();
+            std::fs::write(dir.join(".kibitzer/inspect.json"), "{}").unwrap();
+
+            let listed = KibitzerServer::new()
+                .list_checks(Parameters(ListChecksRequest {
+                    config: None,
+                    path: dir.display().to_string(),
+                }))
+                .await;
+            std::fs::remove_dir_all(&dir).ok();
+
+            assert!(!listed.contains(NOTE), "got:\n{listed}");
+        }
     }
 
     mod plugin_missing_rendering_tests {
@@ -3880,6 +4057,7 @@ mod tests {
 
             let output = KibitzerServer::new()
                 .list_checks(Parameters(ListChecksRequest {
+                    config: None,
                     path: dir.display().to_string(),
                 }))
                 .await;
@@ -3905,6 +4083,7 @@ mod tests {
 
             let output = KibitzerServer::new()
                 .run_checks(Parameters(RunChecksRequest {
+                    config: None,
                     file_path: file_path.display().to_string(),
                     trigger: "batch".to_string(),
                 }))

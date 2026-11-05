@@ -98,6 +98,9 @@ enum Command {
         /// Exit nonzero when any finding of a blocking check was suppressed inline.
         #[arg(long)]
         deny_blocking_suppression: bool,
+        /// Load config from this file instead of walking upward for `.kibitzer/inspect.json`.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
@@ -151,6 +154,10 @@ enum Command {
     /// Query the shared architecture model (packages, symbols, import edges) — export it
     /// as JSON, or render it as a diagram.
     Architecture {
+        /// Load config from this file instead of walking upward for `.kibitzer/inspect.json`.
+        /// Only `affected` reads config content; the other subcommands reject this flag.
+        #[arg(long, value_name = "PATH", global = true)]
+        config: Option<PathBuf>,
         #[command(subcommand)]
         action: ArchitectureAction,
     },
@@ -477,6 +484,7 @@ fn main() -> Result<ExitCode> {
             trigger,
             no_inline_ignores,
             deny_blocking_suppression,
+            config,
         } => run::run_batch(
             dir,
             &trigger,
@@ -486,6 +494,7 @@ fn main() -> Result<ExitCode> {
                 inline_ignores::InlineIgnoreMode::Apply
             },
             deny_blocking_suppression,
+            config.as_deref(),
         ),
         Command::Hook => hook::run_hook(),
         Command::Mcp {
@@ -718,35 +727,47 @@ fn main() -> Result<ExitCode> {
         },
         Command::Status => status::run_status(),
         Command::Install { global, dry_run } => install::run_install(global, dry_run),
-        Command::Architecture { action } => match action {
-            ArchitectureAction::Export {
-                path,
-                scope,
-                out,
-                dry_run,
-                include_private,
-            } => arch_export::run_export(path, scope, out, dry_run, include_private),
-            ArchitectureAction::Diagram {
-                path,
-                scope,
-                level,
-                out,
-            } => arch_diagram::run_diagram(path, scope, level, out),
-            ArchitectureAction::ChangeCoupling { path, limit, top } => {
-                run_change_coupling(&path, limit, top)
+        Command::Architecture { config, action } => {
+            if config.is_some() && !matches!(action, ArchitectureAction::Affected { .. }) {
+                anyhow::bail!(
+                    "--config is only used by `kibitzer architecture affected`; \
+                     the other architecture subcommands work without a config"
+                );
             }
-            ArchitectureAction::RootCauseClusters { path, limit, top } => {
-                run_root_cause_clusters(&path, limit, top)
+            match action {
+                ArchitectureAction::Export {
+                    path,
+                    scope,
+                    out,
+                    dry_run,
+                    include_private,
+                } => arch_export::run_export(path, scope, out, dry_run, include_private),
+                ArchitectureAction::Diagram {
+                    path,
+                    scope,
+                    level,
+                    out,
+                } => arch_diagram::run_diagram(path, scope, level, out),
+                ArchitectureAction::ChangeCoupling { path, limit, top } => {
+                    run_change_coupling(&path, limit, top)
+                }
+                ArchitectureAction::RootCauseClusters { path, limit, top } => {
+                    run_root_cause_clusters(&path, limit, top)
+                }
+                ArchitectureAction::Hotspots { path, limit, top } => {
+                    run_hotspots(&path, limit, top)
+                }
+                ArchitectureAction::Affected { path, base } => {
+                    run_affected(&path, &base, config.as_deref())
+                }
+                ArchitectureAction::SplitSim {
+                    package,
+                    partitions,
+                    path,
+                    format,
+                } => run_split_sim(&path, &package, &partitions, &format),
             }
-            ArchitectureAction::Hotspots { path, limit, top } => run_hotspots(&path, limit, top),
-            ArchitectureAction::Affected { path, base } => run_affected(&path, &base),
-            ArchitectureAction::SplitSim {
-                package,
-                partitions,
-                path,
-                format,
-            } => run_split_sim(&path, &package, &partitions, &format),
-        },
+        }
         Command::Go { action } => match action {
             GoAction::BuildCost { dir } => run_go_build_cost(&dir),
             GoAction::PackageFocus { dir, mode } => run_go_package_focus(&dir, mode),
@@ -1018,10 +1039,14 @@ fn run_hotspots(path: &Path, limit: usize, top: usize) -> Result<ExitCode> {
 /// *successful computation* (a narrowed list, an empty list, or the `__ALL__` bail-out
 /// are all valid answers); only a genuine failure to compute an answer at all (bad
 /// repo, git spawn failure, unresolvable `--base`) is non-zero.
-fn run_affected(path: &Path, base: &str) -> Result<ExitCode> {
-    let (config, repo_root) = match config::find_config(path)? {
-        Some((config, root)) => (config.affected, root),
-        None => (config::AffectedConfig::default(), path.to_path_buf()),
+fn run_affected(path: &Path, base: &str, config_override: Option<&Path>) -> Result<ExitCode> {
+    let (config, repo_root) = if let Some(file) = config_override {
+        (config::read_config(file)?.affected, path.to_path_buf())
+    } else {
+        match config::find_config(path)? {
+            Some((config, root)) => (config.affected, root),
+            None => (config::AffectedConfig::default(), path.to_path_buf()),
+        }
     };
     match affected::compute_affected(&repo_root, base, &config)? {
         affected::AffectedResult::Packages(packages) if packages.is_empty() => {
