@@ -262,6 +262,90 @@ mod tests {
     }
 
     #[test]
+    fn scope_mismatch_hint_truncates_after_five_package_keys() {
+        let dir = tmp_dir("hint-truncation");
+        for i in 0..7 {
+            write_fixture(&dir, &format!("pkg{i}/mod.py"), "def f():\n    pass\n");
+        }
+        let out = dir.join("arch.json");
+        let output = run_kibitzer(&[
+            "architecture",
+            "export",
+            "--path",
+            dir.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--scope",
+            "nonexistent/**",
+        ]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(", …)"), "got {stdout:?}");
+        let keys = stdout.split("model package keys: ").nth(1).unwrap();
+        assert_eq!(
+            keys.split(", ").filter(|k| k.starts_with("pkg")).count(),
+            5,
+            "{stdout:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_config_flag_is_rejected_outside_affected_and_parses_in_both_positions() {
+        let dir = tmp_dir("arch-config-flag");
+        let cfg = dir.join("c.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        let c = cfg.to_str().unwrap();
+        let d = dir.to_str().unwrap();
+
+        let out_path = dir.join("o.json");
+        let o = out_path.to_str().unwrap();
+        let export = run_kibitzer(&[
+            "architecture",
+            "export",
+            "--path",
+            d,
+            "--out",
+            o,
+            "--config",
+            c,
+        ]);
+        assert!(!export.status.success());
+        assert!(String::from_utf8_lossy(&export.stderr).contains("only used by"));
+
+        // Both positions must reach the config loader (a bad path fails there, not in clap).
+        let missing = dir.join("missing.json");
+        let m = missing.to_str().unwrap();
+        for args in [
+            vec![
+                "architecture",
+                "affected",
+                "--path",
+                d,
+                "--base",
+                "HEAD",
+                "--config",
+                m,
+            ],
+            vec![
+                "architecture",
+                "--config",
+                m,
+                "affected",
+                "--path",
+                d,
+                "--base",
+                "HEAD",
+            ],
+        ] {
+            let out = run_kibitzer(&args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && stderr.contains("missing.json"),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
     fn run_export_reports_no_packages_matched_scope_and_exits_zero() {
         let dir = tmp_dir("no-packages-matched-scope");
         write_fixture(&dir, "web/ui/widget.py", "def widget():\n    pass\n");

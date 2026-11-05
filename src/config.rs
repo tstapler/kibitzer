@@ -665,26 +665,32 @@ pub fn find_config(start: &Path) -> Result<Option<(Config, PathBuf)>> {
     loop {
         let candidate = resolve_config_path(&dir);
         if candidate.is_file() {
-            let raw = std::fs::read_to_string(&candidate)
-                .with_context(|| format!("reading {}", candidate.display()))?;
-            let config: Config = serde_json::from_str(&raw).with_context(|| {
-                format!(
-                    "parsing {} (kibitzer {}, resolved from {})",
-                    candidate.display(),
-                    env!("CARGO_PKG_VERSION"),
-                    std::env::current_exe()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| "<unknown>".to_string())
-                )
-            })?;
-            validate(&config, &candidate)?;
-            return Ok(Some((config, dir)));
+            return Ok(Some((read_config(&candidate)?, dir)));
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
             None => return Ok(None),
         }
     }
+}
+
+/// Reads, parses and validates exactly the config file at `path` — no walk, no fallback.
+/// Shared by the upward walk and `--config` so both report the same diagnostics.
+pub fn read_config(path: &Path) -> Result<Config> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let config: Config = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing {} (kibitzer {}, resolved from {})",
+            path.display(),
+            env!("CARGO_PKG_VERSION"),
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string())
+        )
+    })?;
+    validate(&config, path)?;
+    Ok(config)
 }
 
 /// The config file path `find_config(start)` will read, or the `CONFIG_DIR` path under `start`
@@ -1063,16 +1069,6 @@ fn overlay_local(defaults: Vec<Check>, local: Config) -> Config {
     }
 }
 
-/// Reads and validates exactly the config file at `path` — no upward walk, no fallback.
-fn load_config_file(path: &Path) -> Result<Config> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let config: Config =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    validate(&config, path)?;
-    Ok(config)
-}
-
 /// Like `find_config`, but never returns "nothing to do": when no `.kibitzer/inspect.json`
 /// (or deprecated `.claude/inspect.json`) exists above `start`, this returns the built-in
 /// `default_checks()` catalog (pylint-style — checks run out of the box) rather than an
@@ -1103,7 +1099,7 @@ pub fn find_effective_config_with(
         .chain(crate::plugin::registered_plugin_checks())
         .collect();
     if let Some(path) = config_override {
-        let local = load_config_file(path)?;
+        let local = read_config(path)?;
         return Ok((
             overlay_local(defaults, local),
             find_repo_root(start),
@@ -1695,6 +1691,70 @@ mod tests {
             missing.is_err(),
             "an explicit missing config must error, not fall back"
         );
+    }
+
+    #[test]
+    fn find_effective_config_with_reports_legacy_file_as_source() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_dir("source-legacy");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/inspect.json"), "{}").unwrap();
+        let (_, root, source) = find_effective_config_with(None, &dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(root, dir);
+        assert_eq!(source, ConfigSource::File(dir.join(".claude/inspect.json")));
+    }
+
+    #[test]
+    fn find_effective_config_with_override_beats_an_in_repo_config() {
+        let _guard = crate::plugin::XDG_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo = tmp_dir("override-precedence-repo");
+        std::fs::create_dir_all(repo.join(".kibitzer")).unwrap();
+        std::fs::write(
+            repo.join(".kibitzer/inspect.json"),
+            r#"{"checks": [{"name": "in-repo", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+        let cfg = tmp_dir("override-precedence-cfg").join("c.json");
+        std::fs::write(
+            &cfg,
+            r#"{"checks": [{"name": "override-only", "checker": "primitive-obsession", "severity": "advisory"}]}"#,
+        )
+        .unwrap();
+
+        let (config, _, _) = find_effective_config_with(Some(&cfg), &repo).unwrap();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(cfg.parent().unwrap()).ok();
+
+        assert!(config.checks.iter().any(|c| c.name == "override-only"));
+        assert!(!config.checks.iter().any(|c| c.name == "in-repo"));
+    }
+
+    #[test]
+    fn find_effective_config_with_override_errors_name_the_path() {
+        let dir = tmp_dir("override-errors");
+        let missing = dir.join("missing.json");
+        let malformed = dir.join("bad.json");
+        std::fs::write(&malformed, "{not json").unwrap();
+        let invalid = dir.join("unknown-component.json");
+        std::fs::write(
+            &invalid,
+            r#"{"architecture": {"dependency_rules": [{"component": "ghost"}]}}"#,
+        )
+        .unwrap();
+
+        for path in [&missing, &malformed, &invalid] {
+            let err = format!(
+                "{:#}",
+                find_effective_config_with(Some(path), &dir).unwrap_err()
+            );
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

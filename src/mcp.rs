@@ -42,7 +42,8 @@ struct RunChecksRequest {
     #[serde(default = "default_trigger")]
     trigger: String,
     /// Optional explicit config file to use instead of walking up for `.kibitzer/inspect.json`
-    /// (lets a config live outside the repo being analyzed). Read-only analysis only.
+    /// (lets a config live outside the repo being analyzed). Trusted like a repo-local config:
+    /// its `command` checks run. Does not affect the write-tool gate.
     #[serde(default)]
     config: Option<String>,
 }
@@ -56,7 +57,8 @@ struct ListChecksRequest {
     /// Any path inside the repo whose `.kibitzer/inspect.json` should be listed.
     path: String,
     /// Optional explicit config file to use instead of walking up for `.kibitzer/inspect.json`
-    /// (lets a config live outside the repo being analyzed). Read-only analysis only.
+    /// (lets a config live outside the repo being analyzed). Trusted like a repo-local config:
+    /// its `command` checks run. Does not affect the write-tool gate.
     #[serde(default)]
     config: Option<String>,
 }
@@ -76,7 +78,8 @@ struct ArchitectureAssessmentRequest {
     #[serde(default = "default_true")]
     include_diagram: bool,
     /// Optional explicit config file to use instead of walking up for `.kibitzer/inspect.json`
-    /// (lets a config live outside the repo being analyzed). Read-only analysis only.
+    /// (lets a config live outside the repo being analyzed). Trusted like a repo-local config:
+    /// its `command` checks run. Does not affect the write-tool gate.
     #[serde(default)]
     config: Option<String>,
 }
@@ -3909,6 +3912,50 @@ mod tests {
 
             assert!(!listed.contains(NOTE), "got:\n{listed}");
             assert!(listed.contains("from-explicit-config"), "got:\n{listed}");
+        }
+
+        #[tokio::test]
+        async fn bad_config_param_errors_instead_of_falling_back_to_defaults() {
+            let dir = tmp_dir("bad-config-param");
+            let file = dir.join("a.md");
+            std::fs::write(&file, "# t\n").unwrap();
+            let bad = dir.join("missing.json").display().to_string();
+            let server = KibitzerServer::new();
+
+            let listed = server
+                .list_checks(Parameters(ListChecksRequest {
+                    config: Some(bad.clone()),
+                    path: dir.display().to_string(),
+                }))
+                .await;
+            let assessed = server
+                .architecture_assessment(Parameters(ArchitectureAssessmentRequest {
+                    config: Some(bad.clone()),
+                    path: dir.display().to_string(),
+                    scope: None,
+                    include_diagram: false,
+                }))
+                .await;
+            let ran = server
+                .run_checks(Parameters(RunChecksRequest {
+                    config: Some(bad.clone()),
+                    file_path: file.display().to_string(),
+                    trigger: "batch".into(),
+                }))
+                .await;
+            std::fs::remove_dir_all(&dir).ok();
+
+            for (tool, out) in [
+                ("list_checks", listed),
+                ("architecture_assessment", assessed),
+                ("run_checks", ran),
+            ] {
+                assert!(out.contains("error") && out.contains(&bad), "{tool}: {out}");
+                assert!(
+                    !out.contains(NOTE),
+                    "{tool} must not fall back to defaults: {out}"
+                );
+            }
         }
 
         #[tokio::test]
