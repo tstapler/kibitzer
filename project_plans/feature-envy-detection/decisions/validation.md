@@ -107,6 +107,29 @@ no-method-record rule does not apply. Suffix lists cannot fix this honestly; the
 structural (a parameter that is a request/args value consumed in a handler-shaped method), which
 needs its own design. The checker must stay opt-in.
 
+### Held-out sample record (what is and is not preserved)
+
+- Generation: `kibitzer check architecture feature-envy <repo> > ho_<name>` for `cli/cli` (5
+  findings), `caddyserver/caddy` (4), `hashicorp/consul` (150); `cat ho_cli ho_caddy ho_consul |
+  awk 'NR%5==1'` over the 159 findings -> 32 sampled. Build: the shipped one (suffixes incl.
+  `Options`/`Config`/`Flags`/`Settings`). Judged by one reviewer reading the method source.
+- Counts: 0-2 TP, 30-32 FP, i.e. FP rate >= 94%. The **per-finding judgment list was not
+  saved**, and the reason for the 0-2 range (presumably borderline cases) was not recorded, so
+  the exact split is not reproducible from this file. It is deliberately not re-measured or
+  re-tuned here (the sample is spent). Even at the most favourable end (2 TP), FP is 30/32 = 94%.
+
+### Deviation from AC 0 wording
+
+AC 0 says the dominant type is "a parameter of the flagged method" with no methods of its own.
+`is_record_target` (`src/feature_envy.rs`) implements the **wider** rule: the dominant foreign
+type declares no methods anywhere in the model, whether or not it is a parameter. Reason: locally
+built result/summary records (`GetStatistics`, `*Result` fillers) were observed as the same FP
+class as parameter records; the parameter-only first cut was replaced by the wider rule (see the
+Round 2 build table). The with/without-param-gate delta was not isolated in a separate run.
+Narrowing to the AC would re-admit those records. Tests: `suppresses_parameter_record_without_methods`
+and `suppresses_locally_built_record_without_methods` (must not fire),
+`still_flags_parameter_type_that_has_methods` (must still fire).
+
 ### Known true positives
 
 - `ServicePortMap.Update`, `updateNodeInfoSnapshotList`: still fire.
