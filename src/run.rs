@@ -189,16 +189,16 @@ fn run_batch_collect(
     let dangling = if inspecting.is_empty() {
         Vec::new()
     } else {
-        crate::check::dangling_claude_symlinks(dir, &files)
+        crate::check::dangling_claude_symlinks(dir)
     };
     let targets = files
         .iter()
         .map(|f| (f, &file_checks[..]))
         .chain(dangling.iter().map(|f| (f, &inspecting[..])));
 
-    for (file, file_checks) in targets {
+    for (file, checks_for_file) in targets {
         let results = run_checks_for_trigger(
-            file_checks,
+            checks_for_file,
             trigger,
             &repo_root,
             file,
@@ -211,7 +211,7 @@ fn run_batch_collect(
             Vec::new()
         } else {
             crate::inline_post_pass::run_audit(
-                file_checks,
+                checks_for_file,
                 file,
                 &results,
                 &run_ctx,

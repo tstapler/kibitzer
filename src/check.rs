@@ -675,7 +675,9 @@ fn run_checker_against_file(run: NativeRun, file_path: &Path) -> anyhow::Result<
     let source = match crate::checker::read_native_source(file_path) {
         Ok(crate::checker::NativeSource::Text(source)) => source,
         Ok(crate::checker::NativeSource::TooLarge) => return Ok(SourceCheck::passing()),
-        Err(_) if inspects_unreadable_paths(checker_name) => String::new(),
+        Err(_) if file_path.is_symlink() && inspects_unreadable_paths(checker_name) => {
+            String::new()
+        }
         Err(_) if tolerates_unreadable_files(checker_name) => {
             return Ok(SourceCheck::passing());
         }
@@ -1636,37 +1638,81 @@ pub fn walk_and_collect_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Symlinks whose target does not resolve, under `.claude/{skills,agents,commands}` of every
-/// `.claude` directory that holds one of `files` (or sits directly in `dir`). The ordinary
-/// walkers drop them (`canonicalize` fails), so only a checker that inspects unreadable
-/// paths ever sees them. Bounded to those trees so it costs no extra full-repo walk.
-pub fn dangling_claude_symlinks(dir: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = vec![dir.join(".claude")];
-    for file in files {
-        if let Some(root) = file
-            .ancestors()
-            .find(|a| a.file_name().is_some_and(|n| n == ".claude"))
-        {
-            roots.push(root.to_path_buf());
-        }
+/// Symlinks under `dir` whose target does not resolve, found in
+/// `.claude/{skills,agents,commands}` of every `.claude` directory at or below `dir` (plus the
+/// enclosing one when `dir` sits inside a `.claude` tree). The ordinary walkers drop them
+/// (`canonicalize` fails), so only a checker that inspects unreadable paths ever sees them.
+///
+/// Never follows a symlink while walking (a loop link would otherwise recurse to the kernel's
+/// ELOOP limit, with exponential fan-out) and ignores `.gitignore`, only `SKIP_DIRS`.
+pub fn dangling_claude_symlinks(dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(enclosing) = dir.canonicalize().ok().and_then(|d| {
+        d.ancestors()
+            .find(|a| is_claude_dir(a))
+            .map(Path::to_path_buf)
+    }) {
+        roots.push(enclosing);
     }
+    find_claude_dirs(dir, &mut roots);
     roots.sort();
     roots.dedup();
     let mut out = Vec::new();
     for root in roots {
         for kind in ["skills", "agents", "commands"] {
-            let Ok(entries) = walk(&root.join(kind)) else {
-                continue;
-            };
-            out.extend(
-                entries
-                    .into_iter()
-                    .filter(|p| p.is_symlink() && !p.exists()),
-            );
+            collect_dangling(&root.join(kind), &mut out);
         }
     }
+    out.retain(|p| p.starts_with(dir) || dir.canonicalize().is_ok_and(|d| p.starts_with(d)));
     out.sort();
     out
+}
+
+fn is_claude_dir(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == ".claude")
+}
+
+fn is_skipped_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| SKIP_DIRS.contains(&name))
+}
+
+/// Real (non-symlink) directories only; does not descend into a `.claude` once found.
+fn find_claude_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) || is_skipped_dir(&path) {
+            continue;
+        }
+        if is_claude_dir(&path) {
+            out.push(path);
+        } else {
+            find_claude_dirs(&path, out);
+        }
+    }
+}
+
+fn collect_dangling(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            if !path.exists() {
+                out.push(path);
+            }
+        } else if file_type.is_dir() && !is_skipped_dir(&path) {
+            collect_dangling(&path, out);
+        }
+    }
 }
 
 /// Files under `dir` git considers part of the work tree (tracked, or untracked and not
@@ -1779,6 +1825,9 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod dangling_symlink_tests;
 
 #[cfg(test)]
 mod diff_scoping_tests;

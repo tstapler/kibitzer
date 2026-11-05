@@ -13,7 +13,7 @@ Per-rule counts, native vs `stapler-scripts/lint-claude-kb`:
 | `description-too-long` | 1 | 1 | `code-new-project` (1502 chars) |
 | `unknown-frontmatter-key` | 1 | 1 | `github/skills/pr-ship` (`prompt:`) |
 | `broken-skill-ref` | 14 | 7 | all 7 Python hits reproduced; the extra 7 are `security-review`, `claude-in-chrome`, `update-config` (built-in skills), which the script hides via a hard-coded `EXTERNAL_SKILLS` set. Native needs them in the `external_skills` option. |
-| dangling symlink | 0 | 0 | none present in dotfiles. Positive case covered by `tests/claude_skill_cli.rs` (real `kibitzer run`, both git and walk paths) |
+| dangling symlink | 0 | 0 | none present in dotfiles. Positive cases covered by `tests/claude_skill_cli.rs` (real `kibitzer run`, git and walk paths) and `src/check/dangling_symlink_tests.rs` (nested roots, all three kinds, loop links, subdir scope) |
 | `oversized-no-split` | n/a | 11 | Python-only |
 
 Result: every covered finding the script reports is reproduced; the only difference is the

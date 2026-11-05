@@ -131,7 +131,14 @@ mod tests {
     #[test]
     fn prose_without_skill_references_is_clean() {
         let f = tree();
-        assert!(run(&Default::default(), &f, "use `alpha` carefully\n").is_empty());
+        assert!(
+            run(
+                &Default::default(),
+                &f,
+                "use `ghost` carefully, then `ghost` again\n"
+            )
+            .is_empty()
+        );
     }
 
     #[test]

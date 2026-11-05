@@ -29,6 +29,7 @@ fn init_git(dir: &Path) {
         assert!(
             Command::new("git")
                 .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .args(["-c", "user.email=t@t", "-c", "user.name=t"])
                 .args(args)
                 .status()
@@ -73,4 +74,33 @@ fn git_listing_reports_all_three_checks() {
     let dir = tree("claude-skill-git");
     init_git(&dir);
     assert_all_three_fire(&run(&dir));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_native_reports_a_dangling_link_but_still_errors_on_a_missing_file() {
+    let dir = tree("claude-skill-native");
+    let kibitzer = |checker: &str, file: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_kibitzer"))
+            .args(["check", "native", checker])
+            .arg(file)
+            .output()
+            .expect("spawn kibitzer")
+    };
+    let link = kibitzer(
+        "claude-skill-dangling-symlink",
+        &dir.join(".claude/skills/dangling"),
+    );
+    assert_eq!(link.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&link.stdout).contains("[dangling-symlink]"));
+
+    let missing = dir.join(".claude/skills/typo");
+    for checker in ["claude-skill-dangling-symlink", "claude-skill-frontmatter"] {
+        let out = kibitzer(checker, &missing);
+        assert_eq!(out.status.code(), Some(1), "{checker}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("reading"),
+            "{checker}"
+        );
+    }
 }

@@ -599,7 +599,9 @@ fn main() -> Result<ExitCode> {
                     .with_context(|| format!("no checker named '{name}' registered"))?;
                 let source = match std::fs::read_to_string(&file) {
                     Ok(source) => source,
-                    Err(_) if checker.inspects_unreadable_paths() => String::new(),
+                    Err(_) if file.is_symlink() && checker.inspects_unreadable_paths() => {
+                        String::new()
+                    }
                     Err(err) => {
                         return Err(err).with_context(|| format!("reading {}", file.display()));
                     }

@@ -26,6 +26,12 @@ Notes:
 - The symlink check is batch-only because its subject is the symlink path. A per-file shape
   would attach the finding to whichever `.md` was edited. The runner calls it with an empty
   source for unreadable paths (`Checker::inspects_unreadable_paths`).
+- Discovery for the symlink check: `kibitzer run <dir>` walks `<dir>` for `.claude` directories
+  (real directories only, never following symlinks, skipping `SKIP_DIRS` such as `node_modules`,
+  `vendor`, `build`), plus the enclosing `.claude` when `<dir>` is inside one, and reports only
+  paths under `<dir>`. It does not honor `.gitignore`. It never fires from the per-edit hook or
+  MCP (batch only), and `check native` treats an unreadable path as empty source only when it is
+  a symlink.
 - Suppress with the usual `kibitzer:ignore` directive (`docs/suppressing-checks.md`).
 - Python-only, not ported: `oversized-no-split`, `nested-references`, `windows-path`,
   `removed-builtin-command`.

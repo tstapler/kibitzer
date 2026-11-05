@@ -297,6 +297,12 @@ mod tests {
         let long = "a".repeat(65);
         let out = run(SKILL, &format!("---\nname: {long}\ndescription: d\n---\n"));
         assert!(out.iter().any(|m| m.contains("[name-too-long]")));
+        let ok = "a".repeat(64);
+        assert!(
+            run(SKILL, &format!("---\nname: {ok}\ndescription: d\n---\n"))
+                .iter()
+                .all(|m| !m.contains("[name-too-long]"))
+        );
         let out = run(SKILL, "---\nname: Foo_Bar\ndescription: d\n---\n");
         assert!(out.iter().any(|m| m.contains("[name-invalid-chars]")));
         let out = run(SKILL, "---\nname: <b>x</b>\ndescription: d\n---\n");
@@ -311,6 +317,8 @@ mod tests {
             &format!("---\nname: foo\ndescription: {long}\n---\n"),
         );
         assert!(out.iter().any(|m| m.contains("[description-too-long]")));
+        let ok = "a".repeat(1024);
+        assert!(run(SKILL, &format!("---\nname: foo\ndescription: {ok}\n---\n")).is_empty());
         let out = run(SKILL, "---\nname: foo\ndescription: <x>a</x>\n---\n");
         assert!(out.iter().any(|m| m.contains("[description-xml-tag]")));
         // A bare `<placeholder>` is not an XML pair.
