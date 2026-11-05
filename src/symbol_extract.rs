@@ -743,6 +743,9 @@ const LITERAL_KINDS: &[&str] = &[
     "undefined",
 ];
 
+// SEAM(typed-node-kind-migration): `return_statement`/`expression_list`/`comment` are matched
+// by raw string across the Go and TS/JS grammars at once, so no single `<Lang>Kind` enum
+// covers them — see ADR-001.
 /// Body is exactly `return <one literal>`; multi-value returns and expressions are not.
 fn is_single_literal_return(body: Node) -> bool {
     let stmts = body_statements(body);
