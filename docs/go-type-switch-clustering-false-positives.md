@@ -52,6 +52,15 @@ Five genuine clusters, so strip-receiver normalization was not needed to meet th
 `ex.machine.CurState()`, `hint.GetValue()`, `w.desc`; terraform `p.shape`) were not
 individually read.
 
+## Deviations from requirements.md
+
+- **Receiver normalization ships in v1.** `project_plans/type-switch-clustering/requirements.md`
+  ("Rabbit Holes") asked for conservative full-string comparison. The shipped checker strips
+  the method's own receiver variable so `r.kind` and `c.kind` cluster, and skips non-receiver
+  subjects instead. That receiver-rooted rule is what cut findings from 71 to 11.
+- **"Zero false positives on the corpus" is not proven.** 11 findings remain and only 5
+  clusters were individually verified as true positives; the rest were not read.
+
 ## Known limits
 
 - **Hierarchy detection is explicit-embedding only.** Go `type_edges` come from struct or
