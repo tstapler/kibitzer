@@ -629,6 +629,9 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::middle_man::MiddleManChecker),
         Box::new(crate::encapsulate_variable::EncapsulateVariableChecker),
         Box::new(crate::remove_setting_method::RemoveSettingMethodChecker),
+        Box::new(crate::hierarchy_cleanup::CollapseHierarchyChecker),
+        Box::new(crate::hierarchy_cleanup::ExtractSuperclassChecker),
+        Box::new(crate::hierarchy_cleanup::RemoveSubclassChecker),
         Box::new(crate::feature_envy::FeatureEnvyChecker),
         Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
     ]
@@ -1812,6 +1815,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         }
     }
 
@@ -1996,6 +2002,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         }
     }
 
@@ -2060,6 +2069,9 @@ mod tests {
                     delegation_field: None,
                     params: vec![],
                     used_as_value: false,
+                    returns_constant: false,
+                    is_abstract: false,
+                    declares_fields: false,
                 },
             ],
         );
@@ -2087,6 +2099,9 @@ mod tests {
                     delegation_field: None,
                     params: vec![],
                     used_as_value: false,
+                    returns_constant: false,
+                    is_abstract: false,
+                    declares_fields: false,
                 },
             ],
         );
@@ -2113,6 +2128,9 @@ mod tests {
                     delegation_field: None,
                     params: vec![],
                     used_as_value: false,
+                    returns_constant: false,
+                    is_abstract: false,
+                    declares_fields: false,
                 },
             ],
         );

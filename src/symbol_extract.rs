@@ -418,6 +418,9 @@ fn go_type_declaration_symbols(
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
     }
 }
@@ -552,6 +555,14 @@ fn classify_node(
         Vec::new()
     };
 
+    let returns_constant = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+        && returns_constant_body(node, language);
+    let (is_abstract, declares_fields) = if symbol_kind == SymbolKind::Type {
+        class_shape(node, language, source)
+    } else {
+        (false, false)
+    };
+
     Some(SymbolNode {
         id,
         name,
@@ -564,7 +575,129 @@ fn classify_node(
         delegation_field,
         params,
         used_as_value: false,
+        returns_constant,
+        is_abstract,
+        declares_fields,
     })
+}
+
+const LITERAL_KINDS: &[&str] = &[
+    // Java
+    "decimal_integer_literal",
+    "hex_integer_literal",
+    "octal_integer_literal",
+    "binary_integer_literal",
+    "decimal_floating_point_literal",
+    "hex_floating_point_literal",
+    "character_literal",
+    "null_literal",
+    // Kotlin
+    "number_literal",
+    "boolean_literal",
+    // TS/JS
+    "number",
+    // shared spellings
+    "true",
+    "false",
+    "null",
+];
+
+fn is_constant_literal(n: Node) -> bool {
+    match n.kind() {
+        "string_literal" | "string" => {
+            let mut c = n.walk();
+            !n.children(&mut c)
+                .any(|k| k.kind().contains("interpolation"))
+        }
+        "template_string" => {
+            let mut c = n.walk();
+            !n.children(&mut c)
+                .any(|k| k.kind() == "template_substitution")
+        }
+        k => LITERAL_KINDS.contains(&k),
+    }
+}
+
+fn type_extends_capable(language: Language) -> bool {
+    type_relation_supports(language) && language != Language::Go
+}
+
+/// Parameterless body that is exactly `return <literal>` (or Kotlin `= <literal>`).
+fn returns_constant_body(node: Node, language: Language) -> bool {
+    if !type_extends_capable(language) {
+        return false;
+    }
+    let params = node
+        .child_by_field_name("parameters")
+        .or_else(|| find_child_by_kind(node, "function_value_parameters"));
+    if params.is_some_and(|p| p.named_child_count() > 0) {
+        return false;
+    }
+    let Some(mut body) = node
+        .child_by_field_name("body")
+        .or_else(|| find_child_by_kind(node, "function_body"))
+    else {
+        return false;
+    };
+    if body.kind() == "function_body" {
+        match body.named_child(0) {
+            Some(inner) if body.named_child_count() == 1 => body = inner,
+            _ => return false,
+        }
+    }
+    if !matches!(body.kind(), "block" | "statement_block") {
+        return is_constant_literal(body);
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node> = body
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() != "comment")
+        .collect();
+    let [stmt] = stmts.as_slice() else {
+        return false;
+    };
+    if !matches!(stmt.kind(), "return_statement" | "return_expression")
+        || stmt.named_child_count() != 1
+    {
+        return false;
+    }
+    stmt.named_child(0).is_some_and(is_constant_literal)
+}
+
+/// `(is_abstract, declares_fields)` for a class declaration.
+fn class_shape(node: Node, language: Language, source: &str) -> (bool, bool) {
+    if !type_extends_capable(language) || node.kind() != "class_declaration" {
+        return (false, false);
+    }
+    let has_word = |n: Node, words: &[&str]| {
+        node_text(n, source)
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| words.contains(&w))
+    };
+    let is_abstract = matches!(language, Language::Java | Language::Kotlin)
+        && find_child_by_kind(node, "modifiers")
+            .is_some_and(|m| has_word(m, &["abstract", "sealed"]));
+    let body = node
+        .child_by_field_name("body")
+        .or_else(|| find_child_by_kind(node, "class_body"));
+    let mut declares_fields = body.is_some_and(|b| {
+        let mut c = b.walk();
+        b.children(&mut c).any(|k| {
+            matches!(
+                k.kind(),
+                "field_declaration"
+                    | "public_field_definition"
+                    | "field_definition"
+                    | "property_declaration"
+            )
+        })
+    });
+    if language == Language::Kotlin
+        && let Some(ctor) = find_child_by_kind(node, "primary_constructor")
+    {
+        declares_fields |= has_word(ctor, &["val", "var"]);
+    }
+    (is_abstract, declares_fields)
 }
 
 /// True if `node` is, or contains, an anonymous function (closure/arrow).
@@ -3448,5 +3581,75 @@ func f(int, string) {}
             "pkg",
         );
         assert_eq!(find_by_name(&symbols, "foo").delegation_field, None);
+    }
+
+    // --- hierarchy-cleanup signals: returns_constant / is_abstract / declares_fields ---
+
+    #[test]
+    fn returns_constant_true_for_literal_returns_in_each_language() {
+        let cases = [
+            (Language::Java, "class A { int f() { return 1; } }"),
+            (Language::Java, "class A { String f() { return \"s\"; } }"),
+            (Language::TypeScript, "class A { f() { return `x` } }"),
+            (Language::JavaScript, "class A { f() { return true } }"),
+            (Language::Kotlin, "class A {\n  fun f() = 3\n}\n"),
+            (
+                Language::Kotlin,
+                "class A {\n  fun f(): Int { return 3 }\n}\n",
+            ),
+        ];
+        for (lang, src) in cases {
+            assert!(
+                find_by_name(&extract(lang, src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn returns_constant_false_for_computed_parameterised_or_multi_statement_bodies() {
+        let cases = [
+            (Language::Java, "class A { int f() { return g(); } }"),
+            (Language::Java, "class A { int f() { return 1 + 2; } }"),
+            (Language::Java, "class A { int f(int x) { return 1; } }"),
+            (Language::Java, "class A { int f() { g(); return 1; } }"),
+            (Language::Java, "class A { void f() { } }"),
+            (Language::TypeScript, "class A { f() { return `a${1}` } }"),
+            (Language::Kotlin, "class A {\n  fun f() = \"a${1}\"\n}\n"),
+            (Language::Go, "package p\nfunc f() int { return 1 }\n"),
+        ];
+        for (lang, src) in cases {
+            assert!(
+                !find_by_name(&extract(lang, src, "p"), "f").returns_constant,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_shape_reports_abstract_and_fields() {
+        let java = extract(
+            Language::Java,
+            "abstract class A { int x; }\nclass B { void f() { } }",
+            "p",
+        );
+        assert!(find_by_name(&java, "A").is_abstract && find_by_name(&java, "A").declares_fields);
+        assert!(!find_by_name(&java, "B").is_abstract && !find_by_name(&java, "B").declares_fields);
+        let kt = extract(
+            Language::Kotlin,
+            "sealed class S\nclass P(val a: Int)\nclass Q(a: Int)\nclass R {\n  val x = 1\n}\n",
+            "p",
+        );
+        assert!(find_by_name(&kt, "S").is_abstract);
+        assert!(find_by_name(&kt, "P").declares_fields);
+        assert!(!find_by_name(&kt, "Q").declares_fields);
+        assert!(find_by_name(&kt, "R").declares_fields);
+        let ts = extract(
+            Language::TypeScript,
+            "class A { x = 1 }\nclass B { f() { } }",
+            "p",
+        );
+        assert!(find_by_name(&ts, "A").declares_fields);
+        assert!(!find_by_name(&ts, "B").declares_fields);
     }
 }

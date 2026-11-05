@@ -95,6 +95,18 @@ pub struct SymbolNode {
     /// A same-package bare name occurs in a value position; lexical shadowing is not resolved.
     #[serde(default)]
     pub used_as_value: bool,
+    /// Method/function whose whole body is one `return <literal>` and which takes no
+    /// parameters. Only set for the `Extends`-capable languages (Java/Kotlin/TS/JS).
+    #[serde(default)]
+    pub returns_constant: bool,
+    /// `Type` declared `abstract`/`sealed` (Java/Kotlin). TS `abstract class` is a
+    /// different node kind and never becomes a `Type` symbol at all.
+    #[serde(default)]
+    pub is_abstract: bool,
+    /// `Type` with a field/property declaration (Java/Kotlin/TS/JS), including Kotlin
+    /// `val`/`var` primary-constructor parameters. TS constructor parameter properties are not seen.
+    #[serde(default)]
+    pub declares_fields: bool,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -1235,6 +1247,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         }
     }
 
@@ -1379,6 +1394,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2150,6 +2168,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2164,6 +2185,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
 
         let mut packages = BTreeMap::new();
@@ -2202,6 +2226,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2241,6 +2268,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2515,6 +2545,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2534,6 +2567,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2587,6 +2623,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2631,6 +2670,9 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
         });
         packages.insert("app".to_string(), pkg);
 

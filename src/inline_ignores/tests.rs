@@ -980,6 +980,9 @@ fn known_rule_should_AcceptRulesCheckersAndMeta_When_Queried() {
     assert!(known_rule("ignore-syntax"));
     assert!(known_rule("remove-middle-man"));
     assert!(known_rule("remove-setting-method"));
+    assert!(known_rule("collapse-hierarchy"));
+    assert!(known_rule("extract-superclass"));
+    assert!(known_rule("remove-subclass"));
     assert!(!known_rule("made-up-rule"));
 }
 

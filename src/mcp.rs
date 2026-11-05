@@ -3083,6 +3083,9 @@ mod tests {
                 delegation_field: None,
                 params: vec![],
                 used_as_value: false,
+                returns_constant: false,
+                is_abstract: false,
+                declares_fields: false,
             },
             SymbolNode {
                 id: "pkg::Dog".to_string(),
@@ -3096,6 +3099,9 @@ mod tests {
                 delegation_field: None,
                 params: vec![],
                 used_as_value: false,
+                returns_constant: false,
+                is_abstract: false,
+                declares_fields: false,
             },
         ];
         let mut packages = BTreeMap::new();

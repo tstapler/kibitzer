@@ -219,6 +219,9 @@ mod tests {
             is_pure_delegation: false,
             delegation_field: None,
             used_as_value: false,
+            returns_constant: false,
+            is_abstract: false,
+            declares_fields: false,
             params: params
                 .iter()
                 .map(|(n, t)| (n.to_string(), t.to_string()))

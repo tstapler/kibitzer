@@ -29,6 +29,7 @@ mod go_package_focus;
 mod go_refactor;
 mod go_syntax;
 mod god_class;
+mod hierarchy_cleanup;
 mod hook;
 mod hook_footer;
 mod hook_log;
