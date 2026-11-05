@@ -52,6 +52,7 @@ mod plugin;
 mod refactor;
 mod refactor_core;
 mod refactor_split;
+mod remove_setting_method;
 mod root_cause_clusters;
 mod run;
 mod run_context;
