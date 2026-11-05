@@ -633,6 +633,7 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::remove_subclass::RemoveSubclassChecker),
         Box::new(crate::extract_superclass::ExtractSuperclassChecker),
         Box::new(crate::collapse_hierarchy::CollapseHierarchyChecker),
+        Box::new(crate::checkers::go_type_switch_clustering::TypeSwitchClusteringChecker),
         Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
     ]
 }

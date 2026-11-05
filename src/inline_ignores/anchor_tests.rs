@@ -137,6 +137,11 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
         "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
     ),
     (
+        "go-type-switch-clustering",
+        "whole-repo architecture check needing a multi-method model; end-to-end suppression is \
+         covered in tests/go_type_switch_clustering_cli.rs",
+    ),
+    (
         "claude-skill-xref",
         "resolves ids against an on-disk .claude/skills tree, which a single-file fixture lacks",
     ),

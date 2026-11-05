@@ -336,7 +336,7 @@ fn build_id(package_path: &str, parent: Option<&str>, name: &str) -> String {
 /// Go method/parent detection: the `receiver` field is a `parameter_list` wrapping one
 /// `parameter_declaration`, whose `type` field is either the receiver type's identifier
 /// directly (value receiver) or a `pointer_type` wrapping it (pointer receiver).
-fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
+pub(crate) fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
     let receiver = method.child_by_field_name("receiver")?;
     let mut cursor = receiver.walk();
     let decl = receiver

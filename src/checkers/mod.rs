@@ -18,6 +18,7 @@ pub mod go_encapsulate_collection;
 pub mod go_error_context;
 pub mod go_ignored_error;
 pub mod go_table_driven_test;
+pub mod go_type_switch_clustering;
 pub mod go_type_switch_density;
 pub mod hollow_qualifier_phrasing;
 mod import_preamble;
