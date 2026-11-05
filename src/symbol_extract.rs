@@ -3252,6 +3252,11 @@ func f(int, string) {}
             ("string", "return \"x\""),
             ("bool", "return true"),
             ("nil", "return nil"),
+            ("false", "return false"),
+            ("float", "return 1.5"),
+            ("rune", "return 'a'"),
+            ("raw string", "return `raw`"),
+            ("trailing comment", "return 1 // note"),
         ] {
             let src = format!("package pkg\n\nfunc (t *T) Kind() any {{\n\t{ret}\n}}\n");
             assert!(constant_return(Language::Go, &src, "Kind"), "{label}");
@@ -3267,6 +3272,8 @@ func f(int, string) {}
             ("expression", "return 1 + 2"),
             ("two statements", "log()\n\treturn 1"),
             ("empty", ""),
+            ("bare return", "return"),
+            ("negative literal", "return -1"),
         ] {
             let src = format!("package pkg\n\nfunc (t *T) Kind() any {{\n\t{body}\n}}\n");
             assert!(!constant_return(Language::Go, &src, "Kind"), "{label}");
@@ -3275,11 +3282,23 @@ func f(int, string) {}
 
     #[test]
     fn is_constant_return_true_for_typescript_literals_and_false_otherwise() {
-        for ret in ["return 1;", "return 'a';", "return true;", "return null;"] {
+        for ret in [
+            "return 1;",
+            "return 'a';",
+            "return true;",
+            "return null;",
+            "return undefined;",
+        ] {
             let src = format!("class C {{ kind() {{ {ret} }} }}\n");
             assert!(constant_return(Language::TypeScript, &src, "kind"), "{ret}");
         }
-        for ret in ["return this.x;", "return f();"] {
+        for ret in [
+            "return this.x;",
+            "return f();",
+            "return;",
+            "return -1;",
+            "return `t`;",
+        ] {
             let src = format!("class C {{ kind() {{ {ret} }} }}\n");
             assert!(
                 !constant_return(Language::TypeScript, &src, "kind"),

@@ -37,6 +37,16 @@ pub(crate) fn resolved_extends<'a>(
     pairs
 }
 
+/// Test and fixture files (`fixtures/`, `testdata/`) hold deliberately odd shapes; the
+/// hierarchy checks skip them.
+pub(crate) fn is_ignorable_file(model: &ArchModel, file: &std::path::Path) -> bool {
+    let rel = file.strip_prefix(&model.repo_root).unwrap_or(file);
+    is_test_file(rel)
+        || rel
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("fixtures" | "testdata")))
+}
+
 /// Non-test methods declared directly on `type_name` in `pkg`.
 pub(crate) fn methods_of<'a>(
     model: &ArchModel,
@@ -46,7 +56,7 @@ pub(crate) fn methods_of<'a>(
     pkg.symbols
         .iter()
         .filter(|s| s.kind == SymbolKind::Method && s.parent.as_deref() == Some(type_name))
-        .filter(|s| !is_test_file(s.file.strip_prefix(&model.repo_root).unwrap_or(&s.file)))
+        .filter(|s| !is_ignorable_file(model, &s.file))
         .collect()
 }
 
@@ -84,15 +94,24 @@ pub(crate) mod fixtures {
     }
 
     pub fn model(symbols: Vec<SymbolNode>, type_edges: Vec<TypeRelationEdge>) -> ArchModel {
-        let mut packages = BTreeMap::new();
-        packages.insert(
-            "pkg".to_string(),
-            PackageNode {
-                path: "pkg".to_string(),
-                files: vec![],
-                symbols,
-            },
-        );
+        model_pkgs(vec![("pkg", symbols)], type_edges)
+    }
+
+    pub fn model_pkgs(
+        pkgs: Vec<(&str, Vec<SymbolNode>)>,
+        type_edges: Vec<TypeRelationEdge>,
+    ) -> ArchModel {
+        let packages: BTreeMap<String, PackageNode> = pkgs
+            .into_iter()
+            .map(|(path, symbols)| {
+                let node = PackageNode {
+                    path: path.to_string(),
+                    files: vec![],
+                    symbols,
+                };
+                (path.to_string(), node)
+            })
+            .collect();
         ArchModel {
             repo_root: PathBuf::from("/repo"),
             packages,
@@ -114,5 +133,51 @@ pub(crate) mod fixtures {
             file: PathBuf::from("/repo/pkg/a.go"),
             line: 3,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{edge, model, sym};
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolved_extends_dedupes_and_drops_non_extends_unresolved_and_unmodeled() {
+        let syms = vec![
+            sym("pkg", "A", SymbolKind::Type, None),
+            sym("pkg", "B", SymbolKind::Type, None),
+        ];
+        let mut implements = edge("pkg::A", "pkg::B", true);
+        implements.kind = Some(TypeRelationKind::Implements);
+        let mut unknown_kind = edge("pkg::B", "pkg::A", true);
+        unknown_kind.kind = None;
+        let edges = vec![
+            edge("pkg::A", "pkg::B", true),
+            edge("pkg::A", "pkg::B", true),
+            implements,
+            unknown_kind,
+            edge("pkg::A", "ext.Base", false),
+            edge("pkg::A", "pkg::Ghost", true),
+        ];
+        let m = model(syms, edges);
+        let types = type_index(&m);
+        assert_eq!(resolved_extends(&m, &types), vec![("pkg::A", "pkg::B")]);
+    }
+
+    #[test]
+    fn methods_of_omits_test_and_fixture_files() {
+        let mut keep = sym("pkg", "Keep", SymbolKind::Method, Some("T"));
+        keep.file = PathBuf::from("/repo/pkg/a.go");
+        let mut test = sym("pkg", "T1", SymbolKind::Method, Some("T"));
+        test.file = PathBuf::from("/repo/pkg/a_test.go");
+        let mut fixture = sym("pkg", "F1", SymbolKind::Method, Some("T"));
+        fixture.file = PathBuf::from("/repo/pkg/testdata/a.go");
+        let m = model(vec![keep, test, fixture], vec![]);
+        let names: Vec<_> = methods_of(&m, &m.packages["pkg"], "T")
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Keep"]);
     }
 }

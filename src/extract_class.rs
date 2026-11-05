@@ -21,7 +21,7 @@ use crate::jaccard::jaccard;
 /// `pub` constant across modules, per this codebase's existing per-file threshold
 /// convention, e.g. `MAX_FAN_OUT`/`STABLE_MAX`). Also the minimum needed for a `[2, n-1]`
 /// candidate-cut range to be non-empty (`n=4` gives cuts at `k=2,3`).
-pub(crate) const MIN_METHODS_FOR_CLUSTERING: usize = 4;
+const MIN_METHODS_FOR_CLUSTERING: usize = 4;
 
 /// Upper bound on methods-with-field-access-data clustered for one type: `hac_partitions`
 /// is O(n³) and `candidate_splits` adds an O(n²)-per-cut pass on top, so an unbounded type
@@ -56,7 +56,7 @@ pub struct ExtractClassCandidate {
 /// Every Go method of `type_name` in `pkg` that has at least one field access recorded in
 /// `model.field_accesses`, mapped to the set of field ids it accesses. A method with zero
 /// field accesses is simply absent from the returned map — see this module's doc comment.
-pub(crate) fn method_field_sets<'a>(
+fn method_field_sets<'a>(
     model: &'a ArchModel,
     pkg: &'a PackageNode,
     type_name: &str,

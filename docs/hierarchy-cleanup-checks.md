@@ -8,11 +8,11 @@ see `suppressing-checks.md`.
 |---|---|---|---|
 | `remove-subclass` | Remove Subclass | Leaf subtype; ≥1 method, every one `SymbolNode::is_constant_return`; no field of the subtype is read by any method | Go, TS/JS (Java/Kotlin never fire: `is_constant_return` is always false) |
 | `extract-superclass` | Extract Superclass | Two same-package types, no edge between them, ≥ `MIN_METHODS_FOR_CLUSTERING` (4) methods with field accesses each, Jaccard of accessed field *names* ≥ 0.5, ≥ 2 shared names; top 3 per package | Go only (field-access data) |
-| `collapse-hierarchy` | Collapse Hierarchy | Resolved `Extends` edge; subtype has ≥ 3 methods and < 20% of them are absent by name from its direct supertype | Go, TS, Java, Kotlin |
+| `collapse-hierarchy` | Collapse Hierarchy | Resolved `Extends` edge; subtype has ≥ 3 methods and < 20% of them are absent by name from its direct supertype | Go, TS/JS (Java/Kotlin subtypes skipped, see below) |
 
-Guards added after backtesting (not in the original issue): `extract-superclass` skips test
+Guards added after backtesting and code review (not in the original issue). All three skip test and `fixtures/`/`testdata/` files: `extract-superclass` skips test
 files, same-named types (build-tag variants) and single-shared-field pairs; `collapse-hierarchy`
-skips same-named pairs and subtypes with < 3 methods.
+skips same-named pairs, subtypes with < 3 methods and `.java`/`.kt` subtypes; `remove-subclass` skips same-named pairs.
 
 Known false-negatives: a declared-but-never-read field is invisible to `remove-subclass`;
 method comparison is by name, not signature; no cross-package or transitive comparison.
@@ -44,10 +44,21 @@ The 'before' numbers are from the first run (kubernetes only for extract-supercl
   `DeltaFIFO`/`FIFO`/`RealFIFO`, `RemoteImage/RuntimeServiceBuilder`, the dynamiccertificates
   pair, both stapler-squad pairs. False: `GroupVersion*` value types, `AttachedVolume`/
   `VolumeToAttach` data structs. ≈ 8 TP / 5 FP.
-- **collapse-hierarchy**: **mostly false positives.** All 7 kubernetes hits read are
+- **collapse-hierarchy**: **mostly false positives.** All 7 kubernetes hits read were
   intentional (strategy embedding, versioned-compat wrappers, `MicroTime`/`Time`). Of 10
-  sampled Cassandra hits, nearly all are subclasses implementing an abstract parent's methods
+  sampled Cassandra hits, nearly all were subclasses implementing an abstract parent's methods
   (`BooleanType`, `FloatSerializer`: the template-method pattern). The model cannot see
-  `abstract`, so "override everything" is indistinguishable from "adds nothing". Treat as
-  ≈ 85-100% FP on Java; keep advisory, and disable per repo if noisy
-  (`disabled: ["collapse-hierarchy"]`). A real fix needs an `is_abstract` bit on `SymbolNode`.
+  `abstract`, so "override everything" is indistinguishable from "adds nothing".
+  Mitigation: JVM (`.java`/`.kt`) subtypes are now skipped, which takes Cassandra from 80
+  hits to 0 and leaves Go/TS, where kubernetes still gives 6 (judged mostly intentional, so
+  treat the Go rate as still high, ~85%+, n=7). The real fix is an `is_abstract` bit on
+  `SymbolNode` (not done). Disable per repo with `disabled: ["collapse-hierarchy"]`.
+
+### Re-run after code-review changes (release build)
+
+| Repo | remove-subclass | extract-superclass | collapse-hierarchy |
+|---|---|---|---|
+| kubernetes/kubernetes | 1 | 11 | 6 |
+| tstapler/stapler-squad | 0 | 2 | 0 |
+| microsoft/vscode | 2 (fixture hit gone) | 0 | 0 |
+| apache/cassandra | 0 | 0 | 0 (was 80) |

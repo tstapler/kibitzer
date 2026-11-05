@@ -8,12 +8,15 @@ use std::collections::{HashMap, HashSet};
 use crate::arch_model::{ArchModel, PackageNode, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
-use crate::hierarchy_checks::{methods_of, resolved_extends, type_index};
+use crate::hierarchy_checks::{is_ignorable_file, methods_of, resolved_extends, type_index};
 
 const COLLAPSE_HIERARCHY_UNIQUE_THRESHOLD: f64 = 0.20;
 /// A subtype with 1-2 methods that all override its parent is the template-method pattern
 /// (backtest: 150+ such hits on cassandra), not a hollow hierarchy.
 const MIN_SUBTYPE_METHODS: usize = 3;
+/// JVM subclasses overwhelmingly implement an abstract parent's methods (backtest: ~85-100%
+/// false positives on cassandra); the model has no `abstract` bit to tell the cases apart.
+const JVM_EXTENSIONS: [&str; 2] = ["java", "kt"];
 
 pub struct CollapseHierarchyChecker;
 
@@ -43,7 +46,16 @@ fn finding_for_edge(
     let (super_pkg, sup) = types[super_id];
     let sub_methods = methods_of(model, sub_pkg, &sub.name);
     // Same name in two files = build-tag variants of one type, not a hierarchy.
-    if sub.name == sup.name || sub_methods.len() < MIN_SUBTYPE_METHODS {
+    let is_jvm = sub
+        .file
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| JVM_EXTENSIONS.contains(&e));
+    if sub.name == sup.name
+        || sub_methods.len() < MIN_SUBTYPE_METHODS
+        || is_jvm
+        || is_ignorable_file(model, &sub.file)
+    {
         return None;
     }
     let inherited: HashSet<&str> = methods_of(model, super_pkg, &sup.name)
@@ -83,7 +95,8 @@ fn finding_for_edge(
 mod tests {
     use super::*;
     use crate::arch_model::SymbolKind;
-    use crate::hierarchy_checks::fixtures::{edge, model, sym};
+    use crate::hierarchy_checks::fixtures::{edge, model, model_pkgs, sym};
+    use std::path::PathBuf;
 
     fn run(m: &ArchModel) -> Vec<ArchFinding> {
         CollapseHierarchyChecker.check(m, &ArchitectureConfig::default())
@@ -148,6 +161,54 @@ mod tests {
     fn boundary_exactly_twenty_percent_does_not_fire_just_below_does() {
         assert!(run(&hierarchy(4, 1)).is_empty(), "1/5 = 20%");
         assert_eq!(run(&hierarchy(5, 1)).len(), 1, "1/6 < 20%");
+    }
+
+    #[test]
+    fn ignores_jvm_subtypes_and_fixture_files() {
+        let mut jvm = hierarchy(3, 0);
+        for s in &mut jvm.packages.get_mut("pkg").unwrap().symbols {
+            s.file = PathBuf::from("/repo/pkg/S.java");
+        }
+        assert!(run(&jvm).is_empty());
+        let mut fx = hierarchy(3, 0);
+        for s in &mut fx.packages.get_mut("pkg").unwrap().symbols {
+            s.file = PathBuf::from("/repo/fixtures/a.go");
+        }
+        assert!(run(&fx).is_empty());
+    }
+
+    #[test]
+    fn compares_against_the_supertypes_own_package() {
+        let mut parent = vec![sym("lib", "P", SymbolKind::Type, None)];
+        let mut child = vec![sym("app", "S", SymbolKind::Type, None)];
+        for i in 0..3 {
+            parent.push(sym("lib", &format!("M{i}"), SymbolKind::Method, Some("P")));
+            child.push(sym("app", &format!("M{i}"), SymbolKind::Method, Some("S")));
+        }
+        let m = model_pkgs(
+            vec![("lib", parent), ("app", child)],
+            vec![edge("app::S", "lib::P", true)],
+        );
+        assert_eq!(
+            run(&m).len(),
+            1,
+            "all of S's methods override P's in another package"
+        );
+    }
+
+    #[test]
+    fn ignores_same_named_types_across_packages() {
+        let mut parent = vec![sym("lib", "S", SymbolKind::Type, None)];
+        let mut child = vec![sym("app", "S", SymbolKind::Type, None)];
+        for i in 0..3 {
+            parent.push(sym("lib", &format!("M{i}"), SymbolKind::Method, Some("S")));
+            child.push(sym("app", &format!("M{i}"), SymbolKind::Method, Some("S")));
+        }
+        let m = model_pkgs(
+            vec![("lib", parent), ("app", child)],
+            vec![edge("app::S", "lib::S", true)],
+        );
+        assert!(run(&m).is_empty());
     }
 
     #[test]

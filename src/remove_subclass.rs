@@ -4,10 +4,14 @@
 //! "No additional fields" is a proxy — a field of the subtype that some method reads
 //! (`FieldAccessEdge`) disqualifies it; a declared-but-unread field is a known false-negative.
 
+use std::collections::HashSet;
+
 use crate::arch_model::ArchModel;
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
-use crate::hierarchy_checks::{methods_of, resolved_extends, supertype_ids, type_index};
+use crate::hierarchy_checks::{
+    is_ignorable_file, methods_of, resolved_extends, supertype_ids, type_index,
+};
 
 pub struct RemoveSubclassChecker;
 
@@ -25,22 +29,27 @@ impl ArchModelChecker for RemoveSubclassChecker {
         let types = type_index(model);
         let pairs = resolved_extends(model, &types);
         let parents = supertype_ids(&pairs);
+        // Owner type id of every accessed field (`pkg::T.field` -> `pkg::T`), built once.
+        let accessed_owners: HashSet<&str> = model
+            .field_accesses
+            .iter()
+            .filter_map(|a| a.to.rsplit_once('.').map(|(owner, _)| owner))
+            .collect();
         let mut findings = Vec::new();
         for &(sub_id, super_id) in &pairs {
             if parents.contains(sub_id) {
                 continue;
             }
             let (pkg, sub) = types[sub_id];
+            // Same name = build-tag variants of one type, not a hierarchy.
+            if sub.name == types[super_id].1.name || is_ignorable_file(model, &sub.file) {
+                continue;
+            }
             let methods = methods_of(model, pkg, &sub.name);
             if methods.is_empty() || !methods.iter().all(|m| m.is_constant_return) {
                 continue;
             }
-            let own_field_prefix = format!("{sub_id}.");
-            if model
-                .field_accesses
-                .iter()
-                .any(|a| a.to.starts_with(&own_field_prefix))
-            {
+            if accessed_owners.contains(sub_id) {
                 continue;
             }
             findings.push(ArchFinding {
@@ -141,6 +150,63 @@ mod tests {
             line: 2,
         });
         assert!(run(&m).is_empty());
+    }
+
+    #[test]
+    fn multi_level_chain_flags_only_the_leaf() {
+        let mut syms = vec![
+            sym("pkg", "P", SymbolKind::Type, None),
+            sym("pkg", "S", SymbolKind::Type, None),
+            sym("pkg", "Z", SymbolKind::Type, None),
+        ];
+        for owner in ["S", "Z"] {
+            let mut m = sym("pkg", "K", SymbolKind::Method, Some(owner));
+            m.is_constant_return = true;
+            syms.push(m);
+        }
+        let m = model(
+            syms,
+            vec![
+                edge("pkg::S", "pkg::P", true),
+                edge("pkg::Z", "pkg::S", true),
+            ],
+        );
+        let found = run(&m);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].message.contains("pkg::Z is a leaf"),
+            "{}",
+            found[0].message
+        );
+    }
+
+    fn access(to: &str) -> FieldAccessEdge {
+        FieldAccessEdge {
+            from: "pkg::Q.m".into(),
+            to: to.into(),
+            access: AccessKind::Read,
+            file: PathBuf::from("/repo/pkg/a.go"),
+            line: 2,
+        }
+    }
+
+    #[test]
+    fn field_access_on_a_prefix_sharing_or_parent_type_does_not_suppress() {
+        let mut m = hierarchy(1, 0);
+        m.field_accesses = vec![access("pkg::S2.x"), access("pkg::Sx.x"), access("pkg::P.x")];
+        assert_eq!(run(&m).len(), 1);
+    }
+
+    #[test]
+    fn ignores_test_and_fixture_declarations_and_same_named_pairs() {
+        let mut m = hierarchy(1, 0);
+        for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
+            s.file = PathBuf::from("/repo/pkg/testdata/a.go");
+        }
+        assert!(run(&m).is_empty());
+        let mut same = hierarchy(1, 0);
+        same.packages.get_mut("pkg").unwrap().symbols[0].name = "S".into();
+        assert!(run(&same).is_empty());
     }
 
     #[test]
