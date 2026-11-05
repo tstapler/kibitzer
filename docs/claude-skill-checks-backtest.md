@@ -45,11 +45,24 @@ not reveal it. Fixed by `check::dangling_claude_symlinks` (bounded to `.claude/{
 and a dispatch only to checkers with `inspects_unreadable_paths()`. Reproduced before and after in a
 scratch git repo containing `.claude/skills/ghost -> ../nowhere`.
 
+## Transcript backtest (`kibitzer check backtest <name>`, `~/.claude/projects`)
+
+| Checker | Transcripts scanned | Snapshots checked | Findings |
+|---|---|---|---|
+| `claude-skill-frontmatter` | 4802 | 56 | 1 (`invalid-skill-location` on dotfiles `.claude/skills/CHANGELOG.md`, a true positive) |
+| `claude-skill-xref` | 4802 | 56 | 0 |
+| `claude-skill-dangling-symlink` | 4800 | 74 | 0 (batch-only; edits cannot create a finding) |
+
+1242 edits were unreconstructable in each run. The first dangling-symlink run errored when a
+live session's transcript vanished mid-scan; a rerun succeeded. Only 56-74 snapshots means this
+is weak evidence about per-edit noise, not a clean bill.
+
 ## Not run
 
-- A full `kibitzer run` (all default checks) over `~/dotfiles` hit a 280s timeout, so no
-  whole-repo `run` numbers are recorded; the per-file `check native` loop above is what was measured.
-- `scripts/backtest-triage.py` tracking and the transcript-based `kibitzer check backtest`.
+- A whole-repo `kibitzer run` over `~/dotfiles` and over `~/dotfiles/.claude`: both hit a
+  timeout (280s and 250s) under all default checks, so no whole-repo `run` numbers exist. The
+  per-file `check native` loop above is what was measured.
+- `scripts/backtest-triage.py` tracking.
 - Known limitation: `claude-skill-xref` scans raw text, so a "`foo` skill" phrase inside a
   fenced code block is flagged, as `lint-claude-kb` also does. Not triaged for how often this
   produces false positives.
