@@ -171,11 +171,11 @@ fn signature_and_body(
     }
     let lines = sources.lines(model, &m.file)?;
     let slice = lines.get(m.line - 1..end.min(lines.len()))?;
+    let body = normalise_body(slice)?;
     // Guards against a stale model: the sliced signature must still name the method.
     if !signature_names_method(slice, &m.name) {
         return None;
     }
-    let body = normalise_body(slice)?;
     let sig = if m.file.extension().is_some_and(|e| e == "go") {
         String::new()
     } else {
@@ -184,32 +184,38 @@ fn signature_and_body(
     Some((sig, body))
 }
 
+/// A signature longer than this is not one; the cap keeps a brace-less span (an arrow
+/// function, a one-liner) from being joined and scanned whole, once per nested symbol.
+const MAX_SIGNATURE_LINES: usize = 16;
+
 /// Signature lines: from the first line up to and including the opening-brace line.
 fn signature_lines(slice: &[String]) -> &[String] {
-    let end = slice
+    let head = &slice[..slice.len().min(MAX_SIGNATURE_LINES)];
+    let end = head
         .iter()
         .position(|l| l.trim_end().ends_with('{'))
-        .unwrap_or(slice.len().saturating_sub(1));
-    &slice[..(end + 1).min(slice.len())]
+        .unwrap_or(head.len().saturating_sub(1));
+    &head[..(end + 1).min(head.len())]
 }
 
 fn signature_names_method(slice: &[String], name: &str) -> bool {
     find_word(&signature_lines(slice).join(" "), name, 0).is_some()
 }
 
-/// Byte offset of `word` as a whole identifier in `text`, at or after `from`.
+/// Byte offset of `word` as a whole identifier in `text`, at or after `from`. An empty
+/// `word` (some JS/TS members have no name) never matches; `match_indices` always advances,
+/// so no input can make this loop.
 fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
-    let mut start = from;
-    while let Some(i) = text.get(start..)?.find(word) {
-        let at = start + i;
-        let end = at + word.len();
-        if !text[..at].ends_with(is_ident) && !text[end..].starts_with(is_ident) {
-            return Some(at);
-        }
-        start = end;
+    if word.is_empty() {
+        return None;
     }
-    None
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    text.get(from..)?
+        .match_indices(word)
+        .map(|(i, _)| from + i)
+        .find(|&at| {
+            !text[..at].ends_with(is_ident) && !text[at + word.len()..].starts_with(is_ident)
+        })
 }
 
 /// Whitespace-collapsed text of the balanced `( ... )` group after the method name in the
@@ -402,6 +408,35 @@ mod tests {
         assert!(
             go_body_pullable("MYRECV.q()\nRECVX.z()", None, &[]),
             "not the receiver token"
+        );
+    }
+
+    #[test]
+    fn find_word_terminates_on_an_empty_name_and_respects_word_boundaries() {
+        assert_eq!(find_word("void m() {", "", 0), None);
+        assert_eq!(find_word("void m() {", "m", 0), Some(5));
+        assert_eq!(find_word("void mm() { m(); }", "m", 0), Some(12));
+        assert_eq!(find_word("void m() {", "m", 6), None);
+        assert_eq!(find_word("héllo m", "m", 0), Some(7));
+    }
+
+    #[test]
+    fn a_method_with_an_empty_name_is_skipped_not_hung_on() {
+        let slice = lines("  () {\n    a();\n    b();\n  }");
+        assert!(!signature_names_method(&slice, ""));
+        assert_eq!(signature_params_text(&slice, ""), "");
+    }
+
+    #[test]
+    fn signature_window_is_capped_for_brace_less_spans() {
+        let long: Vec<String> = (0..10_000).map(|i| format!("  step({i});")).collect();
+        assert!(signature_lines(&long).len() <= MAX_SIGNATURE_LINES);
+        let mut with_brace = vec!["void m(".to_string(), "  int x) {".to_string()];
+        with_brace.extend((0..5).map(|i| format!("  a({i});")));
+        assert_eq!(
+            signature_lines(&with_brace).len(),
+            2,
+            "stops at the brace line"
         );
     }
 
