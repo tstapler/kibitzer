@@ -414,6 +414,21 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   `single_letter_label_with_a_definition_is_not_flagged`,
   `still_flags_explicit_and_collapsed_single_letter_references_when_dangling`.
 
+### 2026-11-10 — Hugo blog post — TOML `+++` frontmatter arrays misread as undefined shortcut references
+
+- **What changed**: edited a Hugo post (`content/blog/<slug>/index.md`) with `+++` TOML
+  frontmatter; `categories`/`tags`/`keywords` array lines were reported as
+  `["a", "b"] used but never defined`.
+- **Why it's a false positive**: the frontmatter isn't markdown, but the parser read the
+  bracketed arrays as shortcut-reference labels.
+- **Status: resolved.** `check_source` now enables pulldown-cmark's
+  `ENABLE_YAML_STYLE_METADATA_BLOCKS | ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS`, so a
+  leading `---`/`+++` block is one metadata event; source offsets (and so line numbers)
+  are unchanged. Tests: `toml_frontmatter_arrays_are_not_flagged`,
+  `yaml_frontmatter_arrays_are_not_flagged`,
+  `dangling_ref_after_toml_frontmatter_keeps_original_line`,
+  `unclosed_toml_frontmatter_still_checks_body`.
+
 ## Resolution: native `markdown-link-integrity` checker + grace period
 
 `markdown-link-integrity` is no longer a `markdownlint-cli2`/`doc_report.py`
