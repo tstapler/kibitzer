@@ -291,6 +291,12 @@ pub struct ArchModel {
     /// `struct_field_names` for the pull-up-field type-text match.
     #[serde(default)]
     pub struct_field_types: BTreeMap<String, BTreeMap<String, String>>,
+    /// Accesses to a field the receiver type doesn't declare but inherits through resolved
+    /// `Extends` (Go embedding: `a.N` where `A` embeds `Base`), attributed to the declaring
+    /// ancestor (`to` = `"{pkg}::Base.N"`). Kept apart from `field_accesses` so the
+    /// existing consumers of that list are unaffected; read by `push-down-field`.
+    #[serde(default)]
+    pub promoted_field_accesses: Vec<FieldAccessEdge>,
     pub pruning: PruningSummary,
 }
 
@@ -558,12 +564,23 @@ pub fn build_model(
         }
     }
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
-    let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites);
+    let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites.clone());
     let file_import_aliases =
         resolve_file_import_aliases(&packages, &package_short_names, raw_file_imports);
     // Must run after `file_import_aliases` is fully computed — Go qualified-embed
     // resolution (`resolve_one_type_edge`) depends on it.
     let type_edges = resolve_type_edges(&packages, &file_import_aliases, raw_type_relation_sites);
+    let struct_field_names: BTreeMap<String, BTreeSet<String>> = struct_fields
+        .iter()
+        .map(|((pkg, ty), names)| {
+            (
+                format!("{pkg}::{ty}"),
+                names.iter().cloned().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect();
+    let promoted_field_accesses =
+        resolve_promoted_field_accesses(&struct_field_names, &type_edges, &raw_field_access_sites);
 
     Ok(ArchModel {
         repo_root: repo_root.to_path_buf(),
@@ -573,16 +590,9 @@ pub fn build_model(
         field_accesses,
         type_edges,
         file_import_aliases,
-        struct_field_names: struct_fields
-            .iter()
-            .map(|((pkg, ty), names)| {
-                (
-                    format!("{pkg}::{ty}"),
-                    names.iter().cloned().collect::<BTreeSet<_>>(),
-                )
-            })
-            .collect(),
+        struct_field_names,
         struct_field_types,
+        promoted_field_accesses,
         pruning: PruningSummary {
             include_private: prune.include_private,
             excluded_dirs: vec![],
@@ -911,6 +921,63 @@ fn resolve_field_access_edges(
         .collect()
 }
 
+/// Attributes `recv.field` sites whose receiver type does not declare `field` to the
+/// nearest resolved-`Extends` ancestor that does (breadth-first, cycle-safe).
+fn resolve_promoted_field_accesses(
+    struct_field_names: &BTreeMap<String, BTreeSet<String>>,
+    type_edges: &[TypeRelationEdge],
+    raw_sites: &[RawFieldAccessSite],
+) -> Vec<FieldAccessEdge> {
+    let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in type_edges
+        .iter()
+        .filter(|e| e.resolved && e.kind == Some(TypeRelationKind::Extends))
+    {
+        parents
+            .entry(e.from.as_str())
+            .or_default()
+            .push(e.to.as_str());
+    }
+    let mut out = Vec::new();
+    for site in raw_sites {
+        let recv = format!("{}::{}", site.package_path, site.receiver_type);
+        if struct_field_names
+            .get(&recv)
+            .is_some_and(|f| f.contains(&site.field_name))
+        {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::from([recv.as_str()]);
+        let mut queue = std::collections::VecDeque::from([recv.as_str()]);
+        while let Some(id) = queue.pop_front() {
+            let mut found = None;
+            for &p in parents.get(id).into_iter().flatten() {
+                if struct_field_names
+                    .get(p)
+                    .is_some_and(|f| f.contains(&site.field_name))
+                {
+                    found = Some(p);
+                    break;
+                }
+                if seen.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+            if let Some(owner) = found {
+                out.push(FieldAccessEdge {
+                    from: site.caller_id.clone(),
+                    to: format!("{owner}.{}", site.field_name),
+                    access: site.access,
+                    file: site.file.clone(),
+                    line: site.line,
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Resolves each file's raw Go import list into `alias -> target package path`, per
 /// `ArchModel::file_import_aliases`'s doc comment. An import with an explicit alias
 /// (`import metav1 "..."`) uses it directly; otherwise the alias is the target
@@ -1028,6 +1095,7 @@ impl ArchModel {
             file_import_aliases: self.file_import_aliases.clone(),
             struct_field_names: self.struct_field_names.clone(),
             struct_field_types: self.struct_field_types.clone(),
+            promoted_field_accesses: self.promoted_field_accesses.clone(),
             pruning: self.pruning.clone(),
         }
     }
@@ -1200,6 +1268,31 @@ pub(crate) fn load_cached_model(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn build_model_attributes_promoted_go_field_access_to_the_embedded_declarer() {
+        let src = "package pkg\n\ntype Base struct{ N int }\n\ntype A struct{ Base }\n\nfunc (a *A) Bump() {\n\ta.N++\n}\n";
+        let files = vec![(PathBuf::from("/repo/pkg/a.go"), src.to_string())];
+        let model = build_model(
+            Path::new("/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            model.field_accesses.is_empty(),
+            "existing list is unchanged"
+        );
+        let p = &model.promoted_field_accesses;
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].to.ends_with("::Base.N") && p[0].from.ends_with("::A.Bump"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
     fn build_model_persists_struct_field_names_and_types() {
         let files = vec![(
             PathBuf::from("/repo/pkg/a.go"),
@@ -1367,6 +1460,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         }
     }
@@ -1430,6 +1524,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2209,6 +2304,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2265,6 +2361,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2308,6 +2405,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2351,6 +2449,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 

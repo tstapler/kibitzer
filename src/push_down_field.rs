@@ -45,6 +45,7 @@ impl ArchModelChecker for PushDownFieldChecker {
                 for a in model
                     .field_accesses
                     .iter()
+                    .chain(&model.promoted_field_accesses)
                     .filter(|a| a.to == to && !is_ignorable_file(model, &a.file))
                 {
                     let owner = owner_type_id(&a.from);
@@ -129,6 +130,13 @@ mod tests {
         let f = run(&m);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].message.contains("'n'") && f[0].message.contains("pkg::A"));
+    }
+
+    #[test]
+    fn promoted_accesses_count_as_evidence() {
+        let mut m = hierarchy();
+        m.promoted_field_accesses = vec![access("pkg::A.Run", "n")];
+        assert_eq!(run(&m).len(), 1);
     }
 
     #[test]

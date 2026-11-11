@@ -727,6 +727,7 @@ mod tests {
             file_import_aliases: std::collections::BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         }
     }

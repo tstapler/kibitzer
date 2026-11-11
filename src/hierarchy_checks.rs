@@ -65,6 +65,19 @@ pub(crate) fn supertype_ids<'a>(pairs: &[(&'a str, &'a str)]) -> HashSet<&'a str
     pairs.iter().map(|&(_, parent)| parent).collect()
 }
 
+/// Go "inheritance" is struct embedding, and embedding a type from another package is
+/// composition with a library mixin (`metav1.TypeMeta`, `rest.Strategy`), not a hierarchy
+/// whose supertype the author can refactor. The pull-up checkers therefore only trust a Go
+/// subtype that lives in the same package as its embedded supertype. Non-Go subtypes are
+/// unaffected.
+pub(crate) fn go_subtype_is_foreign(
+    sub_pkg: &PackageNode,
+    sub: &SymbolNode,
+    sup_pkg: &PackageNode,
+) -> bool {
+    sub.file.extension().is_some_and(|e| e == "go") && sub_pkg.path != sup_pkg.path
+}
+
 /// Supertype id -> its direct subtype ids (sorted), from [`resolved_extends`] pairs.
 pub(crate) fn subtypes_by_super<'a>(
     pairs: &[(&'a str, &'a str)],
@@ -160,6 +173,7 @@ pub(crate) mod fixtures {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: Default::default(),
         }
     }

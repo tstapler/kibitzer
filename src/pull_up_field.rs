@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use crate::arch_model::ArchModel;
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
-use crate::hierarchy_checks::{is_ignorable_file, resolved_extends, subtypes_by_super, type_index};
+use crate::hierarchy_checks::{
+    go_subtype_is_foreign, is_ignorable_file, resolved_extends, subtypes_by_super, type_index,
+};
 
 pub struct PullUpFieldChecker;
 
@@ -28,12 +30,15 @@ impl ArchModelChecker for PullUpFieldChecker {
         let mut findings = Vec::new();
 
         for (&sup_id, subs) in &children {
-            let (_, sup) = types[sup_id];
+            let (sup_pkg, sup) = types[sup_id];
             let sup_fields = model.struct_field_names.get(sup_id);
             let mut groups: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
             for &sub_id in subs {
-                let (_, st) = types[sub_id];
-                if st.name == sup.name || is_ignorable_file(model, &st.file) {
+                let (spkg, st) = types[sub_id];
+                if st.name == sup.name
+                    || is_ignorable_file(model, &st.file)
+                    || go_subtype_is_foreign(spkg, st, sup_pkg)
+                {
                     continue;
                 }
                 for (field, ty) in model.struct_field_types.get(sub_id).into_iter().flatten() {
@@ -121,6 +126,32 @@ mod tests {
     fn silent_when_supertype_declares_it_or_only_one_sibling_has_it() {
         assert!(run(&build(&[("count", "int")], &[("count", "int")], &["count"])).is_empty());
         assert!(run(&build(&[("count", "int")], &[("other", "int")], &[])).is_empty());
+    }
+
+    #[test]
+    fn go_siblings_embedding_a_foreign_package_supertype_are_skipped() {
+        use crate::hierarchy_checks::fixtures::model_pkgs;
+        let mut m = model_pkgs(
+            vec![
+                ("base", vec![sym("base", "Base", SymbolKind::Type, None)]),
+                (
+                    "pkg",
+                    vec![
+                        sym("pkg", "A", SymbolKind::Type, None),
+                        sym("pkg", "B", SymbolKind::Type, None),
+                    ],
+                ),
+            ],
+            vec![
+                edge("pkg::A", "base::Base", true),
+                edge("pkg::B", "base::Base", true),
+            ],
+        );
+        for id in ["pkg::A", "pkg::B"] {
+            m.struct_field_types
+                .insert(id.into(), [("c".to_string(), "int".to_string())].into());
+        }
+        assert!(run(&m).is_empty());
     }
 
     #[test]

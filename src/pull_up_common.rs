@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use crate::arch_model::{ArchModel, SymbolNode};
 use crate::architecture_checks::ArchFinding;
 use crate::hierarchy_checks::{
-    is_ignorable_file, methods_of, resolved_extends, subtypes_by_super, type_index,
+    go_subtype_is_foreign, is_ignorable_file, methods_of, resolved_extends, subtypes_by_super,
+    type_index,
 };
 
 /// Bodies shorter than this many non-blank lines are too generic to flag.
@@ -60,8 +61,10 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
             .iter()
             .copied()
             .filter(|s| {
-                let (_, st) = types[s];
-                st.name != sup.name && !is_ignorable_file(model, &st.file)
+                let (spkg, st) = types[s];
+                st.name != sup.name
+                    && !is_ignorable_file(model, &st.file)
+                    && !go_subtype_is_foreign(spkg, st, sup_pkg)
             })
             .collect();
         if subs.len() < 2 {

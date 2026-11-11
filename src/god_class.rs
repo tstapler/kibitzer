@@ -580,6 +580,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 1.0);
@@ -602,6 +603,7 @@ mod tests {
             file_import_aliases: BTreeMap::new(),
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 0.0);
@@ -637,6 +639,7 @@ mod tests {
             file_import_aliases: aliases,
             struct_field_names: Default::default(),
             struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }
