@@ -974,6 +974,19 @@ fn java_exception_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.java"],
         ),
+        native_check(
+            "sentinel-return-java",
+            Severity::Advisory,
+            &["**/*.java", "!**/test/**"],
+        ),
+        native_check("sentinel-return-python", Severity::Advisory, &["**/*.py"]),
+        native_check(
+            "sentinel-return-kotlin",
+            Severity::Advisory,
+            &["**/*.kt", "**/*.kts", "!**/test/**"],
+        ),
+        // sentinel-return-typescript / -javascript are opt-in: the vscode backtest
+        // exceeded the 40% false-positive bar (docs/sentinel-return-false-positives.md).
     ]
 }
 
