@@ -54,6 +54,9 @@ mod tests {
         for s in syms.iter_mut().take(3) {
             s.file = dir.join("types.go");
         }
+        let mut log = sym("pkg", "log", SymbolKind::Method, Some("Base"));
+        log.file = dir.join("types.go");
+        syms.push(log);
         if base_has_method {
             let mut b = sym("pkg", "Do", SymbolKind::Method, Some("Base"));
             b.file = dir.join("types.go");
@@ -67,6 +70,8 @@ mod tests {
             ],
         );
         m.repo_root = dir;
+        m.struct_field_names
+            .insert("pkg::Base".into(), ["n".to_string()].into());
         m
     }
 
@@ -79,6 +84,13 @@ mod tests {
         let f = run(&build(GO_A, GO_B, true, false));
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].message.contains("[pull-up-method]"));
+    }
+
+    #[test]
+    fn go_body_using_an_outer_only_member_is_not_pullable() {
+        let a = "package pkg\n\nfunc (a *A) Do() {\n\ta.Opts.mark()\n\ta.log()\n}\n";
+        let b = "package pkg\n\nfunc (b *B) Do() {\n\tb.Opts.mark()\n\tb.log()\n}\n";
+        assert!(run(&build(a, b, true, false)).is_empty());
     }
 
     #[test]

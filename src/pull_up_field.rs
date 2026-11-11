@@ -1,7 +1,8 @@
 //! Fowler's **Pull Up Field**: ≥2 direct sibling subtypes declare a field with the same
 //! name AND the same type text, and the supertype doesn't already declare that field.
 //! Reads `ArchModel::struct_field_types` (Go structs only today, so other languages never
-//! fire). Name-only matches never fire.
+//! fire). Name-only matches never fire, and more than half of the supertype's direct
+//! subtypes must declare the field (a minority means a shared mixin, not a missing field).
 
 use std::collections::BTreeMap;
 
@@ -48,7 +49,12 @@ impl ArchModelChecker for PullUpFieldChecker {
                 }
             }
             for ((field, ty), owners) in groups {
-                if owners.len() < 2 || sup_fields.is_some_and(|f| f.contains(field)) {
+                // A field only a minority of subtypes declare points at a mixin supertype
+                // (`TypeMeta`, a metrics base) rather than a missing common field.
+                if owners.len() < 2
+                    || owners.len() * 2 <= subs.len()
+                    || sup_fields.is_some_and(|f| f.contains(field))
+                {
                     continue;
                 }
                 let (_, first) = types[owners[0]];
@@ -151,6 +157,25 @@ mod tests {
             m.struct_field_types
                 .insert(id.into(), [("c".to_string(), "int".to_string())].into());
         }
+        assert!(run(&m).is_empty());
+    }
+
+    #[test]
+    fn silent_when_only_a_minority_of_subtypes_declare_it() {
+        let mut m = build(&[("c", "int")], &[("c", "int")], &[]);
+        m.packages
+            .get_mut("pkg")
+            .unwrap()
+            .symbols
+            .push(sym("pkg", "C", SymbolKind::Type, None));
+        m.type_edges.push(edge("pkg::C", "pkg::Base", true));
+        m.type_edges.push(edge("pkg::D", "pkg::Base", true));
+        m.packages
+            .get_mut("pkg")
+            .unwrap()
+            .symbols
+            .push(sym("pkg", "D", SymbolKind::Type, None));
+        // 2 of 4 subtypes (A, B) declare it: not a majority.
         assert!(run(&m).is_empty());
     }
 

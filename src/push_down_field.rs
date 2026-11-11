@@ -4,6 +4,11 @@
 //! languages never fire. The supertype's own methods are not counted as evidence (per
 //! the acceptance criteria); any access from outside the hierarchy blocks the finding.
 //! No access evidence at all is skipped. The supertype needs ≥2 direct subtypes.
+//!
+//! Accesses are only recorded through a method's own receiver, so the absence of other
+//! accessors proves nothing for an exported field (any package can read `x.Field` through a
+//! plain variable). Only unexported fields are therefore considered, and a Go subtype in a
+//! different package than the embedded supertype is ignored.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -11,7 +16,8 @@ use crate::arch_model::ArchModel;
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 use crate::hierarchy_checks::{
-    is_ignorable_file, owner_type_id, resolved_extends, subtree, subtypes_by_super, type_index,
+    go_subtype_is_foreign, is_ignorable_file, owner_type_id, resolved_extends, subtree,
+    subtypes_by_super, type_index,
 };
 
 pub struct PushDownFieldChecker;
@@ -28,7 +34,15 @@ impl ArchModelChecker for PushDownFieldChecker {
 
         let mut findings = Vec::new();
         for (&sup_id, subs) in &children {
-            let (_, sup) = types[sup_id];
+            let (sup_pkg, sup) = types[sup_id];
+            let subs: Vec<&str> = subs
+                .iter()
+                .copied()
+                .filter(|s| {
+                    let (spkg, st) = types[s];
+                    !go_subtype_is_foreign(spkg, st, sup_pkg)
+                })
+                .collect();
             let Some(fields) = model.struct_field_names.get(sup_id) else {
                 continue;
             };
@@ -37,7 +51,7 @@ impl ArchModelChecker for PushDownFieldChecker {
             }
             let subtrees: Vec<HashSet<&str>> = subs.iter().map(|s| subtree(s, &children)).collect();
 
-            for field in fields {
+            for field in fields.iter().filter(|f| !is_exported_name(f)) {
                 let to = format!("{sup_id}.{field}");
                 let mut owning = BTreeSet::new();
                 let mut evidence = false;
@@ -83,6 +97,11 @@ impl ArchModelChecker for PushDownFieldChecker {
         findings.sort_by(|a, b| (&a.file, a.line, &a.message).cmp(&(&b.file, b.line, &b.message)));
         findings
     }
+}
+
+/// Go export rule: an upper-case first letter.
+fn is_exported_name(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
 }
 
 #[cfg(test)]
@@ -172,5 +191,64 @@ mod tests {
         m.packages.get_mut("pkg").unwrap().symbols[0].file =
             PathBuf::from("/repo/pkg/fixtures/a.go");
         assert!(run(&m).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::arch_model::{AccessKind, FieldAccessEdge, SymbolKind};
+    use crate::hierarchy_checks::fixtures::{edge, model_pkgs, sym};
+    use std::path::PathBuf;
+
+    fn build(field: &str, sub_pkg: &str) -> ArchModel {
+        let base = sym("pkg", "Base", SymbolKind::Type, None);
+        let subs = vec![
+            sym(sub_pkg, "A", SymbolKind::Type, None),
+            sym(sub_pkg, "B", SymbolKind::Type, None),
+        ];
+        let pkgs = if sub_pkg == "pkg" {
+            vec![("pkg", [vec![base], subs].concat())]
+        } else {
+            vec![("pkg", vec![base]), (sub_pkg, subs)]
+        };
+        let mut m = model_pkgs(
+            pkgs,
+            vec![
+                edge(&format!("{sub_pkg}::A"), "pkg::Base", true),
+                edge(&format!("{sub_pkg}::B"), "pkg::Base", true),
+            ],
+        );
+        m.struct_field_names
+            .insert("pkg::Base".into(), BTreeSet::from([field.to_string()]));
+        m.field_accesses = vec![FieldAccessEdge {
+            from: format!("{sub_pkg}::A.Run"),
+            to: format!("pkg::Base.{field}"),
+            access: AccessKind::Read,
+            file: PathBuf::from("/repo/pkg/a.go"),
+            line: 1,
+        }];
+        m
+    }
+
+    fn run(m: &ArchModel) -> usize {
+        PushDownFieldChecker
+            .check(m, &ArchitectureConfig::default())
+            .len()
+    }
+
+    #[test]
+    fn unexported_same_package_fires_but_exported_or_foreign_package_does_not() {
+        assert_eq!(run(&build("n", "pkg")), 1);
+        assert_eq!(
+            run(&build("N", "pkg")),
+            0,
+            "exported: other accessors are unobservable"
+        );
+        assert_eq!(
+            run(&build("n", "other")),
+            0,
+            "subtype in a different Go package"
+        );
     }
 }

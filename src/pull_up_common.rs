@@ -75,7 +75,7 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
             .map(|m| m.name.as_str())
             .collect();
 
-        type Key = (String, Vec<(String, String)>, String);
+        type Key = (String, Vec<(String, String)>, String, String);
         let mut groups: BTreeMap<Key, Vec<(&str, &SymbolNode)>> = BTreeMap::new();
         for &sub_id in &subs {
             let (pkg, st) = types[sub_id];
@@ -83,22 +83,30 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
                 if is_constructor(m) != (kind == MemberKind::Constructor) {
                     continue;
                 }
-                let Some(body) = sources.normalised_body(model, m) else {
+                let Some((sig, body)) = sources.signature_and_body(model, m) else {
                     continue;
                 };
+                if uses_upper_snake_constant(&body) {
+                    continue;
+                }
                 groups
-                    .entry((member_key(m), m.params.clone(), body))
+                    .entry((member_key(m), m.params.clone(), sig, body))
                     .or_default()
                     .push((sub_id, m));
             }
         }
-        for ((name, _, _), members) in groups {
+        let sup_fields = model.struct_field_names.get(sup_id);
+        for ((name, _, _, body), members) in groups {
             let mut owners: Vec<&str> = members.iter().map(|(s, _)| *s).collect();
             owners.dedup();
             if owners.len() < 2 {
                 continue;
             }
             if kind == MemberKind::Method && sup_method_names.contains(&name.as_str()) {
+                continue;
+            }
+            let is_go = members[0].1.file.extension().is_some_and(|e| e == "go");
+            if is_go && !go_body_pullable(&body, sup_fields, &sup_method_names) {
                 continue;
             }
             let (_, first) = members[0];
@@ -142,6 +150,24 @@ impl SourceCache {
             .as_ref()
     }
 
+    /// `(parameter-list text, normalised body)`. The text is needed because `params` is only
+    /// populated for Go/TS/JS: without it, same-text Java constructors taking different
+    /// parameter *types* would compare equal. Go gets `""` (its receiver differs by design).
+    fn signature_and_body(
+        &mut self,
+        model: &ArchModel,
+        m: &SymbolNode,
+    ) -> Option<(String, String)> {
+        let body = self.normalised_body(model, m)?;
+        let sig = if m.file.extension().is_some_and(|e| e == "go") {
+            String::new()
+        } else {
+            let lines = self.lines(model, &m.file)?;
+            signature_params_text(lines.get(m.line - 1..m.end_line?.min(lines.len()))?)
+        };
+        Some((sig, body))
+    }
+
     fn normalised_body(&mut self, model: &ArchModel, m: &SymbolNode) -> Option<String> {
         let end = m.end_line?;
         if end < m.line || m.line == 0 {
@@ -151,6 +177,46 @@ impl SourceCache {
         let slice = lines.get(m.line - 1..end.min(lines.len()))?;
         normalise_body(slice)
     }
+}
+
+/// Whitespace-collapsed text of the first balanced `( ... )` in the signature lines (up to
+/// the opening-brace line).
+fn signature_params_text(slice: &[String]) -> String {
+    let end = slice
+        .iter()
+        .position(|l| l.trim_end().ends_with('{'))
+        .unwrap_or(slice.len().saturating_sub(1));
+    let text = slice[..=end.min(slice.len().saturating_sub(1))].join(" ");
+    let Some(start) = text.find('(') else {
+        return String::new();
+    };
+    let mut depth = 0usize;
+    let mut out = String::new();
+    for c in text[start..].chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A `FOO_BAR` token: a constant that may resolve to a different value in each sibling.
+fn uses_upper_snake_constant(body: &str) -> bool {
+    body.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|t| {
+            t.len() >= 3
+                && t.contains('_')
+                && t.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
 }
 
 /// The lines between the signature's opening-brace line (the first line ending in `{`, so
@@ -176,6 +242,37 @@ fn normalise_body(slice: &[String]) -> Option<String> {
         })
         .collect();
     (norm.len() >= MIN_BODY_LINES).then(|| norm.join("\n"))
+}
+
+/// A Go base type cannot see the struct that embeds it, so a text-identical body only moves
+/// up if every use of the receiver (normalised to `RECV`) is `RECV.<member>` with `member`
+/// declared on the supertype itself; a bare `RECV` or an outer-only member means the same
+/// text binds to different concrete types in each sibling.
+fn go_body_pullable(
+    body: &str,
+    sup_fields: Option<&std::collections::BTreeSet<String>>,
+    sup_methods: &[&str],
+) -> bool {
+    let mut rest = body;
+    while let Some(i) = rest.find("RECV") {
+        let before_ok = !rest[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+        let after = &rest[i + 4..];
+        rest = after;
+        if !before_ok || after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let Some(member_text) = after.strip_prefix('.') else {
+            return false;
+        };
+        let end = member_text
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(member_text.len());
+        let member = &member_text[..end];
+        if !(sup_fields.is_some_and(|f| f.contains(member)) || sup_methods.contains(&member)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `func (r *T) M(` -> `r`.
@@ -256,6 +353,45 @@ mod tests {
             one_liner, None,
             "a one-statement body stays too small to flag"
         );
+    }
+
+    #[test]
+    fn go_bodies_are_pullable_only_through_supertype_declared_members() {
+        let fields = std::collections::BTreeSet::from(["n".to_string()]);
+        assert!(go_body_pullable(
+            "RECV.n++\nRECV.log()",
+            Some(&fields),
+            &["log"]
+        ));
+        assert!(
+            !go_body_pullable("RECV.Opts.mark()", Some(&fields), &["log"]),
+            "outer-only member"
+        );
+        assert!(!go_body_pullable("return RECV", None, &[]), "bare receiver");
+        assert!(
+            go_body_pullable("x := 1\nuse(x)", None, &[]),
+            "no receiver use"
+        );
+        assert!(
+            go_body_pullable("MYRECV.q()\nRECVX.z()", None, &[]),
+            "not the receiver token"
+        );
+    }
+
+    #[test]
+    fn signature_params_text_captures_types_and_ignores_layout() {
+        let a = signature_params_text(&lines(
+            "  private A(JavaDriverClient client,\n     String q)\n  {",
+        ));
+        let b = signature_params_text(&lines("  private B(SimpleClient client, String q) {"));
+        assert_eq!(a, "(JavaDriverClient client, String q");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn upper_snake_constants_are_detected() {
+        assert!(uses_upper_snake_constant("use(DEFAULT_URL)"));
+        assert!(!uses_upper_snake_constant("use(defaultUrl, HTTP, a_b)"));
     }
 
     #[test]
