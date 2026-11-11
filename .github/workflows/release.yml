@@ -290,11 +290,28 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
+      # cargo-dist's generated job hardcodes `secrets.HOMEBREW_TAP_TOKEN` as a plain PAT. This
+      # hand-inserted step mints a short-lived, tap-scoped installation token for the
+      # tstapler-homebrew-tap-writer GitHub App instead (repo variable HOMEBREW_TAP_APP_CLIENT_ID,
+      # secret HOMEBREW_TAP_APP_PRIVATE_KEY; set with `set-homebrew-tap-app-credentials`). If the
+      # step fails, the checkout falls back to the PAT so a release still publishes; delete the
+      # fallback once an app-token release has succeeded. See dist-workspace.toml's `allow-dirty`
+      # comment: `dist generate` will not re-apply this edit.
+      - name: Mint homebrew-tap token
+        id: tap-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: tstapler
+          repositories: homebrew-tap
+          permission-contents: write
       - uses: actions/checkout@v6
         with:
           persist-credentials: true
           repository: "tstapler/homebrew-tap"
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token || secrets.HOMEBREW_TAP_TOKEN }}
       # So we have access to the formula
       - name: Fetch homebrew formulae
         uses: actions/download-artifact@v8
