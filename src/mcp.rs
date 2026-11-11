@@ -823,15 +823,19 @@ impl KibitzerServer {
                         list` to review the queue."
     )]
     async fn report_false_positive(&self, req: Parameters<ReportFalsePositiveRequest>) -> String {
+        let file = crate::false_positive::normalize_path(std::path::Path::new(&req.0.file))
+            .to_string_lossy()
+            .into_owned();
         let report = crate::false_positive::FalsePositiveReport {
             date: crate::false_positive::today_date_string(),
             check_name: req.0.check_name,
-            file: req.0.file,
+            file: file.clone(),
             what_changed: req.0.what_changed,
             why_false_positive: req.0.why_false_positive,
             mechanism: req.0.mechanism,
             repo: req.0.repo,
             session: req.0.session,
+            file_hash: crate::false_positive::file_content_hash(std::path::Path::new(&file)),
         };
         let path = crate::false_positive::default_queue_path();
         match crate::false_positive::append_report(&path, &report) {
