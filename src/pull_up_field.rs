@@ -57,6 +57,13 @@ impl ArchModelChecker for PullUpFieldChecker {
                 {
                     continue;
                 }
+                let mut names: Vec<&str> =
+                    owners.iter().map(|o| types[o].1.name.as_str()).collect();
+                names.sort_unstable();
+                names.dedup();
+                if names.len() != owners.len() {
+                    continue; // same-named copies of one type, not siblings
+                }
                 let (_, first) = types[owners[0]];
                 findings.push(ArchFinding {
                     file: Some(first.file.clone()),
@@ -176,6 +183,37 @@ mod tests {
             .symbols
             .push(sym("pkg", "D", SymbolKind::Type, None));
         // 2 of 4 subtypes (A, B) declare it: not a majority.
+        assert!(run(&m).is_empty());
+    }
+
+    #[test]
+    fn silent_when_the_siblings_are_same_named_copies() {
+        use crate::hierarchy_checks::fixtures::model_pkgs;
+        let mut m = model_pkgs(
+            vec![
+                (
+                    "pkg",
+                    vec![
+                        sym("pkg", "Base", SymbolKind::Type, None),
+                        sym("pkg", "A", SymbolKind::Type, None),
+                    ],
+                ),
+                ("pkg2", vec![sym("pkg2", "A", SymbolKind::Type, None)]),
+            ],
+            vec![
+                edge("pkg::A", "pkg::Base", true),
+                edge("pkg2::A", "pkg::Base", true),
+            ],
+        );
+        for pkg in m.packages.values_mut() {
+            for sym in &mut pkg.symbols {
+                sym.file = PathBuf::from("/repo/x/a.ts"); // non-Go: the Go package guard must not be what skips it
+            }
+        }
+        for id in ["pkg::A", "pkg2::A"] {
+            m.struct_field_types
+                .insert(id.into(), [("c".to_string(), "int".to_string())].into());
+        }
         assert!(run(&m).is_empty());
     }
 

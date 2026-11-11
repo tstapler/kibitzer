@@ -39,6 +39,25 @@ pub(crate) fn is_constructor(sym: &SymbolNode) -> bool {
             && sym.parent.as_deref() == Some(sym.name.as_str()))
 }
 
+/// A method whose line range lies inside another function/method of the same package and
+/// file is a member of an anonymous or local class; the model attributes it to the
+/// enclosing named class, which would make a pull-up finding meaningless.
+fn is_nested(pkg: &crate::arch_model::PackageNode, m: &SymbolNode) -> bool {
+    let Some(end) = m.end_line else {
+        return false;
+    };
+    pkg.symbols.iter().any(|o| {
+        o.id != m.id
+            && o.file == m.file
+            && matches!(
+                o.kind,
+                crate::arch_model::SymbolKind::Method | crate::arch_model::SymbolKind::Function
+            )
+            && o.end_line
+                .is_some_and(|oe| o.line <= m.line && oe >= end && (o.line, oe) != (m.line, end))
+    })
+}
+
 /// Java constructors are named after their (differing) owners; group them under one key.
 fn member_key(m: &SymbolNode) -> String {
     if is_constructor(m) {
@@ -70,6 +89,7 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
         if subs.len() < 2 {
             continue;
         }
+        let total_direct_subtypes = children[sup_id].len();
         let sup_method_names: Vec<&str> = methods_of(model, sup_pkg, &sup.name)
             .iter()
             .map(|m| m.name.as_str())
@@ -80,7 +100,7 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
         for &sub_id in &subs {
             let (pkg, st) = types[sub_id];
             for m in methods_of(model, pkg, &st.name) {
-                if is_constructor(m) != (kind == MemberKind::Constructor) {
+                if is_constructor(m) != (kind == MemberKind::Constructor) || is_nested(pkg, m) {
                     continue;
                 }
                 let Some((sig, body)) = sources.signature_and_body(model, m) else {
@@ -100,6 +120,19 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
             let mut owners: Vec<&str> = members.iter().map(|(s, _)| *s).collect();
             owners.dedup();
             if owners.len() < 2 {
+                continue;
+            }
+            // Same-named "siblings" are copies of one class (vendored/forked), and their
+            // by-name supertype resolution is unreliable.
+            let mut names: Vec<&str> = owners.iter().map(|o| types[o].1.name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            if names.len() != owners.len() {
+                continue;
+            }
+            // A method only a minority of subtypes share points at a generic base
+            // (`Disposable`), not a missing common method.
+            if kind == MemberKind::Method && owners.len() * 2 <= total_direct_subtypes {
                 continue;
             }
             if kind == MemberKind::Method && sup_method_names.contains(&name.as_str()) {
