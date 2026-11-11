@@ -41,6 +41,15 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
         java_swallowed_interrupt,
     ),
     ("java-lost-exception-cause", "C.java", java_lost_cause),
+    ("sentinel-return-java", "C.java", || {
+        "class Foo {\n  int bar() {\n    try { a(); } catch (Exception e) { return -1; }\n    return 0;\n  }\n}\n".into()
+    }),
+    ("sentinel-return-javascript", "x.js", || {
+        "function bar() {\n  try { a(); } catch (e) { return -1; }\n  return 0;\n}\n".into()
+    }),
+    ("sentinel-return-kotlin", "x.kt", || {
+        "fun bar(): Int {\n  try { a() } catch (e: Exception) { return -1 }\n  return 0\n}\n".into()
+    }),
     ("go-file-size", "x.go", || long_file("//")),
     ("typescript-file-size", "x.ts", || long_file("//")),
     ("tsx-file-size", "x.tsx", || long_file("//")),
