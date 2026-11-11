@@ -141,3 +141,32 @@ subtypes, not ≥2) before marking done.
    owning type name for methods. A method with `name == parent` is a Java
    constructor. TS/Kotlin use the `constructor` keyword. This can be
    implemented without additional model data.
+
+## Test case matrix (requirement -> test)
+
+Fixtures use `hierarchy_checks::fixtures::sym` (gains `end_line: None`) and in-memory `ArchModel`s; body-hash tests write temp source files.
+
+| AC | Unit tests | Error / edge | Integration |
+|---|---|---|---|
+| 1 | single-subtype caller fires | no resolved callers silent; callers in 2 subtypes silent | tiny Java repo via `kibitzer run` |
+| 2 | single-subtype accessor fires; P's own accessors excluded | no access edges silent | Go fixture repo |
+| 3 | 2 siblings identical body fire | `end_line` None skip; differing body silent; supertype already declares silent | Java fixture repo |
+| 4 | TS/Kotlin `constructor`, Java name==parent fire | non-constructor same-body silent | fixture repo |
+| 5 | same name+type in 2 siblings fires | same name, different type silent; supertype has field silent | Go fixture repo |
+| 6 | registry contains all five; `default_checks()` contains all five | | `kibitzer list-checks` output |
+| 7 | test file / testdata sibling ignored; unresolved Extends ignored | | |
+| 8 | external caller/accessor suppresses push-down | | |
+| 9 | `end_line` off-by-one test per language; serde round-trip of old cache JSON without field | | |
+| 10 | `struct_field_names` populated; old cache deserializes | | |
+| 11 | | | corpus backtest per `docs/backtest-repos.md`, triage >=10 hits each, recorded in docs |
+| 12 | | | each doc file exists and is linked from `docs/hierarchy-cleanup-checks.md` |
+
+## Pre-mortem (inline)
+
+- P2: Go embedding makes siblings look like subtypes; mitigation in plan Risks.
+- P2: type-text availability (Go-only) - addressed by 1b.
+- P3: backtest FP above 20% -> require >=3 siblings guard or document.
+No P1.
+
+## Readiness gate: PASS (after patches)
+1 tests cover every AC; 2 no TBDs; 3 no ADRs; 4/5 no blockers; 6 n/a (cache fields serde-default); 7 no P1; 8 pull_up_common.rs shared helper, no cycles.

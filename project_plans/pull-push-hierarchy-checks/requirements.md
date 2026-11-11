@@ -34,37 +34,22 @@ The remaining gaps are:
 
 ## Acceptance criteria
 
-1. `push-down-method` fires when a supertype has a method whose only resolved
-   call-site callers are methods belonging to exactly one direct subtype, and
-   silently skips the case when no resolved callers exist (no-evidence stance).
-2. `push-down-field` fires when a supertype field (`pkg::Type.field` id) has
-   field-access edges whose `from` ids all resolve to methods of exactly one
-   direct subtype, and skips when no access evidence exists.
-3. `pull-up-method` fires when ≥2 direct sibling subtypes of the same
-   supertype declare a same-named method whose line-range body hashes (using
-   `duplicate_code.rs`'s windowed approach) are identical, and skips
-   cross-file body comparison when `end_line` is not yet populated.
-4. `pull-up-constructor-body` fires under the same conditions as
-   `pull-up-method` but restricted to constructors (methods named
-   `constructor`, `__init__`, `new`, or matching a language-specific
-   constructor pattern).
-5. `pull-up-field` fires when ≥2 direct sibling subtypes declare a field with
-   the same name (regardless of type text), and treats identical name + type
-   text as a stronger signal.
-6. All five checkers are `ArchModelChecker` implementations registered in
-   `architecture_checks::model_registry()` and in `config::default_checks()`.
-7. All five skip test files and `fixtures/`/`testdata/` directories using the
-   existing `hierarchy_checks::is_ignorable_file` guard.
-8. All five skip unresolved `Extends` edges (same guard as existing hierarchy
-   checkers).
-9. Each checker ships with a false-positive documentation file following the
-   `docs/*-false-positives.md` convention.
-10. All five pass backtest (`kibitzer check backtest <name>`) with ≤5% false-
-    positive rate on the standard corpus (`docs/backtest-repos.md`), or the
-    threshold and known FP categories are documented before merging.
-11. `SymbolNode` gains an optional `end_line: Option<usize>` field populated
-    by `extract_symbols_for_file` for Go/TS/Java/Kotlin method bodies; `None`
-    on languages not yet wired up. `#[serde(default)]` for cache compatibility.
-12. `ArchModel` gains a `struct_field_names: BTreeMap<String, BTreeSet<String>>`
-    field (key = `pkg::TypeName`, value = field-name set) populated during
-    `build_model`. `#[serde(default)]` for cache compatibility.
+(Authoritative copy of the backlog item's 12 criteria, same numbering.)
+
+1. `push-down-method` fires when a supertype method's only resolved callers all belong to methods of exactly one direct subtype; silent when no resolved callers exist.
+2. `push-down-field` fires when a supertype field's field-access edges all originate from methods of exactly one direct subtype (excluding the supertype's own methods); skips when no access evidence exists.
+3. `pull-up-method` fires when >=2 direct sibling subtypes share a same-named method with identical body hashes (from `end_line`-delimited source slices); skips when `end_line` is None.
+4. `pull-up-constructor-body` fires under the same conditions as pull-up-method, constructors only (TS/Kotlin: `constructor`; Java: method name equals owning type name).
+5. `pull-up-field` fires when >=2 direct sibling subtypes declare a field with the same name AND same type text, and the supertype does not already declare it.
+6. All five are `ArchModelChecker` impls registered in `architecture_checks::model_registry()` and `config::default_checks()`.
+7. All five skip test files and fixtures/testdata via `hierarchy_checks::is_ignorable_file`, and skip unresolved Extends edges.
+8. push-down-method and push-down-field also gate on no external callers/accessors outside the type hierarchy.
+9. `SymbolNode` gains `end_line: Option<usize>` (serde default), populated by `extract_symbols_for_file` for Go/TS/Java/Kotlin method bodies.
+10. `ArchModel` gains `struct_field_names: BTreeMap<String, BTreeSet<String>>` (serde default) persisting field-declaration data already computed in `build_model`.
+11. All five pass corpus backtest with <=20% FP on the standard repos, or threshold and known FP categories are documented before merging.
+12. Each checker ships `docs/<name>-false-positives.md` following the existing convention.
+
+## Known constraints discovered in validation
+
+- `extract_struct_fields_for_file` (src/symbol_extract.rs:1178) is Go-only and yields `(type_name, field_name)` with no type text. AC5 needs type text, so Phase 1b also persists a companion `struct_field_types` map (`pkg::Type` -> field -> type text) populated by extending the Go field walker; pull-up-field and push-down-field are Go-only until other languages gain field extraction. Document this limit in the FP docs.
+- Field-access edges exist for Go only (`field_access_supports`), so push-down-field is Go-only too.

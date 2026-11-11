@@ -19,7 +19,11 @@ tree-sitter `node.end_position().row + 1` (1-indexed, inclusive) for every
 method/function node. All test fixture construction (e.g.
 `hierarchy_checks::fixtures::sym`) needs `end_line: None`.
 
-### 1b. Store `struct_field_names` in `ArchModel`
+### 1b. Store `struct_field_names` (+ field type text) in `ArchModel`
+
+Also add `#[serde(default)] pub struct_field_types: BTreeMap<String, BTreeMap<String, String>>`
+(`pkg::Type` -> field -> type text); extend the Go walker so AC5's type-text match
+has data. Go-only, like the existing field extraction.
 
 File: `src/arch_model.rs`
 
@@ -43,6 +47,7 @@ For each supertype P with ≥2 direct resolved subtypes [S1, S2, ...Sn]:
     Map each caller from-id to its owner type (prefix before the last '.').
     Discard callers whose owner type == P (a supertype method calling M is not
       evidence of single-subtype usage).
+    If any caller is outside P and P's subtypes (external caller): skip (AC8).
     If the remaining callers all belong to methods of exactly one Si:
       Emit finding: "[push-down-method] {M.id} is only called from {Si} ..."
 ```
@@ -59,6 +64,7 @@ For each supertype P with ≥2 direct resolved subtypes [S1, S2, ...Sn]:
     Collect all field_accesses where to == "{P.id}.{F}" (the synthetic id).
     If accesses is empty: skip.
     Discard accesses from methods on P itself.
+    If any access comes from outside P's hierarchy: skip (AC8).
     If the remaining accesses all come from methods of exactly one Si:
       Emit finding: "[push-down-field] {P.id}.{F} accessed only from {Si} ..."
 ```
@@ -79,6 +85,7 @@ For each supertype P with ≥2 direct resolved subtypes [S1, S2, ...Sn]:
     Emit finding: "[pull-up-field] field '{F}' is declared in {list of Si} ..."
 ```
 
+Match on field name AND identical type text (AC5); name-only matches never fire.
 Require ≥2 subtypes with the field for a finding. Don't require *all* subtypes
 to have it — a subset suffices (same as `duplicate-code`'s ≥3-occurrence bar
 would here be ≥2 siblings).
@@ -93,6 +100,8 @@ If two sibling subtypes have same method name AND same body hash AND the
 supertype does NOT already declare that method, emit a finding.
 
 Skip when `end_line` is `None` (language not yet wired).
+Shared helpers (body slicing/normalized hashing, sibling grouping) live in
+`src/pull_up_common.rs`; `pull_up_constructor_body.rs` is a thin filter over it.
 
 ### 3c. `pull_up_constructor_body.rs`
 
@@ -106,7 +115,7 @@ patterns:
 
 Run all five checkers against the standard corpus (`docs/backtest-repos.md`).
 For each checker, record raw findings and triage ≥10 at random. If FP rate >
-30%, add a noise guard (e.g. a minimum-method-count threshold, an is-abstract
+20%, add a noise guard (e.g. a minimum-method-count threshold, an is-abstract
 guard, a same-name-different-package exclusion).
 
 Expect low raw counts: inheritance hierarchies at real scale tend to be
@@ -144,6 +153,7 @@ extending its table. Update `default_checks()` and `model_registry()`.
   method is auto-promoted, not a copy. Mitigation: skip `type_edges` where
   the Go embed has the same field name as the embedded type (structural signal
   for promotion vs inheritance).
+- **Go-only field data**: pull-up-field/push-down-field only see Go structs; documented, not a bug.
 - **end_line accuracy**: tree-sitter reports byte offsets for end position.
   Converting to 1-indexed line numbers requires `node.end_position().row + 1`.
   Off-by-one will produce wrong body slices. Must be unit-tested.
