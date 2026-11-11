@@ -28,8 +28,7 @@ impl ArchModelChecker for PullUpMethodChecker {
 mod tests {
     use super::*;
     use crate::arch_model::SymbolKind;
-    use crate::hierarchy_checks::fixtures::{edge, model, sym};
-    use crate::pull_up_common::test_support::scratch_dir;
+    use crate::hierarchy_checks::fixtures::{edge, model, scratch_dir, sym};
 
     const GO_A: &str = "package pkg\n\nfunc (a *A) Do() {\n\ta.n++\n\ta.log()\n}\n";
     const GO_B: &str = "package pkg\n\nfunc (b *B) Do() {\n\tb.n++\n\tb.log()\n}\n";
@@ -187,5 +186,76 @@ mod tests {
             1,
             "positive control: the same data is a constructor-body candidate"
         );
+    }
+
+    /// Two TypeScript siblings of `pkg::Base` (`pkg::A` and `<second_pkg>::<second>`) with a
+    /// `Do` method whose body is `body_line` plus a fixed second line. Non-Go on purpose: the
+    /// Go package guard must not be what explains a silent result.
+    fn ts_siblings(second_pkg: &str, second: &str, body_line: &str) -> ArchModel {
+        use crate::hierarchy_checks::fixtures::model_pkgs;
+        let dir = scratch_dir();
+        let src = format!("class X {{\n  Do() {{\n    {body_line}\n    this.log();\n  }}\n}}\n");
+        let ty = |pkg: &str, name: &str| {
+            let mut t = sym(pkg, name, SymbolKind::Type, None);
+            t.file = dir.join("types.ts");
+            t
+        };
+        let method = |pkg: &str, owner: &str, file: &str| {
+            let mut m = sym(pkg, "Do", SymbolKind::Method, Some(owner));
+            std::fs::write(dir.join(file), &src).unwrap();
+            m.file = dir.join(file);
+            m.line = 2;
+            m.end_line = Some(5);
+            m
+        };
+        let mut base_run = sym("pkg", "log", SymbolKind::Method, Some("Base"));
+        base_run.file = dir.join("types.ts");
+        let mut pkg_syms = vec![
+            ty("pkg", "Base"),
+            ty("pkg", "A"),
+            method("pkg", "A", "a.ts"),
+            base_run,
+        ];
+        let mut m = if second_pkg == "pkg" {
+            pkg_syms.extend([ty("pkg", second), method("pkg", second, "b.ts")]);
+            model_pkgs(vec![("pkg", pkg_syms)], vec![])
+        } else {
+            let other = vec![ty(second_pkg, second), method(second_pkg, second, "b.ts")];
+            model_pkgs(vec![("pkg", pkg_syms), (second_pkg, other)], vec![])
+        };
+        m.type_edges = vec![
+            edge("pkg::A", "pkg::Base", true),
+            edge(&format!("{second_pkg}::{second}"), "pkg::Base", true),
+        ];
+        m.repo_root = dir;
+        m
+    }
+
+    #[test]
+    fn same_named_siblings_in_different_packages_are_copies_not_siblings() {
+        let body = "this.n++;";
+        assert_eq!(
+            run(&ts_siblings("pkg2", "C", body)).len(),
+            1,
+            "positive control: differently named siblings fire"
+        );
+        assert!(run(&ts_siblings("pkg2", "A", body)).is_empty());
+    }
+
+    #[test]
+    fn a_subtype_named_like_its_supertype_is_not_a_sibling() {
+        let body = "this.n++;";
+        assert_eq!(run(&ts_siblings("pkg2", "C", body)).len(), 1, "control");
+        assert!(run(&ts_siblings("pkg2", "Base", body)).is_empty());
+    }
+
+    #[test]
+    fn bodies_naming_an_upper_snake_constant_are_skipped() {
+        assert_eq!(
+            run(&ts_siblings("pkg", "B", "this.n++;")).len(),
+            1,
+            "control"
+        );
+        assert!(run(&ts_siblings("pkg", "B", "use(DEFAULT_URL);")).is_empty());
     }
 }

@@ -10,16 +10,17 @@
 //! value is skipped; only exported methods are considered. A call counts as evidence only
 //! when its source line goes through the calling method's own receiver (`this.m()` /
 //! `recv.m()`), since `snap.m()` on another value of the supertype would break if `m`
-//! moved down; an unreadable call-site line is accepted rather than blocking.
+//! moved down; an unreadable call-site line is accepted rather than blocking. Every
+//! `.m(` on the line must go through that receiver.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::arch_model::{ArchModel, CallEdge};
+use crate::arch_model::{ArchModel, CallEdge, SymbolNode};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 use crate::hierarchy_checks::{
-    go_receiver_ident_from_line, is_constructor, is_ignorable_file, methods_of, owner_type_id,
-    resolved_extends, subtree, subtypes_by_super, type_index,
+    SourceCache, go_receiver_ident_from_line, is_constructor, is_ignorable_file, methods_of,
+    owner_type_id, resolved_extends, subtree, subtypes_by_super, type_index,
 };
 
 pub struct PushDownMethodChecker;
@@ -49,13 +50,14 @@ impl ArchModelChecker for PushDownMethodChecker {
             callers.entry(e.to.as_str()).or_default().push(e);
         }
 
-        let symbols: HashMap<&str, &crate::arch_model::SymbolNode> = model
+        let symbols: HashMap<&str, &SymbolNode> = model
             .packages
             .values()
             .flat_map(|p| &p.symbols)
             .map(|s| (s.id.as_str(), s))
             .collect();
 
+        let mut sources = SourceCache::default();
         let mut findings = Vec::new();
         for (&sup_id, subs) in &children {
             let (pkg, sup) = types[sup_id];
@@ -90,7 +92,7 @@ impl ArchModelChecker for PushDownMethodChecker {
                     let Some(owner) = owner_type_id(&e.from) else {
                         return false;
                     };
-                    if !called_through_own_receiver(&symbols, e, &m.name) {
+                    if !called_through_own_receiver(model, &mut sources, &symbols, e, &m.name) {
                         return false;
                     }
                     match subtrees.iter().position(|t| t.contains(owner)) {
@@ -125,33 +127,30 @@ impl ArchModelChecker for PushDownMethodChecker {
 }
 
 /// True unless the call-site line provably calls `name` on something other than the
-/// calling method's own receiver.
+/// calling method's own receiver. Every `.name(` on the line must go through it.
 fn called_through_own_receiver(
-    symbols: &HashMap<&str, &crate::arch_model::SymbolNode>,
+    model: &ArchModel,
+    sources: &mut SourceCache,
+    symbols: &HashMap<&str, &SymbolNode>,
     edge: &CallEdge,
     name: &str,
 ) -> bool {
-    let Some(line) = std::fs::read_to_string(&edge.file).ok().and_then(|t| {
-        t.lines()
-            .nth(edge.line.saturating_sub(1))
-            .map(str::to_string)
-    }) else {
-        return true;
-    };
     // An unmodeled caller cannot be verified, so it blocks the finding.
     let Some(caller) = symbols.get(edge.from.as_str()) else {
         return false;
     };
-    let is_go = caller.file.extension().is_some_and(|e| e == "go");
-    let recv = if is_go {
-        std::fs::read_to_string(&caller.file)
-            .ok()
-            .and_then(|t| {
-                t.lines()
-                    .nth(caller.line.saturating_sub(1))
-                    .and_then(|l| go_receiver_ident_from_line(l).map(str::to_string))
-            })
+    let Some(line) = sources
+        .line(model, &edge.file, edge.line)
+        .map(str::to_string)
+    else {
+        return true;
+    };
+    let recv = if caller.file.extension().is_some_and(|e| e == "go") {
+        sources
+            .line(model, &caller.file, caller.line)
+            .and_then(go_receiver_ident_from_line)
             .unwrap_or_default()
+            .to_string()
     } else {
         "this".to_string()
     };
@@ -159,9 +158,7 @@ fn called_through_own_receiver(
         return true;
     }
     let needle = format!(".{name}(");
-    let mut seen_call = false;
-    for (idx, _) in line.match_indices(&needle) {
-        seen_call = true;
+    line.match_indices(&needle).all(|(idx, _)| {
         let chain: String = line[..idx]
             .chars()
             .rev()
@@ -170,18 +167,15 @@ fn called_through_own_receiver(
             .chars()
             .rev()
             .collect();
-        if chain == recv || chain.starts_with(&format!("{recv}.")) {
-            return true;
-        }
-    }
-    !seen_call
+        chain == recv || chain.starts_with(&format!("{recv}."))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arch_model::SymbolKind;
-    use crate::hierarchy_checks::fixtures::{edge, model, sym};
+    use crate::hierarchy_checks::fixtures::{edge, model, scratch_dir, sym};
     use std::path::PathBuf;
 
     fn call(from: &str, to: &str) -> CallEdge {
@@ -294,11 +288,10 @@ mod tests {
     #[test]
     fn caller_in_a_grandchild_counts_for_its_direct_subtype() {
         let mut m = hierarchy();
-        m.packages
-            .get_mut("pkg")
-            .unwrap()
-            .symbols
-            .push(sym("pkg", "A2", SymbolKind::Type, None));
+        m.packages.get_mut("pkg").unwrap().symbols.extend([
+            sym("pkg", "A2", SymbolKind::Type, None),
+            sym("pkg", "Go", SymbolKind::Method, Some("A2")),
+        ]);
         m.type_edges.push(edge("pkg::A2", "pkg::A", true));
         m.call_edges = vec![call("pkg::A2.Go", "pkg::Base.Shared")];
         assert_eq!(run(&m).len(), 1);
@@ -306,7 +299,6 @@ mod tests {
 
     #[test]
     fn a_call_on_another_value_of_the_supertype_is_not_evidence() {
-        use crate::pull_up_common::test_support::scratch_dir;
         let dir = scratch_dir();
         let f = dir.join("a.go");
         std::fs::write(
@@ -335,5 +327,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(run(&m).len(), 1, "a.Shared() goes through the receiver");
+    }
+
+    fn call_in(from: &str, file: &str) -> CallEdge {
+        CallEdge {
+            file: PathBuf::from(file),
+            ..call(from, "pkg::Base.Shared")
+        }
+    }
+
+    #[test]
+    fn calls_from_ignorable_files_are_not_evidence() {
+        for file in ["/repo/pkg/testdata/a.go", "/repo/pkg/foo_test.go"] {
+            let mut m = hierarchy();
+            m.call_edges = vec![call_in("pkg::A.RunA", file)];
+            assert!(run(&m).is_empty(), "sole edge in {file} is no evidence");
+
+            // The B edge lives in an ignorable file, so only A's normal edge counts.
+            m.call_edges = vec![
+                call("pkg::A.RunA", "pkg::Base.Shared"),
+                call_in("pkg::B.RunB", file),
+            ];
+            assert_eq!(run(&m).len(), 1, "control: ignorable {file} edge dropped");
+        }
+    }
+
+    #[test]
+    fn single_subtype_exported_and_value_gates() {
+        let with_call = |mut m: ArchModel| {
+            m.call_edges = vec![call("pkg::A.RunA", "pkg::Base.Shared")];
+            m
+        };
+        assert_eq!(run(&with_call(hierarchy())).len(), 1, "control");
+
+        let mut m = with_call(hierarchy());
+        m.packages
+            .get_mut("pkg")
+            .unwrap()
+            .symbols
+            .retain(|s| s.id != "pkg::B" && s.id != "pkg::B.RunB");
+        m.type_edges.retain(|e| e.from != "pkg::B");
+        assert!(run(&m).is_empty(), "one subtype is collapse-hierarchy turf");
+
+        let mut m = with_call(hierarchy());
+        m.packages.get_mut("pkg").unwrap().symbols[3].exported = false;
+        assert!(run(&m).is_empty(), "unexported method");
+
+        let mut m = with_call(hierarchy());
+        m.packages.get_mut("pkg").unwrap().symbols[3].used_as_value = true;
+        assert!(run(&m).is_empty(), "used as a value");
+    }
+
+    #[test]
+    fn constructors_are_never_pushed_down() {
+        let build = |name: &str| {
+            let mut m = hierarchy();
+            let s = &mut m.packages.get_mut("pkg").unwrap().symbols[3];
+            s.name = name.into();
+            s.id = format!("pkg::Base.{name}");
+            m.call_edges = vec![call("pkg::A.RunA", &format!("pkg::Base.{name}"))];
+            m
+        };
+        assert_eq!(run(&build("init")).len(), 1, "control: an ordinary name");
+        assert!(run(&build("constructor")).is_empty());
+    }
+
+    #[test]
+    fn a_caller_missing_from_the_model_blocks() {
+        let mut m = hierarchy();
+        m.call_edges = vec![call("pkg::A.RunA", "pkg::Base.Shared")];
+        assert_eq!(run(&m).len(), 1, "control");
+        m.call_edges = vec![call("pkg::A.Ghost", "pkg::Base.Shared")];
+        assert!(run(&m).is_empty(), "A.Ghost is unmodeled");
+    }
+
+    fn ts_call_model(src: &str, relative: bool) -> ArchModel {
+        let dir = scratch_dir();
+        let f = dir.join("a.ts");
+        std::fs::write(&f, src).unwrap();
+        let mut m = hierarchy();
+        m.repo_root = dir;
+        let file = if relative { PathBuf::from("a.ts") } else { f };
+        for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
+            if s.id == "pkg::A.RunA" {
+                s.file = file.clone();
+            }
+        }
+        m.call_edges = vec![CallEdge {
+            file,
+            line: 1,
+            ..call("pkg::A.RunA", "pkg::Base.Shared")
+        }];
+        m
+    }
+
+    #[test]
+    fn non_go_callers_must_go_through_this() {
+        assert_eq!(run(&ts_call_model("this.Shared();\n", false)).len(), 1);
+        assert!(run(&ts_call_model("other.Shared();\n", false)).is_empty());
+    }
+
+    #[test]
+    fn every_call_on_the_line_must_use_the_own_receiver() {
+        let both = ts_call_model("this.Shared(); this.Shared();\n", false);
+        assert_eq!(run(&both).len(), 1, "control");
+        let mixed = ts_call_model("this.Shared(); other.Shared();\n", false);
+        assert!(run(&mixed).is_empty());
+    }
+
+    #[test]
+    fn relative_call_sites_resolve_against_the_repo_root() {
+        assert_eq!(run(&ts_call_model("this.Shared();\n", true)).len(), 1);
+        assert!(
+            run(&ts_call_model("other.Shared();\n", true)).is_empty(),
+            "an unresolved relative path would be accepted as unreadable"
+        );
     }
 }

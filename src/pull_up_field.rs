@@ -171,30 +171,49 @@ mod tests {
         assert!(run(&build(&[("count", "int")], &[("other", "int")], &[])).is_empty());
     }
 
-    #[test]
-    fn go_siblings_embedding_a_foreign_package_supertype_are_skipped() {
+    /// Go `Base` (with a method, so it is not an empty marker) in package `base`; siblings
+    /// `A`/`B` in `sub_pkg`.
+    fn go_siblings(sub_pkg: &str) -> ArchModel {
         use crate::hierarchy_checks::fixtures::model_pkgs;
+        let mut base_syms = vec![
+            sym("base", "Base", SymbolKind::Type, None),
+            sym("base", "Run", SymbolKind::Method, Some("Base")),
+        ];
+        let sub_syms = vec![
+            sym(sub_pkg, "A", SymbolKind::Type, None),
+            sym(sub_pkg, "B", SymbolKind::Type, None),
+        ];
+        let pkgs = if sub_pkg == "base" {
+            base_syms.extend(sub_syms);
+            vec![("base", base_syms)]
+        } else {
+            vec![("base", base_syms), (sub_pkg, sub_syms)]
+        };
         let mut m = model_pkgs(
+            pkgs,
             vec![
-                ("base", vec![sym("base", "Base", SymbolKind::Type, None)]),
-                (
-                    "pkg",
-                    vec![
-                        sym("pkg", "A", SymbolKind::Type, None),
-                        sym("pkg", "B", SymbolKind::Type, None),
-                    ],
-                ),
-            ],
-            vec![
-                edge("pkg::A", "base::Base", true),
-                edge("pkg::B", "base::Base", true),
+                edge(&format!("{sub_pkg}::A"), "base::Base", true),
+                edge(&format!("{sub_pkg}::B"), "base::Base", true),
             ],
         );
-        for id in ["pkg::A", "pkg::B"] {
+        for id in [format!("{sub_pkg}::A"), format!("{sub_pkg}::B")] {
             m.struct_field_types
-                .insert(id.into(), [("c".to_string(), "int".to_string())].into());
+                .insert(id, [("c".to_string(), "int".to_string())].into());
         }
-        assert!(run(&m).is_empty());
+        m
+    }
+
+    #[test]
+    fn go_siblings_embedding_a_foreign_package_supertype_are_skipped() {
+        assert_eq!(
+            run(&go_siblings("base")).len(),
+            1,
+            "positive control: same Go package fires"
+        );
+        assert!(
+            run(&go_siblings("pkg")).is_empty(),
+            "Go siblings in a different package than Base"
+        );
     }
 
     #[test]
@@ -232,32 +251,43 @@ mod tests {
     #[test]
     fn silent_when_the_siblings_are_same_named_copies() {
         use crate::hierarchy_checks::fixtures::model_pkgs;
-        let mut m = model_pkgs(
-            vec![
-                (
-                    "pkg",
-                    vec![
-                        sym("pkg", "Base", SymbolKind::Type, None),
-                        sym("pkg", "A", SymbolKind::Type, None),
-                    ],
-                ),
-                ("pkg2", vec![sym("pkg2", "A", SymbolKind::Type, None)]),
-            ],
-            vec![
-                edge("pkg::A", "pkg::Base", true),
-                edge("pkg2::A", "pkg::Base", true),
-            ],
-        );
-        for pkg in m.packages.values_mut() {
-            for sym in &mut pkg.symbols {
-                sym.file = PathBuf::from("/repo/x/a.ts"); // non-Go: the Go package guard must not be what skips it
+        // Non-Go files, so the Go package guard cannot be what skips them. Base has a method
+        // so the empty-marker guard is not either.
+        let build_copies = |second: &str| {
+            let mut m = model_pkgs(
+                vec![
+                    (
+                        "pkg",
+                        vec![
+                            sym("pkg", "Base", SymbolKind::Type, None),
+                            sym("pkg", "Run", SymbolKind::Method, Some("Base")),
+                            sym("pkg", "A", SymbolKind::Type, None),
+                        ],
+                    ),
+                    ("pkg2", vec![sym("pkg2", second, SymbolKind::Type, None)]),
+                ],
+                vec![
+                    edge("pkg::A", "pkg::Base", true),
+                    edge(&format!("pkg2::{second}"), "pkg::Base", true),
+                ],
+            );
+            for pkg in m.packages.values_mut() {
+                for sym in &mut pkg.symbols {
+                    sym.file = PathBuf::from("/repo/x/a.ts");
+                }
             }
-        }
-        for id in ["pkg::A", "pkg2::A"] {
-            m.struct_field_types
-                .insert(id.into(), [("c".to_string(), "int".to_string())].into());
-        }
-        assert!(run(&m).is_empty());
+            for id in ["pkg::A".to_string(), format!("pkg2::{second}")] {
+                m.struct_field_types
+                    .insert(id, [("c".to_string(), "int".to_string())].into());
+            }
+            m
+        };
+        assert_eq!(
+            run(&build_copies("C")).len(),
+            1,
+            "positive control: differently named siblings fire"
+        );
+        assert!(run(&build_copies("A")).is_empty());
     }
 
     #[test]

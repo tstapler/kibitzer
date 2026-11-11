@@ -4,6 +4,7 @@
 //! a parent's method set, or "unrelated."
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::checkers::is_test_file;
@@ -134,12 +135,54 @@ pub(crate) fn owner_type_id(member_id: &str) -> Option<&str> {
     Some(&member_id[..after + dot])
 }
 
+/// Per-run cache of source files so each is read once. Relative paths resolve against
+/// `model.repo_root` first, then as given; an unreadable file is cached as `None`.
+#[derive(Default)]
+pub(crate) struct SourceCache {
+    files: HashMap<PathBuf, Option<Vec<String>>>,
+}
+
+impl SourceCache {
+    pub(crate) fn lines(&mut self, model: &ArchModel, file: &Path) -> Option<&[String]> {
+        if !self.files.contains_key(file) {
+            let text = std::fs::read_to_string(model.repo_root.join(file))
+                .or_else(|_| std::fs::read_to_string(file))
+                .ok();
+            self.files.insert(
+                file.to_path_buf(),
+                text.map(|s| s.lines().map(str::to_string).collect()),
+            );
+        }
+        self.files.get(file)?.as_deref()
+    }
+
+    /// 1-based `line` of `file`.
+    pub(crate) fn line(&mut self, model: &ArchModel, file: &Path, line: usize) -> Option<&str> {
+        self.lines(model, file)?
+            .get(line.checked_sub(1)?)
+            .map(String::as_str)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
     use crate::arch_model::{PackageNode, TypeRelationEdge};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fresh scratch dir (no "test" path component: `is_test_file` would skip it).
+    pub fn scratch_dir() -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kib-hier-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     pub fn sym(pkg: &str, name: &str, kind: SymbolKind, parent: Option<&str>) -> SymbolNode {
         let id = match parent {

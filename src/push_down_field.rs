@@ -5,10 +5,12 @@
 //! hierarchy blocks the finding (moving the field down would break that code).
 //! No access evidence at all is skipped. The supertype needs ≥2 direct subtypes.
 //!
-//! Accesses are only recorded through a method's own receiver, so the absence of other
-//! accessors proves nothing for an exported field (any package can read `x.Field` through a
-//! plain variable). Only unexported fields are therefore considered, and a Go subtype in a
-//! different package than the embedded supertype is ignored.
+//! Accesses are only recorded through a method's own receiver. Any package can read an
+//! exported field through a plain variable, so only unexported fields are considered; that
+//! rule removes out-of-package exposure only. Every function in the same package can still
+//! read `x.field` unseen, so in-package non-receiver reads remain a known false-positive
+//! source (see `docs/push-down-field-false-positives.md`). A Go subtype in a different
+//! package than the embedded supertype is ignored.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -213,6 +215,23 @@ mod tests {
         m.packages.get_mut("pkg").unwrap().symbols[0].file =
             PathBuf::from("/repo/pkg/fixtures/a.go");
         assert!(run(&m).is_empty());
+    }
+
+    #[test]
+    fn accesses_from_ignorable_files_are_not_evidence() {
+        for file in ["/repo/pkg/testdata/a.go", "/repo/pkg/foo_test.go"] {
+            let in_file = |from: &str| FieldAccessEdge {
+                file: PathBuf::from(file),
+                ..access(from, "n")
+            };
+            let mut m = hierarchy();
+            m.field_accesses = vec![in_file("pkg::A.Run")];
+            assert!(run(&m).is_empty(), "sole access in {file} is no evidence");
+
+            // B's access lives in an ignorable file, so only A's normal access counts.
+            m.field_accesses = vec![access("pkg::A.Run", "n"), in_file("pkg::B.Run")];
+            assert_eq!(run(&m).len(), 1, "control: ignorable {file} access dropped");
+        }
     }
 }
 

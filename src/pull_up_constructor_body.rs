@@ -28,8 +28,7 @@ impl ArchModelChecker for PullUpConstructorBodyChecker {
 mod tests {
     use super::*;
     use crate::arch_model::SymbolKind;
-    use crate::hierarchy_checks::fixtures::{edge, model, sym};
-    use crate::pull_up_common::test_support::scratch_dir;
+    use crate::hierarchy_checks::fixtures::{edge, model, scratch_dir, sym};
 
     fn build(
         ext: &str,
@@ -95,5 +94,51 @@ mod tests {
         assert!(run(&build("ts", ("constructor", "constructor"), (a, b), 2, 5)).is_empty());
         // Same bodies but methods named `run`: not constructors.
         assert!(run(&build("ts", ("run", "run"), (a, a), 2, 5)).is_empty());
+    }
+
+    fn java_ctor_pair(a_sig: &str, b_sig: &str, body: &str) -> ArchModel {
+        let a = format!("class A {{\n  {a_sig} {{\n    {body}\n    this.x = x;\n  }}\n}}\n");
+        let b = format!("class B {{\n  {b_sig} {{\n    {body}\n    this.x = x;\n  }}\n}}\n");
+        build("java", ("A", "B"), (&a, &b), 2, 5)
+    }
+
+    #[test]
+    fn java_constructors_with_different_parameter_types_do_not_match() {
+        assert_eq!(
+            run(&java_ctor_pair("A(int x)", "B(int x)", "init();")).len(),
+            1,
+            "control: same parameter types"
+        );
+        assert!(run(&java_ctor_pair("A(int x)", "B(long x)", "init();")).is_empty());
+    }
+
+    #[test]
+    fn a_leading_annotation_with_parens_does_not_hide_the_parameter_types() {
+        let ann = |ctor: &str| format!("@SuppressWarnings(\"unchecked\") {ctor}");
+        assert_eq!(
+            run(&java_ctor_pair(
+                &ann("A(int x)"),
+                &ann("B(int x)"),
+                "init();"
+            ))
+            .len(),
+            1,
+            "control"
+        );
+        assert!(
+            run(&java_ctor_pair(
+                &ann("A(int x)"),
+                &ann("B(long x)"),
+                "init();"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn constructor_bodies_naming_an_upper_snake_constant_are_skipped() {
+        let fires = |body: &str| run(&java_ctor_pair("A(int x)", "B(int x)", body)).len();
+        assert_eq!(fires("init();"), 1, "control");
+        assert_eq!(fires("init(DEFAULT_URL);"), 0);
     }
 }

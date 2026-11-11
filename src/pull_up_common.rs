@@ -4,14 +4,13 @@
 //! identical, same-signature bodies. A method with `end_line == None`, an unreadable
 //! file, or a trivial (<2 line) body is skipped.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 
 use crate::arch_model::{ArchModel, SymbolNode};
 use crate::architecture_checks::ArchFinding;
 use crate::hierarchy_checks::{
-    go_receiver_ident_from_line, go_subtype_is_foreign, is_constructor, is_ignorable_file,
-    methods_of, resolved_extends, subtypes_by_super, type_index,
+    SourceCache, go_receiver_ident_from_line, go_subtype_is_foreign, is_constructor,
+    is_ignorable_file, methods_of, resolved_extends, subtypes_by_super, type_index,
 };
 
 /// Bodies shorter than this many non-blank lines are too generic to flag.
@@ -96,7 +95,7 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
                 if is_constructor(m) != (kind == MemberKind::Constructor) || is_nested(pkg, m) {
                     continue;
                 }
-                let Some((sig, body)) = sources.signature_and_body(model, m) else {
+                let Some((sig, body)) = signature_and_body(&mut sources, model, m) else {
                     continue;
                 };
                 if uses_upper_snake_constant(&body) {
@@ -158,83 +157,92 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
     findings
 }
 
-#[derive(Default)]
-struct SourceCache {
-    files: HashMap<PathBuf, Option<Vec<String>>>,
+/// `(parameter-list text, normalised body)`. The text is needed because `params` is only
+/// populated for Go/TS/JS: without it, same-text Java constructors taking different
+/// parameter *types* would compare equal. Go gets `""` (its receiver differs by design).
+fn signature_and_body(
+    sources: &mut SourceCache,
+    model: &ArchModel,
+    m: &SymbolNode,
+) -> Option<(String, String)> {
+    let end = m.end_line?;
+    if end < m.line || m.line == 0 {
+        return None;
+    }
+    let lines = sources.lines(model, &m.file)?;
+    let slice = lines.get(m.line - 1..end.min(lines.len()))?;
+    // Guards against a stale model: the sliced signature must still name the method.
+    if !signature_names_method(slice, &m.name) {
+        return None;
+    }
+    let body = normalise_body(slice)?;
+    let sig = if m.file.extension().is_some_and(|e| e == "go") {
+        String::new()
+    } else {
+        signature_params_text(slice, &m.name)
+    };
+    Some((sig, body))
 }
 
-impl SourceCache {
-    fn lines(&mut self, model: &ArchModel, file: &Path) -> Option<&Vec<String>> {
-        self.files
-            .entry(file.to_path_buf())
-            .or_insert_with(|| {
-                std::fs::read_to_string(file)
-                    .or_else(|_| std::fs::read_to_string(model.repo_root.join(file)))
-                    .ok()
-                    .map(|s| s.lines().map(str::to_string).collect())
-            })
-            .as_ref()
-    }
-
-    /// `(parameter-list text, normalised body)`. The text is needed because `params` is only
-    /// populated for Go/TS/JS: without it, same-text Java constructors taking different
-    /// parameter *types* would compare equal. Go gets `""` (its receiver differs by design).
-    fn signature_and_body(
-        &mut self,
-        model: &ArchModel,
-        m: &SymbolNode,
-    ) -> Option<(String, String)> {
-        let body = self.normalised_body(model, m)?;
-        let sig = if m.file.extension().is_some_and(|e| e == "go") {
-            String::new()
-        } else {
-            let lines = self.lines(model, &m.file)?;
-            signature_params_text(lines.get(m.line - 1..m.end_line?.min(lines.len()))?)
-        };
-        Some((sig, body))
-    }
-
-    fn normalised_body(&mut self, model: &ArchModel, m: &SymbolNode) -> Option<String> {
-        let end = m.end_line?;
-        if end < m.line || m.line == 0 {
-            return None;
-        }
-        let lines = self.lines(model, &m.file)?;
-        let slice = lines.get(m.line - 1..end.min(lines.len()))?;
-        normalise_body(slice)
-    }
-}
-
-/// Whitespace-collapsed text of the first balanced `( ... )` in the signature lines (up to
-/// the opening-brace line).
-fn signature_params_text(slice: &[String]) -> String {
-    if slice.is_empty() {
-        return String::new();
-    }
+/// Signature lines: from the first line up to and including the opening-brace line.
+fn signature_lines(slice: &[String]) -> &[String] {
     let end = slice
         .iter()
         .position(|l| l.trim_end().ends_with('{'))
         .unwrap_or(slice.len().saturating_sub(1));
-    let text = slice[..=end.min(slice.len().saturating_sub(1))].join(" ");
-    let Some(start) = text.find('(') else {
-        return String::new();
-    };
-    let mut depth = 0usize;
-    let mut out = String::new();
-    for c in text[start..].chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => {}
+    &slice[..(end + 1).min(slice.len())]
+}
+
+fn signature_names_method(slice: &[String], name: &str) -> bool {
+    find_word(&signature_lines(slice).join(" "), name, 0).is_some()
+}
+
+/// Byte offset of `word` as a whole identifier in `text`, at or after `from`.
+fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut start = from;
+    while let Some(i) = text.get(start..)?.find(word) {
+        let at = start + i;
+        let end = at + word.len();
+        if !text[..at].ends_with(is_ident) && !text[end..].starts_with(is_ident) {
+            return Some(at);
         }
-        out.push(c);
+        start = end;
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    None
+}
+
+/// Whitespace-collapsed text of the balanced `( ... )` group after the method name in the
+/// signature lines, so a leading `@Annotation("x")` is not mistaken for the parameter list.
+/// (Java constructors: the name is the class name.)
+fn signature_params_text(slice: &[String], name: &str) -> String {
+    let text = signature_lines(slice).join(" ");
+    let mut from = 0;
+    while let Some(at) = find_word(&text, name, from) {
+        let after = at + name.len();
+        let rest = text[after..].trim_start();
+        if rest.starts_with('(') {
+            let mut depth = 0usize;
+            let mut out = String::new();
+            for c in rest.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            out.push(c);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                out.push(c);
+            }
+            return out.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        from = after;
+    }
+    String::new()
 }
 
 /// A `FOO_BAR` token: a constant that may resolve to a different value in each sibling.
@@ -266,19 +274,25 @@ fn normalise_body(slice: &[String]) -> Option<String> {
     let mut in_block_comment = false;
     let mut norm: Vec<String> = Vec::new();
     for raw in body.lines() {
-        let l = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut l = collapsed.as_str();
         if in_block_comment {
-            in_block_comment = !l.contains("*/");
-            continue;
+            let Some(i) = l.find("*/") else { continue };
+            in_block_comment = false;
+            l = l[i + 2..].trim_start();
+        } else if l.starts_with("/*") {
+            match l.find("*/") {
+                Some(i) => l = l[i + 2..].trim_start(),
+                None => {
+                    in_block_comment = true;
+                    continue;
+                }
+            }
         }
         if l.is_empty() || l.starts_with("//") {
             continue;
         }
-        if l.starts_with("/*") {
-            in_block_comment = !l.contains("*/");
-            continue;
-        }
-        norm.push(l);
+        norm.push(l.to_string());
     }
     (norm.len() >= MIN_BODY_LINES).then(|| norm.join("\n"))
 }
@@ -334,26 +348,9 @@ fn replace_ident(text: &str, from: &str, to: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Fresh scratch dir (no "test" path component: `is_test_file` would skip it).
-    pub fn scratch_dir() -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "kib-pullup-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn lines(s: &str) -> Vec<String> {
         s.lines().map(str::to_string).collect()
@@ -410,12 +407,67 @@ mod tests {
 
     #[test]
     fn signature_params_text_captures_types_and_ignores_layout() {
-        let a = signature_params_text(&lines(
-            "  private A(JavaDriverClient client,\n     String q)\n  {",
-        ));
-        let b = signature_params_text(&lines("  private B(SimpleClient client, String q) {"));
-        assert_eq!(a, "(JavaDriverClient client, String q");
-        assert_ne!(a, b);
+        let a = signature_params_text(
+            &lines("  private A(JavaDriverClient client,\n     String q)\n  {"),
+            "A",
+        );
+        let b = signature_params_text(&lines("  private B(SimpleClient client, String q) {"), "B");
+        assert_ne!(a, b, "different parameter types");
+        let a2 = signature_params_text(&lines("  A(JavaDriverClient client, String q) {"), "A");
+        assert_eq!(a, a2, "layout does not matter");
+        assert!(a.starts_with('(') && a.ends_with(')'), "{a}");
+    }
+
+    #[test]
+    fn signature_params_text_skips_a_leading_annotation_with_parens() {
+        let sup = |ty: &str| {
+            signature_params_text(
+                &lines(&format!(
+                    "  @SuppressWarnings(\"unchecked\")\n  A({ty} x) {{"
+                )),
+                "A",
+            )
+        };
+        assert_ne!(sup("int"), sup("long"));
+        assert!(!sup("int").contains("unchecked"), "{}", sup("int"));
+    }
+
+    #[test]
+    fn code_after_a_block_comment_close_is_kept() {
+        let with_tail = normalise_body(&lines("void m() {\n  /* x */ a();\n  b();\n}"));
+        let plain = normalise_body(&lines("void m() {\n  a();\n  b();\n}"));
+        assert_eq!(with_tail, plain);
+        let multi = normalise_body(&lines("void m() {\n  /* x\n  y */ a();\n  b();\n}"));
+        assert_eq!(multi, plain);
+        let only = normalise_body(&lines("void m() {\n  /* x */\n  a();\n  b();\n}"));
+        assert_eq!(only, plain);
+    }
+
+    #[test]
+    fn stale_signature_slice_is_rejected() {
+        let model = crate::hierarchy_checks::fixtures::model(vec![], vec![]);
+        let dir = crate::hierarchy_checks::fixtures::scratch_dir();
+        let f = dir.join("A.java");
+        std::fs::write(&f, "class A {\n  A() {\n    a();\n    b();\n  }\n}\n").unwrap();
+        let mut m = crate::hierarchy_checks::fixtures::sym(
+            "p",
+            "A",
+            crate::arch_model::SymbolKind::Method,
+            Some("A"),
+        );
+        m.file = f.clone();
+        m.line = 2;
+        m.end_line = Some(5);
+        let mut sources = SourceCache::default();
+        assert!(signature_and_body(&mut sources, &model, &m).is_some());
+        // The file was edited since the model was built: those lines are another method now.
+        std::fs::write(
+            &f,
+            "class A {\n  void other() {\n    a();\n    b();\n  }\n}\n",
+        )
+        .unwrap();
+        let mut fresh = SourceCache::default();
+        assert!(signature_and_body(&mut fresh, &model, &m).is_none());
     }
 
     #[test]

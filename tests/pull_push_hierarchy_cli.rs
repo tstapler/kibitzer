@@ -71,17 +71,30 @@ fn go_module(label: &str, subdir: &str, source: &str) -> PathBuf {
     dir
 }
 
+/// Combined stdout+stderr of a clean `kibitzer run` (a crash or panic fails the test, so a
+/// negative assertion below cannot pass just because the process died).
 fn run(dir: &Path) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_kibitzer"))
         .arg("run")
         .arg(dir)
         .output()
         .expect("spawn kibitzer");
-    format!(
+    let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    )
+    );
+    assert!(
+        out.status.code().is_some() && !text.contains("panicked"),
+        "kibitzer did not run cleanly ({:?}):\n{text}",
+        out.status
+    );
+    text
+}
+
+/// The `[tag]` lines of `output`.
+fn tagged_lines<'a>(output: &'a str, tag: &str) -> Vec<&'a str> {
+    output.lines().filter(|l| l.contains(tag)).collect()
 }
 
 #[test]
@@ -96,10 +109,10 @@ fn go_repo_reports_both_push_down_checks_and_the_go_pull_up_checks() {
         assert!(output.contains(tag), "missing {tag}:\n{output}");
     }
     // push-down-method: Shared is called only from A, Other only from B.
-    assert!(
-        output.contains("Base.Shared") && output.contains("Base.Other"),
-        "{output}"
-    );
+    let pdm = tagged_lines(&output, "[push-down-method]");
+    for member in ["Base.Shared", "Base.Other"] {
+        assert!(pdm.iter().any(|l| l.contains(member)), "{member}: {output}");
+    }
     // push-down-field: `p` is touched only by A; `n` is used by both siblings so is not pushed down.
     assert!(output.contains("field 'p'"), "{output}");
     assert!(!output.contains("field 'n' of"), "{output}");

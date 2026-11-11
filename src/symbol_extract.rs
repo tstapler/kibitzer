@@ -2727,6 +2727,7 @@ mod tests {
         let ctor = find_by_name(&kt, "constructor");
         assert_eq!(ctor.kind, SymbolKind::Method);
         assert_eq!(ctor.parent.as_deref(), Some("A"));
+        assert_eq!(ctor.end_line, Some(4));
     }
 
     #[test]
