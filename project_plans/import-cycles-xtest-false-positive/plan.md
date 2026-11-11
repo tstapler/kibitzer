@@ -326,3 +326,40 @@ Returning `None` from `go_package_identity` broke `refactor::tests::plan_should_
 and `apply_should_RenameTestPackages_*` (the refactor planner needs `a_test.go` grouped with `a`). Shipped
 instead: `QualifiedImportLangConfig::skips_edges` (Go: `go_declares_external_test_package`) skips pass-2 edge
 emission for `package X_test` files while leaving node/`file_packages` membership unchanged.
+
+**Why AC3's literal "excluded from the node/edge set" is not met (deliberate).** Dropping `X_test` files from
+the node set broke two refactor-planner tests (above): renaming package `a` must also rewrite `package a_test`
+files, which requires them grouped with `a`. AC3's stated purpose ("so their imports cannot create false cycle
+edges") is met by emitting no outgoing edges from those files; they remain package-group members only.
+
+## Corpus backtest (AC8)
+
+Baseline = `635eab4` (pre-fix) release build; after = this branch's release build. Command, per repo:
+
+    <bin> check architecture import-cycles ~/code/github.com/<owner>/<repo>
+
+| Repo | `[import-cycle]` findings before → after | Notes |
+|---|---|---|
+| kubernetes/kubernetes | 28 → 2 | 0 findings new by file. Removed: the `X_test`-shaped ones. Remaining 2 (`pkg/proxy/ipvs/testing/fake_test.go`, `kubeadm/app/util/staticpod/utils_linux.go`) are unchanged; the first is an *internal* test file (`package testing`) in the helper package — same pre-existing FP class as go-git below, out of scope (AC4 keeps internal test files). The kubeadm one was not inspected, so its status is unverified. |
+| tstapler/stapler-squad | 4 → 3 | Only change: the Go `server/auth → … → testutil → … → session → server/auth` cycle removed. The 3 TypeScript cycles are byte-identical. |
+| tstapler/go-git (extra, Go; not in the standard corpus) | 1 → 2 | **Two new findings, both false positives, newly surfaced by this change.** Dropping `X_test` edges broke the one large SCC (pre-fix) into `http/internal/test ↔ http` and `ssh/internal/test ↔ ssh`. Edges behind them: `plumbing/transport/http/proxy_test.go` (`package http`) imports `http/internal/test`; `http/internal/test/proxy_test.go` (`package test`) imports `http` (same shape under `ssh/`; `ssh/proxy_test.go` and `ssh/upload_pack_test.go` import `ssh/internal/test`; `ssh/internal/test/proxy_test.go` imports `ssh`). Each cycle mixes `_test.go` edges from two different packages' test builds, which Go never compiles together: `go vet ./plumbing/transport/http/... ./plumbing/transport/ssh/...` exits 0 on the checkout. Same class as the remaining kubernetes `pkg/proxy/ipvs/testing/fake_test.go` finding (`package testing`, internal test file). |
+
+Real-cycle detection is covered at `build()` level by `go_real_mutual_import_still_reports_cycle`. The corpus
+has no confirmed-real Go cycle (Go rejects them), so "no lost real cycles" rests on that test plus the
+unchanged TypeScript results. Raw outputs: `~/.cache/tmp/cyc/{kubernetes,stapler-squad,go-git}.{B,H}.txt` (not committed).
+
+**Known gap (not fixed here):** cycles whose edges come from `_test.go` files of two or more different packages are
+false positives (a real cycle needs all test edges from one package's test build). Fixing needs per-edge test-file
+provenance in `find_cycles` (an `ImportGraph` edge change plus checker backtest) and conflicts with AC4's
+requirement that internal test files stay in the graph, so it is left as a follow-up. Criterion 8 holds on the named
+corpus (kubernetes, stapler-squad: no new findings by file) but this go-git result is a new-finding regression
+on an extra repo and should not be read as clean.
+Full suite after the change: `cargo test --workspace` → 2576 passed, 0 failed, 7 ignored (one
+`refactor_core::txn::tests::the_lock_covers_everything_between_session_and_commit` failure on one earlier run; its output was not captured, so
+no root cause is established. Reruns: 20/20 pass in isolation, 20/20 pass under 8 busy-loop CPU hogs, 6/6 pass for the whole `refactor_core::` module.
+This branch's source diff vs 635eab4 touches only `src/import_graph.rs`, which `src/refactor_core/` does not reference.)
+
+**AC3 status: NOT MET as written (reported fail, pending a human decision).** The literal criterion
+(`X_test` files excluded from the node/edge set) is not implemented; only their outgoing edges are skipped (see
+"Why AC3's literal ... is not met" above). Options for the owner: accept the deviation, or exclude the files and rework the
+refactor planner's package-rename handling.
