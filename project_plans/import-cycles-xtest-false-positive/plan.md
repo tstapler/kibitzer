@@ -334,32 +334,38 @@ edges") is met by emitting no outgoing edges from those files; they remain packa
 
 ## Corpus backtest (AC8)
 
-Baseline = `635eab4` (pre-fix) release build; after = this branch's release build. Command, per repo:
+Baseline = `635eab4` (pre-fix) release build; after = this branch's release build (edge skip for `package X_test`
+plus `find_cycles` ignoring edges whose source file is `_test.go`). Command, per repo, run from the repo root:
 
-    <bin> check architecture import-cycles ~/code/github.com/<owner>/<repo>
+    <bin> check architecture import-cycles .
 
 | Repo | `[import-cycle]` findings before → after | Notes |
 |---|---|---|
-| kubernetes/kubernetes | 28 → 2 | 0 findings new by file. Removed: the `X_test`-shaped ones. Remaining 2 (`pkg/proxy/ipvs/testing/fake_test.go`, `kubeadm/app/util/staticpod/utils_linux.go`) are unchanged; the first is an *internal* test file (`package testing`) in the helper package — same pre-existing FP class as go-git below, out of scope (AC4 keeps internal test files). The kubeadm one was not inspected, so its status is unverified. |
-| tstapler/stapler-squad | 4 → 3 | Only change: the Go `server/auth → … → testutil → … → session → server/auth` cycle removed. The 3 TypeScript cycles are byte-identical. |
-| tstapler/go-git (extra, Go; not in the standard corpus) | 1 → 2 | **Two new findings, both false positives, newly surfaced by this change.** Dropping `X_test` edges broke the one large SCC (pre-fix) into `http/internal/test ↔ http` and `ssh/internal/test ↔ ssh`. Edges behind them: `plumbing/transport/http/proxy_test.go` (`package http`) imports `http/internal/test`; `http/internal/test/proxy_test.go` (`package test`) imports `http` (same shape under `ssh/`; `ssh/proxy_test.go` and `ssh/upload_pack_test.go` import `ssh/internal/test`; `ssh/internal/test/proxy_test.go` imports `ssh`). Each cycle mixes `_test.go` edges from two different packages' test builds, which Go never compiles together: `go vet ./plumbing/transport/http/... ./plumbing/transport/ssh/...` exits 0 on the checkout. Same class as the remaining kubernetes `pkg/proxy/ipvs/testing/fake_test.go` finding (`package testing`, internal test file). |
+| kubernetes/kubernetes | 28 → 0 | 0 findings new, 28 removed (`comm` of sorted outputs). The two that remained under the edge-skip-only fix (`pkg/proxy/ipvs/testing/fake_test.go`, a `_test.go` cross-package shape, and `kubeadm/.../utils_linux.go`) are also gone. |
+| tstapler/stapler-squad | 4 → 3 | 0 new, 1 removed: the Go `server/auth -> ... -> testutil -> ... -> server/auth` cycle. The 3 TypeScript cycles are unchanged. |
+| tstapler/go-git (extra, Go) | 1 → 0 | See root cause below. |
+| go-git/go-git (extra, Go) | 1 → 0 | Same shape. |
 
-Real-cycle detection is covered at `build()` level by `go_real_mutual_import_still_reports_cycle`. The corpus
-has no confirmed-real Go cycle (Go rejects them), so "no lost real cycles" rests on that test plus the
-unchanged TypeScript results. Raw outputs: `~/.cache/tmp/cyc/{kubernetes,stapler-squad,go-git}.{B,H}.txt` (not committed).
+**Root cause of the earlier go-git 1 → 2 (edge-skip-only version).** Dropping `X_test` edges broke the one large SCC into
+`http/internal/test <-> http` and `ssh/internal/test <-> ssh`. Each is made of two `_test.go` edges from different
+packages' test builds: `plumbing/transport/http/proxy_test.go` (`package http`) imports `http/internal/test`, and
+`http/internal/test/proxy_test.go` (`package test`) imports `http`. No non-test file imports `internal/test`; the two
+builds are never compiled together, and `go vet ./plumbing/transport/http/... ./plumbing/transport/ssh/...` exits 0.
+Those files declare `package http` / `package test` (no `_test` suffix), so excluding `X_test` nodes could not have
+removed them. Fix: `find_cycles` (`src/architecture_checks.rs`) ignores edges whose source file ends `_test.go`; edges stay
+in the graph (AC4). Regression test: `go_cross_package_internal_test_edges_do_not_report_cycle`.
 
-**Known gap (not fixed here):** cycles whose edges come from `_test.go` files of two or more different packages are
-false positives (a real cycle needs all test edges from one package's test build). Fixing needs per-edge test-file
-provenance in `find_cycles` (an `ImportGraph` edge change plus checker backtest) and conflicts with AC4's
-requirement that internal test files stay in the graph, so it is left as a follow-up. Criterion 8 holds on the named
-corpus (kubernetes, stapler-squad: no new findings by file) but this go-git result is a new-finding regression
-on an extra repo and should not be read as clean.
-Full suite after the change: `cargo test --workspace` → 2576 passed, 0 failed, 7 ignored (one
-`refactor_core::txn::tests::the_lock_covers_everything_between_session_and_commit` failure on one earlier run; its output was not captured, so
-no root cause is established. Reruns: 20/20 pass in isolation, 20/20 pass under 8 busy-loop CPU hogs, 6/6 pass for the whole `refactor_core::` module.
-This branch's source diff vs 635eab4 touches only `src/import_graph.rs`, which `src/refactor_core/` does not reference.)
+Real-cycle detection is covered at `build()` level by `go_real_mutual_import_still_reports_cycle`. The corpus has no
+confirmed-real Go cycle (Go rejects them), so "no lost real cycles" rests on that test, the unchanged TypeScript cycles,
+and "0 findings in head but not baseline". **Known gap:** a real cycle made solely of one package's own `_test.go`
+edges ("import cycle not allowed in test") is no longer reported.
+Full suite: `cargo test --workspace` -> 2577 passed, 0 failed, 7 ignored.
 
-**AC3 status: NOT MET as written (reported fail, pending a human decision).** The literal criterion
-(`X_test` files excluded from the node/edge set) is not implemented; only their outgoing edges are skipped (see
-"Why AC3's literal ... is not met" above). Options for the owner: accept the deviation, or exclude the files and rework the
-refactor planner's package-rename handling.
+**AC3 status: NOT MET as written (needs an owner decision).** The literal criterion (`X_test` files excluded from the
+node/edge set) was tried: excluding them from `file_packages` and nodes fails 2 tests,
+`refactor::tests::plan_should_CoverAllImportersAndTestPackage_When_WholePackageMoveWithTestFile` (`src/refactor/tests.rs:254`)
+and `refactor::tests::apply_tests::apply_should_RenameTestPackages_When_WholePackageMoveWithTestFiles`
+(`src/refactor/tests.rs:434`). Cause: `package_key_for_file` (`src/arch_model.rs:334`) falls back to a plain directory
+key for files missing from `file_packages`, which does not match Go's module-qualified key, so `a_test` files split from
+package `a` and the planner no longer renames their package clause. Making the exclusion work means reworking
+`arch_model` grouping for unmapped Go files. The shipped version skips only their outgoing edges.

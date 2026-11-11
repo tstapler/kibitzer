@@ -350,9 +350,9 @@ fn go_package_identity(
 }
 
 /// True for a file declaring `package X_test` (an external test package). It stays
-/// grouped with `X` (so refactors and the architecture model still see it), but its
-/// imports must not become edges: it is a separate compilation unit that may legally
-/// import packages importing `X`, so an `X -> helper` edge would fabricate cycles.
+/// grouped with `X` (the refactor planner and architecture model rely on that grouping
+/// via `file_packages`), but its imports must not become edges: it is a separate
+/// compilation unit that may legally import packages importing `X`.
 fn go_declares_external_test_package(tree: &tree_sitter::Tree, src: &[u8]) -> bool {
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -1638,6 +1638,38 @@ mod tests {
         );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("[import-cycle]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_cross_package_internal_test_edges_do_not_report_cycle() {
+        // go-git shape: http's own test imports http/internal/test, whose test imports http.
+        let dir = tmp_dir("go-cross-pkg-test-cycle");
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let files = vec![
+            write(&dir, "http/http.go", "package http\n\nfunc H() {}\n"),
+            write(
+                &dir,
+                "http/proxy_test.go",
+                "package http\n\nimport \"example.com/m/http/internal/test\"\n\nvar _ = test.T\n",
+            ),
+            write(
+                &dir,
+                "http/internal/test/helper.go",
+                "package test\n\nvar T = 1\n",
+            ),
+            write(
+                &dir,
+                "http/internal/test/proxy_test.go",
+                "package test\n\nimport \"example.com/m/http\"\n\nvar _ = http.H\n",
+            ),
+        ];
+
+        let graph = build(&dir, &files).unwrap();
+
+        assert_eq!(graph.edges.len(), 2, "test edges stay in the graph");
+        assert!(crate::architecture_checks::find_cycles(&graph).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

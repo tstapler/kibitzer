@@ -538,7 +538,7 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
             self.stack.push(node.to_string());
             self.on_stack.insert(node.to_string(), true);
 
-            for edge in self.graph.edges_from(node) {
+            for edge in self.graph.edges_from(node).filter(|e| !is_test_file_edge(e)) {
                 let successor = edge.to.clone();
                 if !self.indices.contains_key(&successor) {
                     self.strongconnect(&successor);
@@ -589,8 +589,26 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     tarjan
         .sccs
         .into_iter()
-        .filter(|scc| scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0]))
+        .filter(|scc| {
+            scc.len() > 1
+                || graph
+                    .edges_from(&scc[0])
+                    .any(|e| e.to == scc[0] && !is_test_file_edge(e))
+        })
         .collect()
+}
+
+/// Go `_test.go` imports belong to a test build, not the production build. A cycle that
+/// joins `_test.go` edges from two different packages' test builds (e.g. `http` tests
+/// importing `http/internal/test`, whose own tests import `http`) never compiles
+/// together, so Go accepts it. Skipped for cycle detection only; the edges stay in the
+/// graph. Known gap: a real cycle made solely of one package's `_test.go` edges
+/// ("import cycle not allowed in test") is no longer reported.
+fn is_test_file_edge(edge: &ImportEdge) -> bool {
+    edge.file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("_test.go"))
 }
 
 // ---------------------------------------------------------------------------------
