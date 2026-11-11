@@ -1,8 +1,8 @@
 //! Fowler's **Push Down Field**: a supertype field accessed only from methods of exactly
 //! one direct subtype (or its descendants) belongs on that subtype. Needs
 //! `ArchModel::struct_field_names` and `field_accesses`, both Go-only today, so other
-//! languages never fire. The supertype's own methods are not counted as evidence (per
-//! the acceptance criteria); any access from outside the hierarchy blocks the finding.
+//! languages never fire. Any access from the supertype's own methods or from outside the
+//! hierarchy blocks the finding (moving the field down would break that code).
 //! No access evidence at all is skipped. The supertype needs ≥2 direct subtypes.
 //!
 //! Accesses are only recorded through a method's own receiver, so the absence of other
@@ -63,8 +63,10 @@ impl ArchModelChecker for PushDownFieldChecker {
                     .filter(|a| a.to == to && !is_ignorable_file(model, &a.file))
                 {
                     let owner = owner_type_id(&a.from);
+                    // The supertype's own methods use the field, so moving it down breaks them.
                     if owner == Some(sup_id) {
-                        continue;
+                        blocked = true;
+                        break;
                     }
                     match owner.and_then(|o| subtrees.iter().position(|t| t.contains(o))) {
                         Some(i) => {
@@ -143,12 +145,19 @@ mod tests {
     }
 
     #[test]
-    fn fires_when_only_one_subtype_accesses_it_ignoring_own_methods() {
+    fn fires_when_only_one_subtype_accesses_it() {
         let mut m = hierarchy();
-        m.field_accesses = vec![access("pkg::A.Run", "n"), access("pkg::Base.Init", "n")];
+        m.field_accesses = vec![access("pkg::A.Run", "n")];
         let f = run(&m);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].message.contains("'n'") && f[0].message.contains("pkg::A"));
+    }
+
+    #[test]
+    fn silent_when_the_supertypes_own_methods_use_it() {
+        let mut m = hierarchy();
+        m.field_accesses = vec![access("pkg::A.Run", "n"), access("pkg::Base.Init", "n")];
+        assert!(run(&m).is_empty());
     }
 
     #[test]

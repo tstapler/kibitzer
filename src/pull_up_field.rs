@@ -48,6 +48,9 @@ impl ArchModelChecker for PullUpFieldChecker {
                     }
                 }
             }
+            // One finding per sibling set: two mirror types sharing 40 fields is one design
+            // question, not 40.
+            let mut by_owners: BTreeMap<Vec<&str>, Vec<(&str, &str)>> = BTreeMap::new();
             for ((field, ty), owners) in groups {
                 // A field only a minority of subtypes declare points at a mixin supertype
                 // (`TypeMeta`, a metrics base) rather than a missing common field.
@@ -64,14 +67,31 @@ impl ArchModelChecker for PullUpFieldChecker {
                 if names.len() != owners.len() {
                     continue; // same-named copies of one type, not siblings
                 }
+                by_owners.entry(owners).or_default().push((field, ty));
+            }
+            for (owners, fields) in by_owners {
                 let (_, first) = types[owners[0]];
+                const SHOWN: usize = 5;
+                let listed: Vec<String> = fields
+                    .iter()
+                    .take(SHOWN)
+                    .map(|(f, t)| format!("'{f}' ({t})"))
+                    .collect();
+                let more = fields.len().saturating_sub(SHOWN);
                 findings.push(ArchFinding {
                     file: Some(first.file.clone()),
                     line: Some(first.line),
                     message: format!(
-                        "[pull-up-field] field '{field}' ({ty}) is declared in sibling subtypes \
-                         {} of {sup_id} — consider pulling it up (Fowler, Pull Up Field)",
-                        owners.join(", ")
+                        "[pull-up-field] {} field(s) declared in each of the sibling subtypes {} \
+                         of {sup_id}: {}{} — consider pulling them up (Fowler, Pull Up Field)",
+                        fields.len(),
+                        owners.join(", "),
+                        listed.join(", "),
+                        if more > 0 {
+                            format!(", and {more} more")
+                        } else {
+                            String::new()
+                        }
                     ),
                     severity_override: None,
                     operation: None,

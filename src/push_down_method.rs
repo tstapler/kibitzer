@@ -7,7 +7,10 @@
 //! `collapse-hierarchy` territory); a caller on the supertype itself or outside the
 //! hierarchy (including free functions) blocks the finding, since moving the method down
 //! would break it; a method a subtype also declares (an override) or that is used as a
-//! value is skipped; only exported methods are considered.
+//! value is skipped; only exported methods are considered. A call counts as evidence only
+//! when its source line goes through the calling method's own receiver (`this.m()` /
+//! `recv.m()`), since `snap.m()` on another value of the supertype would break if `m`
+//! moved down; an unreadable call-site line is accepted rather than blocking.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -18,7 +21,7 @@ use crate::hierarchy_checks::{
     is_ignorable_file, methods_of, owner_type_id, resolved_extends, subtree, subtypes_by_super,
     type_index,
 };
-use crate::pull_up_common::is_constructor;
+use crate::pull_up_common::{go_receiver_name, is_constructor};
 
 pub struct PushDownMethodChecker;
 
@@ -40,6 +43,13 @@ impl ArchModelChecker for PushDownMethodChecker {
         {
             callers.entry(e.to.as_str()).or_default().push(e);
         }
+
+        let symbols: HashMap<&str, &crate::arch_model::SymbolNode> = model
+            .packages
+            .values()
+            .flat_map(|p| &p.symbols)
+            .map(|s| (s.id.as_str(), s))
+            .collect();
 
         let mut findings = Vec::new();
         for (&sup_id, subs) in &children {
@@ -75,6 +85,9 @@ impl ArchModelChecker for PushDownMethodChecker {
                     let Some(owner) = owner_type_id(&e.from) else {
                         return false;
                     };
+                    if !called_through_own_receiver(&symbols, e, &m.name) {
+                        return false;
+                    }
                     match subtrees.iter().position(|t| t.contains(owner)) {
                         Some(i) => {
                             owning.insert(i);
@@ -104,6 +117,58 @@ impl ArchModelChecker for PushDownMethodChecker {
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
     }
+}
+
+/// True unless the call-site line provably calls `name` on something other than the
+/// calling method's own receiver.
+fn called_through_own_receiver(
+    symbols: &HashMap<&str, &crate::arch_model::SymbolNode>,
+    edge: &CallEdge,
+    name: &str,
+) -> bool {
+    let Some(line) = std::fs::read_to_string(&edge.file).ok().and_then(|t| {
+        t.lines()
+            .nth(edge.line.saturating_sub(1))
+            .map(str::to_string)
+    }) else {
+        return true;
+    };
+    let Some(caller) = symbols.get(edge.from.as_str()) else {
+        return true;
+    };
+    let is_go = caller.file.extension().is_some_and(|e| e == "go");
+    let recv = if is_go {
+        std::fs::read_to_string(&caller.file)
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .nth(caller.line.saturating_sub(1))
+                    .and_then(|l| go_receiver_name(l).map(str::to_string))
+            })
+            .unwrap_or_default()
+    } else {
+        "this".to_string()
+    };
+    if recv.is_empty() {
+        return true;
+    }
+    let needle = format!(".{name}(");
+    let mut seen_call = false;
+    for (idx, _) in line.match_indices(&needle) {
+        seen_call = true;
+        let chain: String = line[..idx]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if chain == recv || chain.starts_with(&format!("{recv}.")) {
+            return true;
+        }
+    }
+    !seen_call
 }
 
 #[cfg(test)]
@@ -231,5 +296,38 @@ mod tests {
         m.type_edges.push(edge("pkg::A2", "pkg::A", true));
         m.call_edges = vec![call("pkg::A2.Go", "pkg::Base.Shared")];
         assert_eq!(run(&m).len(), 1);
+    }
+
+    #[test]
+    fn a_call_on_another_value_of_the_supertype_is_not_evidence() {
+        use crate::pull_up_common::test_support::scratch_dir;
+        let dir = scratch_dir();
+        let f = dir.join("a.go");
+        std::fs::write(
+            &f,
+            "package pkg\n\nfunc (a *A) RunA() int {\n\tsnap := a.Snapshot()\n\treturn snap.Shared()\n}\n",
+        )
+        .unwrap();
+        let mut m = hierarchy();
+        for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
+            if s.id == "pkg::A.RunA" {
+                s.file = f.clone();
+                s.line = 3;
+            }
+        }
+        let mut e = call("pkg::A.RunA", "pkg::Base.Shared");
+        e.file = f.clone();
+        e.line = 5;
+        m.call_edges = vec![e.clone()];
+        assert!(
+            run(&m).is_empty(),
+            "snap.Shared() is not a call on A's own receiver"
+        );
+        std::fs::write(
+            &f,
+            "package pkg\n\nfunc (a *A) RunA() int {\n\tx := 1\n\treturn a.Shared() + x\n}\n",
+        )
+        .unwrap();
+        assert_eq!(run(&m).len(), 1, "a.Shared() goes through the receiver");
     }
 }

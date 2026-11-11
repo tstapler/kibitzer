@@ -309,7 +309,7 @@ fn go_body_pullable(
 }
 
 /// `func (r *T) M(` -> `r`.
-fn go_receiver_name(first_line: &str) -> Option<&str> {
+pub(crate) fn go_receiver_name(first_line: &str) -> Option<&str> {
     let rest = first_line.trim_start().strip_prefix("func")?.trim_start();
     let rest = rest.strip_prefix('(')?.trim_start();
     let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
