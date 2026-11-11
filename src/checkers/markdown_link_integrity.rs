@@ -94,7 +94,14 @@ pub fn check_source(path: &Path, body: &str) -> Result<Vec<Finding>> {
     // + literal `]`, misreported the same way task-list checkboxes were. With this
     // option, `[[...]]` is its own `LinkType::WikiLink` event — never reference-style —
     // so it never reaches that matching logic at all.
-    let opts = Options::ENABLE_TASKLISTS | Options::ENABLE_WIKILINKS;
+    // ENABLE_*_METADATA_BLOCKS: a leading `---` (YAML) or `+++` (Hugo TOML) frontmatter
+    // block is emitted as one MetadataBlock, not parsed as markdown — otherwise TOML arrays
+    // like `tags = ["a", "b"]` read as dangling shortcut references. Source offsets are
+    // unchanged, so finding line numbers stay correct.
+    let opts = Options::ENABLE_TASKLISTS
+        | Options::ENABLE_WIKILINKS
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
     let parser = Parser::new_with_broken_link_callback(body, opts, Some(callback));
 
     let ref_defs = build_ref_defs(&parser, &line_starts);
