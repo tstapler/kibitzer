@@ -3088,6 +3088,7 @@ mod tests {
                 delegation_field: None,
                 params: vec![],
                 used_as_value: false,
+                end_line: None,
             },
             SymbolNode {
                 id: "pkg::Dog".to_string(),
@@ -3102,6 +3103,7 @@ mod tests {
                 delegation_field: None,
                 params: vec![],
                 used_as_value: false,
+                end_line: None,
             },
         ];
         let mut packages = BTreeMap::new();
@@ -3121,6 +3123,9 @@ mod tests {
             field_accesses: Vec::new(),
             type_edges: Vec::new(),
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
 

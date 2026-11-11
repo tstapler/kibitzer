@@ -740,6 +740,11 @@ pub fn model_registry() -> Vec<Box<dyn ArchModelChecker>> {
         Box::new(crate::remove_subclass::RemoveSubclassChecker),
         Box::new(crate::extract_superclass::ExtractSuperclassChecker),
         Box::new(crate::collapse_hierarchy::CollapseHierarchyChecker),
+        Box::new(crate::push_down_method::PushDownMethodChecker),
+        Box::new(crate::push_down_field::PushDownFieldChecker),
+        Box::new(crate::pull_up_method::PullUpMethodChecker),
+        Box::new(crate::pull_up_constructor_body::PullUpConstructorBodyChecker),
+        Box::new(crate::pull_up_field::PullUpFieldChecker),
         Box::new(crate::checkers::go_type_switch_clustering::TypeSwitchClusteringChecker),
         Box::new(crate::go_package_focus::GoPackageFocusChecker::default()),
     ]
@@ -1985,6 +1990,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -2000,6 +2006,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }
@@ -2170,6 +2179,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -2210,6 +2220,9 @@ mod tests {
             field_accesses,
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }
@@ -2235,6 +2248,7 @@ mod tests {
                     delegation_field: None,
                     params: vec![],
                     used_as_value: false,
+                    end_line: None,
                 },
             ],
         );
@@ -2263,6 +2277,7 @@ mod tests {
                     delegation_field: None,
                     params: vec![],
                     used_as_value: false,
+                    end_line: None,
                 },
             ],
         );
@@ -2290,6 +2305,7 @@ mod tests {
                     delegation_field: None,
                     params: vec![],
                     used_as_value: false,
+                    end_line: None,
                 },
             ],
         );

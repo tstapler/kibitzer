@@ -3,7 +3,8 @@
 //! trusted: an unresolved target is often an external base, so it can't establish a leaf,
 //! a parent's method set, or "unrelated."
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::checkers::is_test_file;
@@ -37,14 +38,17 @@ pub(crate) fn resolved_extends<'a>(
     pairs
 }
 
-/// Test and fixture files (`fixtures/`, `testdata/`) hold deliberately odd shapes; the
-/// hierarchy checks skip them.
+/// Test and fixture files (`fixtures/`, `testdata/`, and codegen golden output under
+/// `output_tests/`) hold deliberately odd shapes; the hierarchy checks skip them.
 pub(crate) fn is_ignorable_file(model: &ArchModel, file: &std::path::Path) -> bool {
     let rel = file.strip_prefix(&model.repo_root).unwrap_or(file);
     is_test_file(rel)
-        || rel
-            .components()
-            .any(|c| matches!(c.as_os_str().to_str(), Some("fixtures" | "testdata")))
+        || rel.components().any(|c| {
+            matches!(
+                c.as_os_str().to_str(),
+                Some("fixtures" | "testdata" | "output_tests")
+            )
+        })
 }
 
 /// Non-test methods declared directly on `type_name` in `pkg`.
@@ -65,12 +69,120 @@ pub(crate) fn supertype_ids<'a>(pairs: &[(&'a str, &'a str)]) -> HashSet<&'a str
     pairs.iter().map(|&(_, parent)| parent).collect()
 }
 
+/// Go "inheritance" is struct embedding, and embedding a type from another package is
+/// composition with a library mixin (`metav1.TypeMeta`, `rest.Strategy`), not a hierarchy
+/// whose supertype the author can refactor. The pull-up checkers therefore only trust a Go
+/// subtype that lives in the same package as its embedded supertype. Non-Go subtypes are
+/// unaffected.
+pub(crate) fn go_subtype_is_foreign(
+    sub_pkg: &PackageNode,
+    sub: &SymbolNode,
+    sup_pkg: &PackageNode,
+) -> bool {
+    sub.file.extension().is_some_and(|e| e == "go") && sub_pkg.path != sup_pkg.path
+}
+
+/// TS/Kotlin: a method named `constructor`. Java: a method named after its owning type.
+pub(crate) fn is_constructor(sym: &SymbolNode) -> bool {
+    sym.name == "constructor"
+        || (sym.file.extension().is_some_and(|e| e == "java")
+            && sym.parent.as_deref() == Some(sym.name.as_str()))
+}
+
+/// `func (r *T) M(` -> `r`.
+pub(crate) fn go_receiver_ident_from_line(first_line: &str) -> Option<&str> {
+    let rest = first_line.trim_start().strip_prefix("func")?.trim_start();
+    let rest = rest.strip_prefix('(')?.trim_start();
+    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    let name = &rest[..end];
+    (!name.is_empty() && name != "_").then_some(name)
+}
+
+/// Supertype id -> its direct subtype ids (sorted), from [`resolved_extends`] pairs.
+pub(crate) fn subtypes_by_super<'a>(
+    pairs: &[(&'a str, &'a str)],
+) -> BTreeMap<&'a str, Vec<&'a str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for &(sub, sup) in pairs {
+        map.entry(sup).or_default().push(sub);
+    }
+    map
+}
+
+/// `root` plus every transitive subtype of it.
+pub(crate) fn subtree<'a>(
+    root: &'a str,
+    children: &BTreeMap<&'a str, Vec<&'a str>>,
+) -> HashSet<&'a str> {
+    let mut seen = HashSet::from([root]);
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        for &c in children.get(id).into_iter().flatten() {
+            if seen.insert(c) {
+                stack.push(c);
+            }
+        }
+    }
+    seen
+}
+
+/// Owning type id of a method/field-qualified symbol id (`"{pkg}::{Type}.{member}"` ->
+/// `"{pkg}::{Type}"`); `None` for a free function or type id. Splits after the `::` so a
+/// dotted package path (`github.com/x/y::T.m`) isn't cut in the wrong place.
+pub(crate) fn owner_type_id(member_id: &str) -> Option<&str> {
+    let after = member_id.find("::")? + 2;
+    let dot = member_id[after..].rfind('.')?;
+    Some(&member_id[..after + dot])
+}
+
+/// Per-run cache of source files so each is read once. Relative paths resolve against
+/// `model.repo_root` first, then as given; an unreadable file is cached as `None`.
+#[derive(Default)]
+pub(crate) struct SourceCache {
+    files: HashMap<PathBuf, Option<Vec<String>>>,
+}
+
+impl SourceCache {
+    pub(crate) fn lines(&mut self, model: &ArchModel, file: &Path) -> Option<&[String]> {
+        if !self.files.contains_key(file) {
+            let text = std::fs::read_to_string(model.repo_root.join(file))
+                .or_else(|_| std::fs::read_to_string(file))
+                .ok();
+            self.files.insert(
+                file.to_path_buf(),
+                text.map(|s| s.lines().map(str::to_string).collect()),
+            );
+        }
+        self.files.get(file)?.as_deref()
+    }
+
+    /// 1-based `line` of `file`.
+    pub(crate) fn line(&mut self, model: &ArchModel, file: &Path, line: usize) -> Option<&str> {
+        self.lines(model, file)?
+            .get(line.checked_sub(1)?)
+            .map(String::as_str)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
     use crate::arch_model::{PackageNode, TypeRelationEdge};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fresh scratch dir (no "test" path component: `is_test_file` would skip it).
+    pub fn scratch_dir() -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kib-hier-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     pub fn sym(pkg: &str, name: &str, kind: SymbolKind, parent: Option<&str>) -> SymbolNode {
         let id = match parent {
@@ -90,6 +202,7 @@ pub(crate) mod fixtures {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -120,6 +233,9 @@ pub(crate) mod fixtures {
             field_accesses: vec![],
             type_edges,
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: Default::default(),
         }
     }
@@ -141,6 +257,21 @@ mod tests {
     use super::fixtures::{edge, model, sym};
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn owner_type_id_splits_after_the_package_separator() {
+        assert_eq!(owner_type_id("a.b/c::T.m"), Some("a.b/c::T"));
+        assert_eq!(owner_type_id("a.b/c::free"), None);
+        assert_eq!(owner_type_id("pkg::T"), None);
+    }
+
+    #[test]
+    fn subtree_includes_root_and_transitive_children_and_survives_cycles() {
+        let pairs = [("b", "a"), ("c", "b"), ("a", "c")];
+        let children = subtypes_by_super(&pairs);
+        let t = subtree("a", &children);
+        assert_eq!(t.len(), 3);
+    }
 
     #[test]
     fn resolved_extends_dedupes_and_drops_non_extends_unresolved_and_unmodeled() {

@@ -1,0 +1,54 @@
+# `push-down-field` check — known false positives and tuning
+
+`push-down-field` (`src/push_down_field.rs`) is Fowler's *Push Down Field*: a field declared on a
+supertype that is accessed only from methods of exactly one direct subtype (or its descendants).
+Advisory, batch-only, on by default. Source: `ArchModel.struct_field_names` plus `field_accesses` and
+`promoted_field_accesses` (Go only; other languages never fire).
+
+`promoted_field_accesses` exists because Go reads an embedded field as `a.N` on the *embedding* struct,
+which `field_accesses` does not attribute to the declaring type. Without it the check could never fire
+on Go: the first corpus run returned 0 hits for that reason, not because the code was clean.
+
+## What it requires
+
+| Gate | Why |
+|---|---|
+| Unexported fields only | Accesses are recorded only through a method's own receiver. For an exported field any package can read `x.Field` through a plain variable, so the absence of other accessors is no evidence (the first 12 sampled hits were all exported API fields: 100% false positives). Restricting to unexported fields removes that out-of-package exposure only; it does not make absent evidence safe (see the last row of the next table). |
+| Supertype has ≥2 direct resolved subtypes, all in the supertype's package | A Go subtype in another package is composition with a library type. |
+| ≥1 access, all from exactly one direct subtype's subtree | No access evidence is skipped. |
+| No access from the supertype's own methods or from outside the hierarchy | Moving the field down would break them (stapler-squad `ReviewState.lastAcknowledgedNs`). |
+| Test, `fixtures/`, `testdata/` files and unresolved `Extends` edges ignored | Shared guard. |
+
+## Known false-positive patterns
+
+| Pattern | Example | Status |
+|---|---|---|
+| Access through a defined type that is not a struct: `type unmounterDefaults flexVolumeUnmounter` | kubernetes `flexVolume.mounter` is also read by `unmounterDefaults.TearDownAt`, but the model drops accesses from a receiver that declares no fields | Not filtered. |
+| Field set from a free function or through a local value rather than a method receiver | kubernetes `typesFromEnv.deviceType`/`attributeType` are assigned via `result.deviceType = ...` in `compile.go`, not from `sizeEstimator` | Not filtered (2 hits). |
+| Field read by reflection / struct tags / serialization | Invisible to the model | Not filtered. |
+| Access through a non-receiver variable (`x.field`, `x` a local or parameter) in the same package | Only receiver accesses are recorded, and every function in the package can read an unexported field. The unexported-only rule shuts out other packages but not these in-package reads. | Not filtered; a known false-positive source. |
+
+The checker asks for private symbols (`needs_private_symbols`): subtypes are often unexported, and without
+them the first corpus pass saw only 3 of the 17 hits below.
+
+## Backtest (release build, final)
+
+Every hit was read against the source by one reviewer (`grep` of each use of the field in its package).
+
+**Standard corpus** (`kibitzer check architecture push-down-field <repo>`): kubernetes 17, all seven other repos 0.
+3 false positives (the first two patterns above): **3/17 = 17.6%**. The 14 plausible hits are the `flexVolume` pod
+fields, `downwardAPIVolume.pod`, `hostPath.pathType`, two `localVolume` fields, four `patcher` fields (each used by exactly
+one of `jsonPatcher`/`smpPatcher`), and the three `*Opts.initializeLabelAllowListsOnce` `sync.Once` fields used only by the
+`*Vec` types.
+
+**Held-out repos** (not used to design any guard): argo-cd, caddy, trivy, containerd, etcd, docker/compose, syft, pack, cli, coredns (ten Go repos named before any of this check's output on them was seen). 3 hits (cli, containerd, etcd): 1 false positive
+(cli `asset.alt`), 2 plausible (containerd `dockerBase.performances`, etcd `baseReadTx.mu`): **1/3**.
+
+Combined **4/20 = 20.0%**. n is small. Earlier builds: 12 of 12 sampled hits were false positives before the
+unexported-only rule, and one stapler-squad hit was removed once the supertype's own accesses blocked a finding.
+Transcript replay: 0 findings over 1818 snapshots.
+
+## Suppression
+
+Add `kibitzer:ignore push-down-field -- <why>` above the flagged line, or disable the check per repo
+(`disabled: ["push-down-field"]`); see `docs/suppressing-checks.md`.

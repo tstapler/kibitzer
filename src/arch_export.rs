@@ -166,6 +166,35 @@ mod tests {
     }
 
     #[test]
+    fn run_export_omits_derived_hierarchy_maps() {
+        let dir = tmp_dir("derived-maps");
+        write_fixture(
+            &dir,
+            "pkg/a.go",
+            "package pkg\n\ntype Base struct{ N int }\n\ntype A struct{ Base }\n\nfunc (a *A) Bump() {\n\ta.N++\n}\n",
+        );
+        let out = dir.join("arch.json");
+        run_export(dir.clone(), None, out.clone(), false, true).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let obj = parsed.as_object().unwrap();
+        for key in [
+            "struct_field_names",
+            "struct_field_types",
+            "promoted_field_accesses",
+        ] {
+            assert!(!obj.contains_key(key), "{key} leaked into the export");
+        }
+        assert!(
+            obj.contains_key("type_edges"),
+            "control: other model fields remain"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_export_dry_run_prints_json_and_writes_no_file() {
         // No go.mod here (deliberately): a bare go.mod file would itself count as an
         // "unsupported language" scanned file and could trip the >=50% warning line onto

@@ -1,6 +1,6 @@
 # Hierarchy cleanup checks
 
-Three advisory, batch-only, whole-repo checks over `ArchModel.type_edges` (resolved `Extends`
+Eight advisory, batch-only, whole-repo checks over `ArchModel.type_edges` (resolved `Extends`
 edges only; unresolved targets are ignored). Suppress with `kibitzer:ignore <rule> -- <why>`;
 see `suppressing-checks.md`.
 
@@ -9,8 +9,21 @@ see `suppressing-checks.md`.
 | `remove-subclass` | Remove Subclass | Leaf subtype; ≥1 method, every one `SymbolNode::is_constant_return`; no field of the subtype is read by any method | Go, TS/JS (Java/Kotlin never fire: `is_constant_return` is always false) |
 | `extract-superclass` | Extract Superclass | Two same-package types, no edge between them, ≥ `MIN_METHODS_FOR_CLUSTERING` (4) methods with field accesses each, Jaccard of accessed field *names* ≥ 0.5, ≥ 2 shared names; top 3 per package | Go only (field-access data) |
 | `collapse-hierarchy` | Collapse Hierarchy | Resolved `Extends` edge; subtype has ≥ 3 methods and < 20% of them are absent by name from its direct supertype | Go, TS/JS (Java/Kotlin subtypes skipped, see below) |
+| `push-down-method` | Push Down Method | Supertype method (≥2 subtypes) whose resolved callers, via the caller's own receiver, are all in one direct subtype's subtree | Go, TS/JS (call graph) |
+| `push-down-field` | Push Down Field | Unexported supertype field accessed only from one direct subtype; no access from the supertype or outside | Go only |
+| `pull-up-method` | Pull Up Method | ≥2 sibling subtypes (a majority) with a same-signature method whose normalised bodies are identical; supertype lacks it | Go, TS/JS, Java, Kotlin |
+| `pull-up-constructor-body` | Pull Up Constructor Body | Same as `pull-up-method`, constructors only (`constructor`; Java name == type) | TS/JS, Java, Kotlin |
+| `pull-up-field` | Pull Up Field | A majority of subtypes declare a field with the same name and type text; supertype lacks it | Go only |
 
-Guards added after backtesting and code review (not in the original issue). All three skip test and `fixtures/`/`testdata/` files: `extract-superclass` skips test
+The last five have their own false-positive pages: `push-down-method-false-positives.md`,
+`push-down-field-false-positives.md`, `pull-up-method-false-positives.md`,
+`pull-up-constructor-body-false-positives.md`, `pull-up-field-false-positives.md`. Measured rates (every hit read by one reviewer; standard corpus plus ten held-out Go repos): push-down-method 0/3 (0 corpus
+hits, 3 held-out); push-down-field 4/20; pull-up-method 0/21; pull-up-constructor-body 1/15 (corpus only); pull-up-field 5/34
+overall, 3/15 = 20.0% on the held-out repos alone (the corpus rate is optimistic because two guards were tuned on it). Samples are
+small. They need `SymbolNode::end_line`, `ArchModel::struct_field_names`/`struct_field_types`
+and `promoted_field_accesses`, added with them.
+
+Guards added after backtesting and code review (not in the original issue). All eight skip test files and `fixtures/`/`testdata/`/`output_tests/` files (`is_ignorable_file`; the `output_tests/` skip, for codegen golden output, was added with the five newer checks and changed no output on kubernetes, vscode or cassandra in the backtest): `extract-superclass` skips test
 files, same-named types (build-tag variants) and single-shared-field pairs; `collapse-hierarchy`
 skips same-named pairs, subtypes with < 3 methods and `.java`/`.kt` subtypes; `remove-subclass` skips same-named pairs.
 

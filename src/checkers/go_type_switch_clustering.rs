@@ -333,6 +333,9 @@ mod tests {
             field_accesses: vec![],
             type_edges,
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: PruningSummary::default(),
         }
     }

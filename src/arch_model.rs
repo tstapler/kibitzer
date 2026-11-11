@@ -5,7 +5,7 @@
 //! (CLI `architecture export`/`diagram`, MCP query tools, LSP symbol mapper/index) shares
 //! these instead of reimplementing walk-and-parse itself.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +16,8 @@ use crate::checker::{GrammarCache, Language};
 use crate::import_graph::{ImportEdge, ImportGraph};
 use crate::symbol_extract::{
     RawCallSite, RawFieldAccessSite, RawTypeRelationSite, extract_call_sites_for_file,
-    extract_field_access_sites_for_file, extract_struct_fields_for_file, extract_symbols_for_file,
-    extract_type_relation_sites_for_file,
+    extract_field_access_sites_for_file, extract_struct_field_types_for_file,
+    extract_symbols_for_file, extract_type_relation_sites_for_file,
 };
 
 /// The kind of a single extracted symbol. Exhaustively matched by every consumer (the
@@ -100,6 +100,10 @@ pub struct SymbolNode {
     /// A same-package bare name occurs in a value position; lexical shadowing is not resolved.
     #[serde(default)]
     pub used_as_value: bool,
+    /// 1-indexed inclusive last line of a `Method`/`Function` body, for slicing source text
+    /// (pull-up checkers). `None` where not populated; `#[serde(default)]` for old caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -279,6 +283,21 @@ pub struct ArchModel {
     /// `import_graph::build_qualified_name_language` already uses for `ImportEdge`s, so
     /// an external/stdlib import never appears here as a resolvable target.
     pub file_import_aliases: BTreeMap<PathBuf, HashMap<String, String>>,
+    /// `"{package_path}::{type_name}"` -> declared field names (Go structs only today).
+    /// Derived: rebuilt by `build_model`, so not serialized into `architecture export`.
+    #[serde(default, skip_serializing)]
+    pub struct_field_names: BTreeMap<String, BTreeSet<String>>,
+    /// `"{package_path}::{type_name}"` -> field name -> type text; companion to
+    /// `struct_field_names` for the pull-up-field type-text match. Derived; not serialized.
+    #[serde(default, skip_serializing)]
+    pub struct_field_types: BTreeMap<String, BTreeMap<String, String>>,
+    /// Accesses to a field the receiver type doesn't declare but inherits through resolved
+    /// `Extends` (Go embedding: `a.N` where `A` embeds `Base`), attributed to the declaring
+    /// ancestor (`to` = `"{pkg}::Base.N"`). Kept apart from `field_accesses` so the
+    /// existing consumers of that list are unaffected; read by `push-down-field`. Derived;
+    /// not serialized.
+    #[serde(default, skip_serializing)]
+    pub promoted_field_accesses: Vec<FieldAccessEdge>,
     pub pruning: PruningSummary,
 }
 
@@ -435,6 +454,7 @@ pub fn build_model(
     let mut value_names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut raw_field_access_sites: Vec<RawFieldAccessSite> = Vec::new();
     let mut raw_type_relation_sites: Vec<RawTypeRelationSite> = Vec::new();
+    let mut struct_field_types: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut struct_fields: HashMap<(String, String), std::collections::HashSet<String>> =
         HashMap::new();
     // Go-only, see `ArchModel::file_import_aliases`'s doc comment. Collected per-file
@@ -509,7 +529,14 @@ pub fn build_model(
             path,
         ));
 
-        for (type_name, field_name) in extract_struct_fields_for_file(language, source, &tree) {
+        for (type_name, field_name, type_text) in
+            extract_struct_field_types_for_file(language, source, &tree)
+        {
+            let key = format!("{package_path}::{type_name}");
+            struct_field_types
+                .entry(key)
+                .or_default()
+                .insert(field_name.clone(), type_text);
             struct_fields
                 .entry((package_path.clone(), type_name))
                 .or_default()
@@ -542,12 +569,23 @@ pub fn build_model(
         }
     }
     let call_edges = resolve_call_edges(&packages, raw_call_sites);
-    let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites);
+    let field_accesses = resolve_field_access_edges(&struct_fields, raw_field_access_sites.clone());
     let file_import_aliases =
         resolve_file_import_aliases(&packages, &package_short_names, raw_file_imports);
     // Must run after `file_import_aliases` is fully computed — Go qualified-embed
     // resolution (`resolve_one_type_edge`) depends on it.
     let type_edges = resolve_type_edges(&packages, &file_import_aliases, raw_type_relation_sites);
+    let struct_field_names: BTreeMap<String, BTreeSet<String>> = struct_fields
+        .iter()
+        .map(|((pkg, ty), names)| {
+            (
+                format!("{pkg}::{ty}"),
+                names.iter().cloned().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect();
+    let promoted_field_accesses =
+        resolve_promoted_field_accesses(&struct_field_names, &type_edges, &raw_field_access_sites);
 
     Ok(ArchModel {
         repo_root: repo_root.to_path_buf(),
@@ -557,6 +595,9 @@ pub fn build_model(
         field_accesses,
         type_edges,
         file_import_aliases,
+        struct_field_names,
+        struct_field_types,
+        promoted_field_accesses,
         pruning: PruningSummary {
             include_private: prune.include_private,
             excluded_dirs: vec![],
@@ -885,6 +926,63 @@ fn resolve_field_access_edges(
         .collect()
 }
 
+/// Attributes `recv.field` sites whose receiver type does not declare `field` to the
+/// nearest resolved-`Extends` ancestor that does (breadth-first, cycle-safe).
+fn resolve_promoted_field_accesses(
+    struct_field_names: &BTreeMap<String, BTreeSet<String>>,
+    type_edges: &[TypeRelationEdge],
+    raw_sites: &[RawFieldAccessSite],
+) -> Vec<FieldAccessEdge> {
+    let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in type_edges
+        .iter()
+        .filter(|e| e.resolved && e.kind == Some(TypeRelationKind::Extends))
+    {
+        parents
+            .entry(e.from.as_str())
+            .or_default()
+            .push(e.to.as_str());
+    }
+    let mut out = Vec::new();
+    for site in raw_sites {
+        let recv = format!("{}::{}", site.package_path, site.receiver_type);
+        if struct_field_names
+            .get(&recv)
+            .is_some_and(|f| f.contains(&site.field_name))
+        {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::from([recv.as_str()]);
+        let mut queue = std::collections::VecDeque::from([recv.as_str()]);
+        while let Some(id) = queue.pop_front() {
+            let mut found = None;
+            for &p in parents.get(id).into_iter().flatten() {
+                if struct_field_names
+                    .get(p)
+                    .is_some_and(|f| f.contains(&site.field_name))
+                {
+                    found = Some(p);
+                    break;
+                }
+                if seen.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+            if let Some(owner) = found {
+                out.push(FieldAccessEdge {
+                    from: site.caller_id.clone(),
+                    to: format!("{owner}.{}", site.field_name),
+                    access: site.access,
+                    file: site.file.clone(),
+                    line: site.line,
+                });
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Resolves each file's raw Go import list into `alias -> target package path`, per
 /// `ArchModel::file_import_aliases`'s doc comment. An import with an explicit alias
 /// (`import metav1 "..."`) uses it directly; otherwise the alias is the target
@@ -1000,6 +1098,9 @@ impl ArchModel {
             field_accesses: self.field_accesses.clone(),
             type_edges: self.type_edges.clone(),
             file_import_aliases: self.file_import_aliases.clone(),
+            struct_field_names: self.struct_field_names.clone(),
+            struct_field_types: self.struct_field_types.clone(),
+            promoted_field_accesses: self.promoted_field_accesses.clone(),
             pruning: self.pruning.clone(),
         }
     }
@@ -1171,6 +1272,137 @@ pub(crate) fn load_cached_model(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_model_attributes_promoted_go_field_access_to_the_embedded_declarer() {
+        let src = "package pkg\n\ntype Base struct{ N int }\n\ntype A struct{ Base }\n\nfunc (a *A) Bump() {\n\ta.N++\n}\n";
+        let files = vec![(PathBuf::from("/repo/pkg/a.go"), src.to_string())];
+        let model = build_model(
+            Path::new("/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            model.field_accesses.is_empty(),
+            "existing list is unchanged"
+        );
+        let p = &model.promoted_field_accesses;
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].to.ends_with("::Base.N") && p[0].from.ends_with("::A.Bump"),
+            "{p:?}"
+        );
+    }
+
+    fn go_model(src: &str) -> ArchModel {
+        let files = vec![(PathBuf::from("/repo/pkg/a.go"), src.to_string())];
+        build_model(
+            Path::new("/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_receiver_that_declares_the_field_itself_gets_no_promoted_edge() {
+        let model = go_model(
+            "package pkg\n\ntype Base struct{ N int }\n\ntype A struct {\n\tBase\n\tN int\n}\n\nfunc (a *A) Bump() {\n\ta.N++\n}\n",
+        );
+        assert!(model.promoted_field_accesses.is_empty());
+        assert!(
+            model.field_accesses.iter().any(|a| a.to.ends_with("::A.N")),
+            "control: the access exists and is attributed to A itself: {:?}",
+            model.field_accesses
+        );
+    }
+
+    #[test]
+    fn a_field_two_embeddings_up_is_attributed_to_its_declarer() {
+        let model = go_model(
+            "package pkg\n\ntype Base struct{ N int }\n\ntype B struct{ Base }\n\ntype C struct{ B }\n\nfunc (c *C) Bump() {\n\tc.N++\n}\n",
+        );
+        let p = &model.promoted_field_accesses;
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].to.ends_with("::Base.N") && p[0].from.ends_with("::C.Bump"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn promoted_field_resolution_terminates_on_an_extends_cycle() {
+        let edge = |from: &str, to: &str| TypeRelationEdge {
+            from: from.into(),
+            to: to.into(),
+            kind: Some(TypeRelationKind::Extends),
+            resolved: true,
+            file: PathBuf::from("/repo/pkg/a.go"),
+            line: 1,
+        };
+        let site = RawFieldAccessSite {
+            package_path: "pkg".into(),
+            caller_id: "pkg::A.Bump".into(),
+            receiver_type: "A".into(),
+            field_name: "N".into(),
+            access: AccessKind::Read,
+            file: PathBuf::from("/repo/pkg/a.go"),
+            line: 3,
+        };
+        let edges = [edge("pkg::A", "pkg::B"), edge("pkg::B", "pkg::A")];
+        let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        names.insert("pkg::A".into(), BTreeSet::new());
+        names.insert("pkg::B".into(), BTreeSet::new());
+        assert!(
+            resolve_promoted_field_accesses(&names, &edges, std::slice::from_ref(&site)).is_empty()
+        );
+        // Control: the same cycle, but one member declares the field.
+        names.insert("pkg::B".into(), BTreeSet::from(["N".to_string()]));
+        let got = resolve_promoted_field_accesses(&names, &edges, &[site]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].to, "pkg::B.N");
+    }
+
+    #[test]
+    fn build_model_persists_struct_field_names_and_types() {
+        let files = vec![(
+            PathBuf::from("/repo/pkg/a.go"),
+            "package pkg\n\ntype T struct {\n\tX, Y int\n\tName string\n}\n".to_string(),
+        )];
+        let model = build_model(
+            Path::new("/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap();
+        let (key, names) = model.struct_field_names.iter().next().expect("one struct");
+        assert!(key.ends_with("::T"), "{key}");
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Name", "X", "Y"]
+        );
+        assert_eq!(model.struct_field_types[key]["Name"], "string");
+    }
+
+    #[test]
+    fn model_without_struct_field_maps_still_deserializes() {
+        let mut v = serde_json::to_value(empty_model(Path::new("/repo"))).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("struct_field_names");
+        obj.remove("struct_field_types");
+        let back: ArchModel = serde_json::from_value(v).unwrap();
+        assert!(back.struct_field_names.is_empty() && back.struct_field_types.is_empty());
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1256,6 +1488,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -1313,6 +1546,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         }
     }
@@ -1374,6 +1610,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -1401,6 +1640,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2150,6 +2390,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2173,6 +2416,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2188,6 +2432,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
 
         let mut packages = BTreeMap::new();
@@ -2202,6 +2447,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2227,6 +2475,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2242,6 +2491,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2267,6 +2519,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2282,6 +2535,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2542,6 +2798,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2562,6 +2819,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2616,6 +2874,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2661,6 +2920,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("app".to_string(), pkg);
 

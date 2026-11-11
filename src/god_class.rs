@@ -513,6 +513,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -577,6 +578,9 @@ mod tests {
             ],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 1.0);
@@ -597,6 +601,9 @@ mod tests {
             ],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 0.0);
@@ -630,6 +637,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: aliases,
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }
