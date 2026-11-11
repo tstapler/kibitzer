@@ -361,11 +361,10 @@ and "0 findings in head but not baseline". **Known gap:** a real cycle made sole
 edges ("import cycle not allowed in test") is no longer reported.
 Full suite: `cargo test --workspace` -> 2577 passed, 0 failed, 7 ignored.
 
-**AC3 status: NOT MET as written (needs an owner decision).** The literal criterion (`X_test` files excluded from the
-node/edge set) was tried: excluding them from `file_packages` and nodes fails 2 tests,
-`refactor::tests::plan_should_CoverAllImportersAndTestPackage_When_WholePackageMoveWithTestFile` (`src/refactor/tests.rs:254`)
-and `refactor::tests::apply_tests::apply_should_RenameTestPackages_When_WholePackageMoveWithTestFiles`
-(`src/refactor/tests.rs:434`). Cause: `package_key_for_file` (`src/arch_model.rs:334`) falls back to a plain directory
-key for files missing from `file_packages`, which does not match Go's module-qualified key, so `a_test` files split from
-package `a` and the planner no longer renames their package clause. Making the exclusion work means reworking
-`arch_model` grouping for unmapped Go files. The shipped version skips only their outgoing edges.
+**AC3 status: MET.** `package X_test` files are excluded from `graph.nodes`, `graph.edges` and `graph.file_packages`
+(`go_external_test_file_is_outside_graph_but_groups_with_its_package`). The first attempt, excluding them without more,
+failed two refactor tests (`src/refactor/tests.rs:254`, `:434`): `package_key_for_file` (`src/arch_model.rs:334`) fell back to a
+directory key that does not match Go's module-qualified key, so `a_test` files split from package `a`. Fix: new
+`ImportGraph::excluded_files` maps those files to their package's key, and `package_key_for_file` consults it after
+`file_packages`, so the model and planner still group and rename them with `X`. Corpus counts above were re-run on this
+final build (unchanged). `cargo test --workspace` -> 2578 passed, 0 failed, 7 ignored; clippy and `cargo fmt --check` clean.

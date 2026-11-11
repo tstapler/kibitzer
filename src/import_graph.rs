@@ -33,6 +33,10 @@ pub struct ImportGraph {
     /// matches this graph's node keys instead of re-deriving (and potentially
     /// mismatching) them.
     pub file_packages: BTreeMap<PathBuf, String>,
+    /// Files left out of the graph (no node, no edges, not in `file_packages`) that still
+    /// group with a package for the architecture model and refactor planner — Go's
+    /// `package X_test` files, mapped to `X`'s key.
+    pub excluded_files: BTreeMap<PathBuf, String>,
 }
 
 impl ImportGraph {
@@ -170,8 +174,9 @@ struct QualifiedImportLangConfig {
         src: &[u8],
         cache: &mut PackageIdentityCache,
     ) -> Option<String>,
-    /// True when this file's imports must not become edges even though the file still
-    /// belongs to its package (Go's `package X_test`; see `go_declares_external_test_package`).
+    /// True when this file is left out of the graph (no node, no edges, no `file_packages`
+    /// entry) but recorded in `ImportGraph::excluded_files` under its package key — Go's
+    /// `package X_test`; see `go_declares_external_test_package`.
     skips_edges: fn(tree: &tree_sitter::Tree, src: &[u8]) -> bool,
     /// Every (normalized import target, 1-based line) pair in the tree. Implementations
     /// must exclude imports that don't name a package at all (e.g. Java's `import
@@ -225,6 +230,19 @@ fn build_qualified_name_language(
             .parse(&source, None)
             .with_context(|| format!("parsing {}", file.display()))?;
 
+        if (cfg.skips_edges)(&tree, source.as_bytes())
+            && let Some(pkg) = (cfg.package_identity)(
+                repo_root,
+                file,
+                &tree,
+                source.as_bytes(),
+                &mut identity_cache,
+            )
+        {
+            graph.excluded_files.insert((*file).clone(), pkg);
+            continue;
+        }
+
         if let Some(pkg) = (cfg.package_identity)(
             repo_root,
             file,
@@ -241,9 +259,6 @@ fn build_qualified_name_language(
     // Pass 2: extract each file's imports and add an edge only for those that resolve
     // to a `graph.nodes` entry (the graph-membership guard).
     for (file, pkg, tree, source) in &file_packages {
-        if (cfg.skips_edges)(tree, source.as_bytes()) {
-            continue;
-        }
         let mut imports = Vec::new();
         (cfg.collect_imports)(tree.root_node(), source.as_bytes(), &mut imports);
 
@@ -349,10 +364,9 @@ fn go_package_identity(
     go_package_import_path(&module_path, &module_dir, file)
 }
 
-/// True for a file declaring `package X_test` (an external test package). It stays
-/// grouped with `X` (the refactor planner and architecture model rely on that grouping
-/// via `file_packages`), but its imports must not become edges: it is a separate
-/// compilation unit that may legally import packages importing `X`.
+/// True for a file declaring `package X_test` (an external test package): a separate
+/// compilation unit that may legally import packages importing `X`, so it is kept out of
+/// the graph rather than fabricating `X -> helper -> X` cycles.
 fn go_declares_external_test_package(tree: &tree_sitter::Tree, src: &[u8]) -> bool {
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -1670,6 +1684,39 @@ mod tests {
 
         assert_eq!(graph.edges.len(), 2, "test edges stay in the graph");
         assert!(crate::architecture_checks::find_cycles(&graph).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_external_test_file_is_outside_graph_but_groups_with_its_package() {
+        let dir = tmp_dir("go-xtest-excluded");
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let widget = write(
+            &dir,
+            "widget/widget.go",
+            "package widget\n\nfunc New() {}\n",
+        );
+        let helper = write(
+            &dir,
+            "widgettest/helper.go",
+            "package widgettest\n\nimport \"example.com/m/widget\"\n\nvar _ = widget.New\n",
+        );
+        let xtest = write(
+            &dir,
+            "widget/widget_test.go",
+            "package widget_test\n\nimport \"example.com/m/widgettest\"\n\nvar _ = widgettest.X\n",
+        );
+
+        let graph = build(&dir, &[widget, helper, xtest.clone()]).unwrap();
+
+        assert!(!graph.file_packages.contains_key(&xtest));
+        assert!(graph.edges.iter().all(|e| e.file != xtest));
+        assert_eq!(
+            graph.excluded_files.get(&xtest).map(String::as_str),
+            Some("example.com/m/widget")
+        );
+        assert!(graph.nodes.contains("example.com/m/widget"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
