@@ -984,7 +984,12 @@ fn java_exception_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.kt", "**/*.kts", "!**/test/**"],
         ),
-        // sentinel-return-typescript / -javascript / -python are opt-in: their backtests
+        native_check(
+            "sentinel-return-javascript",
+            Severity::Advisory,
+            &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        ),
+        // sentinel-return-typescript / -python are opt-in: their backtests
         // exceeded the 40% false-positive bar (docs/sentinel-return-false-positives.md).
     ]
 }

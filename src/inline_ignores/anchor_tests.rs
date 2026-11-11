@@ -44,6 +44,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("sentinel-return-java", "C.java", || {
         "class Foo {\n  int bar() {\n    try { a(); } catch (Exception e) { return -1; }\n    return 0;\n  }\n}\n".into()
     }),
+    ("sentinel-return-javascript", "x.js", || {
+        "function bar() {\n  try { a(); } catch (e) { return -1; }\n  return 0;\n}\n".into()
+    }),
     ("sentinel-return-kotlin", "x.kt", || {
         "fun bar(): Int {\n  try { a() } catch (e: Exception) { return -1 }\n  return 0\n}\n".into()
     }),
