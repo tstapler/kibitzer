@@ -365,9 +365,9 @@ edges ("import cycle not allowed in test") is still reported (`go_cycle_made_of_
 **Reproduce the backtest** (baseline vs head, same repos):
 
     git worktree add --detach ~/.cache/tmp/cyc-base 635eab4 && (cd ~/.cache/tmp/cyc-base && cargo build --release)
-    cargo build --release
+    cargo build --release   # in this checkout; export HEAD_CHECKOUT=$PWD
     for r in kubernetes/kubernetes tstapler/stapler-squad tstapler/go-git go-git/go-git; do
-      (cd ~/code/github.com/$r && for b in ~/.cache/tmp/cyc-base .../this-checkout; do
+      (cd ~/code/github.com/$r && for b in ~/.cache/tmp/cyc-base "$HEAD_CHECKOUT"; do
         $b/target/release/kibitzer check architecture import-cycles . | grep -c import-cycle; done)
     done
 
