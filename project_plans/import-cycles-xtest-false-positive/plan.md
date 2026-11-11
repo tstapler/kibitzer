@@ -317,3 +317,12 @@ None. The fix is a straightforward application of existing parsing infrastructur
 - Should `coupling` and `layering` acceptance tests be added explicitly for external test
   files, or is the upstream graph fix sufficient evidence? (The existing tests for those
   checkers cover their logic; the graph fix's test covers the data they receive.)
+
+---
+
+## Implementation note (supersedes Story 1.1)
+
+Returning `None` from `go_package_identity` broke `refactor::tests::plan_should_CoverAllImportersAndTestPackage_*`
+and `apply_should_RenameTestPackages_*` (the refactor planner needs `a_test.go` grouped with `a`). Shipped
+instead: `QualifiedImportLangConfig::skips_edges` (Go: `go_declares_external_test_package`) skips pass-2 edge
+emission for `package X_test` files while leaving node/`file_packages` membership unchanged.
