@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -323,7 +323,8 @@ impl ArchitectureChecker for PackageSizeChecker {
         "package-size"
     }
 
-    /// Sums each Go package's line count across its files (from `graph.file_packages`,
+    /// Sums each Go package's line count across its files (from `graph.file_packages` and
+    /// `graph.excluded_files`, so external `X_test` files still count toward `X`,
     /// filtered to `.go` — this check is Go-specific, unlike the other architecture
     /// checkers here) and flags any package whose total exceeds [`MAX_PACKAGE_LINES`].
     /// Unlike those other checkers, this one reads file contents directly: `ImportGraph`
@@ -339,7 +340,7 @@ impl ArchitectureChecker for PackageSizeChecker {
         _model: Option<&crate::arch_model::ArchModel>,
     ) -> Vec<ArchFinding> {
         let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
-        for (file, pkg) in &graph.file_packages {
+        for (file, pkg) in graph.file_packages.iter().chain(&graph.excluded_files) {
             if file.extension().and_then(|e| e.to_str()) != Some("go") {
                 continue;
             }
@@ -528,7 +529,9 @@ impl ArchitectureChecker for ComponentDependencyChecker {
 pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     let mut cycles = cyclic_sccs(graph, &|e| !is_test_file_edge(e));
 
-    let in_cycle: BTreeSet<&String> = cycles.iter().flatten().collect();
+    // A package already in a production cycle is not re-checked: that cycle is itself a
+    // compile error and is reported as-is.
+    let in_cycle: HashSet<&str> = cycles.iter().flatten().map(String::as_str).collect();
     let mut test_edges_by_pkg: BTreeMap<&str, Vec<&ImportEdge>> = BTreeMap::new();
     for e in graph.edges.iter().filter(|e| is_test_file_edge(e)) {
         test_edges_by_pkg.entry(&e.from).or_default().push(e);
@@ -536,7 +539,7 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     let production = ReverseProduction::new(graph);
     let mut extra = Vec::new();
     for (pkg, test_edges) in test_edges_by_pkg {
-        if in_cycle.contains(&pkg.to_string()) || !production.any_reaches(pkg, &test_edges) {
+        if in_cycle.contains(pkg) || !production.any_reaches(pkg, &test_edges) {
             continue;
         }
         let with_own_tests = |e: &ImportEdge| !is_test_file_edge(e) || e.from == pkg;
@@ -546,14 +549,14 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
                 .filter(|scc| scc.iter().any(|m| m == pkg)),
         );
     }
-    for scc in extra {
-        let mut key = scc.clone();
+    let sorted = |scc: &[String]| {
+        let mut key = scc.to_vec();
         key.sort();
-        if !cycles.iter().any(|c| {
-            let mut k = c.clone();
-            k.sort();
-            k == key
-        }) {
+        key
+    };
+    let mut seen: HashSet<Vec<String>> = cycles.iter().map(|c| sorted(c)).collect();
+    for scc in extra {
+        if seen.insert(sorted(&scc)) {
             cycles.push(scc);
         }
     }
@@ -1834,6 +1837,22 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("pkg"));
         assert!(findings[0].message.contains("consider splitting"));
+    }
+
+    #[test]
+    fn package_size_counts_external_test_files_excluded_from_the_graph() {
+        let dir = TempDir::new("xtest");
+        let file = dir.write("a.go", MAX_PACKAGE_LINES / 2 + 1);
+        let xtest = dir.write("a_test.go", MAX_PACKAGE_LINES / 2 + 1);
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file, "pkg".to_string());
+        graph.excluded_files.insert(xtest, "pkg".to_string());
+
+        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default(), None);
+
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
