@@ -38,10 +38,9 @@ Mirrors the backlog item's 8 criteria.
 1. Canonical `widget` / `widgettest` / `widget_test` layout: `import-cycles` reports zero findings.
 2. Two regular packages that import each other still produce `[import-cycle]`.
 3. Files whose `package` clause ends in `_test` cannot create cycle edges. **Implementation
-   deviation:** the files are not dropped from `graph.nodes`/`file_packages` (the refactor
-   planner needs `a_test.go` grouped with `a`; dropping them failed 2 existing
-   `refactor::tests`). Only their *outgoing edges* are skipped (`skips_edges` in
-   `QualifiedImportLangConfig`). The false edge is absent from the graph either way.
+   note:** the files are dropped from `graph.nodes`/`file_packages`/`edges` but kept in
+   `ImportGraph::excluded_files`, so the refactor planner still groups `a_test.go` with `a`
+   (`excludes_from_graph` in `QualifiedImportLangConfig`).
 4. Internal test files (`package widget` in `widget_test.go`) keep contributing edges.
 5. All existing tests pass (`cargo test`: 2575 passed in the bin target).
 6. Regression test `go_external_test_package_does_not_create_false_cycle`.

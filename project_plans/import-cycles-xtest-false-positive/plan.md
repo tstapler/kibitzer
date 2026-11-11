@@ -324,13 +324,9 @@ None. The fix is a straightforward application of existing parsing infrastructur
 
 Returning `None` from `go_package_identity` broke `refactor::tests::plan_should_CoverAllImportersAndTestPackage_*`
 and `apply_should_RenameTestPackages_*` (the refactor planner needs `a_test.go` grouped with `a`). Shipped
-instead: `QualifiedImportLangConfig::skips_edges` (Go: `go_declares_external_test_package`) skips pass-2 edge
-emission for `package X_test` files while leaving node/`file_packages` membership unchanged.
-
-**Why AC3's literal "excluded from the node/edge set" is not met (deliberate).** Dropping `X_test` files from
-the node set broke two refactor-planner tests (above): renaming package `a` must also rewrite `package a_test`
-files, which requires them grouped with `a`. AC3's stated purpose ("so their imports cannot create false cycle
-edges") is met by emitting no outgoing edges from those files; they remain package-group members only.
+instead: `QualifiedImportLangConfig::excludes_from_graph` (Go: `go_declares_external_test_package`) drops
+`package X_test` files from `graph.nodes`, `graph.edges` and `graph.file_packages`, and records them in
+`ImportGraph::excluded_files` so package grouping (`package_key_for_file`, package line counts) still sees them.
 
 ## Corpus backtest (AC8)
 
