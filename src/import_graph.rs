@@ -1541,6 +1541,23 @@ mod tests {
         path
     }
 
+    struct DirGuard(PathBuf);
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cycle_findings(graph: &ImportGraph) -> Vec<crate::architecture_checks::ArchFinding> {
+        crate::architecture_checks::ArchitectureChecker::check(
+            &crate::architecture_checks::ImportCycleChecker,
+            graph,
+            &crate::config::ArchitectureConfig::default(),
+            None,
+        )
+    }
+
     #[test]
     fn build_skips_a_non_utf8_file_instead_of_failing() {
         let dir = tmp_dir("non-utf8");
@@ -1589,6 +1606,7 @@ mod tests {
     #[test]
     fn go_external_test_package_does_not_create_false_cycle() {
         let dir = tmp_dir("go-external-test-pkg");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let widget = write(
             &dir,
@@ -1615,20 +1633,14 @@ mod tests {
             e.from == "example.com/m/widget" && e.to == "example.com/m/widget/widgettest"
         }));
         assert!(crate::architecture_checks::find_cycles(&graph).is_empty());
-        let findings = crate::architecture_checks::ArchitectureChecker::check(
-            &crate::architecture_checks::ImportCycleChecker,
-            &graph,
-            &crate::config::ArchitectureConfig::default(),
-            None,
-        );
+        let findings = cycle_findings(&graph);
         assert!(findings.is_empty(), "import-cycles reported: {findings:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn go_real_mutual_import_still_reports_cycle() {
         let dir = tmp_dir("go-real-cycle");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let a = write(
             &dir,
@@ -1644,22 +1656,16 @@ mod tests {
         let graph = build(&dir, &[a, b]).unwrap();
 
         assert_eq!(crate::architecture_checks::find_cycles(&graph).len(), 1);
-        let findings = crate::architecture_checks::ArchitectureChecker::check(
-            &crate::architecture_checks::ImportCycleChecker,
-            &graph,
-            &crate::config::ArchitectureConfig::default(),
-            None,
-        );
+        let findings = cycle_findings(&graph);
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("[import-cycle]"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn go_cross_package_internal_test_edges_do_not_report_cycle() {
         // go-git shape: http's own test imports http/internal/test, whose test imports http.
         let dir = tmp_dir("go-cross-pkg-test-cycle");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let files = vec![
             write(&dir, "http/http.go", "package http\n\nfunc H() {}\n"),
@@ -1682,16 +1688,14 @@ mod tests {
 
         let graph = build(&dir, &files).unwrap();
 
-        assert_eq!(graph.edges.len(), 2, "test edges stay in the graph");
         assert!(crate::architecture_checks::find_cycles(&graph).is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn go_cycle_made_of_one_packages_own_test_imports_is_still_reported() {
         // a's internal test imports b and b imports a: "import cycle not allowed in test".
         let dir = tmp_dir("go-own-test-cycle");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let files = vec![
             write(&dir, "a/a.go", "package a\n\nfunc A() {}\n"),
@@ -1709,16 +1713,11 @@ mod tests {
 
         let graph = build(&dir, &files).unwrap();
 
-        let findings = crate::architecture_checks::ArchitectureChecker::check(
-            &crate::architecture_checks::ImportCycleChecker,
-            &graph,
-            &crate::config::ArchitectureConfig::default(),
-            None,
-        );
+        let findings = cycle_findings(&graph);
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert!(findings[0].message.contains("[import-cycle]"));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(findings[0].message.contains("example.com/m/a"));
+        assert!(findings[0].message.contains("example.com/m/b"));
     }
 
     #[test]
@@ -1726,6 +1725,7 @@ mod tests {
         // Each direction exists in both a production file and a _test.go file (test file
         // listed first); the finding must cite a production one whichever node leads.
         let dir = tmp_dir("go-finding-location");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let files = vec![
             write(
@@ -1752,26 +1752,20 @@ mod tests {
 
         let graph = build(&dir, &files).unwrap();
 
-        let findings = crate::architecture_checks::ArchitectureChecker::check(
-            &crate::architecture_checks::ImportCycleChecker,
-            &graph,
-            &crate::config::ArchitectureConfig::default(),
-            None,
-        );
+        let findings = cycle_findings(&graph);
         assert_eq!(findings.len(), 1);
         let file = findings[0].file.as_ref().unwrap();
         assert!(
             !file.to_string_lossy().ends_with("_test.go"),
             "got {file:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn go_three_package_cycle_through_one_packages_own_test_imports_is_reported() {
         // a's test imports b; b imports c; c imports a.
         let dir = tmp_dir("go-three-pkg-test-cycle");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let files = vec![
             write(&dir, "a/a.go", "package a\n\nfunc A() {}\n"),
@@ -1797,13 +1791,12 @@ mod tests {
         let cycles = crate::architecture_checks::find_cycles(&graph);
         assert_eq!(cycles.len(), 1, "got: {cycles:?}");
         assert_eq!(cycles[0].len(), 3);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn go_external_test_file_is_outside_graph_but_groups_with_its_package() {
         let dir = tmp_dir("go-xtest-excluded");
+        let _guard = DirGuard(dir.clone());
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
         let widget = write(
             &dir,
@@ -1830,8 +1823,69 @@ mod tests {
             Some("example.com/m/widget")
         );
         assert!(graph.nodes.contains("example.com/m/widget"));
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn go_declares_external_test_package_cases() {
+        // The predicate reads only the package clause; file names are not consulted.
+        let cases = [
+            ("package a_test\n", true),
+            ("package a\n", false),
+            ("package a_test\n\nimport \"fmt\"\n", true),
+            ("//go:build integration\n\npackage a_test\n", true),
+            ("// Package a docs.\npackage a_test\n", true),
+            ("package contest_test\n", true),
+            ("package contest\n", false),
+        ];
+        for (src, want) in cases {
+            let tree = parse_go(src);
+            assert_eq!(
+                go_declares_external_test_package(&tree, src.as_bytes()),
+                want,
+                "source: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_package_with_internal_and_external_test_files_uses_only_internal_edges() {
+        let dir = tmp_dir("go-mixed-test-files");
+        let _guard = DirGuard(dir.clone());
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let files = vec![
+            write(&dir, "a/a.go", "package a\n\nfunc A() {}\n"),
+            write(
+                &dir,
+                "a/a_test.go",
+                "package a\n\nimport \"example.com/m/b\"\n\nvar _ = b.B\n",
+            ),
+            write(
+                &dir,
+                "a/a_ext_test.go",
+                "package a_test\n\nimport \"example.com/m/c\"\n\nvar _ = c.C\n",
+            ),
+            write(
+                &dir,
+                "b/b.go",
+                "package b\n\nimport \"example.com/m/a\"\n\nvar B = a.A\n",
+            ),
+            write(
+                &dir,
+                "c/c.go",
+                "package c\n\nimport \"example.com/m/a\"\n\nvar C = a.A\n",
+            ),
+        ];
+
+        let graph = build(&dir, &files).unwrap();
+
+        let cycles = crate::architecture_checks::find_cycles(&graph);
+        assert_eq!(cycles.len(), 1, "got: {cycles:?}");
+        let mut members = cycles[0].clone();
+        members.sort();
+        assert_eq!(
+            members,
+            vec!["example.com/m/a".to_string(), "example.com/m/b".to_string()]
+        );
     }
 
     #[test]

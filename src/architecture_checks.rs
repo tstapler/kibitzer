@@ -516,51 +516,41 @@ impl ArchitectureChecker for ComponentDependencyChecker {
     }
 }
 
-/// Tarjan's SCC algorithm, keeping only components with more than one node (or a
-/// single node with a self-edge) — those are the only SCCs that represent an actual
-/// import cycle rather than an isolated, acyclic package. Exposed (not just used
-/// internally by `ImportCycleChecker`) so `src/mermaid.rs` can highlight cycle edges
-/// in the rendered dependency diagram without re-deriving SCCs itself.
+/// Cyclic SCCs (Tarjan) of the import graph: components with >1 node or a self-edge.
+/// Public so `src/mermaid.rs` can highlight cycle edges.
 ///
-/// Go test builds are modelled per package: the production graph uses only non-`_test.go`
-/// edges, and each package `P` is then re-checked with just `P`'s own `_test.go` edges
-/// added ("import cycle not allowed in test"). `_test.go` edges from two different
-/// packages never compile together, so they are never combined into one cycle.
+/// Go `_test.go` edges are checked per package: production edges first, then each
+/// package `P` again with only `P`'s own test edges added.
 pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     let mut cycles = cyclic_sccs(graph, &|e| !is_test_file_edge(e));
 
     // A package already in a production cycle is not re-checked: that cycle is itself a
     // compile error and is reported as-is.
-    let in_cycle: HashSet<&str> = cycles.iter().flatten().map(String::as_str).collect();
+    let in_cycle: HashSet<String> = cycles.iter().flatten().cloned().collect();
     let mut test_edges_by_pkg: BTreeMap<&str, Vec<&ImportEdge>> = BTreeMap::new();
     for e in graph.edges.iter().filter(|e| is_test_file_edge(e)) {
         test_edges_by_pkg.entry(&e.from).or_default().push(e);
     }
     let production = ReverseProduction::new(graph);
-    let mut extra = Vec::new();
+    let mut seen: HashSet<Vec<String>> = cycles.iter().map(|c| canonical(c)).collect();
     for (pkg, test_edges) in test_edges_by_pkg {
         if in_cycle.contains(pkg) || !production.any_reaches(pkg, &test_edges) {
             continue;
         }
         let with_own_tests = |e: &ImportEdge| !is_test_file_edge(e) || e.from == pkg;
-        extra.extend(
-            cyclic_sccs(graph, &with_own_tests)
-                .into_iter()
-                .filter(|scc| scc.iter().any(|m| m == pkg)),
-        );
-    }
-    let sorted = |scc: &[String]| {
-        let mut key = scc.to_vec();
-        key.sort();
-        key
-    };
-    let mut seen: HashSet<Vec<String>> = cycles.iter().map(|c| sorted(c)).collect();
-    for scc in extra {
-        if seen.insert(sorted(&scc)) {
-            cycles.push(scc);
+        for scc in cyclic_sccs(graph, &with_own_tests) {
+            if scc.iter().any(|m| m == pkg) && seen.insert(canonical(&scc)) {
+                cycles.push(scc);
+            }
         }
     }
     cycles
+}
+
+fn canonical(scc: &[String]) -> Vec<String> {
+    let mut key = scc.to_vec();
+    key.sort();
+    key
 }
 
 /// The non-`_test.go` edges reversed and integer-indexed, built once so the per-package
@@ -1188,6 +1178,20 @@ mod tests {
         g.edges.push(edge_at("b", "a", "b/b.go", 1));
         g.edges.push(edge_at("a", "b", "a/a_test.go", 2));
         assert_eq!(find_cycles(&g).len(), 1);
+    }
+
+    #[test]
+    fn find_cycles_keeps_production_cycle_members_when_a_cycle_package_has_test_edges() {
+        // Re-checking `a` with its test edge would yield {a, b, c}; the skip keeps {a, b}.
+        let mut g = ImportGraph::default();
+        g.nodes.extend(["a", "b", "c"].map(String::from));
+        g.edges.push(edge_at("a", "b", "a/a.go", 1));
+        g.edges.push(edge_at("b", "a", "b/b.go", 1));
+        g.edges.push(edge_at("a", "c", "a/a_test.go", 2));
+        g.edges.push(edge_at("c", "a", "c/c.go", 1));
+        let cycles = find_cycles(&g);
+        assert_eq!(cycles.len(), 1, "got: {cycles:?}");
+        assert_eq!(canonical(&cycles[0]), vec!["a", "b"]);
     }
 
     #[test]
