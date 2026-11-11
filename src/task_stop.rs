@@ -232,7 +232,9 @@ fn stop_hook_context(
         return Ok(None);
     }
 
-    let lines_out = stop_hook_findings_for_files(cwd, &files)?;
+    let reports = crate::false_positive::read_reports(&crate::false_positive::default_queue_path())
+        .unwrap_or_default();
+    let lines_out = stop_hook_findings_for_files(cwd, &files, &reports)?;
     if lines_out.is_empty() {
         return Ok(None);
     }
@@ -256,7 +258,14 @@ fn format_report(files: &BTreeSet<PathBuf>, lines_out: &[String]) -> String {
 /// `{file}: {check_name}: {description}` — split out from [`run_stop_hook_with_offsets_dir`]
 /// so a test can exercise the recheck-and-filter behavior directly against a real repo
 /// fixture without going through the transcript/offset-tracking machinery.
-fn stop_hook_findings_for_files(cwd: &Path, files: &BTreeSet<PathBuf>) -> Result<Vec<String>> {
+///
+/// A finding whose `(check, file, file content)` matches a queued `report_false_positive`
+/// is skipped, so reporting a false positive silences it until the file changes.
+fn stop_hook_findings_for_files(
+    cwd: &Path,
+    files: &BTreeSet<PathBuf>,
+    reports: &[crate::false_positive::FalsePositiveReport],
+) -> Result<Vec<String>> {
     // Loaded once so `predates_git_head` can look up each failing result's own `Check`
     // (native/command, scope, etc.) by name — `run_checks_smart` only hands back the
     // resulting `CheckResult`s, not the config that produced them.
@@ -271,8 +280,16 @@ fn stop_hook_findings_for_files(cwd: &Path, files: &BTreeSet<PathBuf>) -> Result
             continue;
         }
         let results = crate::daemon::run_checks_smart(cwd, file, TRIGGER, None, false)?;
+        let hash = crate::false_positive::file_content_hash(file);
         for result in results.iter().filter(|r| !r.passed) {
-            if predates_git_head(&config, &repo_root, file, result) {
+            if predates_git_head(&config, &repo_root, file, result)
+                || crate::false_positive::is_reported(
+                    reports,
+                    &result.check_name,
+                    file,
+                    hash.as_deref(),
+                )
+            {
                 continue;
             }
             lines_out.push(format!(
@@ -600,7 +617,7 @@ mod tests {
         git(&dir, &["commit", "-q", "-m", "initial"]);
 
         let files = BTreeSet::from([target.clone()]);
-        let lines = stop_hook_findings_for_files(&dir, &files).unwrap();
+        let lines = stop_hook_findings_for_files(&dir, &files, &[]).unwrap();
         assert!(
             lines
                 .iter()
@@ -628,12 +645,64 @@ mod tests {
         std::fs::write(&target, "This is bad. This is worse. This is worst.\n").unwrap();
 
         let files = BTreeSet::from([target.clone()]);
-        let lines = stop_hook_findings_for_files(&dir, &files).unwrap();
+        let lines = stop_hook_findings_for_files(&dir, &files, &[]).unwrap();
         assert!(
             lines
                 .iter()
                 .any(|l| l.contains("repetitive-sentence-structure")),
             "newly introduced finding should still be reported, got: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_hook_skips_a_finding_already_reported_false_positive_until_file_changes() {
+        let dir = tmp_path("reported-fp-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+        let target = dir.join("doc.md");
+        std::fs::write(&target, "Clean prose.\n").unwrap();
+        git(&dir, &["add", "doc.md"]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        std::fs::write(&target, "This is bad. This is worse. This is worst.\n").unwrap();
+        let files = BTreeSet::from([target.clone()]);
+
+        let before = stop_hook_findings_for_files(&dir, &files, &[]).unwrap();
+        assert!(!before.is_empty(), "precondition: finding fires");
+
+        let report = crate::false_positive::FalsePositiveReport {
+            date: "2026-11-10".into(),
+            check_name: "repetitive-sentence-structure".into(),
+            file: target.to_string_lossy().into_owned(),
+            what_changed: String::new(),
+            why_false_positive: String::new(),
+            mechanism: None,
+            repo: None,
+            session: None,
+            file_hash: crate::false_positive::file_content_hash(&target),
+        };
+        let reports = [report];
+        let suppressed = stop_hook_findings_for_files(&dir, &files, &reports).unwrap();
+        assert!(
+            suppressed
+                .iter()
+                .all(|l| !l.contains("repetitive-sentence-structure")),
+            "{suppressed:?}"
+        );
+
+        std::fs::write(
+            &target,
+            "This is bad. This is worse. This is worst. Again.\n",
+        )
+        .unwrap();
+        let after_edit = stop_hook_findings_for_files(&dir, &files, &reports).unwrap();
+        assert!(
+            after_edit
+                .iter()
+                .any(|l| l.contains("repetitive-sentence-structure"))
         );
 
         std::fs::remove_dir_all(&dir).ok();

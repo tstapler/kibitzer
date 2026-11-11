@@ -28,6 +28,36 @@ pub struct FalsePositiveReport {
     pub repo: Option<String>,
     #[serde(default)]
     pub session: Option<String>,
+    /// SHA-256 of the file's contents when the report was filed; lets the Stop hook stop
+    /// re-reporting that file until its content changes. Absent on older reports.
+    #[serde(default)]
+    pub file_hash: Option<String>,
+}
+
+/// Hex SHA-256 of `path`'s current contents, or `None` if unreadable.
+pub fn file_content_hash(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    let digest = Sha256::digest(bytes);
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether a queued report already covers a finding from `check_name` on `file` in its
+/// current state (`current_hash`): same check, same path, same file content.
+pub fn is_reported(
+    reports: &[FalsePositiveReport],
+    check_name: &str,
+    file: &Path,
+    current_hash: Option<&str>,
+) -> bool {
+    let Some(current_hash) = current_hash else {
+        return false;
+    };
+    reports.iter().any(|r| {
+        r.check_name == check_name
+            && Path::new(&r.file) == file
+            && r.file_hash.as_deref() == Some(current_hash)
+    })
 }
 
 /// `$XDG_DATA_HOME/kibitzer/false-positive-reports.jsonl`, falling back to
@@ -163,6 +193,7 @@ mod tests {
             mechanism: Some("src/go_ignored_error.rs::scan_block".to_string()),
             repo: Some("tstapler/kibitzer".to_string()),
             session: Some("triage-1".to_string()),
+            file_hash: None,
         }
     }
 

@@ -428,6 +428,24 @@ also the one that deletes/shrinks the old inline-link prose it's replacing.
   `yaml_frontmatter_arrays_are_not_flagged`,
   `dangling_ref_after_toml_frontmatter_keeps_original_line`,
   `unclosed_toml_frontmatter_still_checks_body`.
+- **Backtest** (baseline `9c93b23` vs. head, `kibitzer check native markdown-link-integrity`
+  per file, over all 31 `.md` files in the `tstapler/personal-website` Hugo repo, which
+  use `+++` frontmatter): 78 output lines before, 4 after. 28 of the 31 files went from
+  2-4 lines to 0 (all frontmatter noise); the 3 remaining files (`cert_updates`,
+  `the_powerline_effect`, `pgbouncer-zero-downtime`) each dropped from 3-4 lines to 1,
+  which is a body finding (`[another post]`/`[blog post] used but never defined`,
+  `#demo-repo -> no such heading`), not frontmatter. No file gained findings.
+- **Related: "unnamed finding" and repeat-after-report.** The leading
+  `broken markdown link/anchor` line is the check's configured `message` header
+  (`src/config.rs`); `CheckResult::describe` (`src/check_result.rs`) prints it above one
+  line per finding, so it was never unnamed (`kibitzer run` on a file with two dangling
+  refs prints the header plus `t.md:1: [missing] used but never defined` and
+  `t.md:1: [nope] used but never defined`). The repeat: nothing consulted the
+  `report_false_positive` queue (`read_reports` was only used by the CLI list command), so
+  filing a report never silenced the Stop hook. Reports now record a SHA-256 of the file
+  (`file_hash`), and the Stop hook skips a finding whose check, file and current content
+  hash match a queued report; editing the file re-enables it. Test:
+  `stop_hook_skips_a_finding_already_reported_false_positive_until_file_changes`.
 
 ## Resolution: native `markdown-link-integrity` checker + grace period
 
