@@ -78,6 +78,22 @@ pub(crate) fn go_subtype_is_foreign(
     sub.file.extension().is_some_and(|e| e == "go") && sub_pkg.path != sup_pkg.path
 }
 
+/// TS/Kotlin: a method named `constructor`. Java: a method named after its owning type.
+pub(crate) fn is_constructor(sym: &SymbolNode) -> bool {
+    sym.name == "constructor"
+        || (sym.file.extension().is_some_and(|e| e == "java")
+            && sym.parent.as_deref() == Some(sym.name.as_str()))
+}
+
+/// `func (r *T) M(` -> `r`.
+pub(crate) fn go_receiver_ident_from_line(first_line: &str) -> Option<&str> {
+    let rest = first_line.trim_start().strip_prefix("func")?.trim_start();
+    let rest = rest.strip_prefix('(')?.trim_start();
+    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    let name = &rest[..end];
+    (!name.is_empty() && name != "_").then_some(name)
+}
+
 /// Supertype id -> its direct subtype ids (sorted), from [`resolved_extends`] pairs.
 pub(crate) fn subtypes_by_super<'a>(
     pairs: &[(&'a str, &'a str)],

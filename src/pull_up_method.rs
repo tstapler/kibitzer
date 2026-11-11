@@ -152,23 +152,40 @@ mod tests {
 
         let mut m = build(GO_A, GO_B, true, false);
         let root = m.repo_root.clone();
+        // Move only the *types* under testdata/: the method files stay real and readable,
+        // so the ignorable-file filter is the only thing that can explain the silence.
         for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
-            if s.name == "Do" {
-                s.file = root.join("testdata").join("a.go");
+            if s.kind == SymbolKind::Type {
+                s.file = root.join("testdata").join("types.go");
             }
         }
         assert!(run(&m).is_empty());
+        let mut control = build(GO_A, GO_B, true, false);
+        assert_eq!(
+            run(&control).len(),
+            1,
+            "same data fires without the testdata move"
+        );
+        control.type_edges.clear();
     }
 
     #[test]
     fn constructors_are_not_pull_up_method_candidates() {
+        use crate::pull_up_common::{MemberKind, find_pull_up_candidates};
         let ts = "class A {\n  constructor() {\n    this.a = 1;\n    this.b = 2;\n  }\n}\n";
         let mut m = build(ts, ts, true, false);
         for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
             if s.name == "Do" {
                 s.name = "constructor".into();
+                s.line = 2;
+                s.end_line = Some(5);
             }
         }
         assert!(run(&m).is_empty());
+        assert_eq!(
+            find_pull_up_candidates(&m, MemberKind::Constructor).len(),
+            1,
+            "positive control: the same data is a constructor-body candidate"
+        );
     }
 }

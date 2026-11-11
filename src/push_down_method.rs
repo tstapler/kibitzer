@@ -18,16 +18,21 @@ use crate::arch_model::{ArchModel, CallEdge};
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 use crate::hierarchy_checks::{
-    is_ignorable_file, methods_of, owner_type_id, resolved_extends, subtree, subtypes_by_super,
-    type_index,
+    go_receiver_ident_from_line, is_constructor, is_ignorable_file, methods_of, owner_type_id,
+    resolved_extends, subtree, subtypes_by_super, type_index,
 };
-use crate::pull_up_common::{go_receiver_name, is_constructor};
 
 pub struct PushDownMethodChecker;
 
 impl ArchModelChecker for PushDownMethodChecker {
     fn name(&self) -> &str {
         "push-down-method"
+    }
+
+    /// Callers and subtypes are frequently unexported; without them the receiver check below
+    /// cannot find the caller and the hierarchy is missing its private members.
+    fn needs_private_symbols(&self) -> bool {
+        true
     }
 
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
@@ -114,7 +119,7 @@ impl ArchModelChecker for PushDownMethodChecker {
                 });
             }
         }
-        findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+        findings.sort_by(|a, b| (&a.file, a.line, &a.message).cmp(&(&b.file, b.line, &b.message)));
         findings
     }
 }
@@ -133,8 +138,9 @@ fn called_through_own_receiver(
     }) else {
         return true;
     };
+    // An unmodeled caller cannot be verified, so it blocks the finding.
     let Some(caller) = symbols.get(edge.from.as_str()) else {
-        return true;
+        return false;
     };
     let is_go = caller.file.extension().is_some_and(|e| e == "go");
     let recv = if is_go {
@@ -143,7 +149,7 @@ fn called_through_own_receiver(
             .and_then(|t| {
                 t.lines()
                     .nth(caller.line.saturating_sub(1))
-                    .and_then(|l| go_receiver_name(l).map(str::to_string))
+                    .and_then(|l| go_receiver_ident_from_line(l).map(str::to_string))
             })
             .unwrap_or_default()
     } else {

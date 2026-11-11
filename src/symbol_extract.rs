@@ -2711,11 +2711,10 @@ mod tests {
             "class A {\n  A(int x) {\n    this.x = x;\n  }\n}\n",
             "p",
         );
-        let c = find_by_name(&java, "A");
         let ctor = java
             .iter()
             .find(|s| s.name == "A" && s.kind == SymbolKind::Method)
-            .unwrap_or(c);
+            .expect("Java constructor extracted as a Method");
         assert_eq!(ctor.kind, SymbolKind::Method);
         assert_eq!(ctor.parent.as_deref(), Some("A"));
         assert_eq!(ctor.end_line, Some(4));

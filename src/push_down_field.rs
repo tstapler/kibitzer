@@ -27,10 +27,28 @@ impl ArchModelChecker for PushDownFieldChecker {
         "push-down-field"
     }
 
+    /// Subtypes (and their accessor methods) are frequently unexported.
+    fn needs_private_symbols(&self) -> bool {
+        true
+    }
+
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
         let types = type_index(model);
         let pairs = resolved_extends(model, &types);
         let children = subtypes_by_super(&pairs);
+
+        let mut accesses_by_field: std::collections::HashMap<
+            &str,
+            Vec<&crate::arch_model::FieldAccessEdge>,
+        > = std::collections::HashMap::new();
+        for a in model
+            .field_accesses
+            .iter()
+            .chain(&model.promoted_field_accesses)
+            .filter(|a| !is_ignorable_file(model, &a.file))
+        {
+            accesses_by_field.entry(a.to.as_str()).or_default().push(a);
+        }
 
         let mut findings = Vec::new();
         for (&sup_id, subs) in &children {
@@ -56,12 +74,7 @@ impl ArchModelChecker for PushDownFieldChecker {
                 let mut owning = BTreeSet::new();
                 let mut evidence = false;
                 let mut blocked = false;
-                for a in model
-                    .field_accesses
-                    .iter()
-                    .chain(&model.promoted_field_accesses)
-                    .filter(|a| a.to == to && !is_ignorable_file(model, &a.file))
-                {
+                for a in accesses_by_field.get(to.as_str()).into_iter().flatten() {
                     let owner = owner_type_id(&a.from);
                     // The supertype's own methods use the field, so moving it down breaks them.
                     if owner == Some(sup_id) {

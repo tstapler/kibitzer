@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use crate::arch_model::{ArchModel, SymbolNode};
 use crate::architecture_checks::ArchFinding;
 use crate::hierarchy_checks::{
-    go_subtype_is_foreign, is_ignorable_file, methods_of, resolved_extends, subtypes_by_super,
-    type_index,
+    go_receiver_ident_from_line, go_subtype_is_foreign, is_constructor, is_ignorable_file,
+    methods_of, resolved_extends, subtypes_by_super, type_index,
 };
 
 /// Bodies shorter than this many non-blank lines are too generic to flag.
@@ -30,13 +30,6 @@ impl MemberKind {
             MemberKind::Constructor => "pull-up-constructor-body",
         }
     }
-}
-
-/// TS/Kotlin: a method named `constructor`. Java: a method named after its owning type.
-pub(crate) fn is_constructor(sym: &SymbolNode) -> bool {
-    sym.name == "constructor"
-        || (sym.file.extension().is_some_and(|e| e == "java")
-            && sym.parent.as_deref() == Some(sym.name.as_str()))
 }
 
 /// A method whose line range lies inside another function/method of the same package and
@@ -161,7 +154,7 @@ pub(crate) fn find_pull_up_candidates(model: &ArchModel, kind: MemberKind) -> Ve
             });
         }
     }
-    findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    findings.sort_by(|a, b| (&a.file, a.line, &a.message).cmp(&(&b.file, b.line, &b.message)));
     findings
 }
 
@@ -215,6 +208,9 @@ impl SourceCache {
 /// Whitespace-collapsed text of the first balanced `( ... )` in the signature lines (up to
 /// the opening-brace line).
 fn signature_params_text(slice: &[String]) -> String {
+    if slice.is_empty() {
+        return String::new();
+    }
     let end = slice
         .iter()
         .position(|l| l.trim_end().ends_with('{'))
@@ -264,16 +260,26 @@ fn normalise_body(slice: &[String]) -> Option<String> {
         return None;
     }
     let mut body = slice[open + 1..last].join("\n");
-    if let Some(recv) = go_receiver_name(slice.first()?) {
+    if let Some(recv) = go_receiver_ident_from_line(slice.first()?) {
         body = replace_ident(&body, recv, "RECV");
     }
-    let norm: Vec<String> = body
-        .lines()
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| {
-            !l.is_empty() && !l.starts_with("//") && !l.starts_with('*') && !l.starts_with("/*")
-        })
-        .collect();
+    let mut in_block_comment = false;
+    let mut norm: Vec<String> = Vec::new();
+    for raw in body.lines() {
+        let l = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if in_block_comment {
+            in_block_comment = !l.contains("*/");
+            continue;
+        }
+        if l.is_empty() || l.starts_with("//") {
+            continue;
+        }
+        if l.starts_with("/*") {
+            in_block_comment = !l.contains("*/");
+            continue;
+        }
+        norm.push(l);
+    }
     (norm.len() >= MIN_BODY_LINES).then(|| norm.join("\n"))
 }
 
@@ -306,15 +312,6 @@ fn go_body_pullable(
         }
     }
     true
-}
-
-/// `func (r *T) M(` -> `r`.
-pub(crate) fn go_receiver_name(first_line: &str) -> Option<&str> {
-    let rest = first_line.trim_start().strip_prefix("func")?.trim_start();
-    let rest = rest.strip_prefix('(')?.trim_start();
-    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
-    let name = &rest[..end];
-    (!name.is_empty() && name != "_").then_some(name)
 }
 
 fn replace_ident(text: &str, from: &str, to: &str) -> String {
@@ -419,6 +416,19 @@ mod tests {
         let b = signature_params_text(&lines("  private B(SimpleClient client, String q) {"));
         assert_eq!(a, "(JavaDriverClient client, String q");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn dereference_statements_are_code_not_comments() {
+        let a = normalise_body(&lines("func (a *A) F() {\n\t*a.p = 1\n\ta.q()\n}"));
+        let b = normalise_body(&lines("func (b *B) F() {\n\t*b.p = 2\n\tb.q()\n}"));
+        assert!(a.is_some());
+        assert_ne!(a, b);
+        let c = normalise_body(&lines(
+            "void m() {\n  /* note\n   * more\n   */\n  a();\n  b();\n}",
+        ));
+        let d = normalise_body(&lines("void m() {\n  a();\n  b();\n}"));
+        assert_eq!(c, d, "block comments are still ignored");
     }
 
     #[test]
