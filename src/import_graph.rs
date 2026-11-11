@@ -259,6 +259,9 @@ fn build_qualified_name_language(
     // Pass 2: extract each file's imports and add an edge only for those that resolve
     // to a `graph.nodes` entry (the graph-membership guard).
     for (file, pkg, tree, source) in &file_packages {
+        if (cfg.skips_edges)(tree, source.as_bytes()) {
+            continue;
+        }
         let mut imports = Vec::new();
         (cfg.collect_imports)(tree.root_node(), source.as_bytes(), &mut imports);
 

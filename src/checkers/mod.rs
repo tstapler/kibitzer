@@ -35,6 +35,12 @@ pub mod primitive_obsession;
 pub mod repetitive_sentences;
 pub mod rules;
 pub mod sentence_length_uniformity;
+mod sentinel_return;
+pub mod sentinel_return_java;
+pub mod sentinel_return_javascript;
+pub mod sentinel_return_kotlin;
+pub mod sentinel_return_python;
+pub mod sentinel_return_typescript;
 pub mod split_loop;
 pub mod test_no_assertion;
 
