@@ -358,3 +358,8 @@ Full suite after the change: `cargo test --workspace` → 2576 passed, 0 failed,
 `refactor_core::txn::tests::the_lock_covers_everything_between_session_and_commit` failure on one earlier run; its output was not captured, so
 no root cause is established. Reruns: 20/20 pass in isolation, 20/20 pass under 8 busy-loop CPU hogs, 6/6 pass for the whole `refactor_core::` module.
 This branch's source diff vs 635eab4 touches only `src/import_graph.rs`, which `src/refactor_core/` does not reference.)
+
+**AC3 status: NOT MET as written (reported fail, pending a human decision).** The literal criterion
+(`X_test` files excluded from the node/edge set) is not implemented; only their outgoing edges are skipped (see
+"Why AC3's literal ... is not met" above). Options for the owner: accept the deviation, or exclude the files and rework the
+refactor planner's package-rename handling.
