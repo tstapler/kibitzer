@@ -153,17 +153,18 @@ impl SourceCache {
     }
 }
 
-/// Text between the signature's opening `{` and the last `}`, whitespace-collapsed,
-/// comment-only lines dropped, Go receiver name replaced by `RECV`. `None` for a
-/// brace-less body (e.g. Kotlin expression body) or one under [`MIN_BODY_LINES`].
+/// The lines between the signature's opening-brace line (the first line ending in `{`, so
+/// a `{` inside a return type like Go's `interface{}` is not mistaken for it) and the
+/// closing `}` line, whitespace-collapsed, comment-only lines dropped, Go receiver name
+/// replaced by `RECV`. `None` for a brace-less body (e.g. Kotlin expression body), a
+/// one-line `{ ... }` body, or one under [`MIN_BODY_LINES`].
 fn normalise_body(slice: &[String]) -> Option<String> {
-    let text = slice.join("\n");
-    let open = text.find('{')?;
-    let close = text.rfind('}')?;
-    if close <= open {
+    let open = slice.iter().position(|l| l.trim_end().ends_with('{'))?;
+    let last = slice.len().checked_sub(1)?;
+    if open >= last || slice[last].trim() != "}" {
         return None;
     }
-    let mut body = text[open + 1..close].to_string();
+    let mut body = slice[open + 1..last].join("\n");
     if let Some(recv) = go_receiver_name(slice.first()?) {
         body = replace_ident(&body, recv, "RECV");
     }
@@ -246,6 +247,15 @@ mod tests {
         let c = normalise_body(&lines("void m() {\n  a();\n  c();\n}"));
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn brace_in_a_go_return_type_is_not_the_body_opener() {
+        let one_liner = normalise_body(&lines("func (m *M) Value() interface{} {\n\treturn m\n}"));
+        assert_eq!(
+            one_liner, None,
+            "a one-statement body stays too small to flag"
+        );
     }
 
     #[test]
