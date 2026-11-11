@@ -21,18 +21,27 @@ on Go: the first corpus run returned 0 hits for that reason, not because the cod
 
 ## Known false-positive patterns
 
-| Pattern | Why it fires | Status |
+| Pattern | Example | Status |
 |---|---|---|
-| Access through a non-receiver variable (`x.field` where `x` is a local) | Only receiver accesses are recorded. | Not filtered; mitigated for exported fields by the unexported-only rule. |
-| Field read by reflection / struct tags / serialization | Invisible to the model. | Not filtered. |
+| Access through a defined type that is not a struct: `type unmounterDefaults flexVolumeUnmounter` | kubernetes `flexVolume.mounter` is also read by `unmounterDefaults.TearDownAt`, but the model drops accesses from a receiver that declares no fields | Not filtered. |
+| Field set from a free function or through a local value rather than a method receiver | kubernetes `typesFromEnv.deviceType`/`attributeType` are assigned via `result.deviceType = ...` in `compile.go`, not from `sizeEstimator` | Not filtered (2 hits). |
+| Field read by reflection / struct tags / serialization | Invisible to the model | Not filtered. |
+| Access through a non-receiver variable (`x.field`, `x` a local) | Only receiver accesses are recorded | Mitigated for exported fields by the unexported-only rule. |
+
+The checker asks for private symbols (`needs_private_symbols`): subtypes are often unexported, and without
+them the first corpus pass saw only 3 of the 17 hits below.
 
 ## Backtest (release build, final)
 
-`kibitzer check architecture push-down-field <repo>`: kubernetes 3, all other seven repos 0.
-All 3 were read against the source: the unexported `initializeLabelAllowListsOnce` (`sync.Once`) on
-`HistogramOpts`/`TimingHistogramOpts`/`SummaryOpts`, used only inside the `*Vec` types' methods
-(`grep` over `component-base/metrics/*.go`); none is used by the plain (non-Vec) types. **0 false
-positives of 3 (0%)**, n is small. Transcript replay: 0 findings over 1818 snapshots.
+`kibitzer check architecture push-down-field <repo>`: kubernetes 17; cassandra, nowinandroid, servo,
+ripgrep, deno, vscode, stapler-squad 0. All 17 were read against the source (`grep` of every use of
+the field in its package). **3 false positives of 17 = 17.6%** (the first two patterns above), by one reviewer;
+n is small. The 14 plausible hits are the `flexVolume` pod fields, `downwardAPIVolume.pod`, `hostPath.pathType`,
+two `localVolume` fields, four `patcher` fields (each used by exactly one of `jsonPatcher`/`smpPatcher`), and the
+three `*Opts.initializeLabelAllowListsOnce` `sync.Once` fields used only by the `*Vec` types.
+Earlier builds: 12 of 12 sampled hits were false positives before the unexported-only rule; one stapler-squad hit
+(`ReviewState.lastAcknowledgedNs`) was removed once the supertype's own accesses blocked a finding.
+Transcript replay: 0 findings over 1818 snapshots.
 
 ## Suppression
 

@@ -15,6 +15,7 @@ subtype's descendants). Advisory, batch-only, on by default. Source: `ArchModel.
 | Each caller's source line goes through the calling method's own receiver (`this.m()`, `recv.m()`) | `snap.m()` on another value of the supertype would break (found on stapler-squad's `ReviewState`). An unreadable line is accepted. |
 | Exported, not used as a value, not a constructor, not overridden by any direct subtype | Overrides are polymorphism; value use is an unresolved caller. |
 | Test, `fixtures/`, `testdata/` files and unresolved `Extends` edges ignored | Same guard as the other hierarchy checks. |
+| Private symbols included (`needs_private_symbols`) | Callers and subtypes are often unexported; an unmodeled caller blocks the finding rather than being accepted. |
 
 ## Known false-positive patterns
 

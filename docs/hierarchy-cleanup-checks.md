@@ -19,7 +19,7 @@ see `suppressing-checks.md`.
 The last five have their own false-positive pages: `push-down-method-false-positives.md`,
 `push-down-field-false-positives.md`, `pull-up-method-false-positives.md`,
 `pull-up-constructor-body-false-positives.md`, `pull-up-field-false-positives.md`. Measured rates
-(all hits read by one reviewer): push-down-method 0 hits, so unmeasured; push-down-field 0/3;
+(all hits read by one reviewer): push-down-method 0 hits, so unmeasured; push-down-field 3/17 (17.6%);
 pull-up-method 0/20; pull-up-constructor-body 1/15; pull-up-field 6/23 (26%, over the 20% bar and
 documented). They need `SymbolNode::end_line`, `ArchModel::struct_field_names`/`struct_field_types`
 and `promoted_field_accesses`, added with them.
