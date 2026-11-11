@@ -27,14 +27,18 @@ subtype's descendants). Advisory, batch-only, on by default. Source: `ArchModel.
 
 ## Backtest (release build, final)
 
-Corpus (`docs/backtest-repos.md`; `kibitzer check architecture push-down-method <repo>`):
-kubernetes, cassandra, nowinandroid, servo, ripgrep, deno, vscode, stapler-squad: **0 findings on all
-eight**. The first run on stapler-squad produced 1 finding, a false positive (`snap.m()` case above),
-which the receiver check removed. Transcript replay (`kibitzer check backtest`, 1818 snapshots): 0.
+Every hit was read against the source by one reviewer; callers were checked with `grep` over the whole repo.
 
-Zero corpus hits means the false-positive rate is unmeasured, not 0%. That the check can fire is shown by
-unit tests and a hand-built Go fixture (two embedded subtypes, each calling a different base method):
-both methods were reported through the real binary.
+**Standard corpus** (`kibitzer check architecture push-down-method <repo>`, `docs/backtest-repos.md`): **0 hits** on all
+eight repos. The first run on stapler-squad produced 1 false positive (the `snap.m()` case above), which the receiver
+check removed.
+
+**Held-out repos** (not used to design any guard): argo-cd, caddy, trivy, containerd, etcd, docker/compose, syft, pack, cli, coredns (ten Go repos named before any of this check's output on them was seen). **3 hits** (caddy 2, trivy 1), all sound within
+the repo, so **0/3 false positives**, with the public-API caveat above. n is tiny, so treat the rate as "not yet
+contradicted", not as a measured 0%.
+
+Also shown by unit tests and a hand-built Go fixture (two embedded subtypes, each calling a different base method),
+reported through the real binary. Transcript replay: 0 findings over 1818 snapshots.
 
 ## Suppression
 

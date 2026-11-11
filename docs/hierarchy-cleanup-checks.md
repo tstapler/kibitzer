@@ -18,10 +18,10 @@ see `suppressing-checks.md`.
 
 The last five have their own false-positive pages: `push-down-method-false-positives.md`,
 `push-down-field-false-positives.md`, `pull-up-method-false-positives.md`,
-`pull-up-constructor-body-false-positives.md`, `pull-up-field-false-positives.md`. Measured rates
-(all hits read by one reviewer): push-down-method 0 hits, so unmeasured; push-down-field 3/17 (17.6%);
-pull-up-method 0/20; pull-up-constructor-body 1/15; pull-up-field 6/23 (26%, over the 20% bar and
-documented). They need `SymbolNode::end_line`, `ArchModel::struct_field_names`/`struct_field_types`
+`pull-up-constructor-body-false-positives.md`, `pull-up-field-false-positives.md`. Measured rates (every hit read by one reviewer; standard corpus plus ten held-out Go repos): push-down-method 0/3 (0 corpus
+hits, 3 held-out); push-down-field 4/20; pull-up-method 0/21; pull-up-constructor-body 1/15 (corpus only); pull-up-field 5/34
+overall, 3/15 = 20.0% on the held-out repos alone (the corpus rate is optimistic because two guards were tuned on it). Samples are
+small. They need `SymbolNode::end_line`, `ArchModel::struct_field_names`/`struct_field_types`
 and `promoted_field_accesses`, added with them.
 
 Guards added after backtesting and code review (not in the original issue). All three skip test and `fixtures/`/`testdata/` files: `extract-superclass` skips test

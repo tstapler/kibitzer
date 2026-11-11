@@ -31,11 +31,18 @@ lines is skipped. Works for every language that has methods in the model (Go, TS
 
 ## Backtest (release build, final; `kibitzer check architecture pull-up-method <repo>`)
 
-cassandra 16, kubernetes 2, vscode 2; nowinandroid, servo, ripgrep, deno, stapler-squad 0.
-All 20 hits read: all 20 are plausible pull-up candidates (duplicated shard loops in the two memtables,
-`ListType`/`SetType`, `Direct`/`Standard` readers, TS `capabilities` getters, Go `SignPod`). **0 false
-positives of 20 (0%)**, by one reviewer. Iterations on the way: first build 92 hits with 5 of 14
-sampled wrong (36%); after the Go receiver guard 44 hits, then these guards. Transcript replay: 0 over 1818 snapshots.
+Every hit was read against the source by one reviewer.
+
+**Standard corpus**: cassandra 16, kubernetes 2, vscode 2; nowinandroid, servo, ripgrep, deno, stapler-squad 0. All 20 are
+plausible pull-up candidates (duplicated shard loops in the two memtables, `ListType`/`SetType`, `Direct`/`Standard` readers,
+TS `capabilities` getters, Go `SignPod`): **0/20**.
+
+**Held-out Go repos** (not used to design any guard): argo-cd, caddy, trivy, containerd, etcd, docker/compose, syft, pack, cli, coredns (ten Go repos named before any of this check's output on them was seen). 1 hit (containerd `Commit` on the two Windows
+snapshotters, identical bodies over the embedded `windowsBaseSnapshotter`), plausible: **0/1**. No held-out Java/TS repo
+was available.
+
+Combined **0/21**. Iterations on the way: the first build gave 92 hits with 5 of 14 sampled wrong (36%); the Go receiver
+guard, then the guards in the table above, got to the current figures. Transcript replay: 0 over 1818 snapshots.
 
 ## Suppression
 

@@ -37,14 +37,17 @@ pub(crate) fn resolved_extends<'a>(
     pairs
 }
 
-/// Test and fixture files (`fixtures/`, `testdata/`) hold deliberately odd shapes; the
-/// hierarchy checks skip them.
+/// Test and fixture files (`fixtures/`, `testdata/`, and codegen golden output under
+/// `output_tests/`) hold deliberately odd shapes; the hierarchy checks skip them.
 pub(crate) fn is_ignorable_file(model: &ArchModel, file: &std::path::Path) -> bool {
     let rel = file.strip_prefix(&model.repo_root).unwrap_or(file);
     is_test_file(rel)
-        || rel
-            .components()
-            .any(|c| matches!(c.as_os_str().to_str(), Some("fixtures" | "testdata")))
+        || rel.components().any(|c| {
+            matches!(
+                c.as_os_str().to_str(),
+                Some("fixtures" | "testdata" | "output_tests")
+            )
+        })
 }
 
 /// Non-test methods declared directly on `type_name` in `pkg`.

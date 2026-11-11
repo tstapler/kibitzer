@@ -10,7 +10,8 @@ use crate::arch_model::ArchModel;
 use crate::architecture_checks::{ArchFinding, ArchModelChecker};
 use crate::config::ArchitectureConfig;
 use crate::hierarchy_checks::{
-    go_subtype_is_foreign, is_ignorable_file, resolved_extends, subtypes_by_super, type_index,
+    go_subtype_is_foreign, is_ignorable_file, methods_of, resolved_extends, subtypes_by_super,
+    type_index,
 };
 
 pub struct PullUpFieldChecker;
@@ -33,6 +34,13 @@ impl ArchModelChecker for PullUpFieldChecker {
         for (&sup_id, subs) in &children {
             let (sup_pkg, sup) = types[sup_id];
             let sup_fields = model.struct_field_names.get(sup_id);
+            // An empty marker type (`type ExtraConfig struct{}`) is an extension hook, not a
+            // supertype with a role to pull state into.
+            if sup_fields.is_none_or(|f| f.is_empty())
+                && methods_of(model, sup_pkg, &sup.name).is_empty()
+            {
+                continue;
+            }
             let mut groups: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
             for &sub_id in subs {
                 let (spkg, st) = types[sub_id];
@@ -117,6 +125,8 @@ mod tests {
                 sym("pkg", "Base", SymbolKind::Type, None),
                 sym("pkg", "A", SymbolKind::Type, None),
                 sym("pkg", "B", SymbolKind::Type, None),
+                // A supertype needs a role (a method) to not be an empty marker type.
+                sym("pkg", "Run", SymbolKind::Method, Some("Base")),
             ],
             vec![
                 edge("pkg::A", "pkg::Base", true),
@@ -204,6 +214,19 @@ mod tests {
             .push(sym("pkg", "D", SymbolKind::Type, None));
         // 2 of 4 subtypes (A, B) declare it: not a majority.
         assert!(run(&m).is_empty());
+    }
+
+    #[test]
+    fn silent_when_the_supertype_is_an_empty_marker_type() {
+        let mut m = build(&[("c", "int")], &[("c", "int")], &[]);
+        assert_eq!(run(&m).len(), 1, "positive control: Base has a method");
+        m.packages
+            .get_mut("pkg")
+            .unwrap()
+            .symbols
+            .retain(|s| s.kind != SymbolKind::Method);
+        m.struct_field_names.clear();
+        assert!(run(&m).is_empty(), "no fields and no methods: empty marker");
     }
 
     #[test]

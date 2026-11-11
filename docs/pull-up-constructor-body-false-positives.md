@@ -22,10 +22,14 @@ showed no change in any output.
 
 ## Backtest (release build, final; `kibitzer check architecture pull-up-constructor-body <repo>`)
 
-cassandra 11, deno 2, vscode 2; kubernetes, nowinandroid, servo, ripgrep, stapler-squad 0. All 15 hits
-read: 14 plausible (shared `super(...)` plus field assignment), 1 false positive (the JS illegal-constructor
-idiom). **1 of 15 (6.7%)**, by one reviewer. The first build (22 hits) had 3 of 11 sampled wrong (27%): different
-parameter types, a per-class constant, and the JS idiom. Transcript replay: 0 over 1818 snapshots.
+Every hit was read against the source by one reviewer.
+
+**Standard corpus**: cassandra 11, deno 2, vscode 2; kubernetes, nowinandroid, servo, ripgrep, stapler-squad 0. 14 plausible
+(shared `super(...)` plus field assignment), 1 false positive (the JS illegal-constructor idiom): **1/15 = 6.7%**.
+
+**Held-out Go repos**: 0 hits, as expected (Go has no constructor keyword). No held-out Java/Kotlin/TS repo was available,
+so the 6.7% rests on the standard corpus alone. The first build (22 hits) had 3 of 11 sampled wrong (27%): different parameter
+types, a per-class constant, and the JS idiom. Transcript replay: 0 over 1818 snapshots.
 
 ## Suppression
 

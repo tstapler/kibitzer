@@ -33,14 +33,19 @@ them the first corpus pass saw only 3 of the 17 hits below.
 
 ## Backtest (release build, final)
 
-`kibitzer check architecture push-down-field <repo>`: kubernetes 17; cassandra, nowinandroid, servo,
-ripgrep, deno, vscode, stapler-squad 0. All 17 were read against the source (`grep` of every use of
-the field in its package). **3 false positives of 17 = 17.6%** (the first two patterns above), by one reviewer;
-n is small. The 14 plausible hits are the `flexVolume` pod fields, `downwardAPIVolume.pod`, `hostPath.pathType`,
-two `localVolume` fields, four `patcher` fields (each used by exactly one of `jsonPatcher`/`smpPatcher`), and the
-three `*Opts.initializeLabelAllowListsOnce` `sync.Once` fields used only by the `*Vec` types.
-Earlier builds: 12 of 12 sampled hits were false positives before the unexported-only rule; one stapler-squad hit
-(`ReviewState.lastAcknowledgedNs`) was removed once the supertype's own accesses blocked a finding.
+Every hit was read against the source by one reviewer (`grep` of each use of the field in its package).
+
+**Standard corpus** (`kibitzer check architecture push-down-field <repo>`): kubernetes 17, all seven other repos 0.
+3 false positives (the first two patterns above): **3/17 = 17.6%**. The 14 plausible hits are the `flexVolume` pod
+fields, `downwardAPIVolume.pod`, `hostPath.pathType`, two `localVolume` fields, four `patcher` fields (each used by exactly
+one of `jsonPatcher`/`smpPatcher`), and the three `*Opts.initializeLabelAllowListsOnce` `sync.Once` fields used only by the
+`*Vec` types.
+
+**Held-out repos** (not used to design any guard): argo-cd, caddy, trivy, containerd, etcd, docker/compose, syft, pack, cli, coredns (ten Go repos named before any of this check's output on them was seen). 3 hits (cli, containerd, etcd): 1 false positive
+(cli `asset.alt`), 2 plausible (containerd `dockerBase.performances`, etcd `baseReadTx.mu`): **1/3**.
+
+Combined **4/20 = 20.0%**. n is small. Earlier builds: 12 of 12 sampled hits were false positives before the
+unexported-only rule, and one stapler-squad hit was removed once the supertype's own accesses blocked a finding.
 Transcript replay: 0 findings over 1818 snapshots.
 
 ## Suppression
