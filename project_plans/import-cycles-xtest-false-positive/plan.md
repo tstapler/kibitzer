@@ -342,12 +342,19 @@ Baseline = `635eab4` (pre-fix) release build; after = this branch's release buil
 |---|---|---|
 | kubernetes/kubernetes | 28 → 2 | 0 findings new by file. Removed: the `X_test`-shaped ones. Remaining 2 (`pkg/proxy/ipvs/testing/fake_test.go`, `kubeadm/app/util/staticpod/utils_linux.go`) are unchanged; the first is an *internal* test file (`package testing`) in the helper package — same pre-existing FP class as go-git below, out of scope (AC4 keeps internal test files). The kubeadm one was not inspected, so its status is unverified. |
 | tstapler/stapler-squad | 4 → 3 | Only change: the Go `server/auth → … → testutil → … → session → server/auth` cycle removed. The 3 TypeScript cycles are byte-identical. |
-| tstapler/go-git (extra, Go) | 1 → 2 | The one large SCC split into two smaller ones once `X_test` edges were gone: `http/internal/test ↔ http` and `ssh/internal/test ↔ ssh`, both from `internal/test/proxy_test.go` (`package test`, an internal test file) importing the consumer. A pre-existing false-positive class (a helper package's own `_test.go` imports the package under test, which is legal in Go); previously hidden inside the big cycle. Not introduced by this change. |
+| tstapler/go-git (extra, Go; not in the standard corpus) | 1 → 2 | **Two new findings, both false positives, newly surfaced by this change.** Dropping `X_test` edges broke the one large SCC (pre-fix) into `http/internal/test ↔ http` and `ssh/internal/test ↔ ssh`. Edges behind them: `plumbing/transport/http/proxy_test.go` (`package http`) imports `http/internal/test`; `http/internal/test/proxy_test.go` (`package test`) imports `http` (same shape under `ssh/`; `ssh/proxy_test.go` and `ssh/upload_pack_test.go` import `ssh/internal/test`; `ssh/internal/test/proxy_test.go` imports `ssh`). Each cycle mixes `_test.go` edges from two different packages' test builds, which Go never compiles together: `go vet ./plumbing/transport/http/... ./plumbing/transport/ssh/...` exits 0 on the checkout. Same class as the remaining kubernetes `pkg/proxy/ipvs/testing/fake_test.go` finding (`package testing`, internal test file). |
 
 Real-cycle detection is covered at `build()` level by `go_real_mutual_import_still_reports_cycle`. The corpus
 has no confirmed-real Go cycle (Go rejects them), so "no lost real cycles" rests on that test plus the
 unchanged TypeScript results. Raw outputs: `~/.cache/tmp/cyc/{kubernetes,stapler-squad,go-git}.{B,H}.txt` (not committed).
 
-Follow-up (not in scope): suppress edges from internal `_test.go` files of helper packages for cycle purposes.
-Full suite after the change: `cargo test --workspace` → 2576 passed, 0 failed, 7 ignored (one unrelated
-`refactor_core::txn::tests::the_lock_covers_everything_between_session_and_commit` failure on one earlier run did not recur).
+**Known gap (not fixed here):** cycles whose edges come from `_test.go` files of two or more different packages are
+false positives (a real cycle needs all test edges from one package's test build). Fixing needs per-edge test-file
+provenance in `find_cycles` (an `ImportGraph` edge change plus checker backtest) and conflicts with AC4's
+requirement that internal test files stay in the graph, so it is left as a follow-up. Criterion 8 holds on the named
+corpus (kubernetes, stapler-squad: no new findings by file) but this go-git result is a new-finding regression
+on an extra repo and should not be read as clean.
+Full suite after the change: `cargo test --workspace` → 2576 passed, 0 failed, 7 ignored (one
+`refactor_core::txn::tests::the_lock_covers_everything_between_session_and_commit` failure on one earlier run; its output was not captured, so
+no root cause is established. Reruns: 20/20 pass in isolation, 20/20 pass under 8 busy-loop CPU hogs, 6/6 pass for the whole `refactor_core::` module.
+This branch's source diff vs 635eab4 touches only `src/import_graph.rs`, which `src/refactor_core/` does not reference.)
