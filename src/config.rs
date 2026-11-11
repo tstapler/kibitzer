@@ -914,6 +914,11 @@ fn hierarchy_checks() -> Vec<Check> {
         whole_repo_check("remove-subclass", "remove-subclass"),
         whole_repo_check("extract-superclass", "extract-superclass"),
         whole_repo_check("collapse-hierarchy", "collapse-hierarchy"),
+        whole_repo_check("push-down-method", "push-down-method"),
+        whole_repo_check("push-down-field", "push-down-field"),
+        whole_repo_check("pull-up-method", "pull-up-method"),
+        whole_repo_check("pull-up-constructor-body", "pull-up-constructor-body"),
+        whole_repo_check("pull-up-field", "pull-up-field"),
     ]
 }
 

@@ -1194,6 +1194,7 @@ fn walk_struct_fields(
 /// Go-only for v1 (see [`field_access_supports`]); other languages return an empty list.
 /// Exists solely to give [`extract_field_access_sites_for_file`] a field-name set to match
 /// a selector's accessed name against.
+#[cfg(test)]
 pub fn extract_struct_fields_for_file(
     language: Language,
     source: &str,

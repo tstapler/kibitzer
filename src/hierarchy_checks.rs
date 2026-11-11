@@ -3,7 +3,7 @@
 //! trusted: an unresolved target is often an external base, so it can't establish a leaf,
 //! a parent's method set, or "unrelated."
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::arch_model::{ArchModel, PackageNode, SymbolKind, SymbolNode, TypeRelationKind};
 use crate::checkers::is_test_file;
@@ -63,6 +63,43 @@ pub(crate) fn methods_of<'a>(
 /// Ids of types that some resolved `Extends` edge points at (i.e. have a subtype).
 pub(crate) fn supertype_ids<'a>(pairs: &[(&'a str, &'a str)]) -> HashSet<&'a str> {
     pairs.iter().map(|&(_, parent)| parent).collect()
+}
+
+/// Supertype id -> its direct subtype ids (sorted), from [`resolved_extends`] pairs.
+pub(crate) fn subtypes_by_super<'a>(
+    pairs: &[(&'a str, &'a str)],
+) -> BTreeMap<&'a str, Vec<&'a str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for &(sub, sup) in pairs {
+        map.entry(sup).or_default().push(sub);
+    }
+    map
+}
+
+/// `root` plus every transitive subtype of it.
+pub(crate) fn subtree<'a>(
+    root: &'a str,
+    children: &BTreeMap<&'a str, Vec<&'a str>>,
+) -> HashSet<&'a str> {
+    let mut seen = HashSet::from([root]);
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        for &c in children.get(id).into_iter().flatten() {
+            if seen.insert(c) {
+                stack.push(c);
+            }
+        }
+    }
+    seen
+}
+
+/// Owning type id of a method/field-qualified symbol id (`"{pkg}::{Type}.{member}"` ->
+/// `"{pkg}::{Type}"`); `None` for a free function or type id. Splits after the `::` so a
+/// dotted package path (`github.com/x/y::T.m`) isn't cut in the wrong place.
+pub(crate) fn owner_type_id(member_id: &str) -> Option<&str> {
+    let after = member_id.find("::")? + 2;
+    let dot = member_id[after..].rfind('.')?;
+    Some(&member_id[..after + dot])
 }
 
 #[cfg(test)]
@@ -144,6 +181,21 @@ mod tests {
     use super::fixtures::{edge, model, sym};
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn owner_type_id_splits_after_the_package_separator() {
+        assert_eq!(owner_type_id("a.b/c::T.m"), Some("a.b/c::T"));
+        assert_eq!(owner_type_id("a.b/c::free"), None);
+        assert_eq!(owner_type_id("pkg::T"), None);
+    }
+
+    #[test]
+    fn subtree_includes_root_and_transitive_children_and_survives_cycles() {
+        let pairs = [("b", "a"), ("c", "b"), ("a", "c")];
+        let children = subtypes_by_super(&pairs);
+        let t = subtree("a", &children);
+        assert_eq!(t.len(), 3);
+    }
 
     #[test]
     fn resolved_extends_dedupes_and_drops_non_extends_unresolved_and_unmodeled() {
