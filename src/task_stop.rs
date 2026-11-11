@@ -233,7 +233,10 @@ fn stop_hook_context(
     }
 
     let reports = crate::false_positive::read_reports(&crate::false_positive::default_queue_path())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            eprintln!("kibitzer: false-positive queue unreadable: {e:#}");
+            Vec::new()
+        });
     let lines_out = stop_hook_findings_for_files(cwd, &files, &reports)?;
     if lines_out.is_empty() {
         return Ok(None);
@@ -671,7 +674,12 @@ mod tests {
         let files = BTreeSet::from([target.clone()]);
 
         let before = stop_hook_findings_for_files(&dir, &files, &[]).unwrap();
-        assert!(!before.is_empty(), "precondition: finding fires");
+        assert!(
+            before
+                .iter()
+                .any(|l| l.contains("repetitive-sentence-structure")),
+            "precondition: finding fires: {before:?}"
+        );
 
         let report = crate::false_positive::FalsePositiveReport {
             date: "2026-11-10".into(),
@@ -699,6 +707,16 @@ mod tests {
         )
         .unwrap();
         let after_edit = stop_hook_findings_for_files(&dir, &files, &reports).unwrap();
+        let other_check = [crate::false_positive::FalsePositiveReport {
+            check_name: "some-other-check".into(),
+            ..reports[0].clone()
+        }];
+        let still_fires = stop_hook_findings_for_files(&dir, &files, &other_check).unwrap();
+        assert!(
+            still_fires
+                .iter()
+                .any(|l| l.contains("repetitive-sentence-structure"))
+        );
         assert!(
             after_edit
                 .iter()

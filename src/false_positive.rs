@@ -37,13 +37,24 @@ pub struct FalsePositiveReport {
 /// Hex SHA-256 of `path`'s current contents, or `None` if unreadable.
 pub fn file_content_hash(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
+    // Regular files only: a FIFO or /dev/zero path would block or exhaust memory.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     let digest = Sha256::digest(bytes);
     Some(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Absolute, symlink-resolved form of `path` (raw path if it can't be resolved), so a
+/// relative report path and the hook's absolute path compare equal.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Whether a queued report already covers a finding from `check_name` on `file` in its
-/// current state (`current_hash`): same check, same path, same file content.
+/// current state (`current_hash`): same check, same path, same file content. Silences
+/// every finding of that check in the file until the file changes.
 pub fn is_reported(
     reports: &[FalsePositiveReport],
     check_name: &str,
@@ -53,9 +64,10 @@ pub fn is_reported(
     let Some(current_hash) = current_hash else {
         return false;
     };
+    let file = normalize_path(file);
     reports.iter().any(|r| {
         r.check_name == check_name
-            && Path::new(&r.file) == file
+            && normalize_path(Path::new(&r.file)) == file
             && r.file_hash.as_deref() == Some(current_hash)
     })
 }
@@ -195,6 +207,55 @@ mod tests {
             session: Some("triage-1".to_string()),
             file_hash: None,
         }
+    }
+
+    #[test]
+    fn file_content_hash_matches_known_sha256_and_tracks_content() {
+        let path = tmp_path("hash");
+        std::fs::write(&path, "abc").unwrap();
+        assert_eq!(
+            file_content_hash(&path).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        std::fs::write(&path, "abd").unwrap();
+        assert_ne!(
+            file_content_hash(&path).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        std::fs::remove_file(&path).ok();
+        assert_eq!(file_content_hash(&path), None);
+        assert_eq!(file_content_hash(&std::env::temp_dir()), None);
+    }
+
+    #[test]
+    fn is_reported_requires_check_path_and_hash_to_all_match() {
+        let path = tmp_path("reported");
+        std::fs::write(&path, "x").unwrap();
+        let report = |check: &str, file: &Path, hash: Option<&str>| FalsePositiveReport {
+            check_name: check.to_string(),
+            file: file.to_string_lossy().into_owned(),
+            file_hash: hash.map(str::to_string),
+            ..sample()
+        };
+        let other = tmp_path("other");
+        let reports = [report("c", &path, Some("h"))];
+        assert!(is_reported(&reports, "c", &path, Some("h")));
+        assert!(!is_reported(&reports, "other-check", &path, Some("h")));
+        assert!(!is_reported(&reports, "c", &other, Some("h")));
+        assert!(!is_reported(&reports, "c", &path, Some("changed")));
+        assert!(!is_reported(&reports, "c", &path, None));
+        let legacy = [report("c", &path, None)];
+        assert!(!is_reported(&legacy, "c", &path, None));
+        assert!(!is_reported(&legacy, "c", &path, Some("h")));
+        let dotted = [report(
+            "c",
+            &std::env::temp_dir()
+                .join(".")
+                .join(path.file_name().unwrap()),
+            Some("h"),
+        )];
+        assert!(is_reported(&dotted, "c", &path, Some("h")));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
