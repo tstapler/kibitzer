@@ -1173,6 +1173,37 @@ mod tests {
     }
 
     #[test]
+    fn find_cycles_reports_self_import_from_own_test_file() {
+        let mut g = ImportGraph::default();
+        g.nodes.insert("a".to_string());
+        g.edges.push(edge_at("a", "a", "a/a_test.go", 3));
+        assert_eq!(find_cycles(&g), vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn find_cycles_does_not_recheck_package_already_in_production_cycle() {
+        let mut g = ImportGraph::default();
+        g.nodes.extend(["a", "b"].map(String::from));
+        g.edges.push(edge_at("a", "b", "a/a.go", 1));
+        g.edges.push(edge_at("b", "a", "b/b.go", 1));
+        g.edges.push(edge_at("a", "b", "a/a_test.go", 2));
+        assert_eq!(find_cycles(&g).len(), 1);
+    }
+
+    #[test]
+    fn find_cycles_reports_cycle_closed_only_by_one_packages_test_edge() {
+        let mut g = ImportGraph::default();
+        g.nodes.extend(["a", "b"].map(String::from));
+        g.edges.push(edge_at("b", "a", "b/b.go", 1));
+        g.edges.push(edge_at("a", "b", "a/a_test.go", 2));
+        let cycles = find_cycles(&g);
+        assert_eq!(cycles.len(), 1);
+        let mut members = cycles[0].clone();
+        members.sort();
+        assert_eq!(members, vec!["a", "b"]);
+    }
+
+    #[test]
     fn fan_in_out_counts_distinct_package_pairs_when_two_files_import_same_package() {
         let edges = vec![
             edge_at("a", "b", "a/f1.go", 3),

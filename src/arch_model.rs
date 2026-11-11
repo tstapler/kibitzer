@@ -1191,6 +1191,17 @@ mod tests {
         assert_eq!(language_for_path(Path::new("foo.rs")), Some(Language::Rust));
     }
 
+    #[test]
+    fn package_key_for_file_uses_excluded_files_for_external_test_package() {
+        let mut g = ImportGraph::default();
+        g.excluded_files
+            .insert(PathBuf::from("/r/p/x_test.go"), "p".to_string());
+        assert_eq!(
+            package_key_for_file(Path::new("/r"), Path::new("/r/p/x_test.go"), &g),
+            "p"
+        );
+    }
+
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn tmp_dir(name: &str) -> PathBuf {

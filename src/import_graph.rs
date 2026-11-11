@@ -177,7 +177,7 @@ struct QualifiedImportLangConfig {
     /// True when this file is left out of the graph (no node, no edges, no `file_packages`
     /// entry) but recorded in `ImportGraph::excluded_files` under its package key — Go's
     /// `package X_test`; see `go_declares_external_test_package`.
-    skips_edges: fn(tree: &tree_sitter::Tree, src: &[u8]) -> bool,
+    excludes_from_graph: fn(tree: &tree_sitter::Tree, src: &[u8]) -> bool,
     /// Every (normalized import target, 1-based line) pair in the tree. Implementations
     /// must exclude imports that don't name a package at all (e.g. Java's `import
     /// static`, which names a member) — such imports must never appear in the output,
@@ -230,7 +230,7 @@ fn build_qualified_name_language(
             .parse(&source, None)
             .with_context(|| format!("parsing {}", file.display()))?;
 
-        if (cfg.skips_edges)(&tree, source.as_bytes())
+        if (cfg.excludes_from_graph)(&tree, source.as_bytes())
             && let Some(pkg) = (cfg.package_identity)(
                 repo_root,
                 file,
@@ -259,9 +259,6 @@ fn build_qualified_name_language(
     // Pass 2: extract each file's imports and add an edge only for those that resolve
     // to a `graph.nodes` entry (the graph-membership guard).
     for (file, pkg, tree, source) in &file_packages {
-        if (cfg.skips_edges)(tree, source.as_bytes()) {
-            continue;
-        }
         let mut imports = Vec::new();
         (cfg.collect_imports)(tree.root_node(), source.as_bytes(), &mut imports);
 
@@ -486,7 +483,7 @@ fn go_lang_config() -> QualifiedImportLangConfig {
         import_stmt_kind: "import_spec",
         language: || tree_sitter_go::LANGUAGE.into(),
         package_identity: go_package_identity,
-        skips_edges: go_declares_external_test_package,
+        excludes_from_graph: go_declares_external_test_package,
         collect_imports: collect_go_imports,
     }
 }
@@ -715,7 +712,7 @@ fn java_lang_config() -> QualifiedImportLangConfig {
         import_stmt_kind: "import_declaration",
         language: || tree_sitter_java::LANGUAGE.into(),
         package_identity: java_package_identity,
-        skips_edges: |_, _| false,
+        excludes_from_graph: |_, _| false,
         collect_imports: collect_java_imports,
     }
 }
@@ -793,7 +790,7 @@ fn kotlin_lang_config() -> QualifiedImportLangConfig {
         import_stmt_kind: "import",
         language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
         package_identity: kotlin_package_identity,
-        skips_edges: |_, _| false,
+        excludes_from_graph: |_, _| false,
         collect_imports: collect_kotlin_imports,
     }
 }
