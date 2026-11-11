@@ -173,11 +173,18 @@ mod tests {
         use crate::pull_up_common::{MemberKind, find_pull_up_candidates};
         let ts = "class A {\n  constructor() {\n    this.a = 1;\n    this.b = 2;\n  }\n}\n";
         let mut m = build(ts, ts, true, false);
+        let dir = m.repo_root.clone();
         for s in &mut m.packages.get_mut("pkg").unwrap().symbols {
             if s.name == "Do" {
                 s.name = "constructor".into();
                 s.line = 2;
                 s.end_line = Some(5);
+                let f = dir.join(format!("{}.ts", s.parent.as_deref().unwrap()));
+                std::fs::write(&f, ts).unwrap();
+                s.file = f;
+            }
+            if s.kind == SymbolKind::Type {
+                s.file = dir.join("types.ts");
             }
         }
         assert!(run(&m).is_empty());

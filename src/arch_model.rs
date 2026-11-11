@@ -102,7 +102,7 @@ pub struct SymbolNode {
     pub used_as_value: bool,
     /// 1-indexed inclusive last line of a `Method`/`Function` body, for slicing source text
     /// (pull-up checkers). `None` where not populated; `#[serde(default)]` for old caches.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<usize>,
 }
 
@@ -284,18 +284,19 @@ pub struct ArchModel {
     /// an external/stdlib import never appears here as a resolvable target.
     pub file_import_aliases: BTreeMap<PathBuf, HashMap<String, String>>,
     /// `"{package_path}::{type_name}"` -> declared field names (Go structs only today).
-    /// `#[serde(default)]` for cache compatibility.
-    #[serde(default)]
+    /// Derived: rebuilt by `build_model`, so not serialized into `architecture export`.
+    #[serde(default, skip_serializing)]
     pub struct_field_names: BTreeMap<String, BTreeSet<String>>,
     /// `"{package_path}::{type_name}"` -> field name -> type text; companion to
-    /// `struct_field_names` for the pull-up-field type-text match.
-    #[serde(default)]
+    /// `struct_field_names` for the pull-up-field type-text match. Derived; not serialized.
+    #[serde(default, skip_serializing)]
     pub struct_field_types: BTreeMap<String, BTreeMap<String, String>>,
     /// Accesses to a field the receiver type doesn't declare but inherits through resolved
     /// `Extends` (Go embedding: `a.N` where `A` embeds `Base`), attributed to the declaring
     /// ancestor (`to` = `"{pkg}::Base.N"`). Kept apart from `field_accesses` so the
-    /// existing consumers of that list are unaffected; read by `push-down-field`.
-    #[serde(default)]
+    /// existing consumers of that list are unaffected; read by `push-down-field`. Derived;
+    /// not serialized.
+    #[serde(default, skip_serializing)]
     pub promoted_field_accesses: Vec<FieldAccessEdge>,
     pub pruning: PruningSummary,
 }
@@ -1290,6 +1291,78 @@ mod tests {
             p[0].to.ends_with("::Base.N") && p[0].from.ends_with("::A.Bump"),
             "{p:?}"
         );
+    }
+
+    fn go_model(src: &str) -> ArchModel {
+        let files = vec![(PathBuf::from("/repo/pkg/a.go"), src.to_string())];
+        build_model(
+            Path::new("/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_receiver_that_declares_the_field_itself_gets_no_promoted_edge() {
+        let model = go_model(
+            "package pkg\n\ntype Base struct{ N int }\n\ntype A struct {\n\tBase\n\tN int\n}\n\nfunc (a *A) Bump() {\n\ta.N++\n}\n",
+        );
+        assert!(model.promoted_field_accesses.is_empty());
+        assert!(
+            model.field_accesses.iter().any(|a| a.to.ends_with("::A.N")),
+            "control: the access exists and is attributed to A itself: {:?}",
+            model.field_accesses
+        );
+    }
+
+    #[test]
+    fn a_field_two_embeddings_up_is_attributed_to_its_declarer() {
+        let model = go_model(
+            "package pkg\n\ntype Base struct{ N int }\n\ntype B struct{ Base }\n\ntype C struct{ B }\n\nfunc (c *C) Bump() {\n\tc.N++\n}\n",
+        );
+        let p = &model.promoted_field_accesses;
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].to.ends_with("::Base.N") && p[0].from.ends_with("::C.Bump"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn promoted_field_resolution_terminates_on_an_extends_cycle() {
+        let edge = |from: &str, to: &str| TypeRelationEdge {
+            from: from.into(),
+            to: to.into(),
+            kind: Some(TypeRelationKind::Extends),
+            resolved: true,
+            file: PathBuf::from("/repo/pkg/a.go"),
+            line: 1,
+        };
+        let site = RawFieldAccessSite {
+            package_path: "pkg".into(),
+            caller_id: "pkg::A.Bump".into(),
+            receiver_type: "A".into(),
+            field_name: "N".into(),
+            access: AccessKind::Read,
+            file: PathBuf::from("/repo/pkg/a.go"),
+            line: 3,
+        };
+        let edges = [edge("pkg::A", "pkg::B"), edge("pkg::B", "pkg::A")];
+        let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        names.insert("pkg::A".into(), BTreeSet::new());
+        names.insert("pkg::B".into(), BTreeSet::new());
+        assert!(
+            resolve_promoted_field_accesses(&names, &edges, std::slice::from_ref(&site)).is_empty()
+        );
+        // Control: the same cycle, but one member declares the field.
+        names.insert("pkg::B".into(), BTreeSet::from(["N".to_string()]));
+        let got = resolve_promoted_field_accesses(&names, &edges, &[site]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].to, "pkg::B.N");
     }
 
     #[test]
