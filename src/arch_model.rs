@@ -5,7 +5,7 @@
 //! (CLI `architecture export`/`diagram`, MCP query tools, LSP symbol mapper/index) shares
 //! these instead of reimplementing walk-and-parse itself.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +16,8 @@ use crate::checker::{GrammarCache, Language};
 use crate::import_graph::{ImportEdge, ImportGraph};
 use crate::symbol_extract::{
     RawCallSite, RawFieldAccessSite, RawTypeRelationSite, extract_call_sites_for_file,
-    extract_field_access_sites_for_file, extract_struct_fields_for_file, extract_symbols_for_file,
-    extract_type_relation_sites_for_file,
+    extract_field_access_sites_for_file, extract_struct_field_types_for_file,
+    extract_symbols_for_file, extract_type_relation_sites_for_file,
 };
 
 /// The kind of a single extracted symbol. Exhaustively matched by every consumer (the
@@ -100,6 +100,10 @@ pub struct SymbolNode {
     /// A same-package bare name occurs in a value position; lexical shadowing is not resolved.
     #[serde(default)]
     pub used_as_value: bool,
+    /// 1-indexed inclusive last line of a `Method`/`Function` body, for slicing source text
+    /// (pull-up checkers). `None` where not populated; `#[serde(default)]` for old caches.
+    #[serde(default)]
+    pub end_line: Option<usize>,
 }
 
 /// One package/module-directory node in `ArchModel` — a path (matching `ImportGraph`'s
@@ -279,6 +283,14 @@ pub struct ArchModel {
     /// `import_graph::build_qualified_name_language` already uses for `ImportEdge`s, so
     /// an external/stdlib import never appears here as a resolvable target.
     pub file_import_aliases: BTreeMap<PathBuf, HashMap<String, String>>,
+    /// `"{package_path}::{type_name}"` -> declared field names (Go structs only today).
+    /// `#[serde(default)]` for cache compatibility.
+    #[serde(default)]
+    pub struct_field_names: BTreeMap<String, BTreeSet<String>>,
+    /// `"{package_path}::{type_name}"` -> field name -> type text; companion to
+    /// `struct_field_names` for the pull-up-field type-text match.
+    #[serde(default)]
+    pub struct_field_types: BTreeMap<String, BTreeMap<String, String>>,
     pub pruning: PruningSummary,
 }
 
@@ -431,6 +443,7 @@ pub fn build_model(
     let mut value_names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut raw_field_access_sites: Vec<RawFieldAccessSite> = Vec::new();
     let mut raw_type_relation_sites: Vec<RawTypeRelationSite> = Vec::new();
+    let mut struct_field_types: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut struct_fields: HashMap<(String, String), std::collections::HashSet<String>> =
         HashMap::new();
     // Go-only, see `ArchModel::file_import_aliases`'s doc comment. Collected per-file
@@ -505,7 +518,14 @@ pub fn build_model(
             path,
         ));
 
-        for (type_name, field_name) in extract_struct_fields_for_file(language, source, &tree) {
+        for (type_name, field_name, type_text) in
+            extract_struct_field_types_for_file(language, source, &tree)
+        {
+            let key = format!("{package_path}::{type_name}");
+            struct_field_types
+                .entry(key)
+                .or_default()
+                .insert(field_name.clone(), type_text);
             struct_fields
                 .entry((package_path.clone(), type_name))
                 .or_default()
@@ -553,6 +573,16 @@ pub fn build_model(
         field_accesses,
         type_edges,
         file_import_aliases,
+        struct_field_names: struct_fields
+            .iter()
+            .map(|((pkg, ty), names)| {
+                (
+                    format!("{pkg}::{ty}"),
+                    names.iter().cloned().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect(),
+        struct_field_types,
         pruning: PruningSummary {
             include_private: prune.include_private,
             excluded_dirs: vec![],
@@ -996,6 +1026,8 @@ impl ArchModel {
             field_accesses: self.field_accesses.clone(),
             type_edges: self.type_edges.clone(),
             file_import_aliases: self.file_import_aliases.clone(),
+            struct_field_names: self.struct_field_names.clone(),
+            struct_field_types: self.struct_field_types.clone(),
             pruning: self.pruning.clone(),
         }
     }
@@ -1167,6 +1199,40 @@ pub(crate) fn load_cached_model(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_model_persists_struct_field_names_and_types() {
+        let files = vec![(
+            PathBuf::from("/repo/pkg/a.go"),
+            "package pkg\n\ntype T struct {\n\tX, Y int\n\tName string\n}\n".to_string(),
+        )];
+        let model = build_model(
+            Path::new("/repo"),
+            &files,
+            &crate::import_graph::ImportGraph::default(),
+            &PruneConfig {
+                include_private: true,
+            },
+        )
+        .unwrap();
+        let (key, names) = model.struct_field_names.iter().next().expect("one struct");
+        assert!(key.ends_with("::T"), "{key}");
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Name", "X", "Y"]
+        );
+        assert_eq!(model.struct_field_types[key]["Name"], "string");
+    }
+
+    #[test]
+    fn model_without_struct_field_maps_still_deserializes() {
+        let mut v = serde_json::to_value(empty_model(Path::new("/repo"))).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("struct_field_names");
+        obj.remove("struct_field_types");
+        let back: ArchModel = serde_json::from_value(v).unwrap();
+        assert!(back.struct_field_names.is_empty() && back.struct_field_types.is_empty());
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1241,6 +1307,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -1298,6 +1365,8 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: empty_pruning(),
         }
     }
@@ -1359,6 +1428,8 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -1386,6 +1457,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         };
 
         let json = serde_json::to_string(&original).expect("serializes");
@@ -2135,6 +2207,8 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2158,6 +2232,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         let mut pkg_b = empty_package("b");
         pkg_b.symbols.push(SymbolNode {
@@ -2173,6 +2248,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
 
         let mut packages = BTreeMap::new();
@@ -2187,6 +2263,8 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2212,6 +2290,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2227,6 +2306,8 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2252,6 +2333,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         let api_pkg = empty_package("server/api");
 
@@ -2267,6 +2349,8 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: empty_pruning(),
         };
 
@@ -2527,6 +2611,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("example.com/app/other".to_string(), other_pkg);
 
@@ -2547,6 +2632,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("somepkg".to_string(), decoy_pkg);
 
@@ -2601,6 +2687,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("elsewhere".to_string(), elsewhere);
         packages.insert("pkg".to_string(), empty_package("pkg"));
@@ -2646,6 +2733,7 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
         packages.insert("app".to_string(), pkg);
 

@@ -258,7 +258,7 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             // Java has no free functions — every `method_declaration` classifies as
             // `Method` in `classify_node`'s language-specific branch below, never
             // `Function`.
-            function_kinds: &["method_declaration"],
+            function_kinds: &["method_declaration", "constructor_declaration"],
             name_finder: field_name,
             is_exported: java_is_exported,
         },
@@ -270,7 +270,7 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             // empty here; the real dispatch lives in `classify_node`.
             type_kinds: &[],
             interface_kinds: &[],
-            function_kinds: &["function_declaration"],
+            function_kinds: &["function_declaration", "secondary_constructor"],
             name_finder: field_name,
             is_exported: kotlin_is_exported,
         },
@@ -419,6 +419,7 @@ fn go_type_declaration_symbols(
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
     }
 }
@@ -515,8 +516,14 @@ fn classify_node(
         return None;
     };
 
-    let name_node = (cfg.name_finder)(node)?;
-    let name = strip_generic_params(node_text(name_node, source));
+    // Kotlin's `secondary_constructor` has no name child; surface it as `constructor` so
+    // the pull-up-constructor-body checker can recognise it.
+    let name = if language == Language::Kotlin && kind == "secondary_constructor" {
+        "constructor".to_string()
+    } else {
+        let name_node = (cfg.name_finder)(node)?;
+        strip_generic_params(node_text(name_node, source))
+    };
     let exported = (cfg.is_exported)(node, source);
     let line = node.start_position().row + 1;
 
@@ -571,6 +578,8 @@ fn classify_node(
         delegation_field,
         params,
         used_as_value: false,
+        end_line: matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+            .then(|| node.end_position().row + 1),
     })
 }
 
@@ -1117,7 +1126,7 @@ fn go_receiver_var_name(method: Node, source: &str) -> Option<String> {
 /// group (`X, Y int`), so every `name`-field child is collected, not just the first. An
 /// embedded field (anonymous — no `name` field at all) is skipped: embedding introduces
 /// promoted fields/methods this v1 extraction doesn't walk into.
-fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String)>) {
+fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String, String)>) {
     let mut cursor = type_decl.walk();
     for spec in type_decl
         .children(&mut cursor)
@@ -1145,11 +1154,21 @@ fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String
             .children(&mut fc)
             .filter(|c| GoKind::of(*c) == GoKind::FieldDeclaration)
         {
+            let type_text = decl
+                .child_by_field_name("type")
+                .map(|t| {
+                    node_text(t, source)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
             let mut nc = decl.walk();
             for field_name_node in decl.children_by_field_name("name", &mut nc) {
                 out.push((
                     type_name.clone(),
                     node_text(field_name_node, source).to_string(),
+                    type_text.clone(),
                 ));
             }
         }
@@ -1160,7 +1179,7 @@ fn walk_struct_fields(
     node: Node,
     language: Language,
     source: &str,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<(String, String, String)>,
 ) {
     if language == Language::Go && GoKind::of(node) == GoKind::TypeDeclaration {
         go_struct_fields(node, source, out);
@@ -1180,6 +1199,19 @@ pub fn extract_struct_fields_for_file(
     source: &str,
     tree: &Tree,
 ) -> Vec<(String, String)> {
+    extract_struct_field_types_for_file(language, source, tree)
+        .into_iter()
+        .map(|(ty, field, _)| (ty, field))
+        .collect()
+}
+
+/// Like [`extract_struct_fields_for_file`] but also yields each field's type text
+/// (whitespace-normalised): `(type_name, field_name, type_text)`. Go-only.
+pub fn extract_struct_field_types_for_file(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+) -> Vec<(String, String, String)> {
     if language != Language::Go {
         return Vec::new();
     }
@@ -2628,6 +2660,89 @@ mod tests {
         let cache = GrammarCache::new();
         let tree = cache.parse(language, source).expect("parses");
         extract_field_access_sites_for_file(language, source, &tree, package_path)
+    }
+
+    #[test]
+    fn end_line_is_one_indexed_inclusive_for_methods_in_each_oop_language() {
+        let go = extract(
+            Language::Go,
+            "package p\n\ntype T struct{}\n\nfunc (t T) M() {\n\t_ = 1\n}\n",
+            "p",
+        );
+        let m = find_by_name(&go, "M");
+        assert_eq!((m.line, m.end_line), (5, Some(7)));
+
+        let ts = extract(
+            Language::TypeScript,
+            "class A {\n  m() {\n    return 1;\n  }\n}\n",
+            "p",
+        );
+        let m = find_by_name(&ts, "m");
+        assert_eq!((m.line, m.end_line), (2, Some(4)));
+
+        let java = extract(
+            Language::Java,
+            "class A {\n  void m() {\n    int x = 1;\n  }\n}\n",
+            "p",
+        );
+        let m = find_by_name(&java, "m");
+        assert_eq!((m.line, m.end_line), (2, Some(4)));
+
+        let kt = extract(
+            Language::Kotlin,
+            "class A {\n  fun m() {\n    val x = 1\n  }\n}\n",
+            "p",
+        );
+        let m = find_by_name(&kt, "m");
+        assert_eq!((m.line, m.end_line), (2, Some(4)));
+    }
+
+    #[test]
+    fn types_have_no_end_line() {
+        let java = extract(Language::Java, "class A {}\n", "p");
+        assert_eq!(find_by_name(&java, "A").end_line, None);
+    }
+
+    #[test]
+    fn java_and_kotlin_constructors_are_extracted_as_methods() {
+        let java = extract(
+            Language::Java,
+            "class A {\n  A(int x) {\n    this.x = x;\n  }\n}\n",
+            "p",
+        );
+        let c = find_by_name(&java, "A");
+        let ctor = java
+            .iter()
+            .find(|s| s.name == "A" && s.kind == SymbolKind::Method)
+            .unwrap_or(c);
+        assert_eq!(ctor.kind, SymbolKind::Method);
+        assert_eq!(ctor.parent.as_deref(), Some("A"));
+        assert_eq!(ctor.end_line, Some(4));
+
+        let kt = extract(
+            Language::Kotlin,
+            "class A {\n  constructor(x: Int) {\n    println(x)\n  }\n}\n",
+            "p",
+        );
+        let ctor = find_by_name(&kt, "constructor");
+        assert_eq!(ctor.kind, SymbolKind::Method);
+        assert_eq!(ctor.parent.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn go_struct_field_types_carry_normalised_type_text() {
+        let cache = GrammarCache::new();
+        let src = "package pkg\n\ntype T struct {\n\tX, Y int\n\tM map[string]  int\n}\n";
+        let tree = cache.parse(Language::Go, src).expect("parses");
+        let got = extract_struct_field_types_for_file(Language::Go, src, &tree);
+        assert_eq!(
+            got,
+            vec![
+                ("T".into(), "X".into(), "int".into()),
+                ("T".into(), "Y".into(), "int".into()),
+                ("T".into(), "M".into(), "map[string] int".into()),
+            ]
+        );
     }
 
     #[test]

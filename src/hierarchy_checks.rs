@@ -90,6 +90,7 @@ pub(crate) mod fixtures {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -120,6 +121,8 @@ pub(crate) mod fixtures {
             field_accesses: vec![],
             type_edges,
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
             pruning: Default::default(),
         }
     }
