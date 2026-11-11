@@ -5,7 +5,9 @@ kibitzer runs a built-in default catalog everywhere — pylint-style, no
 the full list is in `docs/syntax-rules.md` and `docs/comment-quality.md`, plus
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
 `duplicate-code-cross-file`, `file-complexity`, `go-blank-imports`,
-`go-ignored-error`, `go-error-context`). A local
+`go-ignored-error`, `go-error-context`, and the hierarchy checks in
+`docs/hierarchy-cleanup-checks.md` including `push-down-method`, `push-down-field`,
+`pull-up-method`, `pull-up-constructor-body`, `pull-up-field`). A local
 `.kibitzer/inspect.json`
 overlays that catalog rather than replacing it — see
 `config::find_effective_config`. To dismiss one finding you judged acceptable,

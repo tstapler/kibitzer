@@ -13,7 +13,7 @@ on Go: the first corpus run returned 0 hits for that reason, not because the cod
 
 | Gate | Why |
 |---|---|
-| Unexported fields only | Accesses are recorded only through a method's own receiver, so for an exported field the absence of other accessors proves nothing (the first 12 sampled hits were all exported API fields: 100% false positives). |
+| Unexported fields only | Accesses are recorded only through a method's own receiver. For an exported field any package can read `x.Field` through a plain variable, so the absence of other accessors is no evidence (the first 12 sampled hits were all exported API fields: 100% false positives). Restricting to unexported fields removes that out-of-package exposure only; it does not make absent evidence safe (see the last row of the next table). |
 | Supertype has ≥2 direct resolved subtypes, all in the supertype's package | A Go subtype in another package is composition with a library type. |
 | ≥1 access, all from exactly one direct subtype's subtree | No access evidence is skipped. |
 | No access from the supertype's own methods or from outside the hierarchy | Moving the field down would break them (stapler-squad `ReviewState.lastAcknowledgedNs`). |
@@ -26,7 +26,7 @@ on Go: the first corpus run returned 0 hits for that reason, not because the cod
 | Access through a defined type that is not a struct: `type unmounterDefaults flexVolumeUnmounter` | kubernetes `flexVolume.mounter` is also read by `unmounterDefaults.TearDownAt`, but the model drops accesses from a receiver that declares no fields | Not filtered. |
 | Field set from a free function or through a local value rather than a method receiver | kubernetes `typesFromEnv.deviceType`/`attributeType` are assigned via `result.deviceType = ...` in `compile.go`, not from `sizeEstimator` | Not filtered (2 hits). |
 | Field read by reflection / struct tags / serialization | Invisible to the model | Not filtered. |
-| Access through a non-receiver variable (`x.field`, `x` a local) | Only receiver accesses are recorded | Mitigated for exported fields by the unexported-only rule. |
+| Access through a non-receiver variable (`x.field`, `x` a local or parameter) in the same package | Only receiver accesses are recorded, and every function in the package can read an unexported field. The unexported-only rule shuts out other packages but not these in-package reads. | Not filtered; a known false-positive source. |
 
 The checker asks for private symbols (`needs_private_symbols`): subtypes are often unexported, and without
 them the first corpus pass saw only 3 of the 17 hits below.

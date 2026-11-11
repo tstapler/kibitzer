@@ -20,6 +20,12 @@ showed no change in any output.
 | Idiom constructors that are deliberately repeated, e.g. JS "illegal constructor" guards (deno `AbortSignal`/`Window`) | Not filtered; 1 of 15 hits. |
 | Vendored/forked copies of one class in different directories | Both copies are reported (each pair of siblings is real). |
 
+## Known limitations
+
+- Kotlin primary constructors (`class A(val x: Int)`) are not extracted as symbols, so only secondary constructors are compared.
+- Java compact record constructors (`record R(int x) { R { ... } }`) are not extracted.
+- Go pull-up only trusts same-package embedding: a Go subtype in a different package than the embedded supertype is skipped.
+
 ## Backtest (release build, final; `kibitzer check architecture pull-up-constructor-body <repo>`)
 
 Every hit was read against the source by one reviewer.
