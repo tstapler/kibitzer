@@ -106,7 +106,7 @@ impl ArchitectureChecker for ImportCycleChecker {
                 let edge = graph
                     .edges
                     .iter()
-                    .find(|e| e.from == cycle[0] && cycle.contains(&e.to));
+                    .find(|e| e.from == cycle[0] && cycle.contains(&e.to) && !is_test_file_edge(e));
                 let mut path = cycle.clone();
                 path.push(cycle[0].clone());
                 ArchFinding {
@@ -538,7 +538,11 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
             self.stack.push(node.to_string());
             self.on_stack.insert(node.to_string(), true);
 
-            for edge in self.graph.edges_from(node).filter(|e| !is_test_file_edge(e)) {
+            for edge in self
+                .graph
+                .edges_from(node)
+                .filter(|e| !is_test_file_edge(e))
+            {
                 let successor = edge.to.clone();
                 if !self.indices.contains_key(&successor) {
                     self.strongconnect(&successor);
