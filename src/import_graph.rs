@@ -1600,6 +1600,29 @@ mod tests {
         assert!(!graph.edges.iter().any(|e| {
             e.from == "example.com/m/widget" && e.to == "example.com/m/widget/widgettest"
         }));
+        assert!(crate::architecture_checks::find_cycles(&graph).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_real_mutual_import_still_reports_cycle() {
+        let dir = tmp_dir("go-real-cycle");
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let a = write(
+            &dir,
+            "a/a.go",
+            "package a\n\nimport \"example.com/m/b\"\n\nfunc A() { b.B() }\n",
+        );
+        let b = write(
+            &dir,
+            "b/b.go",
+            "package b\n\nimport \"example.com/m/a\"\n\nfunc B() { a.A() }\n",
+        );
+
+        let graph = build(&dir, &[a, b]).unwrap();
+
+        assert_eq!(crate::architecture_checks::find_cycles(&graph).len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
