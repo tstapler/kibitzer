@@ -106,7 +106,8 @@ impl ArchitectureChecker for ImportCycleChecker {
                 let edge = graph
                     .edges
                     .iter()
-                    .find(|e| e.from == cycle[0] && cycle.contains(&e.to));
+                    .filter(|e| e.from == cycle[0] && cycle.contains(&e.to))
+                    .min_by_key(|e| is_test_file_edge(e));
                 let mut path = cycle.clone();
                 path.push(cycle[0].clone());
                 ArchFinding {
@@ -322,7 +323,8 @@ impl ArchitectureChecker for PackageSizeChecker {
         "package-size"
     }
 
-    /// Sums each Go package's line count across its files (from `graph.file_packages`,
+    /// Sums each Go package's line count across its files (from `graph.file_packages` and
+    /// `graph.excluded_files`, so external `X_test` files still count toward `X`,
     /// filtered to `.go` — this check is Go-specific, unlike the other architecture
     /// checkers here) and flags any package whose total exceeds [`MAX_PACKAGE_LINES`].
     /// Unlike those other checkers, this one reads file contents directly: `ImportGraph`
@@ -338,7 +340,7 @@ impl ArchitectureChecker for PackageSizeChecker {
         _model: Option<&crate::arch_model::ArchModel>,
     ) -> Vec<ArchFinding> {
         let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
-        for (file, pkg) in &graph.file_packages {
+        for (file, pkg) in graph.file_packages.iter().chain(&graph.excluded_files) {
             if file.extension().and_then(|e| e.to_str()) != Some("go") {
                 continue;
             }
@@ -514,14 +516,102 @@ impl ArchitectureChecker for ComponentDependencyChecker {
     }
 }
 
-/// Tarjan's SCC algorithm, keeping only components with more than one node (or a
-/// single node with a self-edge) — those are the only SCCs that represent an actual
-/// import cycle rather than an isolated, acyclic package. Exposed (not just used
-/// internally by `ImportCycleChecker`) so `src/mermaid.rs` can highlight cycle edges
-/// in the rendered dependency diagram without re-deriving SCCs itself.
+/// Cyclic SCCs (Tarjan) of the import graph: components with >1 node or a self-edge.
+/// Public so `src/mermaid.rs` can highlight cycle edges.
+///
+/// Go `_test.go` edges are checked per package: production edges first, then each
+/// package `P` again with only `P`'s own test edges added.
 pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
+    let mut cycles = cyclic_sccs(graph, &|e| !is_test_file_edge(e));
+
+    // A package already in a production cycle is not re-checked: that cycle is itself a
+    // compile error and is reported as-is.
+    let in_cycle: HashSet<String> = cycles.iter().flatten().cloned().collect();
+    let mut test_edges_by_pkg: BTreeMap<&str, Vec<&ImportEdge>> = BTreeMap::new();
+    for e in graph.edges.iter().filter(|e| is_test_file_edge(e)) {
+        test_edges_by_pkg.entry(&e.from).or_default().push(e);
+    }
+    let production = ReverseProduction::new(graph);
+    let mut seen: HashSet<Vec<String>> = cycles.iter().map(|c| canonical(c)).collect();
+    for (pkg, test_edges) in test_edges_by_pkg {
+        if in_cycle.contains(pkg) || !production.any_reaches(pkg, &test_edges) {
+            continue;
+        }
+        let with_own_tests = |e: &ImportEdge| !is_test_file_edge(e) || e.from == pkg;
+        for scc in cyclic_sccs(graph, &with_own_tests) {
+            if scc.iter().any(|m| m == pkg) && seen.insert(canonical(&scc)) {
+                cycles.push(scc);
+            }
+        }
+    }
+    cycles
+}
+
+fn canonical(scc: &[String]) -> Vec<String> {
+    let mut key = scc.to_vec();
+    key.sort();
+    key
+}
+
+/// The non-`_test.go` edges reversed and integer-indexed, built once so the per-package
+/// prefilter in `find_cycles` stays cheap on large graphs (kubernetes: thousands of
+/// packages with test edges).
+struct ReverseProduction {
+    index: HashMap<String, usize>,
+    predecessors: Vec<Vec<usize>>,
+}
+
+impl ReverseProduction {
+    fn new(graph: &ImportGraph) -> Self {
+        let index: HashMap<String, usize> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        let mut predecessors = vec![Vec::new(); index.len()];
+        for e in graph.edges.iter().filter(|e| !is_test_file_edge(e)) {
+            if let (Some(&from), Some(&to)) = (index.get(&e.from), index.get(&e.to)) {
+                predecessors[to].push(from);
+            }
+        }
+        Self {
+            index,
+            predecessors,
+        }
+    }
+
+    /// True when some test edge's target reaches `pkg` over production edges, i.e. adding
+    /// `pkg`'s own test edges closes a cycle through `pkg`.
+    fn any_reaches(&self, pkg: &str, test_edges: &[&ImportEdge]) -> bool {
+        let Some(&goal) = self.index.get(pkg) else {
+            return false;
+        };
+        let targets: HashSet<usize> = test_edges
+            .iter()
+            .filter_map(|e| self.index.get(&e.to).copied())
+            .collect();
+        let mut seen = vec![false; self.predecessors.len()];
+        let mut work = vec![goal];
+        while let Some(node) = work.pop() {
+            if std::mem::replace(&mut seen[node], true) {
+                continue;
+            }
+            if targets.contains(&node) {
+                return true;
+            }
+            work.extend(&self.predecessors[node]);
+        }
+        false
+    }
+}
+
+/// Cyclic strongly connected components of the graph restricted to edges for which
+/// `include` is true.
+fn cyclic_sccs(graph: &ImportGraph, include: &dyn Fn(&ImportEdge) -> bool) -> Vec<Vec<String>> {
     struct Tarjan<'a> {
         graph: &'a ImportGraph,
+        include: &'a dyn Fn(&ImportEdge) -> bool,
         index_counter: usize,
         stack: Vec<String>,
         on_stack: HashMap<String, bool>,
@@ -538,7 +628,7 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
             self.stack.push(node.to_string());
             self.on_stack.insert(node.to_string(), true);
 
-            for edge in self.graph.edges_from(node) {
+            for edge in self.graph.edges_from(node).filter(|e| (self.include)(e)) {
                 let successor = edge.to.clone();
                 if !self.indices.contains_key(&successor) {
                     self.strongconnect(&successor);
@@ -572,6 +662,7 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
 
     let mut tarjan = Tarjan {
         graph,
+        include,
         index_counter: 0,
         stack: Vec::new(),
         on_stack: HashMap::new(),
@@ -589,8 +680,24 @@ pub fn find_cycles(graph: &ImportGraph) -> Vec<Vec<String>> {
     tarjan
         .sccs
         .into_iter()
-        .filter(|scc| scc.len() > 1 || graph.edges_from(&scc[0]).any(|e| e.to == scc[0]))
+        .filter(|scc| {
+            scc.len() > 1
+                || graph
+                    .edges_from(&scc[0])
+                    .any(|e| e.to == scc[0] && include(e))
+        })
         .collect()
+}
+
+/// Go `_test.go` imports belong to a test build, not the production build. `_test.go`
+/// edges from two different packages' test builds (e.g. `http` tests importing
+/// `http/internal/test`, whose own tests import `http`) never compile together, so Go
+/// accepts the combination; see `find_cycles` for how test builds are checked.
+fn is_test_file_edge(edge: &ImportEdge) -> bool {
+    edge.file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("_test.go"))
 }
 
 // ---------------------------------------------------------------------------------
@@ -1053,6 +1160,51 @@ mod tests {
             file: PathBuf::from(file),
             line,
         }
+    }
+
+    #[test]
+    fn find_cycles_reports_self_import_from_own_test_file() {
+        let mut g = ImportGraph::default();
+        g.nodes.insert("a".to_string());
+        g.edges.push(edge_at("a", "a", "a/a_test.go", 3));
+        assert_eq!(find_cycles(&g), vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn find_cycles_does_not_recheck_package_already_in_production_cycle() {
+        let mut g = ImportGraph::default();
+        g.nodes.extend(["a", "b"].map(String::from));
+        g.edges.push(edge_at("a", "b", "a/a.go", 1));
+        g.edges.push(edge_at("b", "a", "b/b.go", 1));
+        g.edges.push(edge_at("a", "b", "a/a_test.go", 2));
+        assert_eq!(find_cycles(&g).len(), 1);
+    }
+
+    #[test]
+    fn find_cycles_keeps_production_cycle_members_when_a_cycle_package_has_test_edges() {
+        // Re-checking `a` with its test edge would yield {a, b, c}; the skip keeps {a, b}.
+        let mut g = ImportGraph::default();
+        g.nodes.extend(["a", "b", "c"].map(String::from));
+        g.edges.push(edge_at("a", "b", "a/a.go", 1));
+        g.edges.push(edge_at("b", "a", "b/b.go", 1));
+        g.edges.push(edge_at("a", "c", "a/a_test.go", 2));
+        g.edges.push(edge_at("c", "a", "c/c.go", 1));
+        let cycles = find_cycles(&g);
+        assert_eq!(cycles.len(), 1, "got: {cycles:?}");
+        assert_eq!(canonical(&cycles[0]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn find_cycles_reports_cycle_closed_only_by_one_packages_test_edge() {
+        let mut g = ImportGraph::default();
+        g.nodes.extend(["a", "b"].map(String::from));
+        g.edges.push(edge_at("b", "a", "b/b.go", 1));
+        g.edges.push(edge_at("a", "b", "a/a_test.go", 2));
+        let cycles = find_cycles(&g);
+        assert_eq!(cycles.len(), 1);
+        let mut members = cycles[0].clone();
+        members.sort();
+        assert_eq!(members, vec!["a", "b"]);
     }
 
     #[test]
@@ -1720,6 +1872,22 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("pkg"));
         assert!(findings[0].message.contains("consider splitting"));
+    }
+
+    #[test]
+    fn package_size_counts_external_test_files_excluded_from_the_graph() {
+        let dir = TempDir::new("xtest");
+        let file = dir.write("a.go", MAX_PACKAGE_LINES / 2 + 1);
+        let xtest = dir.write("a_test.go", MAX_PACKAGE_LINES / 2 + 1);
+
+        let mut graph = ImportGraph::default();
+        graph.nodes.insert("pkg".to_string());
+        graph.file_packages.insert(file, "pkg".to_string());
+        graph.excluded_files.insert(xtest, "pkg".to_string());
+
+        let findings = PackageSizeChecker.check(&graph, &ArchitectureConfig::default(), None);
+
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]

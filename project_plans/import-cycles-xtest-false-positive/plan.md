@@ -324,5 +324,57 @@ None. The fix is a straightforward application of existing parsing infrastructur
 
 Returning `None` from `go_package_identity` broke `refactor::tests::plan_should_CoverAllImportersAndTestPackage_*`
 and `apply_should_RenameTestPackages_*` (the refactor planner needs `a_test.go` grouped with `a`). Shipped
-instead: `QualifiedImportLangConfig::skips_edges` (Go: `go_declares_external_test_package`) skips pass-2 edge
-emission for `package X_test` files while leaving node/`file_packages` membership unchanged.
+instead: `QualifiedImportLangConfig::excludes_from_graph` (Go: `go_declares_external_test_package`) drops
+`package X_test` files from `graph.nodes`, `graph.edges` and `graph.file_packages`, and records them in
+`ImportGraph::excluded_files` so package grouping (`package_key_for_file`, package line counts) still sees them.
+
+## Corpus backtest (AC8)
+
+Baseline = `635eab4` (pre-fix) release build; after = this branch's release build (edge skip for `package X_test`
+plus `find_cycles` ignoring edges whose source file is `_test.go`). Command, per repo, run from the repo root:
+
+    <bin> check architecture import-cycles .
+
+| Repo | `[import-cycle]` findings before → after | Notes |
+|---|---|---|
+| kubernetes/kubernetes | 28 → 0 | 0 findings new, 28 removed (`comm` of sorted outputs). The two that remained under the edge-skip-only fix (`pkg/proxy/ipvs/testing/fake_test.go`, a `_test.go` cross-package shape, and `kubeadm/.../utils_linux.go`) are also gone. |
+| tstapler/stapler-squad | 4 → 3 | 0 new, 1 removed: the Go `server/auth -> ... -> testutil -> ... -> server/auth` cycle. The 3 TypeScript cycles are unchanged. |
+| tstapler/go-git (extra, Go) | 1 → 0 | See root cause below. |
+| go-git/go-git (extra, Go) | 1 → 0 | Same shape. |
+
+**Root cause of the earlier go-git 1 → 2 (edge-skip-only version).** Dropping `X_test` edges broke the one large SCC into
+`http/internal/test <-> http` and `ssh/internal/test <-> ssh`. Each is made of two `_test.go` edges from different
+packages' test builds: `plumbing/transport/http/proxy_test.go` (`package http`) imports `http/internal/test`, and
+`http/internal/test/proxy_test.go` (`package test`) imports `http`. No non-test file imports `internal/test`; the two
+builds are never compiled together, and `go vet ./plumbing/transport/http/... ./plumbing/transport/ssh/...` exits 0.
+Those files declare `package http` / `package test` (no `_test` suffix), so excluding `X_test` nodes could not have
+removed them. Fix: `find_cycles` (`src/architecture_checks.rs`) models each package's test build separately: production edges
+form the base graph, and each package is re-checked with only its own `_test.go` edges added, so test edges from two
+packages are never combined. Edges stay
+in the graph (AC4). Regression test: `go_cross_package_internal_test_edges_do_not_report_cycle`.
+
+Real-cycle detection is covered at `build()` level by `go_real_mutual_import_still_reports_cycle`. The corpus has no
+confirmed-real Go cycle (Go rejects them), so "no lost real cycles" rests on that test, the unchanged TypeScript cycles,
+and "0 findings in head but not baseline". A real cycle made solely of one package's own `_test.go`
+edges ("import cycle not allowed in test") is still reported (`go_cycle_made_of_one_packages_own_test_imports_is_still_reported`).
+
+**Reproduce the backtest** (baseline vs head, same repos):
+
+    git worktree add --detach ~/.cache/tmp/cyc-base 635eab4 && (cd ~/.cache/tmp/cyc-base && cargo build --release)
+    cargo build --release   # in this checkout; export HEAD_CHECKOUT=$PWD
+    for r in kubernetes/kubernetes tstapler/stapler-squad tstapler/go-git go-git/go-git; do
+      (cd ~/code/github.com/$r && for b in ~/.cache/tmp/cyc-base "$HEAD_CHECKOUT"; do
+        $b/target/release/kibitzer check architecture import-cycles . | grep -c import-cycle; done)
+    done
+
+Cost: kubernetes `import-cycles` wall time 14.2s (previous commit) vs 16.0s (this build); an earlier version of the
+per-package pass took 121s and was fixed by one integer-indexed reverse-reachability prefilter.
+Full suite: `cargo test --workspace` -> 2577 passed, 0 failed, 7 ignored.
+
+**AC3 status: MET.** `package X_test` files are excluded from `graph.nodes`, `graph.edges` and `graph.file_packages`
+(`go_external_test_file_is_outside_graph_but_groups_with_its_package`). The first attempt, excluding them without more,
+failed two refactor tests (`src/refactor/tests.rs:254`, `:434`): `package_key_for_file` (`src/arch_model.rs:334`) fell back to a
+directory key that does not match Go's module-qualified key, so `a_test` files split from package `a`. Fix: new
+`ImportGraph::excluded_files` maps those files to their package's key, and `package_key_for_file` consults it after
+`file_packages`, so the model and planner still group and rename them with `X`. Corpus counts above were re-run on this
+final build (unchanged). `cargo test --workspace` -> 2613 passed, 0 failed, 7 ignored; clippy and `cargo fmt --check` clean.

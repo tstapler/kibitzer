@@ -231,6 +231,11 @@ import graph on every file edit. `kibitzer check list` doesn't cover these
 (that command lists per-file `Checker`s only); the registered architecture
 checkers are in `src/architecture_checks.rs::registry()`.
 
+For Go, `import-cycles` models each package's test build separately: `package X_test`
+files are left out of the graph, and a cycle through `_test.go` imports is reported only
+when all of those imports come from one package's own test build (Go's "import cycle
+not allowed in test"), never by combining test imports of different packages.
+
 Two more architecture checkers ship alongside `import-cycles`:
 
 - `layering` flags an import edge that runs from a later-declared layer back

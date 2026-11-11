@@ -332,7 +332,11 @@ pub(crate) fn language_for_path(path: &Path) -> Option<Language> {
 /// silently dropped from grouping if `import_graph.rs` support lags future
 /// `language_for_path` additions.
 fn package_key_for_file(repo_root: &Path, file: &Path, import_graph: &ImportGraph) -> String {
-    if let Some(key) = import_graph.file_packages.get(file) {
+    if let Some(key) = import_graph
+        .file_packages
+        .get(file)
+        .or_else(|| import_graph.excluded_files.get(file))
+    {
         return key.clone();
     }
     let dir = file.parent().unwrap_or(Path::new("."));
@@ -1185,6 +1189,17 @@ mod tests {
     #[test]
     fn language_for_path_recognizes_rust() {
         assert_eq!(language_for_path(Path::new("foo.rs")), Some(Language::Rust));
+    }
+
+    #[test]
+    fn package_key_for_file_uses_excluded_files_for_external_test_package() {
+        let mut g = ImportGraph::default();
+        g.excluded_files
+            .insert(PathBuf::from("/r/p/x_test.go"), "p".to_string());
+        assert_eq!(
+            package_key_for_file(Path::new("/r"), Path::new("/r/p/x_test.go"), &g),
+            "p"
+        );
     }
 
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
