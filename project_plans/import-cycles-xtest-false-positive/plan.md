@@ -352,13 +352,27 @@ packages' test builds: `plumbing/transport/http/proxy_test.go` (`package http`) 
 `http/internal/test/proxy_test.go` (`package test`) imports `http`. No non-test file imports `internal/test`; the two
 builds are never compiled together, and `go vet ./plumbing/transport/http/... ./plumbing/transport/ssh/...` exits 0.
 Those files declare `package http` / `package test` (no `_test` suffix), so excluding `X_test` nodes could not have
-removed them. Fix: `find_cycles` (`src/architecture_checks.rs`) ignores edges whose source file ends `_test.go`; edges stay
+removed them. Fix: `find_cycles` (`src/architecture_checks.rs`) models each package's test build separately: production edges
+form the base graph, and each package is re-checked with only its own `_test.go` edges added, so test edges from two
+packages are never combined. Edges stay
 in the graph (AC4). Regression test: `go_cross_package_internal_test_edges_do_not_report_cycle`.
 
 Real-cycle detection is covered at `build()` level by `go_real_mutual_import_still_reports_cycle`. The corpus has no
 confirmed-real Go cycle (Go rejects them), so "no lost real cycles" rests on that test, the unchanged TypeScript cycles,
-and "0 findings in head but not baseline". **Known gap:** a real cycle made solely of one package's own `_test.go`
-edges ("import cycle not allowed in test") is no longer reported.
+and "0 findings in head but not baseline". A real cycle made solely of one package's own `_test.go`
+edges ("import cycle not allowed in test") is still reported (`go_cycle_made_of_one_packages_own_test_imports_is_still_reported`).
+
+**Reproduce the backtest** (baseline vs head, same repos):
+
+    git worktree add --detach ~/.cache/tmp/cyc-base 635eab4 && (cd ~/.cache/tmp/cyc-base && cargo build --release)
+    cargo build --release
+    for r in kubernetes/kubernetes tstapler/stapler-squad tstapler/go-git go-git/go-git; do
+      (cd ~/code/github.com/$r && for b in ~/.cache/tmp/cyc-base .../this-checkout; do
+        $b/target/release/kibitzer check architecture import-cycles . | grep -c import-cycle; done)
+    done
+
+Cost: kubernetes `import-cycles` wall time 14.2s (previous commit) vs 16.0s (this build); an earlier version of the
+per-package pass took 121s and was fixed by one integer-indexed reverse-reachability prefilter.
 Full suite: `cargo test --workspace` -> 2577 passed, 0 failed, 7 ignored.
 
 **AC3 status: MET.** `package X_test` files are excluded from `graph.nodes`, `graph.edges` and `graph.file_packages`
@@ -367,4 +381,4 @@ failed two refactor tests (`src/refactor/tests.rs:254`, `:434`): `package_key_fo
 directory key that does not match Go's module-qualified key, so `a_test` files split from package `a`. Fix: new
 `ImportGraph::excluded_files` maps those files to their package's key, and `package_key_for_file` consults it after
 `file_packages`, so the model and planner still group and rename them with `X`. Corpus counts above were re-run on this
-final build (unchanged). `cargo test --workspace` -> 2578 passed, 0 failed, 7 ignored; clippy and `cargo fmt --check` clean.
+final build (unchanged). `cargo test --workspace` -> 2613 passed, 0 failed, 7 ignored; clippy and `cargo fmt --check` clean.

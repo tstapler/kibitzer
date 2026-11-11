@@ -1692,6 +1692,39 @@ mod tests {
     }
 
     #[test]
+    fn go_cycle_made_of_one_packages_own_test_imports_is_still_reported() {
+        // a's internal test imports b and b imports a: "import cycle not allowed in test".
+        let dir = tmp_dir("go-own-test-cycle");
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let files = vec![
+            write(&dir, "a/a.go", "package a\n\nfunc A() {}\n"),
+            write(
+                &dir,
+                "a/a_test.go",
+                "package a\n\nimport \"example.com/m/b\"\n\nvar _ = b.B\n",
+            ),
+            write(
+                &dir,
+                "b/b.go",
+                "package b\n\nimport \"example.com/m/a\"\n\nvar B = a.A\n",
+            ),
+        ];
+
+        let graph = build(&dir, &files).unwrap();
+
+        let findings = crate::architecture_checks::ArchitectureChecker::check(
+            &crate::architecture_checks::ImportCycleChecker,
+            &graph,
+            &crate::config::ArchitectureConfig::default(),
+            None,
+        );
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert!(findings[0].message.contains("[import-cycle]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn go_external_test_file_is_outside_graph_but_groups_with_its_package() {
         let dir = tmp_dir("go-xtest-excluded");
         write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
