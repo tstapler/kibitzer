@@ -1,4 +1,4 @@
-# Plan: fix-go-external-test-pkg-cycles
+# Plan: import-cycles-xtest-false-positive
 
 **Complexity**: 1 (single function change in one file, no new types or package boundaries)  
 **Calibration**: Adversarial review only; architecture review and UX subagents skipped.

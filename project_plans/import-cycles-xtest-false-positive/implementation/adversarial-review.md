@@ -1,4 +1,4 @@
-# Adversarial Review: fix-go-external-test-pkg-cycles
+# Adversarial Review: import-cycles-xtest-false-positive
 
 **Date**: 2026-11-10  
 **Verdict**: CLEAN

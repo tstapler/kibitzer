@@ -1,4 +1,4 @@
-# Validation Plan: fix-go-external-test-pkg-cycles
+# Validation Plan: import-cycles-xtest-false-positive
 
 **Date**: 2026-11-10  
 **Complexity**: 1 — 1 test per requirement; unit+error+integration triad, pre-mortem, and Product Triad Review are all skipped per calibration.
