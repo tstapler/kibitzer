@@ -62,6 +62,7 @@ fn sentinel_value<'a>(ret: Node, src: &'a [u8]) -> Option<&'a str> {
     let value = value.trim().trim_end_matches(';').trim();
     let is_negative_int = value
         .strip_prefix('-')
+        .map(str::trim_start)
         .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
     (value == "null" || value == "None" || is_negative_int).then_some(value)
 }

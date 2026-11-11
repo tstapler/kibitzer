@@ -42,4 +42,9 @@ mod tests {
     fn suppresses_optional_return_type() {
         assert!(run("def f() -> Optional[int]:\n    try:\n        g()\n    except ValueError:\n        return None\n    return 1\n").is_empty());
     }
+
+    #[test]
+    fn flags_negative_return_with_space_after_minus() {
+        assert_eq!(run("def f():\n    try:\n        g()\n    except ValueError:\n        return - 1\n    return 0\n").len(), 1);
+    }
 }

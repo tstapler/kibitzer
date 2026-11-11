@@ -30,10 +30,10 @@ positive when a failure is swallowed into a sentinel callers must check.
 | TypeScript | `microsoft/vscode` `src/` | 6 | all 6 | 4 (three `terminalLinkResolver.ts` "does not exist" cache nulls, one `launchMainService.ts` map-then-`coalesce`) | 4/6 ≈ 67% | **opt-in** |
 | JavaScript | not run (shares the TypeScript engine; no corpus checked) | — | — | — | unmeasured | **opt-in** |
 | Kotlin | `android/nowinandroid` | 0 | — | — | unmeasured at this size | default |
-| Python | not run | — | — | — | unmeasured | default |
+| Python | `servo/servo` (3266 `.py` files, mostly vendored WPT/third-party) | ≥40 (output truncated at 40; milvus not run) | 7 picked from the first 40 | 4 (`manifestexpected.py:43`, `wpttest.py:443`: KeyError→None for an optional key; `run_tc.py:385`: missing env var; `_inputstream.py:900`: iterator end). TPs: `browser.py:636`, `runner.py:121`, `manifest_build.py:83` | 4/7 ≈ 57% | **opt-in** |
 
 The TypeScript sample is small (n=6), so the 67% is a weak estimate; it exceeds the 40% bar,
 so TypeScript and JavaScript are not in `default_checks()` and can be enabled in
-`.kibitzer/inspect.json`. Python and Kotlin are advisory defaults per the spec without a
-large-corpus measurement; re-run this backtest on a Python and a Kotlin repo before trusting
-their rates.
+`.kibitzer/inspect.json`. Python also exceeds the bar (small sample, weak estimate) and is opt-in. Kotlin is an advisory default
+with no hits on the only local corpus (`nowinandroid`); re-run on a larger Kotlin repo before trusting its rate. Python files have no
+test-path exclusion in the default scope when enabled; add one in `.kibitzer/inspect.json`.
