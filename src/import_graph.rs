@@ -170,6 +170,9 @@ struct QualifiedImportLangConfig {
         src: &[u8],
         cache: &mut PackageIdentityCache,
     ) -> Option<String>,
+    /// True when this file's imports must not become edges even though the file still
+    /// belongs to its package (Go's `package X_test`; see `go_declares_external_test_package`).
+    skips_edges: fn(tree: &tree_sitter::Tree, src: &[u8]) -> bool,
     /// Every (normalized import target, 1-based line) pair in the tree. Implementations
     /// must exclude imports that don't name a package at all (e.g. Java's `import
     /// static`, which names a member) — such imports must never appear in the output,
@@ -238,6 +241,9 @@ fn build_qualified_name_language(
     // Pass 2: extract each file's imports and add an edge only for those that resolve
     // to a `graph.nodes` entry (the graph-membership guard).
     for (file, pkg, tree, source) in &file_packages {
+        if (cfg.skips_edges)(tree, source.as_bytes()) {
+            continue;
+        }
         let mut imports = Vec::new();
         (cfg.collect_imports)(tree.root_node(), source.as_bytes(), &mut imports);
 
@@ -325,14 +331,12 @@ fn go_package_import_path(module_path: &str, module_dir: &Path, file: &Path) -> 
     }
 }
 
-/// Go's package identity is **not** derived from parsing the file's `package_clause`
-/// node — that node names only the local package name (e.g. `a`), not the full import
-/// path other files reference it by (e.g. `example.com/app/a`). It comes from the
-/// nearest `go.mod`'s `module` directive (searched upward from the file's own
-/// directory, per `find_go_mod_upward`) plus the file's directory relative to *that*
-/// `go.mod`'s directory — not always `repo_root`, once a Go module is nested under a
-/// larger repo. `tree`/`_src` are accepted-but-unused only to satisfy
-/// `QualifiedImportLangConfig::package_identity`'s shared signature.
+/// Go's package identity comes from the nearest `go.mod`'s `module` directive (searched
+/// upward from the file's own directory, per `find_go_mod_upward`) plus the file's
+/// directory relative to *that* `go.mod`'s directory — not from the `package` clause,
+/// which names only the local package (e.g. `a`, not `example.com/app/a`). `tree`/`_src`
+/// are unused here; they exist for `QualifiedImportLangConfig::package_identity`'s shared
+/// signature.
 fn go_package_identity(
     repo_root: &Path,
     file: &Path,
@@ -343,6 +347,20 @@ fn go_package_identity(
     let dir = file.parent()?;
     let (module_path, module_dir) = go_module_for_dir(dir, repo_root, cache)?;
     go_package_import_path(&module_path, &module_dir, file)
+}
+
+/// True for a file declaring `package X_test` (an external test package). It stays
+/// grouped with `X` (so refactors and the architecture model still see it), but its
+/// imports must not become edges: it is a separate compilation unit that may legally
+/// import packages importing `X`, so an `X -> helper` edge would fabricate cycles.
+fn go_declares_external_test_package(tree: &tree_sitter::Tree, src: &[u8]) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    root.children(&mut cursor)
+        .find(|c| GoKind::of(*c) == GoKind::PackageClause)
+        .and_then(|pc| pc.named_child(0))
+        .and_then(|id| id.utf8_text(src).ok())
+        .is_some_and(|name| name.ends_with("_test"))
 }
 
 fn collect_go_imports(node: Node, src: &[u8], out: &mut Vec<(String, usize)>) {
@@ -451,6 +469,7 @@ fn go_lang_config() -> QualifiedImportLangConfig {
         import_stmt_kind: "import_spec",
         language: || tree_sitter_go::LANGUAGE.into(),
         package_identity: go_package_identity,
+        skips_edges: go_declares_external_test_package,
         collect_imports: collect_go_imports,
     }
 }
@@ -679,6 +698,7 @@ fn java_lang_config() -> QualifiedImportLangConfig {
         import_stmt_kind: "import_declaration",
         language: || tree_sitter_java::LANGUAGE.into(),
         package_identity: java_package_identity,
+        skips_edges: |_, _| false,
         collect_imports: collect_java_imports,
     }
 }
@@ -756,6 +776,7 @@ fn kotlin_lang_config() -> QualifiedImportLangConfig {
         import_stmt_kind: "import",
         language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
         package_identity: kotlin_package_identity,
+        skips_edges: |_, _| false,
         collect_imports: collect_kotlin_imports,
     }
 }
@@ -1546,6 +1567,66 @@ mod tests {
                 .edges
                 .iter()
                 .any(|e| e.from == "example.com/app/b" && e.to == "example.com/app/a")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_external_test_package_does_not_create_false_cycle() {
+        let dir = tmp_dir("go-external-test-pkg");
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let widget = write(
+            &dir,
+            "widget/widget.go",
+            "package widget\n\nfunc New() {}\n",
+        );
+        let helper = write(
+            &dir,
+            "widget/widgettest/helper.go",
+            "package widgettest\n\nimport \"example.com/m/widget\"\n\nfunc H() { widget.New() }\n",
+        );
+        let ext = write(
+            &dir,
+            "widget/widget_test.go",
+            "package widget_test\n\nimport \"example.com/m/widget/widgettest\"\n\nfunc TestX() { widgettest.H() }\n",
+        );
+
+        let graph = build(&dir, &[widget, helper, ext]).unwrap();
+
+        assert!(graph.edges.iter().any(|e| {
+            e.from == "example.com/m/widget/widgettest" && e.to == "example.com/m/widget"
+        }));
+        assert!(!graph.edges.iter().any(|e| {
+            e.from == "example.com/m/widget" && e.to == "example.com/m/widget/widgettest"
+        }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn go_internal_test_file_still_appears_in_graph() {
+        let dir = tmp_dir("go-internal-test-file");
+        write(&dir, "go.mod", "module example.com/m\n\ngo 1.21\n");
+        let widget = write(
+            &dir,
+            "widget/widget.go",
+            "package widget\n\nfunc New() {}\n",
+        );
+        let internal = write(
+            &dir,
+            "widget/widget_test.go",
+            "package widget\n\nimport \"example.com/m/other\"\n\nfunc TestX() { other.O() }\n",
+        );
+        let other = write(&dir, "other/other.go", "package other\n\nfunc O() {}\n");
+
+        let graph = build(&dir, &[widget, internal, other]).unwrap();
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| { e.from == "example.com/m/widget" && e.to == "example.com/m/other" })
         );
 
         let _ = std::fs::remove_dir_all(&dir);
