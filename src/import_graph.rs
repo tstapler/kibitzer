@@ -1601,6 +1601,13 @@ mod tests {
             e.from == "example.com/m/widget" && e.to == "example.com/m/widget/widgettest"
         }));
         assert!(crate::architecture_checks::find_cycles(&graph).is_empty());
+        let findings = crate::architecture_checks::ArchitectureChecker::check(
+            &crate::architecture_checks::ImportCycleChecker,
+            &graph,
+            &crate::config::ArchitectureConfig::default(),
+            None,
+        );
+        assert!(findings.is_empty(), "import-cycles reported: {findings:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1623,6 +1630,14 @@ mod tests {
         let graph = build(&dir, &[a, b]).unwrap();
 
         assert_eq!(crate::architecture_checks::find_cycles(&graph).len(), 1);
+        let findings = crate::architecture_checks::ArchitectureChecker::check(
+            &crate::architecture_checks::ImportCycleChecker,
+            &graph,
+            &crate::config::ArchitectureConfig::default(),
+            None,
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("[import-cycle]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
