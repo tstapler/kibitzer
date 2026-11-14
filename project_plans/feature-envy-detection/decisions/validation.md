@@ -152,3 +152,13 @@ and `suppresses_locally_built_record_without_methods` (must not fire),
 `kibitzer check backtest feature-envy` exit 0 (4818 transcripts, 1999 snapshots); `cargo fmt --all
 --check` ok; `cargo clippy --all-targets` no warnings; `cargo test --workspace` all pass (after
 `cargo build --workspace`, which `plugin_contract` needs).
+
+### Re-run after merging master (2026-11-14)
+
+`kibitzer check architecture feature-envy <dir>` (debug build, HEAD 3c8c8d1) on
+`~/code/github.com/tstapler/stapler-squad` and `~/code/github.com/kubernetes/kubernetes/pkg`:
+2 + 8 = **10 findings** (same as Round 2). Every-Nth sampling to n >= 32 is impossible on this
+corpus (N=1 gives n=10), so AC 2 as worded cannot be met here; the only n >= 32 sample (held-out
+repos, above) measured >= 94% FP. Merge note: PR #167 was squash-merged to master, so
+`src/feature_envy.rs` kept this branch's version (a superset of master's); test fixtures gained the
+new `SymbolNode`/`ArchModel` fields.
