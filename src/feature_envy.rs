@@ -378,6 +378,8 @@ mod tests {
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
+            is_constant_return: false,
         }
     }
 
@@ -396,6 +398,9 @@ mod tests {
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
             pruning: PruningSummary::default(),
+            struct_field_names: BTreeMap::new(),
+            struct_field_types: BTreeMap::new(),
+            promoted_field_accesses: vec![],
         }
     }
 
