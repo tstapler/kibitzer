@@ -1,4 +1,8 @@
 pub mod ai_vocabulary_density;
+pub mod claude_skill_common;
+pub mod claude_skill_dangling_symlink;
+pub mod claude_skill_frontmatter;
+pub mod claude_skill_xref;
 pub mod comment_quality;
 pub mod complexity;
 pub mod duplicate_code;
@@ -14,6 +18,7 @@ pub mod go_encapsulate_collection;
 pub mod go_error_context;
 pub mod go_ignored_error;
 pub mod go_table_driven_test;
+pub mod go_type_switch_clustering;
 pub mod go_type_switch_density;
 pub mod hollow_qualifier_phrasing;
 mod import_preamble;
@@ -30,6 +35,13 @@ pub mod primitive_obsession;
 pub mod repetitive_sentences;
 pub mod rules;
 pub mod sentence_length_uniformity;
+mod sentinel_return;
+pub mod sentinel_return_java;
+pub mod sentinel_return_javascript;
+pub mod sentinel_return_kotlin;
+pub mod sentinel_return_python;
+pub mod sentinel_return_typescript;
+pub mod split_loop;
 pub mod test_no_assertion;
 
 /// True for common test-file naming conventions across supported languages. Expects a

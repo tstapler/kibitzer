@@ -331,3 +331,60 @@ fn still_flags_an_undefined_all_caps_shortcut_outside_the_severity_tag_set() {
     let findings = check_source(&path(), "See [RFC] for details.\n").unwrap();
     assert_eq!(findings.len(), 1);
 }
+
+#[test]
+fn toml_frontmatter_arrays_are_not_flagged() {
+    let body = "+++\ntitle = \"My Post\"\ncategories = [\"Software Engineering\", \"Infrastructure\"]\ntags = [\"kotlin\", \"java\"]\n+++\n\nBody content.\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn yaml_frontmatter_arrays_are_not_flagged() {
+    let body = "---\ntitle: My Post\ntags: [\"a\", \"b\"]\n---\n\nBody content.\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn dangling_ref_after_toml_frontmatter_keeps_original_line() {
+    let body = "+++\ntags = [\"a\", \"b\"]\n+++\n\nSome text.\n\nSee [thing][missing].\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].line, 7);
+}
+
+#[test]
+fn unclosed_toml_frontmatter_still_checks_body() {
+    let body = "+++\ntitle = \"x\"\n\nSee [thing][missing].\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0]
+            .message
+            .contains("[missing] used but never defined")
+    );
+}
+
+#[test]
+fn dangling_ref_after_yaml_frontmatter_keeps_original_line() {
+    let body = "---\ntags: [\"a\", \"b\"]\n---\n\nSome text.\n\nSee [thing][missing].\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].line, 7);
+}
+
+#[test]
+fn mid_document_thematic_breaks_do_not_hide_dangling_refs() {
+    let body = "Intro.\n\n---\n\nSee [thing][missing].\n\n---\n\nEnd.\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].line, 5);
+}
+
+#[test]
+fn crlf_toml_frontmatter_is_not_flagged() {
+    let body = "+++\r\ntags = [\"a\", \"b\"]\r\n+++\r\n\r\nBody.\r\n";
+    let findings = check_source(&path(), body).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+}

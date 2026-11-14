@@ -13,10 +13,13 @@ remember. `comment-quality-<lang>` (`docs/comment-quality.md`) is wired in
 this way, alongside `syntax-rules-<lang>` (`docs/syntax-rules.md`),
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
 `duplicate-code-cross-file`, `introduce-special-case`
-(`docs/introduce-special-case-false-positives.md`), `parameter-object` (`docs/parameter-object-false-positives.md`), `file-complexity`, `inline-ignore` (reports
+(`docs/introduce-special-case-false-positives.md`), `parameter-object` (`docs/parameter-object-false-positives.md`), `go-type-switch-clustering` (`docs/go-type-switch-clustering-false-positives.md`), `file-complexity`, `inline-ignore` (reports
 malformed `kibitzer:ignore` directives; the directives themselves are applied to
 every checker's findings, see `docs/suppressing-checks.md`), the Go-specific
-`go-blank-imports`/`go-ignored-error`/`go-error-context`, and the mechanical
+`go-blank-imports`/`go-ignored-error`/`go-error-context`, and the type-hierarchy
+checks `remove-subclass`/`extract-superclass`/`collapse-hierarchy` and
+`push-down-method`/`push-down-field`/`pull-up-method`/`pull-up-constructor-body`/`pull-up-field`
+(`docs/hierarchy-cleanup-checks.md` and each `docs/<name>-false-positives.md`, including their measured false-positive rates), and the mechanical
 markdown-prose checks `repetitive-sentence-structure`/`missing-paragraph-break`
 (see `docs/prose-checks.md`, which also covers five backtested-but-opt-in
 prose checks and how to wire in Vale for configurable, project-specific

@@ -41,6 +41,15 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
         java_swallowed_interrupt,
     ),
     ("java-lost-exception-cause", "C.java", java_lost_cause),
+    ("sentinel-return-java", "C.java", || {
+        "class Foo {\n  int bar() {\n    try { a(); } catch (Exception e) { return -1; }\n    return 0;\n  }\n}\n".into()
+    }),
+    ("sentinel-return-javascript", "x.js", || {
+        "function bar() {\n  try { a(); } catch (e) { return -1; }\n  return 0;\n}\n".into()
+    }),
+    ("sentinel-return-kotlin", "x.kt", || {
+        "fun bar(): Int {\n  try { a() } catch (e: Exception) { return -1 }\n  return 0\n}\n".into()
+    }),
     ("go-file-size", "x.go", || long_file("//")),
     ("typescript-file-size", "x.ts", || long_file("//")),
     ("tsx-file-size", "x.tsx", || long_file("//")),
@@ -92,6 +101,11 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("comment-quality-bash", "x.sh", || {
         "# This seamlessly handles requests.\nhandle() { :; }\n".into()
     }),
+    (
+        "claude-skill-frontmatter",
+        ".claude/skills/foo/SKILL.md",
+        || "---\nname: bar\ndescription: d\n---\n".into(),
+    ),
     ("repetitive-sentence-structure", "n.md", || {
         "# T\n\nThis is bad. This is worse. This is worst.\n".into()
     }),
@@ -118,6 +132,51 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
         "go-encapsulate-variable",
         "whole-repo architecture check needing a two-package model, not a single-file fixture; \
          end-to-end suppression is covered in tests/encapsulate_variable_cli.rs",
+    ),
+    (
+        "remove-subclass",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "extract-superclass",
+        "whole-repo architecture check needing a field-access model, not a single-file fixture",
+    ),
+    (
+        "collapse-hierarchy",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "push-down-method",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "push-down-field",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "pull-up-method",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "pull-up-constructor-body",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "pull-up-field",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "go-type-switch-clustering",
+        "whole-repo architecture check needing a multi-method model; end-to-end suppression is \
+         covered in tests/go_type_switch_clustering_cli.rs",
+    ),
+    (
+        "claude-skill-xref",
+        "resolves ids against an on-disk .claude/skills tree, which a single-file fixture lacks",
+    ),
+    (
+        "claude-skill-dangling-symlink",
+        "judges the path on disk (a symlink), not file contents, and reports at line 1 of the link",
     ),
     (
         "go-blank-imports",

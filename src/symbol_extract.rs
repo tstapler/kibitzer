@@ -258,7 +258,7 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             // Java has no free functions — every `method_declaration` classifies as
             // `Method` in `classify_node`'s language-specific branch below, never
             // `Function`.
-            function_kinds: &["method_declaration"],
+            function_kinds: &["method_declaration", "constructor_declaration"],
             name_finder: field_name,
             is_exported: java_is_exported,
         },
@@ -270,7 +270,7 @@ fn lang_symbol_config(lang: Language) -> LangSymbolConfig {
             // empty here; the real dispatch lives in `classify_node`.
             type_kinds: &[],
             interface_kinds: &[],
-            function_kinds: &["function_declaration"],
+            function_kinds: &["function_declaration", "secondary_constructor"],
             name_finder: field_name,
             is_exported: kotlin_is_exported,
         },
@@ -336,7 +336,7 @@ fn build_id(package_path: &str, parent: Option<&str>, name: &str) -> String {
 /// Go method/parent detection: the `receiver` field is a `parameter_list` wrapping one
 /// `parameter_declaration`, whose `type` field is either the receiver type's identifier
 /// directly (value receiver) or a `pointer_type` wrapping it (pointer receiver).
-fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
+pub(crate) fn go_receiver_type_name(method: Node, source: &str) -> Option<String> {
     let receiver = method.child_by_field_name("receiver")?;
     let mut cursor = receiver.walk();
     let decl = receiver
@@ -415,9 +415,11 @@ fn go_type_declaration_symbols(
             exported,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         });
     }
 }
@@ -514,8 +516,14 @@ fn classify_node(
         return None;
     };
 
-    let name_node = (cfg.name_finder)(node)?;
-    let name = strip_generic_params(node_text(name_node, source));
+    // Kotlin's `secondary_constructor` has no name child; surface it as `constructor` so
+    // the pull-up-constructor-body checker can recognise it.
+    let name = if language == Language::Kotlin && kind == "secondary_constructor" {
+        "constructor".to_string()
+    } else {
+        let name_node = (cfg.name_finder)(node)?;
+        strip_generic_params(node_text(name_node, source))
+    };
     let exported = (cfg.is_exported)(node, source);
     let line = node.start_position().row + 1;
 
@@ -542,6 +550,11 @@ fn classify_node(
         None
     };
     let is_pure_delegation = delegating.is_some();
+    let is_constant_return = matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+        && call_graph_supports(language)
+        && node
+            .child_by_field_name("body")
+            .is_some_and(is_single_literal_return);
     let delegation_field = delegating
         .filter(|_| symbol_kind == SymbolKind::Method)
         .and_then(|call| delegation_field_from_call(node, call, language, source));
@@ -561,9 +574,12 @@ fn classify_node(
         exported,
         parent,
         is_pure_delegation,
+        is_constant_return,
         delegation_field,
         params,
         used_as_value: false,
+        end_line: matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method)
+            .then(|| node.end_position().row + 1),
     })
 }
 
@@ -715,6 +731,53 @@ fn delegating_call(body: Node) -> Option<Node> {
             }
         }
         _ => None,
+    }
+}
+
+/// Literal leaf kinds across Go and TS/JS (verified via `to_sexp()`); `identifier` is
+/// excluded so `return nil`'s Go node (`nil`) counts but `return x` does not. Go's
+/// `true`/`false`/`nil` and TS's `true`/`false`/`null`/`undefined` are their own node kinds.
+const LITERAL_KINDS: &[&str] = &[
+    "int_literal",
+    "float_literal",
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "rune_literal",
+    "number",
+    "string",
+    "true",
+    "false",
+    "nil",
+    "null",
+    "undefined",
+];
+
+// SEAM(typed-node-kind-migration): `return_statement`/`expression_list`/`comment` are matched
+// by raw string across the Go and TS/JS grammars at once, so no single `<Lang>Kind` enum
+// covers them — see ADR-001.
+/// Body is exactly `return <one literal>`; multi-value returns and expressions are not.
+fn is_single_literal_return(body: Node) -> bool {
+    let stmts = body_statements(body);
+    let [stmt] = stmts.as_slice() else {
+        return false;
+    };
+    if stmt.kind() != "return_statement" {
+        return false;
+    }
+    let mut cursor = stmt.walk();
+    let values: Vec<Node> = stmt
+        .children(&mut cursor)
+        .filter(|c| c.is_named() && c.kind() != "comment")
+        .collect();
+    let is_literal = |n: &Node| LITERAL_KINDS.contains(&n.kind());
+    match values.as_slice() {
+        [v] if v.kind() == "expression_list" => {
+            let mut c2 = v.walk();
+            let exprs: Vec<Node> = v.children(&mut c2).filter(|c| c.is_named()).collect();
+            matches!(exprs.as_slice(), [e] if is_literal(e))
+        }
+        [v] => is_literal(v),
+        _ => false,
     }
 }
 
@@ -1063,7 +1126,7 @@ fn go_receiver_var_name(method: Node, source: &str) -> Option<String> {
 /// group (`X, Y int`), so every `name`-field child is collected, not just the first. An
 /// embedded field (anonymous — no `name` field at all) is skipped: embedding introduces
 /// promoted fields/methods this v1 extraction doesn't walk into.
-fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String)>) {
+fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String, String)>) {
     let mut cursor = type_decl.walk();
     for spec in type_decl
         .children(&mut cursor)
@@ -1091,11 +1154,21 @@ fn go_struct_fields(type_decl: Node, source: &str, out: &mut Vec<(String, String
             .children(&mut fc)
             .filter(|c| GoKind::of(*c) == GoKind::FieldDeclaration)
         {
+            let type_text = decl
+                .child_by_field_name("type")
+                .map(|t| {
+                    node_text(t, source)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
             let mut nc = decl.walk();
             for field_name_node in decl.children_by_field_name("name", &mut nc) {
                 out.push((
                     type_name.clone(),
                     node_text(field_name_node, source).to_string(),
+                    type_text.clone(),
                 ));
             }
         }
@@ -1106,7 +1179,7 @@ fn walk_struct_fields(
     node: Node,
     language: Language,
     source: &str,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<(String, String, String)>,
 ) {
     if language == Language::Go && GoKind::of(node) == GoKind::TypeDeclaration {
         go_struct_fields(node, source, out);
@@ -1121,11 +1194,25 @@ fn walk_struct_fields(
 /// Go-only for v1 (see [`field_access_supports`]); other languages return an empty list.
 /// Exists solely to give [`extract_field_access_sites_for_file`] a field-name set to match
 /// a selector's accessed name against.
+#[cfg(test)]
 pub fn extract_struct_fields_for_file(
     language: Language,
     source: &str,
     tree: &Tree,
 ) -> Vec<(String, String)> {
+    extract_struct_field_types_for_file(language, source, tree)
+        .into_iter()
+        .map(|(ty, field, _)| (ty, field))
+        .collect()
+}
+
+/// Like [`extract_struct_fields_for_file`] but also yields each field's type text
+/// (whitespace-normalised): `(type_name, field_name, type_text)`. Go-only.
+pub fn extract_struct_field_types_for_file(
+    language: Language,
+    source: &str,
+    tree: &Tree,
+) -> Vec<(String, String, String)> {
     if language != Language::Go {
         return Vec::new();
     }
@@ -2577,6 +2664,89 @@ mod tests {
     }
 
     #[test]
+    fn end_line_is_one_indexed_inclusive_for_methods_in_each_oop_language() {
+        let go = extract(
+            Language::Go,
+            "package p\n\ntype T struct{}\n\nfunc (t T) M() {\n\t_ = 1\n}\n",
+            "p",
+        );
+        let m = find_by_name(&go, "M");
+        assert_eq!((m.line, m.end_line), (5, Some(7)));
+
+        let ts = extract(
+            Language::TypeScript,
+            "class A {\n  m() {\n    return 1;\n  }\n}\n",
+            "p",
+        );
+        let m = find_by_name(&ts, "m");
+        assert_eq!((m.line, m.end_line), (2, Some(4)));
+
+        let java = extract(
+            Language::Java,
+            "class A {\n  void m() {\n    int x = 1;\n  }\n}\n",
+            "p",
+        );
+        let m = find_by_name(&java, "m");
+        assert_eq!((m.line, m.end_line), (2, Some(4)));
+
+        let kt = extract(
+            Language::Kotlin,
+            "class A {\n  fun m() {\n    val x = 1\n  }\n}\n",
+            "p",
+        );
+        let m = find_by_name(&kt, "m");
+        assert_eq!((m.line, m.end_line), (2, Some(4)));
+    }
+
+    #[test]
+    fn types_have_no_end_line() {
+        let java = extract(Language::Java, "class A {}\n", "p");
+        assert_eq!(find_by_name(&java, "A").end_line, None);
+    }
+
+    #[test]
+    fn java_and_kotlin_constructors_are_extracted_as_methods() {
+        let java = extract(
+            Language::Java,
+            "class A {\n  A(int x) {\n    this.x = x;\n  }\n}\n",
+            "p",
+        );
+        let ctor = java
+            .iter()
+            .find(|s| s.name == "A" && s.kind == SymbolKind::Method)
+            .expect("Java constructor extracted as a Method");
+        assert_eq!(ctor.kind, SymbolKind::Method);
+        assert_eq!(ctor.parent.as_deref(), Some("A"));
+        assert_eq!(ctor.end_line, Some(4));
+
+        let kt = extract(
+            Language::Kotlin,
+            "class A {\n  constructor(x: Int) {\n    println(x)\n  }\n}\n",
+            "p",
+        );
+        let ctor = find_by_name(&kt, "constructor");
+        assert_eq!(ctor.kind, SymbolKind::Method);
+        assert_eq!(ctor.parent.as_deref(), Some("A"));
+        assert_eq!(ctor.end_line, Some(4));
+    }
+
+    #[test]
+    fn go_struct_field_types_carry_normalised_type_text() {
+        let cache = GrammarCache::new();
+        let src = "package pkg\n\ntype T struct {\n\tX, Y int\n\tM map[string]  int\n}\n";
+        let tree = cache.parse(Language::Go, src).expect("parses");
+        let got = extract_struct_field_types_for_file(Language::Go, src, &tree);
+        assert_eq!(
+            got,
+            vec![
+                ("T".into(), "X".into(), "int".into()),
+                ("T".into(), "Y".into(), "int".into()),
+                ("T".into(), "M".into(), "map[string] int".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn go_struct_fields_collects_every_declared_field() {
         let fields = struct_fields(
             Language::Go,
@@ -3188,6 +3358,81 @@ func f(int, string) {}
     fn params_empty_for_unsupported_languages() {
         let symbols = extract(Language::Python, "def f(a, b):\n    pass\n", "pkg");
         assert!(pairs(&symbols, "f").is_empty());
+    }
+
+    fn constant_return(language: Language, src: &str, name: &str) -> bool {
+        find_by_name(&extract(language, src, "pkg"), name).is_constant_return
+    }
+
+    #[test]
+    fn is_constant_return_true_for_go_literal_returns() {
+        for (label, ret) in [
+            ("int", "return 1"),
+            ("string", "return \"x\""),
+            ("bool", "return true"),
+            ("nil", "return nil"),
+            ("false", "return false"),
+            ("float", "return 1.5"),
+            ("rune", "return 'a'"),
+            ("raw string", "return `raw`"),
+            ("trailing comment", "return 1 // note"),
+        ] {
+            let src = format!("package pkg\n\nfunc (t *T) Kind() any {{\n\t{ret}\n}}\n");
+            assert!(constant_return(Language::Go, &src, "Kind"), "{label}");
+        }
+    }
+
+    #[test]
+    fn is_constant_return_false_for_go_non_constant_bodies() {
+        for (label, body) in [
+            ("identifier", "return x"),
+            ("call", "return f()"),
+            ("multi-value", "return 1, nil"),
+            ("expression", "return 1 + 2"),
+            ("two statements", "log()\n\treturn 1"),
+            ("empty", ""),
+            ("bare return", "return"),
+            ("negative literal", "return -1"),
+        ] {
+            let src = format!("package pkg\n\nfunc (t *T) Kind() any {{\n\t{body}\n}}\n");
+            assert!(!constant_return(Language::Go, &src, "Kind"), "{label}");
+        }
+    }
+
+    #[test]
+    fn is_constant_return_true_for_typescript_literals_and_false_otherwise() {
+        for ret in [
+            "return 1;",
+            "return 'a';",
+            "return true;",
+            "return null;",
+            "return undefined;",
+        ] {
+            let src = format!("class C {{ kind() {{ {ret} }} }}\n");
+            assert!(constant_return(Language::TypeScript, &src, "kind"), "{ret}");
+        }
+        for ret in [
+            "return this.x;",
+            "return f();",
+            "return;",
+            "return -1;",
+            "return `t`;",
+        ] {
+            let src = format!("class C {{ kind() {{ {ret} }} }}\n");
+            assert!(
+                !constant_return(Language::TypeScript, &src, "kind"),
+                "{ret}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_constant_return_false_for_rust_even_with_a_literal_body() {
+        assert!(!constant_return(
+            Language::Rust,
+            "fn thin() -> i32 { return 1; }\n",
+            "thin"
+        ));
     }
 
     #[test]

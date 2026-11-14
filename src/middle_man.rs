@@ -43,12 +43,7 @@ impl ArchModelChecker for MiddleManChecker {
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
         // Resolved or not: an `implements Foo` whose interface lives outside the repo is
         // still an explicit adapter declaration.
-        let implementers: HashSet<&str> = model
-            .type_edges
-            .iter()
-            .filter(|e| e.kind == Some(TypeRelationKind::Implements))
-            .map(|e| e.from.as_str())
-            .collect();
+        let implementers = implementer_type_ids(model);
         let mut findings: Vec<ArchFinding> = model
             .packages
             .values()
@@ -57,6 +52,16 @@ impl ArchModelChecker for MiddleManChecker {
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
     }
+}
+
+/// Ids of types with an `implements` edge (resolved or not).
+pub(crate) fn implementer_type_ids(model: &ArchModel) -> HashSet<&str> {
+    model
+        .type_edges
+        .iter()
+        .filter(|e| e.kind == Some(TypeRelationKind::Implements))
+        .map(|e| e.from.as_str())
+        .collect()
 }
 
 fn findings_for_package(
@@ -83,7 +88,10 @@ fn findings_for_package(
 }
 
 /// Method ids are `{pkg}::{type}.{name}`, the same shape `type_edges.from` uses for the type.
-fn implements_declared_interface(method: &SymbolNode, implementers: &HashSet<&str>) -> bool {
+pub(crate) fn implements_declared_interface(
+    method: &SymbolNode,
+    implementers: &HashSet<&str>,
+) -> bool {
     method
         .id
         .strip_suffix(method.name.as_str())

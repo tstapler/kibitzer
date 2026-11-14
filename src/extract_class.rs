@@ -357,9 +357,11 @@ mod tests {
             exported: true,
             parent: Some(type_name.to_string()),
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -384,6 +386,9 @@ mod tests {
             field_accesses,
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: PruningSummary {
                 include_private: false,
                 excluded_dirs: vec![],

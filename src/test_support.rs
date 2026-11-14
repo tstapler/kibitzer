@@ -70,6 +70,36 @@ pub(crate) fn check_java_source(checker: &dyn Checker, src: &str) -> Result<Vec<
     checker.check(Path::new("<source>"), &ctx)
 }
 
+/// Parses `src` with `language`'s grammar and runs `checker` against it.
+fn check_source_as(
+    language: crate::checker::Language,
+    checker: &dyn Checker,
+    src: &str,
+) -> Result<Vec<Finding>> {
+    let tree = crate::checker::GrammarCache::new().parse(language, src)?;
+    let ctx = CheckContext {
+        source: src,
+        tree: Some(&tree),
+    };
+    checker.check(Path::new("<source>"), &ctx)
+}
+
+pub(crate) fn check_python_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    check_source_as(crate::checker::Language::Python, checker, src)
+}
+
+pub(crate) fn check_kotlin_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    check_source_as(crate::checker::Language::Kotlin, checker, src)
+}
+
+pub(crate) fn check_typescript_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    check_source_as(crate::checker::Language::TypeScript, checker, src)
+}
+
+pub(crate) fn check_javascript_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    check_source_as(crate::checker::Language::JavaScript, checker, src)
+}
+
 /// The compiled `kibitzer` binary's path. Cargo only sets `CARGO_BIN_EXE_<name>` for
 /// integration tests/benches (this crate has no `tests/` directory — everything is inline
 /// `#[cfg(test)]`, per `validation.md`'s Test Stack section), so it's not available here.
