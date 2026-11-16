@@ -162,3 +162,11 @@ corpus (N=1 gives n=10), so AC 2 as worded cannot be met here; the only n >= 32 
 repos, above) measured >= 94% FP. Merge note: PR #167 was squash-merged to master, so
 `src/feature_envy.rs` kept this branch's version (a superset of master's); test fixtures gained the
 new `SymbolNode`/`ArchModel` fields.
+
+### Owner waiver of AC 2 (target FP <= 30% at n >= 32)
+
+The owner instructed in the work session: "waive AC 2 and ship it." AC 2 is therefore waived, not
+met. The measured numbers above are unchanged: 10 findings on squad + k8s pkg (n >= 32 not
+reachable), and >= 94% FP on the held-out n=32 sample. The checker stays opt-in; a structural
+request-parameter rule is the next lever and is out of scope here. The backlog waive tool
+(`request_owner_action`) returned PERMISSION_DENIED, so the waiver is recorded here.
