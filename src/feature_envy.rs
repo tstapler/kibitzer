@@ -2,7 +2,8 @@
 //! another type's data far more than its own (Tsantalis & Chatzigeorgiou, IEEE TSE 2009).
 //! Foreign field accesses come from `god_class`'s ATFD walker, foreign calls from
 //! `ArchModel::call_edges`, own accesses from `ArchModel::field_accesses`. Go only; opt-in via
-//! `model_registry()`. Skips test files, delegation-named types, pure delegations, tiny methods.
+//! `model_registry()`. Skips test files, delegation-named types, pure delegations, tiny methods,
+//! orchestrator/config receivers (`ORCHESTRATOR_SUFFIXES`) and method-less record targets.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,8 +25,8 @@ const FEATURE_ENVY_MIN_FOREIGN: usize = 5;
 const FEATURE_ENVY_MIN_TOTAL: usize = 4;
 
 /// Receiver roles that orchestrate collaborators by design: reaching into several foreign
-/// types is their job, not envy. Every entry is a false-positive class measured in
-/// `project_plans/feature-envy-detection/decisions/validation.md`.
+/// types is their job, not envy. Suffixes were tuned on the corpus in
+/// `project_plans/feature-envy-detection/decisions/validation.md`; the held-out sample there did not confirm them.
 const ORCHESTRATOR_SUFFIXES: [&str; 23] = [
     "Repository",
     "Storage",
@@ -53,11 +54,13 @@ const ORCHESTRATOR_SUFFIXES: [&str; 23] = [
     "Settings",
 ];
 
-/// Matches `OrderService` and a bare lowercase `reconciler`, but not `Restore` or `Servicer`.
+/// Matches `OrderService`, `Store[K, V]` and a bare lowercase `reconciler`, but not `Restore`,
+/// `Servicer` or `ServiceLocator`. Only CamelCase and bare names match: `userservice` does not.
 fn is_orchestrator_receiver(type_name: &str) -> bool {
+    let base = type_name.split('[').next().unwrap_or(type_name);
     ORCHESTRATOR_SUFFIXES
         .iter()
-        .any(|suffix| type_name.ends_with(suffix) || type_name.eq_ignore_ascii_case(suffix))
+        .any(|suffix| base.ends_with(suffix) || base.eq_ignore_ascii_case(suffix))
 }
 
 /// True when `dominant` (`pkg::Type`) declares no methods anywhere in the model: a DTO / input
@@ -688,10 +691,22 @@ mod tests {
             bare.is_empty(),
             "bare lowercase role name should be skipped"
         );
-        for type_name in ["Restore", "Servicer"] {
+        for type_name in ["Restore", "Servicer", "ServiceLocator", "StoreFront"] {
             let findings = run_as_type(&format!("fe-orch-near-{type_name}"), type_name);
             assert_eq!(findings.len(), 1, "{type_name} must still be flagged");
         }
+    }
+
+    #[test]
+    fn generic_receiver_type_arguments_do_not_hide_the_role_suffix() {
+        assert!(is_orchestrator_receiver("Store[K, V]"));
+        assert!(is_orchestrator_receiver("OrderService[T]"));
+        assert!(!is_orchestrator_receiver("Servicer[T]"));
+        let findings = run_as_type("fe-orch-generic", "OrderService[T]");
+        assert!(
+            findings.is_empty(),
+            "generic OrderService[T] should be skipped"
+        );
     }
 
     #[test]

@@ -94,13 +94,13 @@ reviewer would plausibly accept.
 | squad + k8s pkg, all findings (N=1) | 7 original suffixes + no-method record rule | 37 | 7 | 30 | 81% |
 | squad + k8s pkg, all findings | + role suffixes (tuned on the row above) | 10 | 7 | 3 | 30% (in-sample, n<32) |
 | k8s `staging/` (22) + the 10 above | role suffixes, before `Options`/`Config` | 32 | 9 | 23 | 72% |
-| **Held-out**: `cli/cli`, `caddyserver/caddy`, `hashicorp/consul`, every 5th of 159 findings (`cat ho_cli ho_caddy ho_consul \| awk 'NR%5==1'`) | + `Options`/`Config`/`Flags`/`Settings` (shipped) | 32 | 0-2 | 30-32 | **>= 94%** |
+| **Held-out**: `cli/cli`, `caddyserver/caddy`, `hashicorp/consul`, every 5th of 159 findings (`cat ho_cli ho_caddy ho_consul \| awk 'NR%5==1'`) | + `Options`/`Config`/`Flags`/`Settings` (shipped) | 32 | 0-2 | 30-32 | **>= 93.75% (30/32)** |
 
 Commands: `kibitzer check architecture feature-envy <dir>` for each repo; counts cli 5, caddy 4,
 consul 150, cert-manager 0.
 
 **Conclusion: criterion 2 (FP <= 30% at n >= 32) is not met.** The 30% row has n=10 and its suffix
-list was fitted to that same corpus. On unseen repos the rate is >= 94%, almost entirely
+list was fitted to that same corpus. On unseen repos the rate is >= 93.75% (30/32), almost entirely
 `hashicorp/consul` RPC/HTTP endpoint methods (`func (c *Catalog) Register(args *structs.RegisterRequest, ...)`,
 `HTTPHandlers.*`) whose dominant foreign type is a request struct *with* methods, so the
 no-method-record rule does not apply. Suffix lists cannot fix this honestly; the next lever is
@@ -113,10 +113,10 @@ needs its own design. The checker must stay opt-in.
   findings), `caddyserver/caddy` (4), `hashicorp/consul` (150); `cat ho_cli ho_caddy ho_consul |
   awk 'NR%5==1'` over the 159 findings -> 32 sampled. Build: the shipped one (suffixes incl.
   `Options`/`Config`/`Flags`/`Settings`). Judged by one reviewer reading the method source.
-- Counts: 0-2 TP, 30-32 FP, i.e. FP rate >= 94%. The **per-finding judgment list was not
+- Counts: 0-2 TP, 30-32 FP, i.e. FP rate >= 93.75% (30/32). The **per-finding judgment list was not
   saved**, and the reason for the 0-2 range (presumably borderline cases) was not recorded, so
   the exact split is not reproducible from this file. It is deliberately not re-measured or
-  re-tuned here (the sample is spent). Even at the most favourable end (2 TP), FP is 30/32 = 94%.
+  re-tuned here (the sample is spent). Even at the most favourable end (2 TP), FP is 30/32 = 93.75%.
 
 ### Deviation from AC 0 wording
 
@@ -159,7 +159,7 @@ and `suppresses_locally_built_record_without_methods` (must not fire),
 `~/code/github.com/tstapler/stapler-squad` and `~/code/github.com/kubernetes/kubernetes/pkg`:
 2 + 8 = **10 findings** (same as Round 2). Every-Nth sampling to n >= 32 is impossible on this
 corpus (N=1 gives n=10), so AC 2 as worded cannot be met here; the only n >= 32 sample (held-out
-repos, above) measured >= 94% FP. Merge note: PR #167 was squash-merged to master, so
+repos, above) measured >= 93.75% (30/32) FP. Merge note: PR #167 was squash-merged to master, so
 `src/feature_envy.rs` kept this branch's version (a superset of master's); test fixtures gained the
 new `SymbolNode`/`ArchModel` fields.
 
@@ -167,6 +167,16 @@ new `SymbolNode`/`ArchModel` fields.
 
 The owner instructed in the work session: "waive AC 2 and ship it." AC 2 is therefore waived, not
 met. The measured numbers above are unchanged: 10 findings on squad + k8s pkg (n >= 32 not
-reachable), and >= 94% FP on the held-out n=32 sample. The checker stays opt-in; a structural
+reachable), and >= 93.75% (30/32) FP on the held-out n=32 sample. The checker stays opt-in; a structural
 request-parameter rule is the next lever and is out of scope here. The backlog waive tool
 (`request_owner_action`) returned PERMISSION_DENIED, so the waiver is recorded here.
+
+### PR #185 review round
+
+Generic receivers (`Store[K, V]`) now match the role suffixes (the type arguments are stripped
+first). Re-run on squad + k8s pkg: still 2 + 8 = 10 findings, `kibitzer check backtest
+feature-envy` exit 0, so no measured change on this corpus. The ">= 94%" figure above is
+corrected to 93.75% (30/32 is the best case). Reviewer findings not acted on: bare same-package
+types the model never declared, and embedding-promoted methods, can also read as method-less
+records (INFERRED from code reading, not run; needs its own backtest); the 7 TPs in the 10-finding
+row are not individually listed, so that row's TP count is UNVERIFIED.
