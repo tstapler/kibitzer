@@ -174,7 +174,7 @@ mod tests {
             "package pkg\n\ntype Base struct{ N int }\n\ntype A struct{ Base }\n\nfunc (a *A) Bump() {\n\ta.N++\n}\n",
         );
         let out = dir.join("arch.json");
-        run_export(dir.clone(), None, out.clone(), false, true).unwrap();
+        let _ = run_export(dir.clone(), None, out.clone(), false, true).unwrap();
 
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();

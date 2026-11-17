@@ -472,14 +472,14 @@ mod tests {
         .unwrap();
         let offsets = tmp_path("advances-offsets");
 
-        run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
+        let _ = run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
         let offset_file = session_offset_path(&offsets, &transcript);
         let after_first = SessionOffset::load(&offset_file).offset;
         assert_eq!(after_first, std::fs::metadata(&transcript).unwrap().len());
 
         // Nothing new appended — a second call must not re-derive the same touched
         // files (which would defeat the whole point of tracking an offset).
-        run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
+        let _ = run_stop_hook_with_offsets_dir(&dir, Some(&transcript), &offsets).unwrap();
         assert_eq!(SessionOffset::load(&offset_file).offset, after_first);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -515,7 +515,7 @@ mod tests {
             })
             .collect();
         for handle in handles {
-            handle.join().unwrap();
+            let _ = handle.join().unwrap();
         }
 
         for transcript in &transcripts {

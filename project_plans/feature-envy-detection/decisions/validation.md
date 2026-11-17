@@ -63,3 +63,120 @@ refactor a reviewer would plausibly accept.
 The >30% rule triggered, so `FEATURE_ENVY_MIN_FOREIGN` is 5 (already applied). The rate is still
 far above 30%; the checker stays opt-in (`model_registry()` only). Next levers: suppress
 parameter-record/DTO targets, and methods whose own receiver is a repository/store/handler.
+
+## Round 2: record-target and orchestrator-role suppression (2026-11-04)
+
+Rules added in `src/feature_envy.rs`:
+1. `is_record_target`: skip when the dominant foreign type declares no methods anywhere in the
+   model (DTO / input record / result or summary struct). Covers parameter records and
+   locally built records (`GetStatistics`, `*Result` fillers) alike.
+2. `is_orchestrator_receiver`: skip when the method's own receiver ends in `ORCHESTRATOR_SUFFIXES`
+   (`Repository`, `Storage`, `Store`, `Handler`, `Controller`, `Manager`, `Service`, `Registry`,
+   `Listener`, `Reconciler`, `Runner`, `Executor`, `Generator`, `Collector`, `Builder`, `Scanner`,
+   `Checker`, `Linker`, `Determiner`) or equals one case-insensitively (`reconciler`).
+
+Command (debug build): `kibitzer check architecture feature-envy <dir>` on `stapler-squad` and
+`kubernetes/kubernetes/pkg`.
+
+| Build | Findings (squad + k8s pkg) |
+|---|---|
+| Round 1 baseline | 85 + 43 = 128 |
+| + rule 1 (param-only first cut, then any no-method record) + 7 original suffixes | 12 + 25 = 37 |
+| + rule 2 role suffixes above (shipped) | 2 + 8 = 10 |
+
+### Measured FP rate — target NOT met
+
+All judgments: one reviewer reading the first ~10-15 lines of each method; a TP needs a refactor a
+reviewer would plausibly accept.
+
+| Sample | Build | n | TP | FP | FP rate |
+|---|---|---|---|---|---|
+| squad + k8s pkg, all findings (N=1) | 7 original suffixes + no-method record rule | 37 | 7 | 30 | 81% |
+| squad + k8s pkg, all findings | + role suffixes (tuned on the row above) | 10 | 7 | 3 | 30% (in-sample, n<32) |
+| k8s `staging/` (22) + the 10 above | role suffixes, before `Options`/`Config` | 32 | 9 | 23 | 72% |
+| **Held-out**: `cli/cli`, `caddyserver/caddy`, `hashicorp/consul`, every 5th of 159 findings (`cat ho_cli ho_caddy ho_consul \| awk 'NR%5==1'`) | + `Options`/`Config`/`Flags`/`Settings` (shipped) | 32 | 0-2 | 30-32 | **>= 93.75% (30/32)** |
+
+Commands: `kibitzer check architecture feature-envy <dir>` for each repo; counts cli 5, caddy 4,
+consul 150, cert-manager 0.
+
+**Conclusion: criterion 2 (FP <= 30% at n >= 32) is not met.** The 30% row has n=10 and its suffix
+list was fitted to that same corpus. On unseen repos the rate is >= 93.75% (30/32), almost entirely
+`hashicorp/consul` RPC/HTTP endpoint methods (`func (c *Catalog) Register(args *structs.RegisterRequest, ...)`,
+`HTTPHandlers.*`) whose dominant foreign type is a request struct *with* methods, so the
+no-method-record rule does not apply. Suffix lists cannot fix this honestly; the next lever is
+structural (a parameter that is a request/args value consumed in a handler-shaped method), which
+needs its own design. The checker must stay opt-in.
+
+### Held-out sample record (what is and is not preserved)
+
+- Generation: `kibitzer check architecture feature-envy <repo> > ho_<name>` for `cli/cli` (5
+  findings), `caddyserver/caddy` (4), `hashicorp/consul` (150); `cat ho_cli ho_caddy ho_consul |
+  awk 'NR%5==1'` over the 159 findings -> 32 sampled. Build: the shipped one (suffixes incl.
+  `Options`/`Config`/`Flags`/`Settings`). Judged by one reviewer reading the method source.
+- Counts: 0-2 TP, 30-32 FP, i.e. FP rate >= 93.75% (30/32). The **per-finding judgment list was not
+  saved**, and the reason for the 0-2 range (presumably borderline cases) was not recorded, so
+  the exact split is not reproducible from this file. It is deliberately not re-measured or
+  re-tuned here (the sample is spent). Even at the most favourable end (2 TP), FP is 30/32 = 93.75%.
+
+### Deviation from AC 0 wording
+
+AC 0 says the dominant type is "a parameter of the flagged method" with no methods of its own.
+`is_record_target` (`src/feature_envy.rs`) implements the **wider** rule: the dominant foreign
+type declares no methods anywhere in the model, whether or not it is a parameter. Reason: locally
+built result/summary records (`GetStatistics`, `*Result` fillers) were observed as the same FP
+class as parameter records; the parameter-only first cut was replaced by the wider rule (see the
+Round 2 build table). The with/without-param-gate delta was not isolated in a separate run.
+Narrowing to the AC would re-admit those records. Tests: `suppresses_parameter_record_without_methods`
+and `suppresses_locally_built_record_without_methods` (must not fire),
+`still_flags_parameter_type_that_has_methods` (must still fire).
+
+### Known true positives
+
+- `ServicePortMap.Update`, `updateNodeInfoSnapshotList`: still fire.
+- `transitionWithGuard` (receiver `BacklogService`): **lost, accepted.** It reads 5 fields of its
+  `item` param into a `BacklogItemTransitionInput` (`PlanApproved: item.PlanApproved, ...`). That
+  shape is exactly the service-receiver FP class (consul's endpoints are the same). Narrowing the
+  `Service` suffix by "reads a foreign type heavily" cannot separate them: every FP reads a
+  foreign type heavily. Pinned by
+  `service_receiver_reading_a_param_heavily_is_a_known_accepted_loss`.
+- `recoverMissingSession` (receiver `SessionHealthChecker`): **lost, accepted; the TP label is kept.**
+  Source: `result.IsHealthy = false; result.Issues = append(result.Issues, ...);
+  result.RecoveryAttempted = true; result.RecoverySuccess = true; result.Actions = append(...)`
+  mixed with `instance.Start(false)`, `instance.TmuxAlive()`. It loses to the `Checker` suffix
+  (and, if `HealthCheckResult` is dominant, to the no-method-record rule; which type was dominant
+  before the change was not re-verified). It is a real recovery routine on `Instance`-heavy state,
+  so this is a recall cost of the suffix rules, not a relabelled TP.
+
+### Other checks (fresh run, this commit)
+
+`kibitzer check backtest feature-envy` exit 0 (4818 transcripts, 1999 snapshots); `cargo fmt --all
+--check` ok; `cargo clippy --all-targets` no warnings; `cargo test --workspace` all pass (after
+`cargo build --workspace`, which `plugin_contract` needs).
+
+### Re-run after merging master (2026-11-14)
+
+`kibitzer check architecture feature-envy <dir>` (debug build, HEAD 3c8c8d1) on
+`~/code/github.com/tstapler/stapler-squad` and `~/code/github.com/kubernetes/kubernetes/pkg`:
+2 + 8 = **10 findings** (same as Round 2). Every-Nth sampling to n >= 32 is impossible on this
+corpus (N=1 gives n=10), so AC 2 as worded cannot be met here; the only n >= 32 sample (held-out
+repos, above) measured >= 93.75% (30/32) FP. Merge note: PR #167 was squash-merged to master, so
+`src/feature_envy.rs` kept this branch's version (a superset of master's); test fixtures gained the
+new `SymbolNode`/`ArchModel` fields.
+
+### Owner waiver of AC 2 (target FP <= 30% at n >= 32)
+
+The owner instructed in the work session: "waive AC 2 and ship it." AC 2 is therefore waived, not
+met. The measured numbers above are unchanged: 10 findings on squad + k8s pkg (n >= 32 not
+reachable), and >= 93.75% (30/32) FP on the held-out n=32 sample. The checker stays opt-in; a structural
+request-parameter rule is the next lever and is out of scope here. The backlog waive tool
+(`request_owner_action`) returned PERMISSION_DENIED, so the waiver is recorded here.
+
+### PR #185 review round
+
+Generic receivers (`Store[K, V]`) now match the role suffixes (the type arguments are stripped
+first). Re-run on squad + k8s pkg: still 2 + 8 = 10 findings, `kibitzer check backtest
+feature-envy` exit 0, so no measured change on this corpus. The ">= 94%" figure above is
+corrected to 93.75% (30/32 is the best case). Reviewer findings not acted on: bare same-package
+types the model never declared, and embedding-promoted methods, can also read as method-less
+records (INFERRED from code reading, not run; needs its own backtest); the 7 TPs in the 10-finding
+row are not individually listed, so that row's TP count is UNVERIFIED.
