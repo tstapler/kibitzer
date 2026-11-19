@@ -65,6 +65,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("sentinel-return-rust", "x.rs", || {
         "fn f(x: &str) -> Result<i32, E> {\n    let a = g(x)?;\n    match h(a) {\n        Ok(b) => Ok(b),\n        Err(e) => return Err(e),\n    }\n}\n".into()
     }),
+    ("rust-ignored-error", "x.rs", || {
+        "fn f() {\n    let _ = std::fs::remove_file(\"x\");\n}\n".into()
+    }),
     ("test-no-assertion-rust", "x.rs", || {
         "#[test]\nfn t() {\n    let _x = 1;\n}\n".into()
     }),

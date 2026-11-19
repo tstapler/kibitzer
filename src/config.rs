@@ -930,6 +930,7 @@ fn rust_checks() -> Vec<Check> {
         native_check("primitive-obsession-rust", Severity::Advisory, &["**/*.rs"]),
         native_check("file-complexity-rust", Severity::Advisory, &["**/*.rs"]),
         native_check("sentinel-return-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check("rust-ignored-error", Severity::Advisory, &["**/*.rs"]),
     ]
 }
 
