@@ -339,10 +339,11 @@ impl TestNoAssertionChecker {
             }
             Language::Rust => {
                 // `synstructure::test_derive!`-style macros assert internally.
+                let is_macro = last.ends_with('!');
                 let last = last.rsplit(':').next().unwrap_or(last);
                 last.starts_with("assert")
                     || last.starts_with("debug_assert")
-                    || last.starts_with("test_")
+                    || (is_macro && last.starts_with("test_"))
             }
             _ => {
                 call.callee == GUARDED_PANIC
@@ -1256,6 +1257,20 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
     calls
 }
 
+/// An `assert*`/`debug_assert*` identifier token inside a macro's token tree (string literals
+/// and longer identifiers such as `reassert_state` do not count).
+fn has_assert_token(mac: Node, source: &str) -> bool {
+    let mut found = false;
+    walk_preorder(mac, &mut |n| {
+        if n.kind() == "identifier" {
+            let t = node_text(n, source);
+            found |= t == "assert" || t.starts_with("assert_") || t.starts_with("debug_assert");
+        }
+        !found
+    });
+    found
+}
+
 /// Rust: every call and macro invocation under `root`; a macro's callee keeps its `!` so the
 /// profile vocabulary (`assert_eq!`, `assert_*!`) matches it.
 fn rust_calls_in(root: Node, source: &str) -> Vec<Call> {
@@ -1283,8 +1298,7 @@ fn rust_calls_in(root: Node, source: &str) -> Vec<Call> {
                         Vec::new(),
                     ));
                     // An `assert!` passed through a wrapper macro's token tree is still an oracle.
-                    let body = node_text(node, source);
-                    if body.contains("assert!") || body.contains("assert_") {
+                    if has_assert_token(node, source) {
                         calls.push(Call::new("assert!".to_string(), Vec::new()));
                     }
                 }

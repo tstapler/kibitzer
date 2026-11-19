@@ -342,6 +342,18 @@ mod rust {
     }
 
     #[test]
+    fn nested_fn_is_not_double_counted_in_its_parent() {
+        // The outer fn has 5 branches of its own; the nested fn has 6: neither exceeds 10 alone,
+        // but summed (12) they would.
+        let outer = format!(
+            "fn outer(a: bool) {{\n{}    fn inner(a: bool) {{\n{}    }}\n}}\n",
+            "    if a { }\n".repeat(5),
+            "    if a { }\n".repeat(6)
+        );
+        assert_eq!(run(&format!("{outer}{outer}{outer}")), 0);
+    }
+
+    #[test]
     fn test_code_is_not_counted() {
         let tests = format!(
             "#[cfg(test)]\nmod t {{\n{}{}{}}}\n",

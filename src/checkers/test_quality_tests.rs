@@ -848,3 +848,18 @@ fn smoke() { T::new(); }
     let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
     assert_eq!(lines(&findings), vec![12], "{findings:?}");
 }
+
+#[test]
+fn test_no_assertion_rust_should_NotTreatTestPrefixedHelpersOrStringsAsOracles() {
+    let src = r#"
+fn test_setup() {}
+#[test]
+fn helper_named_like_a_macro() { test_setup(); }
+#[test]
+fn string_mentions_assert() { println!("assert_eq done"); }
+#[test]
+fn wrapped_real_assert() { my_macro!(x => assert!(true)); }
+"#;
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
+    assert_eq!(lines(&findings), vec![4, 6], "{findings:?}");
+}

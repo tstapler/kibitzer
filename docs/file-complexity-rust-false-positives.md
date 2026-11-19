@@ -14,10 +14,10 @@ Command: `find <repo> -name '*.rs' | xargs -n1 kibitzer check native file-comple
 | Repo | Before (no Rust coverage) | After: complex functions / files flagged |
 |---|---|---|
 | BurntSushi/ripgrep (110 files) | 0 | 19 functions / 6 files |
-| servo/servo (1650 files) | 0 | 299 functions / 62 files |
+| servo/servo (1650 files) | 0 | 292 functions / 61 files |
 
 Triage: complexity is a deterministic count, so a false positive here means the function is not
-actually over the threshold. All 19 ripgrep functions and a random 20 of the 299 servo functions
+actually over the threshold. All 19 ripgrep functions and a random 20 of the then-299 servo functions (a nested `fn` was later no longer double-counted in its parent, leaving 292)
 (seed 1) were recounted with an independent regex count of branch tokens over the function body:
 all 39 were above 10 (0 false positives, **0/39 = 0%**; bar 20%). Hand check of
 `crates/core/main.rs:113` (reported 11): 11 branch points counted by eye.

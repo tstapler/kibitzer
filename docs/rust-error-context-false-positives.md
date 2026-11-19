@@ -1,9 +1,9 @@
 # rust-error-context: backtest and known false positives
 
 Advisory, `**/*.rs`. Flags a `?` inside an anyhow-returning function when the operand is a
-call to a well-known foreign fallible API (file/IO, parsing, process, network, `serde_json::`,
-`std::`, `tokio::fs::`) and the chain does not end in `.context(..)`, `.with_context(..)`,
-`.wrap_err(..)`, `.map_err(..)` or `.ok_or*(..)`.
+call to a well-known foreign fallible API (file/IO, parsing, process, network, or a path under `std::`, `serde_json::`, `toml::`,
+`serde_yaml::`, `tokio::fs::`, `tokio::process::`) and the chain does not end in `.context(..)`, `.with_context(..)`,
+`.wrap_err(..)`, `.wrap_err_with(..)`, `.map_err(..)` or `.ok_or*(..)`.
 
 "Anyhow-returning" means the return type names `anyhow::`/`eyre::`, or is a one-argument
 `Result<T>` in a file with `use anyhow::Result` (or an `anyhow::{.., Result}` import). Not

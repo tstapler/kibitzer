@@ -8,8 +8,9 @@ Advisory, `**/*.rs`. Two shapes in non-test code (`#[cfg(test)]`, `#[test]`, and
 
 Not flagged: `let _ = x` of a plain value; `let _ = .. .send/try_send/recv/try_recv/next/clone/
 drop/from_raw(..)` and similar infallible-or-intentional callees; calls passing
-`ExceptionHandling::Report`; `.unwrap()` on `lock()/read()/write()/join()/borrow()`, on
-`write!`/`writeln!`, and on a call whose arguments are all literals (`Regex::new("a+")`).
+`ExceptionHandling::Report`; `.unwrap()` on `lock()/try_lock()/read()/write()/join()/borrow()`, on
+`write!`/`writeln!`, and on `Regex::new`/`Url::parse`-style calls whose arguments are all string literals
+(`Regex::new("a+")`), not `fs::read_to_string("x")`.
 
 ## Backtest (2026-11-19, release build)
 
@@ -18,7 +19,7 @@ Command: `find <repo> -name '*.rs' | xargs -n1 kibitzer check native rust-ignore
 | Version | ripgrep `let _` / `.unwrap()` | servo `let _` / `.unwrap()` |
 |---|---|---|
 | v0: every `let _ = <call>` and bare `.unwrap()` | 4 / 76 | 710 / 2046 |
-| shipped | 4 / 57 | 196 / 1968 |
+| shipped | 4 / 65 | 196 / 2021 |
 
 The exclusions came from triage of v0 samples: 14 of 20 sampled servo `let _` sites were
 `sender.send(..)` (ignoring a dropped receiver is the intended idiom), and 6 of 20 sampled
@@ -47,7 +48,12 @@ inherently opinionated; the 15% counts only provable invariants, not "would you 
 - `let _ = <call>` cannot tell `Result` from other return types without type information, so
   discards of non-`Result` values from unlisted callees still fire.
 - Unwraps that follow an explicit guard are flagged; use `.expect("why")` or `kibitzer:ignore`.
-- With 1968 unwrap findings on servo the check is high-volume on unwrap-heavy code bases.
+- With 2021 unwrap findings on servo the check is high-volume on unwrap-heavy code bases.
 - The `let _` allow-list is by callee name only (`send`, `join`, `remove`, `insert`, ..), so a
   dropped `Result` from a same-named method is missed, and the `ExceptionHandling::Report`
   exemption is specific to servo/mozjs-style bindings. Both came from backtest triage.
+- Because `read`/`write` are exempt receivers (for `RwLock`), `file.read(&mut b).unwrap()` and
+  `fs::read(p).unwrap()` are not flagged.
+- Test detection is by attribute (`#[cfg(..test..)]`, `#[test]`, `#[rstest]`) and by path (`tests/`,
+  `benches/`, `examples/`, `tests.rs`); a checkout under an ancestor directory with one of those
+  names is skipped wholesale.

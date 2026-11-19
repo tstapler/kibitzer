@@ -1,15 +1,7 @@
-//! `split-loop-rust`: Fowler's Split Loop for Rust. A `for`/`while`/`loop` body that advances two
-//! or more accumulators which do not feed each other is doing two jobs.
-//!
-//! Port of the Go checker's model (`split_loop.rs`), precision over recall. Accumulators are
-//! `x op= e` and `x = x <op> e` on a plain local.
-//! Two accumulators are one group when one reads the other (directly or through a body local),
-//! when they sit in the same or exclusive arms of an `if`/`match`, or when they are fed by the
-//! same per-iteration value. Skipped: bodies with `break`/`continue`/`return`/`?` (all
-//! accumulators share the early exit), any use of an accumulator outside its update, nested
-//! loops/closures (own scope), and tally-only counters (`n += 1`). Closures and macros that
-//! mention an accumulator make the use ambiguous, so the loop is not flagged.
-//! See docs/split-loop-rust-false-positives.md.
+//! `split-loop-rust`: Fowler's Split Loop. Flags a loop body advancing 2+ accumulators
+//! (`x op= e`, `x = x <op> e`) that do not feed each other; precision over recall, so loops with
+//! early exits, ambiguous accumulator uses or tally-only counters are skipped.
+//! Rules and backtest: docs/split-loop-rust-false-positives.md.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -364,7 +356,6 @@ fn scan_guarded(
                     None
                 }
             }
-            ("match_expression", "match_block") => None,
             _ => None,
         };
         if node.kind() == "match_expression" && child.kind() == "match_block" {
@@ -582,6 +573,19 @@ mod tests {
     }
 
     #[test]
+    fn loop_form_and_nested_loops() {
+        assert!(!flagged(
+            "let (mut a, mut b) = (0, 0);\nloop { a += g(); b += h(); if i() { return; } }"
+        ));
+        assert!(flagged(
+            "let (mut a, mut b) = (0, 0); let mut n = 0;\nwhile n < 3 { a += g(); b += h(); n += 1; }"
+        ));
+        assert!(!flagged(
+            "let (mut a, mut b) = (0, 0);\nfor v in items { a += v; for w in items { b += h(*w); } }"
+        ));
+    }
+
+    #[test]
     fn predicate_flag_folds_are_not_accumulators() {
         assert!(!flagged(
             "let (mut a, mut b) = (true, true);\nfor _ in 0..n { a &= f() == 0; b &= g() == 0; }"
@@ -685,7 +689,7 @@ mod tests {
     #[test]
     fn nested_loops_and_closures_are_their_own_scope() {
         assert!(!flagged(
-            "let mut a = 0; let mut b = 0;\nfor v in items { a += v; let c = || { b += 1; }; }"
+            "let mut a = 0; let mut b = 0;\nfor v in items { a += v; let c = || { b += g(); }; }"
         ));
     }
 }

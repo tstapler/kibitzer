@@ -145,6 +145,13 @@ pub(crate) fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Fails if `src` does not parse cleanly, so a negative (`is_empty()`) test cannot pass
+/// vacuously on a fixture tree-sitter could not read.
 pub(crate) fn check_rust_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    let tree = crate::checker::GrammarCache::new().parse(crate::checker::Language::Rust, src)?;
+    assert!(
+        !tree.root_node().has_error(),
+        "fixture is not valid Rust: {src}"
+    );
     check_source_as(crate::checker::Language::Rust, checker, src)
 }

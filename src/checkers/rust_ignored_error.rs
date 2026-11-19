@@ -1,16 +1,15 @@
-//! `rust-ignored-error`: a discarded or panicking error in non-test Rust.
-//!
-//! Two shapes: `let _ = <call>;` (a `Result` silently dropped) and a bare `.unwrap()` (a panic
-//! standing in for error handling). `.expect("msg")` is deliberately not flagged: the message
-//! documents the invariant. Test code (`#[cfg(test)]`, `#[test]`, `tests/`, `benches/`,
-//! `examples/`) is skipped. See docs/rust-ignored-error-false-positives.md.
+//! `rust-ignored-error`: `let _ = <call>;` (a `Result` dropped) and bare `.unwrap()` in non-test
+//! Rust; `.expect("msg")` is not flagged. Exemptions and backtest:
+//! docs/rust-ignored-error-false-positives.md.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
-use super::rust_common::{in_test_code, is_test_path, one_line, text};
+use super::rust_common::{
+    SNIPPET_MAX, callee_last_segment, in_test_code, is_test_path, one_line, text,
+};
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::tree_walk::walk_preorder;
 
@@ -18,10 +17,20 @@ const NAME: &str = "rust-ignored-error";
 
 /// `.unwrap()` on these receivers cannot fail except by poisoning/propagated panic, which is
 /// the idiomatic response (`std::sync` guards, thread joins).
+/// Callees whose literal argument is validated once at startup.
+const LITERAL_INVARIANT_CALLEES: &[&str] = &[
+    "Regex::new",
+    "RegexBuilder::new",
+    "RegexSet::new",
+    "Url::parse",
+    "Selector::parse",
+    "HeaderValue::from_static",
+];
 const IDIOMATIC_UNWRAP_RECEIVERS: &[&str] =
     &["lock", "read", "write", "join", "try_lock", "borrow"];
-/// `let _ = <call>` left alone: callees returning a non-`Result`, and channel `send`, whose only
-/// error is a dropped receiver (the dominant, intentional pattern in the backtest corpus).
+/// `let _ = <call>` left alone: callees returning a non-`Result`, and `Result`s that are
+/// conventionally discarded (channel `send`/`recv`, `join`, `spawn`): the dominant, intentional
+/// pattern in the backtest corpus.
 const INFALLIBLE_DISCARDS: &[&str] = &[
     "drop",
     "clone",
@@ -107,13 +116,7 @@ fn callee_name<'a>(call: Node, source: &'a str) -> &'a str {
     let callee = call
         .child_by_field_name("function")
         .map_or("", |f| text(f, source));
-    callee
-        .rsplit(['.', ':'])
-        .next()
-        .unwrap_or(callee)
-        .split('<')
-        .next()
-        .unwrap_or("")
+    callee_last_segment(callee)
 }
 
 fn ignored_let(decl: Node, source: &str) -> Option<String> {
@@ -138,7 +141,7 @@ fn ignored_let(decl: Node, source: &str) -> Option<String> {
     }
     Some(format!(
         "`let _ = {}` discards a possible error — handle it, log it, or comment why it is safe to ignore",
-        one_line(text(value, source), 60)
+        one_line(text(value, source), SNIPPET_MAX)
     ))
 }
 
@@ -175,25 +178,25 @@ fn is_infallible_by_construction(receiver: Node, source: &str) -> bool {
                 .map_or("", |m| text(m, source));
             matches!(name, "write" | "writeln")
         }
-        "call_expression" => receiver
-            .child_by_field_name("arguments")
-            .is_some_and(|args| {
-                let mut cursor = args.walk();
-                let mut named = args.named_children(&mut cursor);
-                let mut any = false;
-                let all_literal = named.all(|a| {
-                    any = true;
-                    matches!(
-                        a.kind(),
-                        "string_literal"
-                            | "raw_string_literal"
-                            | "integer_literal"
-                            | "float_literal"
-                            | "boolean_literal"
-                    )
-                });
-                any && all_literal
-            }),
+        // `Regex::new("a+")`, `Url::parse("..")`: a literal that is a startup invariant. Not
+        // `fs::read_to_string("x")` or `from_str_radix("zz", 10)`, whose failure is the point.
+        "call_expression" => {
+            let callee = receiver
+                .child_by_field_name("function")
+                .map_or("", |f| text(f, source));
+            let listed = LITERAL_INVARIANT_CALLEES
+                .iter()
+                .any(|c| callee == *c || callee.ends_with(&format!("::{c}")));
+            listed
+                && receiver
+                    .child_by_field_name("arguments")
+                    .is_some_and(|args| {
+                        args.named_child_count() > 0
+                            && args.named_children(&mut args.walk()).all(|a| {
+                                matches!(a.kind(), "string_literal" | "raw_string_literal")
+                            })
+                    })
+        }
         _ => false,
     }
 }
@@ -225,6 +228,23 @@ mod tests {
                 .is_empty()
         );
         assert!(run("fn f(cb: C) { let _ = cb.Call_(cx, ExceptionHandling::Report); }").is_empty());
+    }
+
+    #[test]
+    fn awaited_discard_is_flagged_and_rstest_and_cfg_all_test_are_test_code() {
+        assert_eq!(run("async fn f() { let _ = save().await; }").len(), 1);
+        assert!(run("#[rstest]\nfn t() { parse().unwrap(); }").is_empty());
+        assert!(
+            run("#[cfg(all(test, feature = \"x\"))]\nmod t { fn h() { parse().unwrap(); } }")
+                .is_empty()
+        );
+        assert_eq!(
+            run("#[cfg(not(test))]\nmod m { fn h() { parse().unwrap(); } }").len(),
+            1
+        );
+        assert!(
+            run("#[cfg_attr(test, allow(dead_code))]\nfn t() { parse().unwrap(); }").is_empty()
+        );
     }
 
     #[test]

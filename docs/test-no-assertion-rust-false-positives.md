@@ -20,12 +20,17 @@ Command: `find <repo> -name '*.rs' | xargs -n1 kibitzer check native test-no-ass
 | Repo (.rs files) | v0: profile only | + method/path resolution | + depth 4, macros |
 |---|---|---|---|
 | BurntSushi/ripgrep (110) | 39 | 5 | 5 |
-| servo/servo (1650) | 82 | 82 | 15 |
+| servo/servo (1650) | 82 | 82 | 19 |
 
-Triage of all 20 final findings: 1 false positive (`test_validate_classifier`: the oracle is
-`.validate().expect(..)`), 19 true positives (smoke tests: `println!`/`unwrap()` only,
+Review follow-up: a `test_`-prefixed call counted as an oracle only when it is a macro (it had hidden a
+same-file `test_*_inner` helper with no assertion), and `assert` must be an identifier token, not text
+inside a string. That added 4 servo findings (`hang_monitor_tests.rs`, all true positives: the helper
+only checks that nothing hangs).
+
+Triage of all 24 final findings: 1 false positive (`test_validate_classifier`: the oracle is
+`.validate().expect(..)`), 23 true positives (smoke tests: `println!`/`unwrap()` only,
 `test_exit` shutdown tests, compile-time trait checks such as `is_supported::<T>()`).
-**FP rate 1/20 = 5%** (bar: 20%). The v0 numbers are not a rate: 34 of ripgrep's 39 were
+**FP rate 1/24 = 4%** (bar: 20%). The v0 numbers are not a rate: 34 of ripgrep's 39 were
 `glue.rs` builder tests (`.test()` asserts inside the same-file `SearcherTester`).
 
 ## Known limits

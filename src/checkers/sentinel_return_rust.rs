@@ -1,14 +1,7 @@
-//! `sentinel-return-rust`: an explicit `return None` / `return Err(..)` that hand-propagates a
-//! failure (inside an `Err(..)`/`None` match arm, a `let .. else` block, or an `if let Err(..)` /
-//! `.is_none()` / `.is_err()` branch) in a function that also uses `?`.
-//!
-//! Mixing the two exit styles makes the error path hard to follow: the `?` operator expresses
-//! these returns (`clippy::question_mark` flags the same shape). Plain guard returns that
-//! originate a new error (`if n > max { return Err(TooBig) }`) are deliberately not flagged:
-//! the first backtest of "any explicit return" found them idiomatic (docs/sentinel-return-rust-false-positives.md).
-//! Only functions returning `Option<_>`/`Result<_, _>` count. Constructor-like names (`new`,
-//! `try_new`, `from_*`, `try_from*`, `default`) are skipped, as are test code and closures'
-//! own `?`/returns (a closure is its own exit scope). See docs/sentinel-return-rust-false-positives.md.
+//! `sentinel-return-rust`: an explicit `return None`/`return Err(..)` that hand-propagates a failure
+//! (`Err`/`None` arm, `let .. else`, `if let Err`) in a function that also uses `?`: `?` expresses
+//! the same return (`clippy::question_mark` flags the shape). Guard returns that originate an
+//! error are not flagged. Rules and backtest: docs/sentinel-return-rust-false-positives.md.
 
 use std::path::Path;
 
@@ -47,6 +40,13 @@ impl Checker for SentinelReturnRustChecker {
         let tree = ctx
             .tree
             .context("sentinel-return-rust requires a parsed tree")?;
+        // `scan` recurses per tree level; skip pathological nesting rather than overflow the stack.
+        if crate::checkers::split_loop::exceeds_depth(
+            tree.root_node(),
+            crate::checkers::split_loop::MAX_TREE_DEPTH,
+        ) {
+            return Ok(Vec::new());
+        }
         let mut findings = Vec::new();
         walk_preorder(tree.root_node(), &mut |node| {
             if node.kind() == "function_item" && !in_test_code(node, ctx.source) {
@@ -284,5 +284,16 @@ mod tests {
     #[test]
     fn test_code_is_skipped() {
         assert!(run("#[cfg(test)]\nmod t { fn f() -> Result<i32, E> { let a = g()?; match h() { Ok(b) => Ok(b), Err(e) => return Err(e) } } }").is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_input_is_skipped_not_a_stack_overflow() {
+        let depth = 3000;
+        let src = format!(
+            "fn f() -> Option<i32> {{ let a = g()?; {}1{} }}",
+            "{ ".repeat(depth),
+            " }".repeat(depth)
+        );
+        assert!(run(&src).is_empty());
     }
 }

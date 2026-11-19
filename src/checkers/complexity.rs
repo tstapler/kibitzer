@@ -150,7 +150,10 @@ fn rust_decision_points(node: Node) -> usize {
     };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count += rust_decision_points(child);
+        // A nested `fn` is its own complexity root (`collect_rust_complex` reports it).
+        if child.kind() != "function_item" {
+            count += rust_decision_points(child);
+        }
     }
     count
 }

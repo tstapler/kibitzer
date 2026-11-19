@@ -30,14 +30,14 @@ Checks for other languages with no Rust counterpart. N/A is intentional; Planned
 
 | Check | Status | Rationale |
 |---|---|---|
-| `remove-subclass` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `extract-superclass` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `collapse-hierarchy` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `push-down-method` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `push-down-field` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `pull-up-method` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `pull-up-constructor-body` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
-| `pull-up-field` | N/A | Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md). |
+| `remove-subclass` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `extract-superclass` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `collapse-hierarchy` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `push-down-method` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `push-down-field` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `pull-up-method` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `pull-up-constructor-body` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
+| `pull-up-field` | N/A | Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md). |
 | `go-blank-imports` | N/A | Go `_` imports run package `init` side effects; Rust has no import-time side effects (`use .. as _` only brings a trait into scope). |
 | `go-type-switch-density` | N/A | Go `switch x.(type)` on an open interface; a Rust `match` over an enum is compiler-checked for exhaustiveness, which is the fix this check suggests. |
 | `go-type-switch-clustering` | N/A | Same as `go-type-switch-density`: enum `match` is the idiomatic, exhaustive form. |

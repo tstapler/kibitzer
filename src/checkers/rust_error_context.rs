@@ -1,12 +1,6 @@
-//! `rust-error-context`: a `?` inside an `anyhow`-returning function whose operand adds no
-//! context, so the error surfaces with no hint of what was being attempted.
-//!
-//! A function counts as anyhow-returning when its return type names `anyhow::Result` /
-//! `anyhow::Error` / `eyre::Result`, or is a one-argument `Result<T>` in a file that imports
-//! `anyhow::Result` (or `eyre`'s). Aliases defined elsewhere are not resolved. The operand is
-//! accepted when its last call is `.context(..)`, `.with_context(..)`, `.wrap_err(..)`,
-//! `.map_err(..)` or `.ok_or*(..)`. A `?` inside a closure is skipped (its return type is
-//! unknown). See docs/rust-error-context-false-positives.md.
+//! `rust-error-context`: a `?` on a known-foreign fallible call (fs, parse, process) inside an
+//! anyhow-returning function with no `.context(..)`/`.map_err(..)`, so the error carries no hint of
+//! what was attempted. Rules, limits and backtest: docs/rust-error-context-false-positives.md.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,7 +8,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
-use super::rust_common::{in_test_code, is_test_path, one_line, text};
+use super::rust_common::{
+    SNIPPET_MAX, callee_last_segment, in_test_code, is_test_path, one_line, strip_await, text,
+};
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::tree_walk::walk_preorder;
 
@@ -49,8 +45,6 @@ const FOREIGN_FALLIBLE: &[&str] = &[
     "parse",
     "from_str",
     "from_utf8",
-    "from_utf8_lossy",
-    "to_str",
     "connect",
     "bind",
     "accept",
@@ -196,7 +190,7 @@ fn check_try(
         line: node.start_position().row + 1,
         message: format!(
             "`{}?` propagates an anyhow error with no context — add `.context(\"what failed\")` or `.with_context(|| ..)`",
-            one_line(text(operand, source), 50)
+            one_line(text(operand, source), SNIPPET_MAX)
         ),
     })
 }
@@ -217,13 +211,8 @@ fn same_file_anyhow_fns(root: Node, source: &str, imports_result: bool) -> HashS
     names
 }
 
-fn calls_same_file_anyhow_fn(mut operand: Node, source: &str, names: &HashSet<String>) -> bool {
-    while operand.kind() == "await_expression" {
-        let Some(inner) = operand.named_child(0) else {
-            return false;
-        };
-        operand = inner;
-    }
+fn calls_same_file_anyhow_fn(operand: Node, source: &str, names: &HashSet<String>) -> bool {
+    let operand = strip_await(operand);
     let Some(func) = operand
         .child_by_field_name("function")
         .filter(|_| operand.kind() == "call_expression")
@@ -231,16 +220,11 @@ fn calls_same_file_anyhow_fn(mut operand: Node, source: &str, names: &HashSet<St
         return false;
     };
     let callee = text(func, source);
-    names.contains(callee.rsplit(['.', ':']).next().unwrap_or(callee))
+    names.contains(callee_last_segment(callee))
 }
 
-fn is_foreign_fallible(mut operand: Node, source: &str) -> bool {
-    while operand.kind() == "await_expression" {
-        let Some(inner) = operand.named_child(0) else {
-            return false;
-        };
-        operand = inner;
-    }
+fn is_foreign_fallible(operand: Node, source: &str) -> bool {
+    let operand = strip_await(operand);
     let Some(func) = operand
         .child_by_field_name("function")
         .filter(|_| operand.kind() == "call_expression")
@@ -248,8 +232,7 @@ fn is_foreign_fallible(mut operand: Node, source: &str) -> bool {
         return false;
     };
     let callee = text(func, source);
-    let last = callee.rsplit(['.', ':']).next().unwrap_or(callee);
-    let last = last.split('<').next().unwrap_or(last);
+    let last = callee_last_segment(callee);
     let foreign_path = [
         "std::",
         "serde_json::",
@@ -272,13 +255,8 @@ fn is_foreign_fallible(mut operand: Node, source: &str) -> bool {
 }
 
 /// The chain ends in a context-adding method (looking through a trailing `.await`).
-fn has_context(mut operand: Node, source: &str) -> bool {
-    while operand.kind() == "await_expression" {
-        let Some(inner) = operand.named_child(0) else {
-            return false;
-        };
-        operand = inner;
-    }
+fn has_context(operand: Node, source: &str) -> bool {
+    let operand = strip_await(operand);
     if operand.kind() != "call_expression" {
         return false;
     }
@@ -306,25 +284,32 @@ mod tests {
         assert!(f[0].message.contains("context"));
     }
 
+    /// Each suppressor must beat a `std::fs::read("x")?` that would otherwise fire; the bare
+    /// control proves the operand really is one the checker flags.
     #[test]
-    fn context_and_with_context_are_accepted() {
-        assert!(
-            run("fn f() -> anyhow::Result<()> { read().context(\"read\")?; Ok(()) }").is_empty()
-        );
-        assert!(
-            run("fn f() -> anyhow::Result<()> { read().with_context(|| \"read\")?; Ok(()) }")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn map_err_and_ok_or_transform_the_error() {
-        assert!(run("fn f() -> anyhow::Result<()> { read().map_err(|e| MyErr::from(e))?; opt().ok_or(MyErr)?; Ok(()) }").is_empty());
+    fn context_adding_chains_suppress_a_flagged_operand() {
+        let wrap = |op: &str| format!("fn f() -> anyhow::Result<()> {{ {op}?; Ok(()) }}");
+        assert_eq!(run(&wrap("std::fs::read(\"x\")")).len(), 1, "control");
+        for op in [
+            "std::fs::read(\"x\").context(\"read\")",
+            "std::fs::read(\"x\").with_context(|| \"read\")",
+            "std::fs::read(\"x\").map_err(|e| MyErr::from(e))",
+            "std::fs::read(\"x\").ok_or(MyErr)",
+        ] {
+            assert!(run(&wrap(op)).is_empty(), "{op} should be accepted");
+        }
     }
 
     #[test]
     fn awaited_context_is_accepted() {
-        assert!(run("async fn f() -> anyhow::Result<()> { read().await.context(\"x\")?; fetch().context(\"y\").await?; Ok(()) }").is_empty());
+        let wrap = |op: &str| format!("async fn f() -> anyhow::Result<()> {{ {op}?; Ok(()) }}");
+        assert_eq!(
+            run(&wrap("tokio::fs::read(\"x\").await")).len(),
+            1,
+            "control"
+        );
+        assert!(run(&wrap("tokio::fs::read(\"x\").await.context(\"x\")")).is_empty());
+        assert!(run(&wrap("tokio::fs::read(\"x\").context(\"y\").await")).is_empty());
     }
 
     #[test]

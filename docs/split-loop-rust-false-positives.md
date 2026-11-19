@@ -2,7 +2,7 @@
 
 Advisory, `**/*.rs`. Rust port of Go `split-loop-go` (Fowler's Split Loop), precision first: a
 `for`/`while`/`loop` body that advances 2+ accumulators with no link between them. Accumulators:
-`x op= e` and `x = x <binary-op> e` on a plain local (not `push`/index stores). Two accumulators are one group when one reads the other (directly or through a
+`x op= e` (also `x[k] op= e`) and `x = x <binary-op> e` on a plain local; `push`/`insert` calls and plain indexed stores (`x[k] = e`) are not accumulators. Two accumulators are one group when one reads the other (directly or through a
 body local), when they sit in the same or exclusive `if`/`match` arms, or when both are fed by a
 per-iteration value (the loop pattern or a body local). Not flagged: bodies with
 `break`/`continue`/`return`/`?`, any use of an accumulator outside its own update (a `println!`

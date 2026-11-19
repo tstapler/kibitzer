@@ -37,7 +37,7 @@ pub struct Gap {
 }
 
 const TRACKER: &str = "https://github.com/tstapler/kibitzer/issues/184";
-const NO_INHERITANCE: &str = "Rust has no implementation inheritance, so there are no `Extends` edges for this hierarchy check to analyse (docs/hierarchy-cleanup-checks.md).";
+const NO_INHERITANCE: &str = "Rust has no implementation inheritance, so the subclass/superclass hierarchies this check rewrites do not exist; trait supertraits compose behaviour and are not a class hierarchy (docs/hierarchy-cleanup-checks.md).";
 
 pub const GAPS: &[Gap] = &[
     Gap {
