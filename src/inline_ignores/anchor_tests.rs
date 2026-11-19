@@ -58,6 +58,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("java-file-size", "C.java", || long_file("//")),
     ("kotlin-file-size", "x.kt", || long_file("//")),
     ("rust-file-size", "x.rs", || long_file("//")),
+    ("primitive-obsession-rust", "x.rs", || {
+        "struct U {\n    a: String,\n    b: u32,\n    c: bool,\n}\n".into()
+    }),
     ("test-no-assertion-rust", "x.rs", || {
         "#[test]\nfn t() {\n    let _x = 1;\n}\n".into()
     }),

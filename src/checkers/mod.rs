@@ -32,6 +32,7 @@ mod magic_literal_context;
 pub mod markdown_link_integrity;
 pub mod paragraph_breaks;
 pub mod primitive_obsession;
+pub mod primitive_obsession_rust;
 pub mod repetitive_sentences;
 pub mod rules;
 pub mod sentence_length_uniformity;

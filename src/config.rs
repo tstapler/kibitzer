@@ -925,11 +925,14 @@ fn hierarchy_checks() -> Vec<Check> {
 
 /// Rust-specific and Rust-ported checks (docs/rust-parity.md).
 fn rust_checks() -> Vec<Check> {
-    vec![native_check(
-        "test-no-assertion-rust",
-        Severity::Advisory,
-        &["**/*.rs"],
-    )]
+    vec![
+        native_check("test-no-assertion-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check(
+            "primitive-obsession-rust",
+            Severity::Advisory,
+            &["**/*.rs"],
+        ),
+    ]
 }
 
 fn go_exception_checks() -> Vec<Check> {

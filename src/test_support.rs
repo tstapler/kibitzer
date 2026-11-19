@@ -144,3 +144,7 @@ pub(crate) fn unique_temp_dir(label: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+pub(crate) fn check_rust_source(checker: &dyn Checker, src: &str) -> Result<Vec<Finding>> {
+    check_source_as(crate::checker::Language::Rust, checker, src)
+}
