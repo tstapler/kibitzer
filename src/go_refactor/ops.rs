@@ -572,8 +572,7 @@ impl Mover {
         if is_ext_test(file, src) {
             if whole {
                 let dest = join(&self.dest_dir, base_of(file));
-                let content = gs::rewrite_package_clause(src, &self.b_name)
-                    .unwrap_or_else(|| src.to_string());
+                let content = package_clause_or_block(f, file, src, &self.b_name);
                 ws.move_file(file, &dest, content);
                 f.path_map.push(PathMapping {
                     from: file.to_string(),
@@ -772,7 +771,7 @@ impl Mover {
         f: &mut Findings,
         importing_b: &mut Vec<String>,
     ) {
-        for file in ws.files_containing(&format!("\"{}\"", self.a_import)) {
+        for file in ws.files_containing(&self.a_import) {
             let Some(src) = ws.get(&file).map(str::to_string) else {
                 continue;
             };
@@ -1064,7 +1063,21 @@ fn apply_with_pkg_clause(
 ) -> String {
     let applied = gs::apply_edits(src, edits);
     let edited = edited_or_block(f, file, applied, src.to_string());
-    gs::rewrite_package_clause(&edited, new_name).unwrap_or(edited)
+    package_clause_or_block(f, file, &edited, new_name)
+}
+
+/// `src` with its package clause renamed; a file with no clause to rewrite blocks the plan.
+fn package_clause_or_block(f: &mut Findings, file: &str, src: &str, new_name: &str) -> String {
+    gs::rewrite_package_clause(src, new_name).unwrap_or_else(|| {
+        f.block(
+            BlockingDiagnostic::new(
+                "invalid_edit",
+                format!("no package clause to rewrite to `{new_name}`"),
+            )
+            .at(file, None),
+        );
+        src.to_string()
+    })
 }
 
 /// Pull unexported helpers referenced only by the moved set into it; block when a helper
@@ -1158,11 +1171,8 @@ pub fn rename_pkg(
         return;
     };
     for (old, new, content) in moved_files {
-        f.path_map.push(PathMapping {
-            from: old.clone(),
-            to: new.clone(),
-        });
         ws.move_file(&old, &new, content);
+        f.path_map.push(PathMapping { from: old, to: new });
     }
     f.path_map.insert(
         0,
@@ -1177,7 +1187,7 @@ pub fn rename_pkg(
     });
     f.affected_dirs.insert(to_dir.clone());
     // Every importer, wherever it now lives.
-    for file in ws.files_containing(&format!("\"{from_import}\"")) {
+    for file in ws.files_containing(from_import) {
         let Some(src) = ws.get(&file).map(str::to_string) else {
             continue;
         };
@@ -1310,7 +1320,7 @@ fn renamed_files(
                 continue;
             }
         }
-        let content = gs::rewrite_package_clause(&src, new_name).unwrap_or(src);
+        let content = package_clause_or_block(f, file, &src, new_name);
         moved_files.push((file.clone(), join(to_dir, base_of(file)), content));
     }
     f.blockers.is_empty().then_some(moved_files)
@@ -1347,7 +1357,8 @@ fn rename_importer(
     }
     let rewritten = gs::rewrite_import_path(src, from_import, to_import);
     let mut out = edited_or_block(f, file, rewritten, src.to_string());
-    if a.name != new_name && specs.iter().all(|s| s.name == gs::ImportName::Implicit) {
+    // Any implicit spec uses the old qualifier; aliased specs keep their own alias untouched.
+    if a.name != new_name && specs.iter().any(|s| s.name == gs::ImportName::Implicit) {
         match requalify(ws, f, a, file, &out, to_import, new_name) {
             Some(o) => out = o,
             None => return,

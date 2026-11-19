@@ -1311,6 +1311,52 @@ fn rollback_that_itself_fails_is_reported_as_a_dirty_tree() {
     assert_eq!(checksums(&root), before, "recovery restores the tree");
 }
 
+fn step_content<'a>(plan: &'a MovePlan, path: &str) -> &'a str {
+    plan.steps
+        .iter()
+        .find(|s| s.transform.new_path.as_deref() == Some(path))
+        .and_then(|s| s.transform.new_content.as_deref())
+        .unwrap_or_else(|| panic!("no step writes {path}"))
+}
+
+#[test]
+fn a_raw_string_import_is_still_found_and_rewritten() {
+    let root = scratch(
+        "raw-import",
+        &[
+            ("lib/a.go", "package lib\n\nfunc A() {}\n"),
+            (
+                "app/app.go",
+                "package app\n\nimport `example.com/m/lib`\n\nfunc Run() { lib.A() }\n",
+            ),
+        ],
+    );
+    let plan = plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None)
+        .unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    let app = step_content(&plan, "app/app.go");
+    assert!(app.contains("example.com/m/core") && app.contains("core.A()"), "{app}");
+}
+
+#[test]
+fn a_file_importing_a_package_both_implicitly_and_aliased_gets_its_qualifier_rewritten() {
+    let root = scratch(
+        "dual-import",
+        &[
+            ("lib/a.go", "package lib\n\nfunc A() {}\n"),
+            (
+                "app/app.go",
+                "package app\n\nimport (\n\t\"example.com/m/lib\"\n\tother \"example.com/m/lib\"\n)\n\nfunc Run() { lib.A(); other.A() }\n",
+            ),
+        ],
+    );
+    let plan = plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None)
+        .unwrap();
+    let app = step_content(&plan, "app/app.go");
+    assert!(app.contains("core.A()") && app.contains("other.A()"), "{app}");
+    assert!(!app.contains("lib.A()"), "stale qualifier left behind:\n{app}");
+}
+
 #[cfg(unix)]
 #[test]
 fn an_unreadable_go_file_blocks_planning_instead_of_being_skipped() {
