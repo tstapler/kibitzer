@@ -932,6 +932,7 @@ fn rust_checks() -> Vec<Check> {
         native_check("sentinel-return-rust", Severity::Advisory, &["**/*.rs"]),
         native_check("rust-ignored-error", Severity::Advisory, &["**/*.rs"]),
         native_check("rust-error-context", Severity::Advisory, &["**/*.rs"]),
+        native_check("split-loop-rust", Severity::Advisory, &["**/*.rs"]),
     ]
 }
 

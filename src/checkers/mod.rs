@@ -47,6 +47,7 @@ pub mod sentinel_return_python;
 pub mod sentinel_return_rust;
 pub mod sentinel_return_typescript;
 pub mod split_loop;
+pub mod split_loop_rust;
 pub mod test_no_assertion;
 
 /// True for common test-file naming conventions across supported languages. Expects a

@@ -71,6 +71,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("rust-error-context", "x.rs", || {
         "fn f() -> anyhow::Result<()> {\n    std::fs::read(\"x\")?;\n    Ok(())\n}\n".into()
     }),
+    ("split-loop-rust", "x.rs", || {
+        "fn f(items: &[i32]) {\n    let mut a = 0;\n    let mut b = 0;\n    for v in items {\n        a += v;\n        b += items.len() as i32;\n    }\n}\n".into()
+    }),
     ("test-no-assertion-rust", "x.rs", || {
         "#[test]\nfn t() {\n    let _x = 1;\n}\n".into()
     }),
