@@ -70,6 +70,101 @@ inventory::submit! {
     crate::checker::CheckerFactory(|| vec![Box::new(FileComplexityChecker)])
 }
 
+/// Rust counterpart of [`FileComplexityChecker`]: same threshold and same
+/// [`MIN_COMPLEX_FUNCTIONS`] aggregate, over `function_item`s outside test code.
+pub struct FileComplexityRustChecker;
+
+impl Checker for FileComplexityRustChecker {
+    fn name(&self) -> &str {
+        "file-complexity-rust"
+    }
+
+    fn description(&self) -> &str {
+        "flags a Rust file with several functions over a cyclomatic-complexity threshold"
+    }
+
+    fn language(&self) -> Option<Language> {
+        Some(Language::Rust)
+    }
+
+    fn file_globs(&self) -> &[&str] {
+        &["**/*.rs"]
+    }
+
+    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        if crate::checkers::file_size::is_generated(ctx.source) {
+            return Ok(Vec::new());
+        }
+        let tree = ctx
+            .tree
+            .context("file-complexity-rust requires a parsed tree")?;
+        let mut complex = Vec::new();
+        collect_rust_complex(tree.root_node(), ctx.source, &mut complex);
+        if complex.len() < MIN_COMPLEX_FUNCTIONS {
+            return Ok(Vec::new());
+        }
+        Ok(aggregate_findings(&complex))
+    }
+}
+
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(FileComplexityRustChecker)])
+}
+
+fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>) {
+    if is_rust_test_item(node, source) {
+        return;
+    }
+    if node.kind() == "function_item" {
+        let complexity = 1 + rust_decision_points(node, source);
+        if complexity > CYCLOMATIC_COMPLEXITY_THRESHOLD {
+            out.push((node.start_position().row + 1, complexity));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_rust_complex(child, source, out);
+    }
+}
+
+/// A `#[cfg(test)]` module or a `#[test]`-attributed fn: test code is not counted.
+fn is_rust_test_item(node: Node, source: &str) -> bool {
+    if !matches!(node.kind(), "mod_item" | "function_item") {
+        return false;
+    }
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                let text = &source[p.byte_range()];
+                if text.contains("cfg(test)") || text.contains("test]") || text.contains("::test") {
+                    return true;
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => return false,
+        }
+        prev = p.prev_sibling();
+    }
+    false
+}
+
+/// `if`/`if let`, `for`, `while`, `loop`, each `match` arm but the last (the catch-all), and each
+/// `&&`/`||`. Closures are summed into the enclosing function, as with Go's func literals.
+fn rust_decision_points(node: Node, source: &str) -> usize {
+    let mut count = match node.kind() {
+        "if_expression" | "for_expression" | "while_expression" | "loop_expression" => 1,
+        "match_block" => node.named_children(&mut node.walk()).filter(|c| c.kind() == "match_arm").count().saturating_sub(1),
+        "binary_expression" => usize::from(is_short_circuit(node)),
+        _ => 0,
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count += rust_decision_points(child, source);
+    }
+    count
+}
+
 /// One finding per complex function, all sharing the same aggregate message — not a
 /// single finding anchored at just one of them. `PostToolUse`'s diff-scoping filters
 /// findings to whichever lines an edit actually touched, so anchoring at only e.g. the

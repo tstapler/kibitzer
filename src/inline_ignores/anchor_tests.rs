@@ -61,6 +61,7 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("primitive-obsession-rust", "x.rs", || {
         "struct U {\n    a: String,\n    b: u32,\n    c: bool,\n}\n".into()
     }),
+    ("file-complexity-rust", "x.rs", rust_three_complex_functions),
     ("test-no-assertion-rust", "x.rs", || {
         "#[test]\nfn t() {\n    let _x = 1;\n}\n".into()
     }),
@@ -223,6 +224,11 @@ fn complex_func(name: &str) -> String {
         body.push_str(&format!("{lead} x == {i} {{\n\t\treturn\n\t}}"));
     }
     format!("func {name}(x int) {{\n{body}\n}}\n")
+}
+
+fn rust_three_complex_functions() -> String {
+    let body = "    if a { } if b { } if c { } if d { } if e { } if f { } if g { } if h { } if i { } if j { } if k { }\n";
+    format!("fn f1() {{\n{body}}}\nfn f2() {{\n{body}}}\nfn f3() {{\n{body}}}\n")
 }
 
 fn go_three_complex_functions() -> String {

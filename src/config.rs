@@ -932,6 +932,7 @@ fn rust_checks() -> Vec<Check> {
             Severity::Advisory,
             &["**/*.rs"],
         ),
+        native_check("file-complexity-rust", Severity::Advisory, &["**/*.rs"]),
     ]
 }
 
