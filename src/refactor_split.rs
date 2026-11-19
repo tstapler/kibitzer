@@ -1068,12 +1068,28 @@ fn reset_index(repo: &Path, plan: &RefactorPlan) {
 }
 
 /// Rolls an applied-but-failed plan back through the transaction, unstages it and releases its
-/// locks. `Err` carries the rollback failure (the log is kept for the next recovery).
-fn abort_apply(repo: &Path, plan: &RefactorPlan, pending: txn::Pending) -> Result<(), String> {
-    let rolled = pending.rollback().map_err(|e| format!("{e:#}"));
+/// locks. `Err` is a `rollback_failed` error: the tree may be dirty and the log is kept for the
+/// next recovery.
+fn abort_apply(
+    repo: &Path,
+    plan: &RefactorPlan,
+    pending: txn::Pending,
+) -> Result<(), RefactorError> {
+    let rolled = pending.rollback();
     reset_index(repo, plan);
     release_locks(repo, plan);
-    rolled
+    rolled.map_err(|e| RefactorError {
+        code: "rollback_failed",
+        message: format!("{e:#}"),
+    })
+}
+
+/// Combines the failure that triggered an abort with the rollback failure that followed it.
+fn rollback_failed(cause: &str, rb: RefactorError) -> RefactorError {
+    RefactorError {
+        code: "rollback_failed",
+        message: format!("{cause}; rollback also failed, the tree may be dirty: {}", rb.message),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1147,18 +1163,16 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
     if let Err(e) = git(repo, &add) {
         return Err(match abort_apply(repo, &plan, pending) {
             Ok(()) => e,
-            Err(rb) => RefactorError {
-                code: e.code,
-                message: format!("{}; rollback also failed: {rb}", e.message),
-            },
+            Err(rb) => rollback_failed(&e.message, rb),
         });
     }
     let mut verification = run_verification(repo, &plan);
     if !verification.passed {
         if let Err(rb) = abort_apply(repo, &plan, pending) {
-            verification
-                .output
-                .push_str(&format!("\nrollback failed: {rb}"));
+            return Err(rollback_failed(
+                &format!("verification failed:\n{}", verification.output),
+                rb,
+            ));
         }
         return Ok(ApplyOutcome {
             applied: false,
@@ -1169,18 +1183,25 @@ pub fn apply(repo: &Path, id: &str) -> Result<ApplyOutcome, RefactorError> {
     }
     plan.status = PlanStatus::Applied;
     if let Err(e) = save_plan(repo, &plan) {
-        let _ = abort_apply(repo, &plan, pending);
-        return Err(e);
+        return Err(match abort_apply(repo, &plan, pending) {
+            Ok(()) => e,
+            Err(rb) => rollback_failed(&e.message, rb),
+        });
     }
     // Last, so the plan can still be rolled back if saving it failed. A failed commit can leave
     // the log behind, which the next recovery rolls back: the plan must then read Planned again
     // and its locks must not stay held.
     if let Err(e) = pending.commit() {
-        plan.status = PlanStatus::Planned;
-        let _ = save_plan(repo, &plan);
-        reset_index(repo, &plan);
-        release_locks(repo, &plan);
-        return Err(txn_error(e));
+        // Committed with leftovers: the apply stands and recovery will not roll it back.
+        if let Some(c) = e.downcast_ref::<txn::CommitCleanupFailed>() {
+            verification.output.push_str(&format!("\n{c}"));
+        } else {
+            plan.status = PlanStatus::Planned;
+            let _ = save_plan(repo, &plan);
+            reset_index(repo, &plan);
+            release_locks(repo, &plan);
+            return Err(txn_error(e));
+        }
     }
     let diff_summary = git(repo, &["diff", "--cached", "--stat"]).unwrap_or_default();
     Ok(ApplyOutcome {

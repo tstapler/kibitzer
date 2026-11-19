@@ -191,6 +191,22 @@ fn failed_verification_rolls_back() {
 }
 
 #[test]
+fn a_failed_rollback_after_failed_verification_is_an_error_and_keeps_the_log() {
+    let dir = fixture();
+    let mut p = plan(&dir);
+    // Fails verification after destroying the backups the rollback needs.
+    p.verification_steps = vec!["rm -rf .kibitzer/plans/.wal-backup && false".into()];
+    save_plan(&dir, &p).unwrap();
+    let e = apply(&dir, &p.plan_id).unwrap_err();
+    assert_eq!(e.code, "rollback_failed", "{}", e.message);
+    assert!(e.message.contains("verification failed"), "{}", e.message);
+    assert!(
+        dir.join(".kibitzer/plans/.wal").exists(),
+        "the log is kept so the next start can retry"
+    );
+}
+
+#[test]
 fn edit_paths_must_stay_inside_repo() {
     let dir = fixture();
     assert!(safe_rel(&dir, "../outside").is_err());
