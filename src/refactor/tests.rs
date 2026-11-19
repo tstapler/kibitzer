@@ -662,9 +662,8 @@ mod apply_tests {
         let after_first = std::fs::read_to_string(dir.join("b/a1.go")).unwrap();
         let err = apply_plan(&dir, &plan, &RealIo).unwrap_err();
         assert!(
-            format!("{err:#}").contains("stale plan")
-                || format!("{err:#}").contains("already exists"),
-            "second apply must be refused, got: {err:#}"
+            format!("{err:#}").contains("stale plan"),
+            "second apply must be refused as stale, got: {err:#}"
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("b/a1.go")).unwrap(),
@@ -677,7 +676,7 @@ mod apply_tests {
         let files = base_files();
         let (dir, plan) = plan_for("apply-orphan-first", &files, &op("a", "b", &["a/a1.go"]));
         // A killed apply leaves the tree half-moved and the log behind.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct Crash;
             impl ApplyIo for Crash {
                 fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
@@ -693,6 +692,12 @@ mod apply_tests {
             }
             let _ = apply_plan(&dir, &plan, &Crash);
         }));
+        assert!(crashed.is_err(), "the simulated crash must have fired");
+        assert!(dir.join(".kibitzer/plans/.wal").exists(), "the crash left its log");
+        assert!(
+            dir.join("b/a1.go").exists(),
+            "the crash left a half-applied tree (the new file landed)"
+        );
         // The same plan, applied again: recovery must run first, so it is judged against the
         // restored tree and succeeds instead of failing "stale" against the half-applied one.
         apply_plan(&dir, &plan, &RealIo).unwrap();
@@ -725,8 +730,12 @@ mod apply_tests {
         assert!(capped.len() < 70 * 1024, "{}", capped.len());
         assert!(capped.contains("output truncated"));
         assert_eq!(crate::refactor::apply::cap_output("short"), "short");
-        // Multi-byte text must be cut on a character boundary.
-        let multi = "é".repeat(100 * 1024);
-        assert!(crate::refactor::apply::cap_output(&multi).is_char_boundary(0));
+        // 64 KiB is not a multiple of 3, so a 3-byte char straddles the cap and must be dropped
+        // whole rather than split.
+        let multi = "€".repeat(100 * 1024);
+        let capped = crate::refactor::apply::cap_output(&multi);
+        let kept = capped.split("\n[output truncated").next().unwrap();
+        assert_eq!(kept.len(), 65535);
+        assert!(kept.chars().all(|c| c == '€'));
     }
 }
