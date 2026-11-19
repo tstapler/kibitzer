@@ -1031,7 +1031,8 @@ fn an_edited_plan_is_rejected_before_anything_is_written() {
     plan.steps[0].transform.new_content = Some("package x\n".into());
     let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
     assert!(
-        err.to_string().contains("plan_id does not match"),
+        err.to_string().contains("plan_id does not match")
+            && err.to_string().contains("only detects accidental corruption"),
         "{err:#}"
     );
     assert_eq!(checksums(&root), before);

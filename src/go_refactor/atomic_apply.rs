@@ -109,7 +109,9 @@ fn prune_empty_dirs(root: &Path, plan: &MovePlan) {
 fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
     if plan.plan_id != plan.compute_id() {
         bail!(
-            "plan_id does not match the plan's contents (edited or corrupted); regenerate the plan"
+            "plan_id does not match the plan's contents (edited or corrupted); regenerate the plan. \
+             The id is an unkeyed checksum that only detects accidental corruption; a plan file is \
+             as trusted as code, so review plans you did not generate"
         );
     }
     let policy = plan.operation == OperationKind::SyncPolicy;
