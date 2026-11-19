@@ -1272,7 +1272,12 @@ fn a_resealed_policy_plan_cannot_smuggle_a_delete_into_a_genuine_step() {
     super::atomic_apply::check_policy_derivation(&genuine, &root).expect("genuine plan passes");
     let sha = crate::refactor_core::sha256_hex(&std::fs::read(root.join(".golangci.yml")).unwrap());
     let mut forged = genuine.clone();
-    let t = &mut forged.steps[0].transform;
+    let t = &mut forged
+        .steps
+        .iter_mut()
+        .find(|s| s.transform.new_path.as_deref() == Some(".kibitzer/inspect.json"))
+        .expect("the base fixture has an inspect.json step")
+        .transform;
     // Same written bytes and destination, plus a deletion of another policy file.
     t.old_path = Some(".golangci.yml".into());
     t.old_sha256 = Some(sha);

@@ -1226,7 +1226,23 @@ pub fn verify(repo: &Path, id: &str) -> Result<Verification, RefactorError> {
     Ok(run_verification(repo, &plan))
 }
 
-pub fn revert(repo: &Path, id: &str) -> Result<Vec<String>, RefactorError> {
+/// Files restored by [`revert`], plus a warning when the transaction log's leftovers could not be
+/// removed after the revert had already committed.
+#[derive(Debug)]
+pub struct RevertOutcome {
+    pub files: Vec<String>,
+    pub cleanup_warning: Option<String>,
+}
+
+pub fn revert(repo: &Path, id: &str) -> Result<RevertOutcome, RefactorError> {
+    revert_with(repo, id, &txn::Pending::commit)
+}
+
+fn revert_with(
+    repo: &Path,
+    id: &str,
+    commit: &dyn Fn(txn::Pending) -> anyhow::Result<()>,
+) -> Result<RevertOutcome, RefactorError> {
     let session = txn::session(repo).map_err(txn_error)?;
     let mut plan = load_plan(repo, id)?;
     if plan.status != PlanStatus::Applied {
@@ -1257,19 +1273,29 @@ pub fn revert(repo: &Path, id: &str) -> Result<Vec<String>, RefactorError> {
     }
     // The inverse edit set is itself a transaction: all files return to their plan-time content
     // or none does, and a crash mid-revert is recovered like any other.
-    session
+    let cleanup_warning = match session
         .begin(
             &format!("revert-{}", plan.plan_id),
             &revert_changes(repo, &plan),
             &txn::real_rename,
         )
-        .and_then(txn::Pending::commit)
-        .map_err(txn_error)?;
+        .and_then(commit)
+    {
+        Ok(()) => None,
+        // The revert committed; only leftovers remain, so the plan must still move to Reverted.
+        Err(e) => match e.downcast_ref::<txn::CommitCleanupFailed>() {
+            Some(c) => Some(c.to_string()),
+            None => return Err(txn_error(e)),
+        },
+    };
     reset_index(repo, &plan);
     release_locks(repo, &plan);
     plan.status = PlanStatus::Reverted;
     save_plan(repo, &plan)?;
-    Ok(plan.touched_paths)
+    Ok(RevertOutcome {
+        files: plan.touched_paths,
+        cleanup_warning,
+    })
 }
 
 pub fn cap_list<T>(v: Vec<T>) -> (Vec<T>, bool) {

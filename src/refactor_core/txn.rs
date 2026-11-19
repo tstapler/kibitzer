@@ -224,9 +224,18 @@ impl Pending {
         self.commit_with(&finish_commit)
     }
 
-    fn commit_with(mut self, finish: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
-        std::fs::rename(wal_path(&self.root), committed_path(&self.root))
-            .context("marking the transaction committed")?;
+    pub(crate) fn commit_with(mut self, finish: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
+        if let Err(e) = std::fs::rename(wal_path(&self.root), committed_path(&self.root)) {
+            let cause = anyhow::Error::new(e).context("marking the transaction committed");
+            self.settled = true;
+            return Err(match rollback(&self.root, &self.wal) {
+                Ok(()) => cause.context("apply rolled back; the tree is unchanged"),
+                Err(rb) => anyhow::Error::new(RollbackFailed {
+                    cause: format!("{cause:#}"),
+                    rollback: format!("{rb:#}"),
+                }),
+            });
+        }
         sync_dir(&plans_dir(&self.root));
         self.settled = true;
         finish(&self.root).map_err(|e| {
@@ -427,10 +436,19 @@ fn ensure_plans_dir_is_real(root: &Path) -> Result<()> {
 
 fn recover_locked(root: &Path) -> Result<Option<String>> {
     ensure_plans_dir_is_real(root)?;
+    let path = wal_path(root);
     if std::fs::symlink_metadata(committed_path(root)).is_ok() {
+        // Both files means a log is live next to a stale marker; the backups belong to the log.
+        if std::fs::symlink_metadata(&path).is_ok() {
+            bail!(
+                "both {} and {} exist; refusing to delete backups the log may need. Inspect \
+                 {BACKUP_DIR} and remove the stale marker by hand",
+                path.display(),
+                committed_path(root).display()
+            );
+        }
         finish_commit(root)?;
     }
-    let path = wal_path(root);
     let text = match std::fs::File::open(&path) {
         Ok(f) => {
             let mut s = String::new();
@@ -1447,6 +1465,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "new");
         assert!(!committed_path(&root).exists());
         assert!(!backup_dir(&root).exists());
+    }
+
+    #[test]
+    fn recovery_refuses_to_finish_a_commit_while_a_log_still_exists() {
+        let root = scratch("both-files");
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        let p = begin_killed(&root, "p", &[put(root.join("a.go"), "new")], &real_rename).unwrap();
+        drop(p);
+        std::fs::write(committed_path(&root), "").unwrap();
+        let err = session(&root).err().expect("must refuse").to_string();
+        assert!(
+            err.contains(".wal") && err.contains(".wal.committed"),
+            "{err}"
+        );
+        assert!(backup_dir(&root).exists(), "the log's backups must survive");
+        assert!(wal_path(&root).exists());
+    }
+
+    #[test]
+    fn a_commit_whose_marker_and_rollback_both_fail_is_rollback_failed() {
+        let root = scratch("commit-mark-rb");
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        let p = begin(&root, "p", &[put(root.join("a.go"), "new")], &real_rename).unwrap();
+        std::fs::create_dir_all(committed_path(&root).join("x")).unwrap();
+        // Without backups the restore cannot succeed.
+        std::fs::remove_dir_all(backup_dir(&root)).unwrap();
+        let err = p.commit().unwrap_err();
+        assert!(err.downcast_ref::<RollbackFailed>().is_some(), "{err:#}");
+        assert!(wal_path(&root).exists(), "the log is kept for recovery");
     }
 
     #[test]
