@@ -15,6 +15,11 @@ tap = "tstapler/homebrew-tap"
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# `publish-homebrew-formula` has no GitHub App option: it hardcodes `secrets.HOMEBREW_TAP_TOKEN`.
+# release.yml has a hand-inserted `create-github-app-token` step ahead of that job's checkout, and
+# `allow-dirty` keeps `dist generate`/`dist init` from overwriting it. It also means they will not
+# re-apply it after a `cargo-dist-version` bump: redo the insertion by hand each time.
+allow-dirty = ["ci"]
 
 # macos-14 images are retired 2026-11-02 (runner-images#13518)
 [dist.github-custom-runners]

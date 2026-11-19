@@ -98,7 +98,7 @@ fn collect_dense_type_switches(node: Node, src: &[u8], out: &mut Vec<Finding>) {
 /// with more than one listed type is still one clause/one branch, so this counts
 /// `type_case` child nodes, not the total number of `type:` fields across them.
 /// `default_case` is a distinct node kind and is never counted here.
-fn type_case_count(type_switch: Node) -> usize {
+pub(crate) fn type_case_count(type_switch: Node) -> usize {
     let mut cursor = type_switch.walk();
     type_switch
         .children(&mut cursor)
@@ -106,7 +106,7 @@ fn type_case_count(type_switch: Node) -> usize {
         .count()
 }
 
-fn node_text(node: Node, src: &[u8]) -> String {
+pub(crate) fn node_text(node: Node, src: &[u8]) -> String {
     String::from_utf8_lossy(&src[node.start_byte()..node.end_byte()]).into_owned()
 }
 

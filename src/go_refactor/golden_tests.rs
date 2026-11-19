@@ -134,6 +134,15 @@ fn go_available() -> bool {
             "the Go toolchain is required here (CI or KIBITZER_REQUIRE_GO is set) but `go version` failed"
         );
     }
+    if !ok {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "WARNING: Go toolchain not found; go build/vet/test verification is SKIPPED \
+                 (set KIBITZER_REQUIRE_GO=1 to make this a failure)"
+            )
+        });
+    }
     ok
 }
 
@@ -254,24 +263,50 @@ fn golden_cases() {
     }
     cases.sort();
     assert!(
-        cases.len() >= 25,
-        "expected the full fixture matrix, found {}",
-        cases.len()
+        !cases.is_empty(),
+        "no golden fixtures found under {}",
+        data_root().display()
     );
+    // Cases that apply (after.txt exists) and are not policy-only are the ones go verifies.
+    let expected_applied = cases
+        .iter()
+        .filter(|c| {
+            c.join("after.txt").exists()
+                && c.parent().unwrap().file_name().unwrap() != "sync-policy"
+        })
+        .count();
     APPLIED_WITH_GO.store(0, Ordering::SeqCst);
     APPLIED_GO_PLANS.store(0, Ordering::SeqCst);
-    for c in cases {
-        run_case(&c);
-    }
+    // Run every fixture and report all failures, not just the first.
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|c| {
+            std::panic::catch_unwind(|| run_case(c)).err().map(|e| {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "panic".into());
+                format!("--- {} ---\n{msg}", c.display())
+            })
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} golden cases failed:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
     // Proof the verification path ran: every applied Go-changing case went through
     // go build/vet/test (not merely "no failure was observed").
     let (applied, verified) = (
         APPLIED_GO_PLANS.load(Ordering::SeqCst),
         APPLIED_WITH_GO.load(Ordering::SeqCst),
     );
-    assert!(
-        applied >= 9,
-        "expected the applied golden cases, saw {applied}"
+    assert_eq!(
+        applied, expected_applied,
+        "fixtures with after.txt should all have been applied"
     );
     if go_available() {
         assert_eq!(

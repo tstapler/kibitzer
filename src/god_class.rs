@@ -426,7 +426,7 @@ struct ForeignAccessCtx<'a> {
     file_aliases: Option<&'a HashMap<String, String>>,
 }
 
-fn collect_foreign_field_accesses(
+pub(crate) fn collect_foreign_field_accesses(
     method: Node,
     source: &str,
     own_type: &str,
@@ -509,9 +509,11 @@ mod tests {
             exported: true,
             parent: Some(type_name.to_string()),
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -576,6 +578,9 @@ mod tests {
             ],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 1.0);
@@ -596,6 +601,9 @@ mod tests {
             ],
             type_edges: vec![],
             file_import_aliases: BTreeMap::new(),
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         };
         assert_eq!(tight_class_cohesion(&ids, &model), 0.0);
@@ -629,6 +637,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases: aliases,
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: crate::arch_model::PruningSummary::default(),
         }
     }

@@ -362,6 +362,9 @@ mod tests {
             field_accesses: vec![],
             type_edges: vec![],
             file_import_aliases,
+            struct_field_names: Default::default(),
+            struct_field_types: Default::default(),
+            promoted_field_accesses: Default::default(),
             pruning: PruningSummary::default(),
         }
     }
@@ -376,9 +379,11 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 
@@ -392,9 +397,11 @@ mod tests {
             exported: true,
             parent: None,
             is_pure_delegation: false,
+            is_constant_return: false,
             delegation_field: None,
             params: vec![],
             used_as_value: false,
+            end_line: None,
         }
     }
 

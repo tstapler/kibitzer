@@ -22,6 +22,7 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("file-complexity", "x.go", go_three_complex_functions),
     ("duplicate-code", "x.go", go_triplicated_block),
     ("duplicate-code-cross-file", "c.go", cross_file_block),
+    ("introduce-special-case", "x.go", special_case_nil_check),
     ("go-ignored-error", "x.go", go_ignored_error),
     ("go-error-context", "x.go", go_error_context),
     ("go-type-switch-density", "x.go", go_type_switch),
@@ -40,6 +41,15 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
         java_swallowed_interrupt,
     ),
     ("java-lost-exception-cause", "C.java", java_lost_cause),
+    ("sentinel-return-java", "C.java", || {
+        "class Foo {\n  int bar() {\n    try { a(); } catch (Exception e) { return -1; }\n    return 0;\n  }\n}\n".into()
+    }),
+    ("sentinel-return-javascript", "x.js", || {
+        "function bar() {\n  try { a(); } catch (e) { return -1; }\n  return 0;\n}\n".into()
+    }),
+    ("sentinel-return-kotlin", "x.kt", || {
+        "fun bar(): Int {\n  try { a() } catch (e: Exception) { return -1 }\n  return 0\n}\n".into()
+    }),
     ("go-file-size", "x.go", || long_file("//")),
     ("typescript-file-size", "x.ts", || long_file("//")),
     ("tsx-file-size", "x.tsx", || long_file("//")),
@@ -91,6 +101,11 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("comment-quality-bash", "x.sh", || {
         "# This seamlessly handles requests.\nhandle() { :; }\n".into()
     }),
+    (
+        "claude-skill-frontmatter",
+        ".claude/skills/foo/SKILL.md",
+        || "---\nname: bar\ndescription: d\n---\n".into(),
+    ),
     ("repetitive-sentence-structure", "n.md", || {
         "# T\n\nThis is bad. This is worse. This is worst.\n".into()
     }),
@@ -112,6 +127,56 @@ const ANCHOR_EXEMPT: &[(&str, &str)] = &[
     (
         "parameter-object",
         "whole-repo architecture check, reports a cluster of functions at its first member",
+    ),
+    (
+        "go-encapsulate-variable",
+        "whole-repo architecture check needing a two-package model, not a single-file fixture; \
+         end-to-end suppression is covered in tests/encapsulate_variable_cli.rs",
+    ),
+    (
+        "remove-subclass",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "extract-superclass",
+        "whole-repo architecture check needing a field-access model, not a single-file fixture",
+    ),
+    (
+        "collapse-hierarchy",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "push-down-method",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "push-down-field",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "pull-up-method",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "pull-up-constructor-body",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "pull-up-field",
+        "whole-repo architecture check needing a type-hierarchy model, not a single-file fixture",
+    ),
+    (
+        "go-type-switch-clustering",
+        "whole-repo architecture check needing a multi-method model; end-to-end suppression is \
+         covered in tests/go_type_switch_clustering_cli.rs",
+    ),
+    (
+        "claude-skill-xref",
+        "resolves ids against an on-disk .claude/skills tree, which a single-file fixture lacks",
+    ),
+    (
+        "claude-skill-dangling-symlink",
+        "judges the path on disk (a symlink), not file contents, and reports at line 1 of the link",
     ),
     (
         "go-blank-imports",
@@ -176,6 +241,10 @@ fn go_triplicated_block() -> String {
 
 fn cross_file_block() -> String {
     format!("package other\n\n{DO_WORK}")
+}
+
+fn special_case_nil_check() -> String {
+    "package p\n\ntype Svc struct{}\n\nfunc (s *Svc) Name() string { return \"n\" }\n\nfunc describe(svc *Svc) string {\n\tif svc == nil {\n\t\treturn \"none\"\n\t} else {\n\t\treturn svc.Name()\n\t}\n}\n".into()
 }
 
 fn go_ignored_error() -> String {
@@ -252,6 +321,17 @@ fn real_findings(check: &Check, path: &str, source: &str) -> Vec<Finding> {
         );
     }
     let checker = check.checker.as_deref().expect("per-file check");
+    // The sibling files seed the cross-run index so the third file crosses the threshold.
+    let _isolation = if check.name == "introduce-special-case" {
+        let isolation = crate::backtest::IndexIsolation::new();
+        for sibling in ["a.go", "b.go"] {
+            run_checker_configured(checker, Path::new(sibling), source, check.options.as_ref())
+                .unwrap_or_else(|e| panic!("{}: {e:#}", check.name));
+        }
+        Some(isolation)
+    } else {
+        None
+    };
     run_checker_configured(checker, Path::new(path), source, check.options.as_ref())
         .unwrap_or_else(|e| panic!("{}: {e:#}", check.name))
 }

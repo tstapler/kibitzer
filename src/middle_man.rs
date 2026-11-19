@@ -20,6 +20,13 @@ const MIDDLE_MAN_MIN_METHODS: usize = 3;
 const MIDDLE_MAN_DELEGATION_RATIO: f64 = 0.8;
 const INTENTIONAL_DELEGATION_SUFFIXES: [&str; 4] = ["Adapter", "Wrapper", "Proxy", "Decorator"];
 
+/// Types named like adapters/proxies delegate by design, so delegation checks skip them.
+pub(crate) fn is_intentional_delegation_type(name: &str) -> bool {
+    INTENTIONAL_DELEGATION_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
 pub struct MiddleManChecker;
 
 impl ArchModelChecker for MiddleManChecker {
@@ -36,12 +43,7 @@ impl ArchModelChecker for MiddleManChecker {
     fn check(&self, model: &ArchModel, _config: &ArchitectureConfig) -> Vec<ArchFinding> {
         // Resolved or not: an `implements Foo` whose interface lives outside the repo is
         // still an explicit adapter declaration.
-        let implementers: HashSet<&str> = model
-            .type_edges
-            .iter()
-            .filter(|e| e.kind == Some(TypeRelationKind::Implements))
-            .map(|e| e.from.as_str())
-            .collect();
+        let implementers = implementer_type_ids(model);
         let mut findings: Vec<ArchFinding> = model
             .packages
             .values()
@@ -50,6 +52,16 @@ impl ArchModelChecker for MiddleManChecker {
         findings.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
         findings
     }
+}
+
+/// Ids of types with an `implements` edge (resolved or not).
+pub(crate) fn implementer_type_ids(model: &ArchModel) -> HashSet<&str> {
+    model
+        .type_edges
+        .iter()
+        .filter(|e| e.kind == Some(TypeRelationKind::Implements))
+        .map(|e| e.from.as_str())
+        .collect()
 }
 
 fn findings_for_package(
@@ -76,7 +88,10 @@ fn findings_for_package(
 }
 
 /// Method ids are `{pkg}::{type}.{name}`, the same shape `type_edges.from` uses for the type.
-fn implements_declared_interface(method: &SymbolNode, implementers: &HashSet<&str>) -> bool {
+pub(crate) fn implements_declared_interface(
+    method: &SymbolNode,
+    implementers: &HashSet<&str>,
+) -> bool {
     method
         .id
         .strip_suffix(method.name.as_str())
@@ -89,10 +104,7 @@ fn finding_for_type(
     type_name: &str,
     methods: &[&SymbolNode],
 ) -> Option<ArchFinding> {
-    if INTENTIONAL_DELEGATION_SUFFIXES
-        .iter()
-        .any(|suffix| type_name.ends_with(suffix))
-    {
+    if is_intentional_delegation_type(type_name) {
         return None;
     }
     let total = methods.len();

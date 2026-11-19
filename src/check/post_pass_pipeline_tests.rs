@@ -74,6 +74,8 @@ fn run_hook(name: &str, source: &str, changed: Option<&[(usize, usize)]>) -> Hoo
     let file = dir.join("x.go");
     std::fs::write(&file, source).unwrap();
     let run_ctx = RunContext::default();
+    // Default checks include the stateful index checkers; keep them off the real cache.
+    let _isolation = crate::backtest::IndexIsolation::new();
     let results = crate::check::run_checks_for_trigger(
         &crate::config::default_checks(),
         "PostToolUse",

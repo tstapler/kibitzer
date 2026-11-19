@@ -5,7 +5,9 @@ kibitzer runs a built-in default catalog everywhere — pylint-style, no
 the full list is in `docs/syntax-rules.md` and `docs/comment-quality.md`, plus
 `markdown-link-integrity`, `primitive-obsession`, `duplicate-code`,
 `duplicate-code-cross-file`, `file-complexity`, `go-blank-imports`,
-`go-ignored-error`, `go-error-context`). A local
+`go-ignored-error`, `go-error-context`, and the hierarchy checks in
+`docs/hierarchy-cleanup-checks.md` including `push-down-method`, `push-down-field`,
+`pull-up-method`, `pull-up-constructor-body`, `pull-up-field`). A local
 `.kibitzer/inspect.json`
 overlays that catalog rather than replacing it — see
 `config::find_effective_config`. To dismiss one finding you judged acceptable,
@@ -22,6 +24,10 @@ Add its `name` to `disabled` in the repo's `.kibitzer/inspect.json`:
   "disabled": ["primitive-obsession"]
 }
 ```
+
+`disabled` works per checker, not per rule: to silence one `syntax-rules` rule (for example
+`consolidate-conditional`) use a `kibitzer:ignore <rule> -- <why>` comment; disabling
+`syntax-rules-<lang>` drops every rule in that language.
 
 This only removes a *default*. It has no effect on a check you added
 yourself — just delete it from `checks` instead.
@@ -104,7 +110,8 @@ In Markdown the comment is an HTML comment:
   rule list or reason is reported as `[ignore-syntax]` and suppresses nothing.
 - **Native checkers only.** Directives apply to kibitzer's own per-file checkers (the
   ones `kibitzer check list` shows). A shell `command` check, a plugin, an
-  architecture check and a file type with no native checker ignore them, so the hook
+  architecture check (except `encapsulate-variable`, which applies them to its own
+  write-site findings) and a file type with no native checker ignore them, so the hook
   and MCP footers offer the syntax only when a failing native finding could use it.
 - **Scope.** A comment on its own line covers its own rows and the row directly
   below. If comment lines follow it with no blank row between (a reason continued on

@@ -484,7 +484,6 @@ mod apply_tests {
         let (dir, plan) = plan_for("apply-orphan", &files, &op("a", "b", &["a/a1.go"]));
         // Simulate a kill after the first rename: the process dies without cleanup.
         let wal_dir = dir.join(".kibitzer/plans");
-        crate::refactor_core::txn::simulate_kill(true);
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct Crash;
             impl ApplyIo for Crash {
@@ -495,10 +494,12 @@ mod apply_tests {
                 fn run(&self, _: &str, _: &Path) -> (bool, String) {
                     (true, String::new())
                 }
+                fn on_drop(&self) -> crate::refactor_core::txn::OnDrop {
+                    crate::refactor_core::txn::OnDrop::LeaveLog
+                }
             }
             let _ = apply_plan(&dir, &plan, &Crash);
         }));
-        crate::refactor_core::txn::simulate_kill(false);
         assert!(crashed.is_err());
         assert!(wal_dir.join(".wal").exists(), "WAL survives the crash");
         assert!(dir.join("b/a1.go").exists(), "tree is partially applied");
@@ -676,7 +677,6 @@ mod apply_tests {
         let files = base_files();
         let (dir, plan) = plan_for("apply-orphan-first", &files, &op("a", "b", &["a/a1.go"]));
         // A killed apply leaves the tree half-moved and the log behind.
-        crate::refactor_core::txn::simulate_kill(true);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             struct Crash;
             impl ApplyIo for Crash {
@@ -687,10 +687,12 @@ mod apply_tests {
                 fn run(&self, _: &str, _: &Path) -> (bool, String) {
                     (true, String::new())
                 }
+                fn on_drop(&self) -> crate::refactor_core::txn::OnDrop {
+                    crate::refactor_core::txn::OnDrop::LeaveLog
+                }
             }
             let _ = apply_plan(&dir, &plan, &Crash);
         }));
-        crate::refactor_core::txn::simulate_kill(false);
         // The same plan, applied again: recovery must run first, so it is judged against the
         // restored tree and succeeds instead of failing "stale" against the half-applied one.
         apply_plan(&dir, &plan, &RealIo).unwrap();
