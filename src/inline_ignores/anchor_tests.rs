@@ -59,7 +59,7 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("kotlin-file-size", "x.kt", || long_file("//")),
     ("rust-file-size", "x.rs", || long_file("//")),
     ("primitive-obsession-rust", "x.rs", || {
-        "struct U {\n    a: String,\n    b: u32,\n    c: bool,\n}\n".into()
+        "struct U {\n    a: String,\n    b: String,\n    c: bool,\n}\n".into()
     }),
     ("file-complexity-rust", "x.rs", rust_three_complex_functions),
     ("sentinel-return-rust", "x.rs", || {

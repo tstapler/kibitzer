@@ -1,8 +1,9 @@
 //! `primitive-obsession-rust`: a struct whose named fields are all raw primitives (`String`,
-//! integers, floats, `bool`), at least three of them, at least two distinct types, one a `String`.
+//! integers, floats, `bool`): at least three fields, two distinct types, two or more `String`
+//! fields (easy to swap at a call site), and no `pub` field.
 //!
 //! The Go checker flags parameter piles; the Rust analogue is the data clump in a struct
-//! (`struct User { name: String, age: u32, active: bool }`). Skipped to hold the false-positive
+//! (`struct User { name: String, email: String, age: u32 }`). Skipped to hold the false-positive
 //! rate down: `#[cfg(test)]` code, serde/FFI-shaped structs (`Serialize`, `Deserialize`,
 //! `#[repr(..)]`), and same-type bundles (`Rgb { r: u8, g: u8, b: u8 }`) that a newtype would not
 //! disambiguate. See docs/primitive-obsession-rust-false-positives.md.
@@ -82,6 +83,7 @@ fn check_struct(node: Node, source: &str) -> Option<Finding> {
     let mut cursor = body.walk();
     let mut types = BTreeSet::new();
     let mut count = 0;
+    let mut strings = 0;
     for field in body
         .children(&mut cursor)
         .filter(|c| c.kind() == "field_declaration")
@@ -90,12 +92,21 @@ fn check_struct(node: Node, source: &str) -> Option<Finding> {
         if !PRIMITIVES.contains(&ty) {
             return None;
         }
+        // `pub` fields mark a plain data record (wire/FFI/report types), which backtests showed
+        // is overwhelmingly idiomatic; private fields are where an invariant could live.
+        if field
+            .children(&mut field.walk())
+            .any(|c| c.kind() == "visibility_modifier")
+        {
+            return None;
+        }
+        strings += usize::from(ty == "String");
         types.insert(ty);
         count += 1;
     }
     // Stringly-typed signal: numeric-only records (positions, layout results, iterator state)
     // measured as mostly false positives in the backtest.
-    if count < MIN_FIELDS || types.len() < 2 || !types.contains("String") {
+    if count < MIN_FIELDS || types.len() < 2 || strings < 2 {
         return None;
     }
     let name = node
@@ -119,7 +130,7 @@ mod tests {
 
     #[test]
     fn flags_struct_of_three_mixed_primitives() {
-        let f = run("struct User { name: String, age: u32, active: bool }");
+        let f = run("struct User { name: String, email: String, age: u32 }");
         assert_eq!(f.len(), 1);
         assert!(f[0].message.contains("`User`"));
     }
@@ -127,9 +138,15 @@ mod tests {
     #[test]
     fn derive_does_not_hide_the_finding() {
         assert_eq!(
-            run("#[derive(Debug, Clone)]\nstruct U { a: String, b: u32, c: bool }").len(),
+            run("#[derive(Debug, Clone)]\nstruct U { a: String, b: String, c: bool }").len(),
             1
         );
+    }
+
+    #[test]
+    fn one_string_or_a_pub_field_is_not_flagged() {
+        assert!(run("struct U { a: String, b: u32, c: bool }").is_empty());
+        assert!(run("struct U { pub a: String, b: String, c: bool }").is_empty());
     }
 
     #[test]
@@ -139,12 +156,12 @@ mod tests {
 
     #[test]
     fn two_fields_are_below_threshold() {
-        assert!(run("struct U { a: String, b: u32 }").is_empty());
+        assert!(run("struct U { a: String, b: String }").is_empty());
     }
 
     #[test]
     fn a_named_type_field_clears_it() {
-        assert!(run("struct U { a: String, b: u32, c: Id }").is_empty());
+        assert!(run("struct U { a: String, b: String, c: Id }").is_empty());
     }
 
     #[test]
@@ -154,8 +171,12 @@ mod tests {
 
     #[test]
     fn serde_and_test_structs_are_skipped() {
-        assert!(run("#[derive(Deserialize)]\nstruct U { a: String, b: u32, c: bool }").is_empty());
-        assert!(run("#[cfg(test)]\nmod t { struct U { a: String, b: u32, c: bool } }").is_empty());
+        assert!(
+            run("#[derive(Deserialize)]\nstruct U { a: String, b: String, c: bool }").is_empty()
+        );
+        assert!(
+            run("#[cfg(test)]\nmod t { struct U { a: String, b: String, c: bool } }").is_empty()
+        );
     }
 
     #[test]

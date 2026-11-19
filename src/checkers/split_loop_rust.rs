@@ -2,7 +2,7 @@
 //! or more accumulators which do not feed each other is doing two jobs.
 //!
 //! Port of the Go checker's model (`split_loop.rs`), precision over recall. Accumulators are
-//! `x op= e`, `x = x ..`, `x[k] = e` and `x.push/insert/extend/push_str(..)` on a plain local.
+//! `x op= e` and `x = x <op> e` on a plain local.
 //! Two accumulators are one group when one reads the other (directly or through a body local),
 //! when they sit in the same or exclusive arms of an `if`/`match`, or when they are fed by the
 //! same per-iteration value. Skipped: bodies with `break`/`continue`/`return`/`?` (all
@@ -25,16 +25,6 @@ use crate::union_find;
 
 /// Bounds the quadratic `accounted` scan; larger loops are skipped, not flagged.
 const MAX_LOOP_BODY_NODES: usize = 5000;
-const PUSH_METHODS: &[&str] = &[
-    "push",
-    "push_str",
-    "push_back",
-    "push_front",
-    "insert",
-    "extend",
-    "extend_from_slice",
-    "append",
-];
 const TUPLE_PREFIX: &str = "#tuple@";
 
 pub struct SplitLoopRustChecker;
@@ -130,7 +120,7 @@ fn exceeds_node_count(root: Node, limit: usize) -> bool {
 
 fn identifiers(node: Node, source: &str, out: &mut Vec<(String, usize)>) {
     walk_preorder(node, &mut |n| {
-        if n.kind() == "identifier" {
+        if matches!(n.kind(), "identifier" | "shorthand_field_identifier") {
             out.push((text(n, source).to_string(), n.start_byte()));
         }
         true
@@ -303,9 +293,6 @@ fn scan_statements(node: Node, source: &str, guards: &mut Vec<Guard>, scan: &mut
         }
         "call_expression" => {
             note_exits(node, scan);
-            if record_push(node, source, guards, scan) {
-                return;
-            }
         }
         "let_declaration" => {
             note_exits(node, scan);
@@ -482,13 +469,17 @@ fn record_assignment(node: Node, source: &str, guards: &[Guard], scan: &mut Body
     let Some((name, mut deps)) = accumulator_target(lhs, source) else {
         return;
     };
-    let rhs_idents = identifier_set(rhs, source);
-    if is_plain && lhs.kind() == "identifier" {
-        if rhs_idents.contains(&name) && rhs.kind() == "binary_expression" {
-            // `x = x + e`: a self-referencing update is an accumulator.
+    let rhs_idents = value_identifiers(rhs, source);
+    if is_plain {
+        // Only `x = x <op> e` accumulates; indexed stores (`x[k] = e`) and other plain
+        // assignments build collections or move state, which backtests showed are not jobs.
+        if lhs.kind() == "identifier"
+            && rhs_idents.contains(&name)
+            && rhs.kind() == "binary_expression"
+        {
             deps.extend(rhs_idents);
             commit_update(scan, guards, node, name, deps, false);
-        } else {
+        } else if lhs.kind() == "identifier" {
             scan.plain_assigns
                 .entry(name)
                 .or_default()
@@ -497,70 +488,58 @@ fn record_assignment(node: Node, source: &str, guards: &[Guard], scan: &mut Body
         }
         return;
     }
+    // `ok &= cond` / `any |= cond` fold a predicate: a flag, not an aggregate job.
+    if is_flag_fold(node, rhs, source) {
+        scan.accounted.push((node.start_byte(), node.end_byte()));
+        return;
+    }
+    // `x += 1` and `x += CONST_STEP` advance a position or tally; they ride along with the
+    // real job instead of being one.
+    let counter = rhs.kind() == "integer_literal" || rhs_idents.iter().all(|i| is_constant_like(i));
     deps.extend(rhs_idents);
-    let counter = !is_plain && lhs.kind() == "identifier" && rhs.kind() == "integer_literal";
     commit_update(scan, guards, node, name, deps, counter);
 }
 
-/// A literal or empty-constructor value (`Vec::new()`, `0`, `String::new()`): filling a
-/// collection with it is initialisation, not accumulation.
-fn is_initialiser(node: Node, source: &str) -> bool {
-    match node.kind() {
-        "integer_literal" | "float_literal" | "boolean_literal" | "string_literal" => true,
-        "call_expression" => {
-            let args_empty = node
-                .child_by_field_name("arguments")
-                .is_none_or(|a| a.named_child_count() == 0);
-            let callee = node
-                .child_by_field_name("function")
-                .map_or("", |f| text(f, source));
-            args_empty && (callee.ends_with("::new") || callee.ends_with("::default"))
+/// Identifiers read by `node`, without module paths (`libc::CPU_MAX` is a constant, not input).
+fn value_identifiers(node: Node, source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    walk_preorder(node, &mut |n| {
+        if n.kind() == "scoped_identifier" {
+            return false;
         }
-        "macro_invocation" => node
-            .child_by_field_name("macro")
-            .is_some_and(|m| text(m, source) == "vec"),
-        _ => false,
-    }
+        if matches!(n.kind(), "identifier" | "shorthand_field_identifier") {
+            out.insert(text(n, source).to_string());
+        }
+        true
+    });
+    out
 }
 
-/// `x.push(e)` and friends on a plain local `x`.
-fn record_push(call: Node, source: &str, guards: &[Guard], scan: &mut BodyScan) -> bool {
-    let Some(func) = call.child_by_field_name("function") else {
-        return false;
-    };
-    if func.kind() != "field_expression" {
-        return false;
-    }
-    let (Some(recv), Some(method)) = (
-        func.child_by_field_name("value"),
-        func.child_by_field_name("field"),
-    ) else {
-        return false;
-    };
-    if recv.kind() != "identifier" || !PUSH_METHODS.contains(&text(method, source)) {
-        return false;
-    }
-    if let Some(args) = call.child_by_field_name("arguments")
-        && args.named_child_count() > 0
-        && args
-            .named_children(&mut args.walk())
-            .all(|a| is_initialiser(a, source))
-    {
-        return false;
-    }
-    let deps = call
-        .child_by_field_name("arguments")
-        .map(|a| identifier_set(a, source))
-        .unwrap_or_default();
-    commit_update(
-        scan,
-        guards,
-        call,
-        text(recv, source).to_string(),
-        deps,
-        false,
-    );
-    true
+fn is_flag_fold(assign: Node, rhs: Node, source: &str) -> bool {
+    let op = assign
+        .child_by_field_name("operator")
+        .map_or("", |o| text(o, source));
+    matches!(op, "&=" | "|=")
+        && rhs.kind() == "binary_expression"
+        && rhs.child_by_field_name("operator").is_some_and(|o| {
+            matches!(
+                o.kind(),
+                "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||"
+            )
+        })
+}
+
+/// `CONST_NAME`, a primitive type from an `as` cast, or `_`: not a per-iteration input.
+fn is_constant_like(ident: &str) -> bool {
+    const PRIMITIVES: &[&str] = &[
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "bool", "char",
+    ];
+    ident == "_"
+        || PRIMITIVES.contains(&ident)
+        || ident
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]
@@ -586,9 +565,33 @@ mod tests {
     }
 
     #[test]
-    fn flags_independent_push_accumulators() {
-        assert!(flagged(
+    fn collection_builders_are_not_accumulators() {
+        assert!(!flagged(
             "let mut xs = vec![]; let mut ys = vec![];\nfor v in items { xs.push(*v); ys.push(items.len()); }"
+        ));
+        assert!(!flagged(
+            "let mut xs = [0; 4]; let mut ys = [0; 4];\nfor v in items { xs[0] = *v; ys[1] = items.len(); }"
+        ));
+    }
+
+    #[test]
+    fn constant_step_updates_are_not_accumulators() {
+        assert!(!flagged(
+            "let mut a = 0; let mut off = 0;\nfor v in items { a += v; off += STEP as i32; }"
+        ));
+    }
+
+    #[test]
+    fn predicate_flag_folds_are_not_accumulators() {
+        assert!(!flagged(
+            "let (mut a, mut b) = (true, true);\nfor _ in 0..n { a &= f() == 0; b &= g() == 0; }"
+        ));
+    }
+
+    #[test]
+    fn independent_numeric_products_are_flagged() {
+        assert!(flagged(
+            "let (mut a, mut b) = (1.0, 1.0);\nfor _ in 0..n { a *= f(); b *= g(); }"
         ));
     }
 

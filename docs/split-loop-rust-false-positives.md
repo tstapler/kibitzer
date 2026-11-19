@@ -2,38 +2,45 @@
 
 Advisory, `**/*.rs`. Rust port of Go `split-loop-go` (Fowler's Split Loop), precision first: a
 `for`/`while`/`loop` body that advances 2+ accumulators with no link between them. Accumulators:
-`x op= e`, `x = x <binary-op> e`, `x[k] = e`, and `x.push/push_str/push_back/insert/extend/..(e)`
-on a plain local. Two accumulators are one group when one reads the other (directly or through a
+`x op= e` and `x = x <binary-op> e` on a plain local (not `push`/index stores). Two accumulators are one group when one reads the other (directly or through a
 body local), when they sit in the same or exclusive `if`/`match` arms, or when both are fed by a
 per-iteration value (the loop pattern or a body local). Not flagged: bodies with
 `break`/`continue`/`return`/`?`, any use of an accumulator outside its own update (a `println!`
-mention counts), nested loops/closures, tally-only counters (`n += 1`), initialisation
-(`v.push(Vec::new())`, `push(0)`), and state evolution (`w = max(w / 2, 1)`).
+mention counts), nested loops/closures, tally-only counters (`n += 1`), constant-step updates
+(`off += CONST`), predicate folds (`ok &= a == b`), and state evolution (`w = max(w / 2, 1)`).
 
 ## Backtest (2026-11-19, release build)
 
 Command: `find <repo> -name '*.rs' | xargs -n1 kibitzer check native split-loop-rust`.
+Corpus: servo (1650 files), ripgrep (110), deno (1052), `tstapler/dunnage-hardening` (412),
+`rust-lang/book` (654), `tstapler/disk-cleanup` (408), kibitzer `src/` (242), and the crates.io
+registry checkout in `~/.cargo/registry/src` (36,378 files). The registry was added after review
+noted the first shipped version found nothing, leaving recall and precision unmeasured.
 
-| Version | servo (1650 files) | ripgrep (110) | deno (1052) | tstapler/dunnage-hardening (412) | rust-lang/book (654) | tstapler/disk-cleanup (408) | kibitzer `src/` (242) |
-|---|---|---|---|---|---|---|---|
-| v1: direct port of the Go model | 2 | 0 | 2 | not run | not run | not run | not run |
-| shipped | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Version | servo | ripgrep | deno | registry (distinct sites) |
+|---|---|---|---|---|
+| v1: direct port of the Go model | 2 | 0 | 2 | 16 (22 findings) |
+| v2: + item-fed accumulators one group, `x = f(x)` is state, constructor fills are init | 0 | 0 | 0 | 5 findings |
+| shipped: + only `op=`/`x = x <op> e` accumulate (no `push`/index stores), constant-step and `&=`/`\|=` predicate folds excluded, module paths ignored | 0 | 0 | 0 | 2 findings |
 
-All four v1 findings were false positives (**4/4**): two pairs of parallel arrays filled from one
-tuple pattern (`keys.push(key); values.push(value)`, zipped afterwards; servo
-`stylepropertymapreadonly.rs:52`, deno `rt_desktop/lib.rs:953`), one loop halving three texture
-dimensions with `w = max(1, w / 2)` (servo `webgltexture.rs:614`), and one loop initialising two
-`Vec::new()` buckets (deno `coverage/merge.rs:253`). The shipped rules remove exactly those
-shapes: per-iteration-fed accumulators form one group, `x = f(..)` calls are state not
-accumulation, and constructor/literal fills are initialisation.
+Triage by reading the loop:
 
-**The shipped check reports nothing on about 4,500 `.rs` files**, so its false-positive rate is
-0 of 0 findings (bar: <= 20%), and its recall on real code is **unmeasured**: the 14 unit tests
-(positive: independent `+=`, independent `push`, `while` loop; negative: each suppression above)
-are the only evidence it fires. Treat it as a conservative guard until a corpus with a true
-positive turns up.
+- v1: 4/4 false positives on servo and deno (parallel arrays from one tuple pattern, texture
+  dimension halving, two `Vec::new()` buckets); 14 of 16 registry sites were false positives for
+  the same reasons plus `geo`'s `sum_x`/`sum_y` (struct-pattern shorthand fields not seen as loop
+  inputs) and `sysinfo`'s `offset += CONST` step.
+- v2 left `ryu` (`vm_is_trailing_zeros &= ..`, `vr_is_trailing_zeros &= ..`: predicate folds
+  driven by shared loop state), `sysinfo` (`offset += libc::CPU_STATE_MAX as isize`) and `libm`.
+- Shipped: the only findings are `libm` `jn.rs:136` and `jnf.rs:81` (`a *= i; b *= temp` computing
+  `n!` and `(x/2)^n` in one `while`): the same function in f64 and f32, judged one true positive
+  site. **0 false positives out of 2 findings (1 distinct site)** across about 40,000 `.rs`
+  files; bar: <= 20%.
+
+With so few findings the rate carries wide uncertainty and recall is low by design: collection
+builders (`push`, indexed stores) are never accumulators, because on this corpus every such pair
+read as parallel arrays rather than separate jobs.
 
 ## Known limits
 
-- Field accumulators (`self.total += x`) are ignored: only plain locals and `x[k]` count.
+- Field accumulators (`self.total += x`) are ignored: only plain locals count.
 - Any accumulator read in a macro (`println!("{}", sum)`) makes the loop ambiguous and skipped.

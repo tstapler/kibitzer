@@ -114,6 +114,9 @@ enum Command {
         /// Load config from this file instead of walking upward for `.kibitzer/inspect.json`.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Print one JSON object `{"blocking": bool, "lines": [..]}` instead of text output.
+        #[arg(long)]
+        json: bool,
     },
     /// Claude Code PostToolUse hook mode: read the event off stdin.
     Hook,
@@ -498,6 +501,7 @@ fn main() -> Result<ExitCode> {
             no_inline_ignores,
             deny_blocking_suppression,
             config,
+            json,
         } => run::run_batch(
             dir,
             &trigger,
@@ -508,6 +512,7 @@ fn main() -> Result<ExitCode> {
             },
             deny_blocking_suppression,
             config.as_deref(),
+            json,
         ),
         Command::Hook => hook::run_hook(),
         Command::Mcp {

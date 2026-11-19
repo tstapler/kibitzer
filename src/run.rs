@@ -109,22 +109,32 @@ fn finding_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
 ///
 /// `deny_blocking_suppression` also fails the run (exit 1) when any finding of a blocking
 /// check was suppressed inline, so CI can refuse a `kibitzer:ignore` on a blocking check.
+///
+/// With `json`, prints one JSON object (`{"blocking": bool, "lines": [..]}`) instead of text and
+/// leaves out the Rust coverage note, which is prose for a terminal reader.
 pub fn run_batch(
     dir: PathBuf,
     trigger: &str,
     mode: InlineIgnoreMode,
     deny_blocking_suppression: bool,
     config_override: Option<&Path>,
+    json: bool,
 ) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) = run_batch_collect(
+    let (any_blocking_failure, lines) = run_batch_inner(
         &dir,
         trigger,
         mode,
         deny_blocking_suppression,
         config_override,
+        !json,
     )?;
-    for line in &lines {
-        println!("{line}");
+    if json {
+        let out = serde_json::json!({ "blocking": any_blocking_failure, "lines": lines });
+        println!("{out}");
+    } else {
+        for line in &lines {
+            println!("{line}");
+        }
     }
     if any_blocking_failure {
         Ok(ExitCode::from(1))
@@ -139,8 +149,7 @@ fn is_rust_file(path: &Path) -> bool {
 
 /// Printed when Rust files were checked and none produced a finding, so silence on a Rust repo
 /// reads as "these checks ran and found nothing" rather than "Rust is not covered"
-/// (docs/rust-parity.md). `kibitzer run` has no machine-readable output mode, so there is no
-/// JSON stream to keep clean; a future one must not carry this line.
+/// (docs/rust-parity.md). Left out of `--json` output.
 fn rust_coverage_note(rust_files: usize, file_checks: &[Check]) -> String {
     let mut active: Vec<&str> = file_checks
         .iter()
@@ -160,12 +169,31 @@ fn rust_coverage_note(rust_files: usize, file_checks: &[Check]) -> String {
 /// it can be exercised end to end in tests without capturing the process's real stdout:
 /// returns whether any check hit a genuine blocking failure, plus every rendered report
 /// line in print order (see `report_lines`).
+#[cfg(test)]
 fn run_batch_collect(
     dir: &Path,
     trigger: &str,
     mode: InlineIgnoreMode,
     deny_blocking_suppression: bool,
     config_override: Option<&Path>,
+) -> Result<(bool, Vec<String>)> {
+    run_batch_inner(
+        dir,
+        trigger,
+        mode,
+        deny_blocking_suppression,
+        config_override,
+        true,
+    )
+}
+
+fn run_batch_inner(
+    dir: &Path,
+    trigger: &str,
+    mode: InlineIgnoreMode,
+    deny_blocking_suppression: bool,
+    config_override: Option<&Path>,
+    include_coverage_note: bool,
 ) -> Result<(bool, Vec<String>)> {
     let (config, repo_root, _source) = find_effective_config_with(config_override, dir)?;
 
@@ -262,7 +290,7 @@ fn run_batch_collect(
     }
 
     let rust_files = files.iter().filter(|f| is_rust_file(f)).count();
-    if rust_files > 0 && rust_findings == 0 {
+    if include_coverage_note && rust_files > 0 && rust_findings == 0 {
         lines.push(rust_coverage_note(rust_files, &file_checks));
     }
     if any_dismissible {
@@ -528,6 +556,17 @@ mod tests {
             lines.iter().any(|l| l.contains("rust-ignored-error")),
             "{lines:#?}"
         );
+        assert!(!lines.iter().any(|l| l.contains(".rs file")), "{lines:#?}");
+    }
+
+    #[test]
+    fn json_mode_omits_the_coverage_note() {
+        let dir = tmp_dir("rust-coverage-json");
+        std::fs::write(dir.join("lib.rs"), "pub fn one() -> i32 {\n    1\n}\n").unwrap();
+        let (_, lines) =
+            super::run_batch_inner(&dir, "batch", InlineIgnoreMode::Apply, false, None, false)
+                .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
         assert!(!lines.iter().any(|l| l.contains(".rs file")), "{lines:#?}");
     }
 
