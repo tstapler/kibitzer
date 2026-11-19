@@ -506,11 +506,10 @@ fn policy_update_failure_restores_the_tree() {
 }
 
 #[test]
-fn real_write_failure_mid_apply_restores_earlier_writes() {
+fn a_destination_blocked_by_a_regular_file_is_refused_before_any_write() {
     let root = input_copy("base");
     let plan = base_move_plan(&root);
-    // A regular file where the destination directory must go makes the last writes fail
-    // after earlier rewrites already landed.
+    // Late-failure rollback is covered by `failure_at_every_write_restores_the_tree_byte_for_byte`.
     std::fs::write(root.join("util"), "not a directory").unwrap();
     let before = checksums(&root);
     let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
@@ -1261,24 +1260,38 @@ fn a_resealed_forged_sync_policy_plan_is_rejected_in_every_shape() {
 }
 
 #[test]
+fn a_resealed_policy_plan_cannot_smuggle_a_delete_into_a_genuine_step() {
+    let root = input_copy("base");
+    std::fs::write(root.join(".golangci.yml"), "run:\n  timeout: 1m\n").unwrap();
+    let source =
+        plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
+    let genuine = plan_sync_policy(&root, &source).unwrap();
+    super::atomic_apply::check_policy_derivation(&genuine, &root).expect("genuine plan passes");
+    let sha = crate::refactor_core::sha256_hex(&std::fs::read(root.join(".golangci.yml")).unwrap());
+    let mut forged = genuine.clone();
+    let t = &mut forged.steps[0].transform;
+    // Same written bytes and destination, plus a deletion of another policy file.
+    t.old_path = Some(".golangci.yml".into());
+    t.old_sha256 = Some(sha);
+    let err = super::atomic_apply::check_policy_derivation(&forged, &root).unwrap_err();
+    assert!(
+        err.to_string().contains("differs from what the tool derives"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn rollback_that_itself_fails_is_reported_as_a_dirty_tree() {
-    use std::os::unix::fs::PermissionsExt as _;
     let root = input_copy("base");
     let plan = base_move_plan(&root);
     let before = checksums(&root);
-    let go_files: Vec<PathBuf> = before
-        .keys()
-        .filter(|k| k.ends_with(".go"))
-        .map(|k| root.join(k))
-        .collect();
-    let set_mode = |mode: u32| {
-        for f in &go_files {
-            let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode));
-        }
-    };
-    // Read-only originals make the restore copy fail, while the backups stay intact.
+    let backups = root.join(".kibitzer/plans/.wal-backup");
+    let hidden = root.join(".kibitzer/plans/.wal-backup-hidden");
+    // Moving the backups away makes every restore fail regardless of the user's privileges
+    // (root ignores file modes), and putting them back lets a later recovery succeed.
     let sabotage = |_: &Path, _: &Path| {
-        set_mode(0o444);
+        std::fs::rename(&backups, &hidden).unwrap();
         Err(std::io::Error::other("injected"))
     };
     let result = apply_with(&plan, &root, &ApplyOptions::default(), &sabotage).unwrap();
@@ -1292,7 +1305,7 @@ fn rollback_that_itself_fails_is_reported_as_a_dirty_tree() {
         root.join(".kibitzer/plans/.wal").exists(),
         "the WAL must be kept after a failed rollback"
     );
-    set_mode(0o644);
+    std::fs::rename(&hidden, &backups).unwrap();
     crate::refactor_core::txn::session(&root).expect("a later session recovers the kept log");
     assert!(!root.join(".kibitzer/plans/.wal").exists());
     assert_eq!(checksums(&root), before, "recovery restores the tree");
