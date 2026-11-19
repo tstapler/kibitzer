@@ -36,6 +36,7 @@ pub mod primitive_obsession_rust;
 pub mod repetitive_sentences;
 pub mod rules;
 mod rust_common;
+pub mod rust_error_context;
 pub mod rust_ignored_error;
 pub mod sentence_length_uniformity;
 mod sentinel_return;
