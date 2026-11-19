@@ -54,17 +54,57 @@ pub(super) fn in_test_code(node: Node, source: &str) -> bool {
 }
 
 fn is_test_attrs(attrs: &str) -> bool {
-    let word = |hay: &str, w: &str| {
-        hay.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|t| t == w)
-    };
     attrs.split("#[").skip(1).any(|a| {
         let head = a.split(['(', ']']).next().unwrap_or("").trim();
-        let cfg_test = (head == "cfg" || head == "cfg_attr")
-            && word(a, "test")
-            && !a.replace(' ', "").contains("not(test)");
-        cfg_test || head == "test" || head == "rstest" || head.ends_with("::test")
+        // `cfg_attr(test, X)` only decorates; the item still builds in production.
+        (head == "cfg" && cfg_enables_only_for_test(a))
+            || head == "test"
+            || head == "rstest"
+            || head.ends_with("::test")
     })
+}
+
+/// True when a bare `test` predicate appears outside any `not(..)` and outside string literals:
+/// `cfg(test)`, `cfg(all(test, ..))`, `cfg(any(test, ..))`; not `cfg(feature = "test")` or
+/// `cfg(not(any(test, ..)))`.
+fn cfg_enables_only_for_test(attr: &str) -> bool {
+    let b = attr.as_bytes();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut last_ident = "";
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += usize::from(b[i] == b'\\') + 1;
+                }
+                i += 1;
+            }
+            b'(' => {
+                stack.push(last_ident);
+                last_ident = "";
+                i += 1;
+            }
+            b')' => {
+                stack.pop();
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                last_ident = &attr[start..i];
+                let rest = attr[i..].trim_start();
+                if last_ident == "test" && !rest.starts_with('=') && !stack.contains(&"not") {
+                    return true;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Whether `file` is under a `tests/`, `benches/` or `examples/` directory, or is a `tests.rs`

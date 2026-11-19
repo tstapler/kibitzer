@@ -1264,7 +1264,9 @@ fn has_assert_token(mac: Node, source: &str) -> bool {
     walk_preorder(mac, &mut |n| {
         if n.kind() == "identifier" {
             let t = node_text(n, source);
-            found |= t == "assert" || t.starts_with("assert_") || t.starts_with("debug_assert");
+            let followed_by_bang = n.next_sibling().is_some_and(|x| x.kind() == "!");
+            found |= followed_by_bang
+                && (t == "assert" || t.starts_with("assert_") || t.starts_with("debug_assert"));
         }
         !found
     });

@@ -863,3 +863,10 @@ fn wrapped_real_assert() { my_macro!(x => assert!(true)); }
     let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
     assert_eq!(lines(&findings), vec![4, 6], "{findings:?}");
 }
+
+#[test]
+fn test_no_assertion_rust_should_NotCountAnAssertPrefixedVariableInAMacro() {
+    let src = "#[test]\nfn t() { println!(\"{}\", assert_count); }\n";
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
+    assert_eq!(lines(&findings), vec![2], "{findings:?}");
+}

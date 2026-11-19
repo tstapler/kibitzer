@@ -242,8 +242,28 @@ mod tests {
             run("#[cfg(not(test))]\nmod m { fn h() { parse().unwrap(); } }").len(),
             1
         );
+        assert_eq!(
+            run("#[cfg_attr(test, allow(dead_code))]
+fn t() { parse().unwrap(); }")
+            .len(),
+            1
+        );
+        assert_eq!(
+            run("#[cfg(feature = \"test\")]
+fn t() { parse().unwrap(); }")
+            .len(),
+            1
+        );
+        assert_eq!(
+            run("#[cfg(not(any(test, windows)))]
+fn t() { parse().unwrap(); }")
+            .len(),
+            1
+        );
         assert!(
-            run("#[cfg_attr(test, allow(dead_code))]\nfn t() { parse().unwrap(); }").is_empty()
+            run("#[cfg(any(test, feature = \"x\"))]
+fn t() { parse().unwrap(); }")
+            .is_empty()
         );
     }
 
