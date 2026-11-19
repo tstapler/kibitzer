@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value;
 
 use super::atomic_apply::{ApplyOptions, apply, apply_with};
-use crate::refactor_core::sha256_hex;
 use super::types::{ApplyStatus, MovePlan, PlanStepKind};
 use super::*;
+use crate::refactor_core::sha256_hex;
 
 fn data_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/refactor")
@@ -1032,7 +1032,9 @@ fn an_edited_plan_is_rejected_before_anything_is_written() {
     let err = apply(&plan, &root, &ApplyOptions::default()).unwrap_err();
     assert!(
         err.to_string().contains("plan_id does not match")
-            && err.to_string().contains("only detects accidental corruption"),
+            && err
+                .to_string()
+                .contains("only detects accidental corruption"),
         "{err:#}"
     );
     assert_eq!(checksums(&root), before);
@@ -1276,7 +1278,8 @@ fn a_resealed_policy_plan_cannot_smuggle_a_delete_into_a_genuine_step() {
     t.old_sha256 = Some(sha);
     let err = super::atomic_apply::check_policy_derivation(&forged, &root).unwrap_err();
     assert!(
-        err.to_string().contains("differs from what the tool derives"),
+        err.to_string()
+            .contains("differs from what the tool derives"),
         "{err:#}"
     );
 }
@@ -1332,11 +1335,14 @@ fn a_raw_string_import_is_still_found_and_rewritten() {
             ),
         ],
     );
-    let plan = plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None)
-        .unwrap();
+    let plan =
+        plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
     assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     let app = step_content(&plan, "app/app.go");
-    assert!(app.contains("example.com/m/core") && app.contains("core.A()"), "{app}");
+    assert!(
+        app.contains("example.com/m/core") && app.contains("core.A()"),
+        "{app}"
+    );
 }
 
 #[test]
@@ -1351,11 +1357,17 @@ fn a_file_importing_a_package_both_implicitly_and_aliased_gets_its_qualifier_rew
             ),
         ],
     );
-    let plan = plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None)
-        .unwrap();
+    let plan =
+        plan_rename_pkg(&root, "example.com/m/lib", "example.com/m/core", None, None).unwrap();
     let app = step_content(&plan, "app/app.go");
-    assert!(app.contains("core.A()") && app.contains("other.A()"), "{app}");
-    assert!(!app.contains("lib.A()"), "stale qualifier left behind:\n{app}");
+    assert!(
+        app.contains("core.A()") && app.contains("other.A()"),
+        "{app}"
+    );
+    assert!(
+        !app.contains("lib.A()"),
+        "stale qualifier left behind:\n{app}"
+    );
 }
 
 #[cfg(unix)]

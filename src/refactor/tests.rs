@@ -693,7 +693,10 @@ mod apply_tests {
             let _ = apply_plan(&dir, &plan, &Crash);
         }));
         assert!(crashed.is_err(), "the simulated crash must have fired");
-        assert!(dir.join(".kibitzer/plans/.wal").exists(), "the crash left its log");
+        assert!(
+            dir.join(".kibitzer/plans/.wal").exists(),
+            "the crash left its log"
+        );
         assert!(
             dir.join("b/a1.go").exists(),
             "the crash left a half-applied tree (the new file landed)"

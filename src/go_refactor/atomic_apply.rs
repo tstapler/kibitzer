@@ -336,13 +336,7 @@ fn verify_and_settle(
         },
     };
     prune_empty_dirs(root, plan);
-    let mut applied = result(
-        plan,
-        ApplyStatus::Applied,
-        plan.steps.len(),
-        verify,
-        vec![],
-    );
+    let mut applied = result(plan, ApplyStatus::Applied, plan.steps.len(), verify, vec![]);
     applied.cleanup_warning = cleanup_warning;
     Ok(applied)
 }

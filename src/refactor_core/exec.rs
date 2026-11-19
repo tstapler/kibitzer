@@ -402,7 +402,8 @@ mod tests {
     #[test]
     fn locked_goflags_keeps_operator_flags_and_respects_vendor_mode() {
         let scratch = |tag: &str| {
-            let d = std::env::temp_dir().join(format!("kibitzer-goflags-{tag}-{}", std::process::id()));
+            let d =
+                std::env::temp_dir().join(format!("kibitzer-goflags-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             d

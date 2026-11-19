@@ -520,7 +520,9 @@ fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
     let writable_kind = |p: &Path| {
         resolved_rel(root, p).is_some_and(|rel| {
             rel.extension().is_some_and(|x| x == "go")
-                || rel.to_str().is_some_and(|r| super::POLICY_FILES.contains(&r))
+                || rel
+                    .to_str()
+                    .is_some_and(|r| super::POLICY_FILES.contains(&r))
         })
     };
     for e in &wal.entries {
@@ -590,12 +592,16 @@ fn restore_entry(e: &Entry) -> Result<()> {
                 // Masked: a hand-edited log must never be able to set setuid/setgid bits.
                 let mode = match e.mode {
                     Some(m) => Some(m & 0o777),
-                    None => std::fs::metadata(b).ok().map(|m| m.permissions().mode() & 0o777),
+                    None => std::fs::metadata(b)
+                        .ok()
+                        .map(|m| m.permissions().mode() & 0o777),
                 };
                 let tmp = restore_temp_path(&e.path);
                 let placed = write_synced(&tmp, &bytes)
                     .and_then(|()| match mode {
-                        Some(m) => std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m)),
+                        Some(m) => {
+                            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m))
+                        }
                         None => Ok(()),
                     })
                     .and_then(|()| std::fs::rename(&tmp, &e.path));
@@ -1148,7 +1154,10 @@ mod tests {
 
         assert_eq!(recover(&root).unwrap().as_deref(), Some("p"));
         assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "A-old");
-        assert_eq!(std::fs::read_to_string(root.join("gone.go")).unwrap(), "G-old");
+        assert_eq!(
+            std::fs::read_to_string(root.join("gone.go")).unwrap(),
+            "G-old"
+        );
         assert!(
             !root.join("sub").exists(),
             "created directory and temp removed"
@@ -1160,10 +1169,18 @@ mod tests {
     fn the_next_transaction_recovers_an_orphan_before_doing_anything() {
         let root = scratch("orphan-then-begin");
         std::fs::write(root.join("a.go"), "old").unwrap();
-        let p1 =
-            begin_killed(&root, "p1", &[put(root.join("a.go"), "from-p1")], &real_rename).unwrap();
+        let p1 = begin_killed(
+            &root,
+            "p1",
+            &[put(root.join("a.go"), "from-p1")],
+            &real_rename,
+        )
+        .unwrap();
         drop(p1);
-        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "from-p1");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.go")).unwrap(),
+            "from-p1"
+        );
         let p2 = session(&root).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("a.go")).unwrap(),
@@ -1317,11 +1334,7 @@ mod tests {
     }
 
     fn chmod(p: &Path, mode: u32) {
-        std::fs::set_permissions(
-            p,
-            std::os::unix::fs::PermissionsExt::from_mode(mode),
-        )
-        .unwrap();
+        std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
     }
 
     #[test]
@@ -1389,9 +1402,15 @@ mod tests {
             &[("0", "PAYLOAD")],
         );
         let msg = format!("{:#}", recover(&root).unwrap_err());
-        assert!(msg.contains("neither a .go file nor a known policy file"), "{msg}");
+        assert!(
+            msg.contains("neither a .go file nor a known policy file"),
+            "{msg}"
+        );
         assert!(msg.contains("cp -p"), "{msg}");
-        assert_eq!(std::fs::read_to_string(root.join("build.sh")).unwrap(), "good");
+        assert_eq!(
+            std::fs::read_to_string(root.join("build.sh")).unwrap(),
+            "good"
+        );
         // Policy files stay recoverable.
         std::fs::write(root.join(".golangci.yml"), "new").unwrap();
         write_wal_json(
@@ -1400,7 +1419,10 @@ mod tests {
             &[("0", "old")],
         );
         assert_eq!(recover(&root).unwrap().as_deref(), Some("y"));
-        assert_eq!(std::fs::read_to_string(root.join(".golangci.yml")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".golangci.yml")).unwrap(),
+            "old"
+        );
     }
 
     #[test]
@@ -1411,8 +1433,14 @@ mod tests {
         let err = p
             .commit_with(&|_| bail!("injected cleanup failure"))
             .unwrap_err();
-        assert!(err.downcast_ref::<CommitCleanupFailed>().is_some(), "{err:#}");
-        assert!(!wal_path(&root).exists(), "the log no longer drives a rollback");
+        assert!(
+            err.downcast_ref::<CommitCleanupFailed>().is_some(),
+            "{err:#}"
+        );
+        assert!(
+            !wal_path(&root).exists(),
+            "the log no longer drives a rollback"
+        );
         assert!(committed_path(&root).exists());
         // The next session finishes the cleanup instead of undoing the committed apply.
         drop(session(&root).unwrap());
@@ -1429,7 +1457,10 @@ mod tests {
         // A non-empty directory squats on the marker name, so the rename cannot land.
         std::fs::create_dir_all(committed_path(&root).join("x")).unwrap();
         let err = p.commit().unwrap_err();
-        assert!(err.downcast_ref::<CommitCleanupFailed>().is_none(), "{err:#}");
+        assert!(
+            err.downcast_ref::<CommitCleanupFailed>().is_none(),
+            "{err:#}"
+        );
         assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "old");
     }
 }

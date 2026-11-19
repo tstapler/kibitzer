@@ -1088,7 +1088,10 @@ fn abort_apply(
 fn rollback_failed(cause: &str, rb: RefactorError) -> RefactorError {
     RefactorError {
         code: "rollback_failed",
-        message: format!("{cause}; rollback also failed, the tree may be dirty: {}", rb.message),
+        message: format!(
+            "{cause}; rollback also failed, the tree may be dirty: {}",
+            rb.message
+        ),
     }
 }
 
