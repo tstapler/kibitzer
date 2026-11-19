@@ -3,7 +3,7 @@
 //! into `config::default_checks()` (ADR-004).
 //!
 //! One [`CheckerFactory`](crate::checker::CheckerFactory) returns one instance per supported
-//! language (`test-no-assertion-go`, `-python`, `-kotlin`); each reads the tree the
+//! language (`test-no-assertion-go`, `-python`, `-kotlin`, `-rust`); each reads the tree the
 //! dispatcher already parsed. The rule id a finding prints and a `kibitzer:ignore` directive
 //! names is the bare `test-no-assertion`.
 //!
@@ -20,14 +20,19 @@ use anyhow::{Context, Result, bail};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::node_kind::{GoKind, PythonKind};
+use crate::node_kind::{GoKind, PythonKind, RustKind};
 use crate::test_code::{
     AssertionVocabulary, QualityMessage, TestCodeProfile, TestFn, TestKind, line_of, node_text,
 };
 use crate::tree_walk::walk_preorder;
 
 const RULE: &str = "test-no-assertion";
-const SUPPORTED: &[Language] = &[Language::Go, Language::Python, Language::Kotlin];
+const SUPPORTED: &[Language] = &[
+    Language::Go,
+    Language::Python,
+    Language::Kotlin,
+    Language::Rust,
+];
 /// Same-file helper hops followed from a test body: test -> helper -> helper.
 const MAX_HELPER_DEPTH: usize = 2;
 const DEFAULT_ASSERTION_ISH: &[&str] = &["assert", "check", "verify", "expect", "require", "must"];
@@ -180,6 +185,7 @@ impl TestNoAssertionChecker {
             Language::Go => "test-no-assertion-go",
             Language::Python => "test-no-assertion-python",
             Language::Kotlin => "test-no-assertion-kotlin",
+            Language::Rust => "test-no-assertion-rust",
             _ => "test-no-assertion-unsupported",
         }
     }
@@ -188,6 +194,7 @@ impl TestNoAssertionChecker {
         match lang {
             Language::Python => &["**/*.py"],
             Language::Kotlin => &["**/*.kt"],
+            Language::Rust => &["**/*.rs"],
             _ => &["**/*.go"],
         }
     }
@@ -227,6 +234,7 @@ impl TestNoAssertionChecker {
         let (leader, placement) = match self.lang {
             Language::Python => ("#", "directly above the def (below any decorators)"),
             Language::Kotlin => ("//", "above the fun (and its annotations)"),
+            Language::Rust => ("//", "above the fn (and its attributes)"),
             _ => ("//", "above the func"),
         };
         let headline = format!(
@@ -328,6 +336,7 @@ impl TestNoAssertionChecker {
             Language::Kotlin => {
                 is_kotlin_oracle(last) || (ctx.screenshot_file && is_screenshot_capture(last))
             }
+            Language::Rust => last.starts_with("assert") || last.starts_with("debug_assert"),
             _ => {
                 call.callee == GUARDED_PANIC
                     || last.starts_with("Assert")
@@ -648,7 +657,13 @@ impl Checker for TestNoAssertionChecker {
             return Ok(Vec::new());
         }
         let profile = TestCodeProfile::for_language(self.lang);
-        if !profile.is_test_file_source(file, ctx.source) {
+        // Rust tests are inline (`#[cfg(test)]`), so its profile has no test-file predicate.
+        let eligible = if self.lang == Language::Rust {
+            !crate::test_code::is_generated(ctx.source)
+        } else {
+            profile.is_test_file_source(file, ctx.source)
+        };
+        if !eligible {
             return Ok(Vec::new());
         }
         let tests = profile.test_functions(ctx);
@@ -1091,6 +1106,7 @@ fn function_name<'a>(lang: Language, node: Node, source: &'a str) -> Option<&'a 
             GoKind::FunctionDeclaration | GoKind::MethodDeclaration
         ),
         Language::Kotlin => node.kind() == "function_declaration",
+        Language::Rust => RustKind::of(node) == RustKind::FunctionItem,
         _ => PythonKind::of(node) == PythonKind::FunctionDefinition,
     };
     if !is_fn {
@@ -1107,6 +1123,9 @@ fn function_name<'a>(lang: Language, node: Node, source: &'a str) -> Option<&'a 
 fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec<Call> {
     if lang == Language::Kotlin {
         return kotlin_calls_in(root, source);
+    }
+    if lang == Language::Rust {
+        return rust_calls_in(root, source);
     }
     let carriers = if lang == Language::Go {
         handle_carrier_vars(root, source, handles)
@@ -1210,6 +1229,41 @@ fn calls_in(lang: Language, root: Node, source: &str, handles: &[String]) -> Vec
             }
         } else if lang == Language::Python && PythonKind::of(node) == PythonKind::AssertStatement {
             calls.push(Call::new("assert".to_string(), Vec::new()));
+        }
+        true
+    });
+    calls
+}
+
+/// Rust: every call and macro invocation under `root`; a macro's callee keeps its `!` so the
+/// profile vocabulary (`assert_eq!`, `assert_*!`) matches it.
+fn rust_calls_in(root: Node, source: &str) -> Vec<Call> {
+    let mut calls = Vec::new();
+    walk_preorder(root, &mut |node| {
+        match RustKind::of(node) {
+            RustKind::CallExpression => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    let args = node
+                        .child_by_field_name("arguments")
+                        .map(|a| {
+                            let mut cursor = a.walk();
+                            a.named_children(&mut cursor)
+                                .map(|n| node_text(n, source).to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    calls.push(Call::new(node_text(func, source).to_string(), args));
+                }
+            }
+            RustKind::MacroInvocation => {
+                if let Some(mac) = node.child_by_field_name("macro") {
+                    calls.push(Call::new(
+                        format!("{}!", node_text(mac, source)),
+                        Vec::new(),
+                    ));
+                }
+            }
+            _ => {}
         }
         true
     });
@@ -1709,7 +1763,7 @@ fn handles_in(lang: Language, root: Node, source: &str) -> Vec<String> {
     if lang == Language::Python {
         return vec!["self".to_string()];
     }
-    if lang == Language::Kotlin {
+    if matches!(lang, Language::Kotlin | Language::Rust) {
         return Vec::new();
     }
     let mut handles = Vec::new();

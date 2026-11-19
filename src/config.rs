@@ -778,6 +778,7 @@ pub fn default_checks() -> Vec<Check> {
         .chain(hierarchy_checks())
         .chain(go_exception_checks())
         .chain(java_exception_checks())
+        .chain(rust_checks())
         .chain(file_size_checks())
         .chain(syntax_rules_checks())
         .chain(comment_quality_checks())
@@ -920,6 +921,15 @@ fn hierarchy_checks() -> Vec<Check> {
         whole_repo_check("pull-up-constructor-body", "pull-up-constructor-body"),
         whole_repo_check("pull-up-field", "pull-up-field"),
     ]
+}
+
+/// Rust-specific and Rust-ported checks (docs/rust-parity.md).
+fn rust_checks() -> Vec<Check> {
+    vec![native_check(
+        "test-no-assertion-rust",
+        Severity::Advisory,
+        &["**/*.rs"],
+    )]
 }
 
 fn go_exception_checks() -> Vec<Check> {

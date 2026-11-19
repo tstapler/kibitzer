@@ -765,3 +765,61 @@ fn ux_a2_hook_should_NeverEmitDynamicRule_When_AnyInput() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------- test-no-assertion-rust ----------
+
+const RUST_SRC: &str = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn no_assert() {
+        let _x = 1 + 1;
+    }
+
+    #[test]
+    fn has_assert() {
+        assert_eq!(1 + 1, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn panics() {
+        let _x = 1;
+    }
+
+    #[test]
+    #[ignore]
+    fn ignored() {
+        let _x = 1;
+    }
+
+    #[test]
+    fn via_helper() {
+        check_it();
+    }
+
+    fn check_it() {
+        assert!(true);
+    }
+
+    #[test]
+    fn snapshot() {
+        insta::assert_snapshot!("x");
+    }
+}
+"#;
+
+#[test]
+fn test_no_assertion_rust_should_FlagOnlyAssertionFreeTest() {
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), RUST_SRC, None);
+    assert_eq!(lines(&findings), vec![5], "{findings:?}");
+}
+
+#[test]
+fn test_no_assertion_rust_should_BeInDefaultChecks() {
+    assert!(
+        crate::config::default_checks()
+            .iter()
+            .any(|c| c.name == "test-no-assertion-rust")
+    );
+}
