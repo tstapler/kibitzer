@@ -58,6 +58,9 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("java-file-size", "C.java", || long_file("//")),
     ("kotlin-file-size", "x.kt", || long_file("//")),
     ("rust-file-size", "x.rs", || long_file("//")),
+    ("test-no-assertion-rust", "x.rs", || {
+        "#[test]\nfn t() {\n    let _x = 1;\n}\n".into()
+    }),
     ("bash-file-size", "x.sh", || long_file("#")),
     ("syntax-rules-go", "x.go", || {
         "package main\n\nfunc f() {\n\ta := 86400\n\tb := 86400\n\tc := 86400\n}\n".into()

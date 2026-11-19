@@ -457,7 +457,8 @@ fn registry_should_ListOneInstancePerLanguage_When_FromOneFactory() {
         [
             "test-no-assertion-go",
             "test-no-assertion-python",
-            "test-no-assertion-kotlin"
+            "test-no-assertion-kotlin",
+            "test-no-assertion-rust"
         ]
     );
 }
@@ -822,4 +823,23 @@ fn test_no_assertion_rust_should_BeInDefaultChecks() {
             .iter()
             .any(|c| c.name == "test-no-assertion-rust")
     );
+}
+
+#[test]
+fn test_no_assertion_rust_should_FollowMethodChainAndWrapperMacro() {
+    let src = r#"
+struct T;
+impl T {
+    fn new() -> T { T }
+    fn run(&self) { assert_eq!(1, 1); }
+}
+#[test]
+fn chained() { T::new().run(); }
+#[test]
+fn wrapped() { my_macro!(x => assert!(true)); }
+#[test]
+fn smoke() { T::new(); }
+"#;
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
+    assert_eq!(lines(&findings), vec![12], "{findings:?}");
 }

@@ -35,6 +35,7 @@ const SUPPORTED: &[Language] = &[
 ];
 /// Same-file helper hops followed from a test body: test -> helper -> helper.
 const MAX_HELPER_DEPTH: usize = 2;
+const MAX_HELPER_DEPTH_RUST: usize = 4;
 const DEFAULT_ASSERTION_ISH: &[&str] = &["assert", "check", "verify", "expect", "require", "must"];
 /// Python oracles recognised by method name on any receiver: `<x>.raises` / `<x>.warns` cover
 /// aliases such as `py.test.raises`; the rest are pytester `LineMatcher` / `RunResult` checks
@@ -303,7 +304,7 @@ impl TestNoAssertionChecker {
         owner: Option<&str>,
         depth: usize,
     ) -> Option<bool> {
-        if depth >= MAX_HELPER_DEPTH {
+        if depth >= self.max_helper_depth() {
             return None;
         }
         let helper = ctx.resolve(self.lang, &call.callee, handles, owner)?;
@@ -336,7 +337,13 @@ impl TestNoAssertionChecker {
             Language::Kotlin => {
                 is_kotlin_oracle(last) || (ctx.screenshot_file && is_screenshot_capture(last))
             }
-            Language::Rust => last.starts_with("assert") || last.starts_with("debug_assert"),
+            Language::Rust => {
+                // `synstructure::test_derive!`-style macros assert internally.
+                let last = last.rsplit(':').next().unwrap_or(last);
+                last.starts_with("assert")
+                    || last.starts_with("debug_assert")
+                    || last.starts_with("test_")
+            }
             _ => {
                 call.callee == GUARDED_PANIC
                     || last.starts_with("Assert")
@@ -354,6 +361,15 @@ impl TestNoAssertionChecker {
         self.lang == Language::Kotlin
             && test.body.contains("@Test(")
             && test.body.contains("expected =")
+    }
+
+    /// Rust test suites commonly layer helpers (`test_sniff` -> `_sup` -> `_full` -> `_with_flags`).
+    fn max_helper_depth(&self) -> usize {
+        if self.lang == Language::Rust {
+            MAX_HELPER_DEPTH_RUST
+        } else {
+            MAX_HELPER_DEPTH
+        }
     }
 
     fn looks_assertion_ish(&self, callee: &str) -> bool {
@@ -469,6 +485,11 @@ impl Scan {
     ) -> Option<&FnInfo> {
         if lang == Language::Go {
             return self.resolve_go(callee, handles);
+        }
+        if lang == Language::Rust {
+            // `a.b().test`, `Self::helper`, `m::f`: resolve by the last path/method segment.
+            let name = callee.rsplit(['.', ':']).next().unwrap_or(callee);
+            return self.by_name.get(name).map(|&i| &self.fns[i]);
         }
         let name = match (lang, callee.split_once('.')) {
             (_, None) => callee,
@@ -1261,6 +1282,10 @@ fn rust_calls_in(root: Node, source: &str) -> Vec<Call> {
                         format!("{}!", node_text(mac, source)),
                         Vec::new(),
                     ));
+                    // An `assert!` passed through a wrapper macro's token tree is still an oracle.
+                    if node_text(node, source).contains("assert") {
+                        calls.push(Call::new("assert!".to_string(), Vec::new()));
+                    }
                 }
             }
             _ => {}
