@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use super::types::{ApplyResult, ApplyStatus, MovePlan, OperationKind, PlanStep, PlanStepKind};
 use super::verify::{DEFAULT_TIMEOUT, run_verify};
 use crate::refactor_core::txn::{self, Change, Op, Rename};
-use crate::refactor_core::{guard, sha256_hex};
+use crate::refactor_core::{POLICY_FILES, guard, sha256_hex};
 
 #[derive(Default)]
 pub struct ApplyOptions {
@@ -101,14 +101,6 @@ fn prune_empty_dirs(root: &Path, plan: &MovePlan) {
         }
     }
 }
-
-const POLICY_FILES: &[&str] = &[
-    ".kibitzer/inspect.json",
-    ".golangci.yml",
-    ".golangci.yaml",
-    ".go-arch-lint.yml",
-    ".depguard.yml",
-];
 
 /// Plans are data a reviewer may have edited, so a plan may only touch what the tool itself
 /// would produce: `.go` files for move operations, known policy files for `sync_policy`;
@@ -256,6 +248,7 @@ fn result(
         applied_steps,
         verify,
         restore_errors,
+        cleanup_warning: None,
         plan: plan.clone(),
     }
 }
@@ -335,13 +328,21 @@ fn verify_and_settle(
             ));
         }
     }
-    pending.commit()?;
+    let cleanup_warning = match pending.commit() {
+        Ok(()) => None,
+        Err(e) => match e.downcast_ref::<txn::CommitCleanupFailed>() {
+            Some(c) => Some(c.to_string()),
+            None => return Err(e),
+        },
+    };
     prune_empty_dirs(root, plan);
-    Ok(result(
+    let mut applied = result(
         plan,
         ApplyStatus::Applied,
         plan.steps.len(),
         verify,
         vec![],
-    ))
+    );
+    applied.cleanup_warning = cleanup_warning;
+    Ok(applied)
 }

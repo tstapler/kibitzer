@@ -18,6 +18,8 @@ const PLANS_DIR: &str = ".kibitzer/plans";
 const WAL_FILE: &str = ".wal";
 const BACKUP_DIR: &str = ".wal-backup";
 const LOCK_FILE: &str = ".lock";
+/// The log renamed here is the commit point: recovery finishes the cleanup instead of rolling back.
+const COMMITTED_FILE: &str = ".wal.committed";
 
 /// Cross-process advisory lock on a repo's plans dir (`flock` on [`LOCK_FILE`]), held for the life
 /// of a [`Session`] or [`Pending`] so a second process never recovers or clobbers a live log. The
@@ -194,6 +196,10 @@ fn wal_path(root: &Path) -> PathBuf {
     plans_dir(root).join(WAL_FILE)
 }
 
+fn committed_path(root: &Path) -> PathBuf {
+    plans_dir(root).join(COMMITTED_FILE)
+}
+
 fn backup_dir(root: &Path) -> PathBuf {
     plans_dir(root).join(BACKUP_DIR)
 }
@@ -210,10 +216,24 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// Keeps the writes and removes the log and backups.
-    pub fn commit(mut self) -> Result<()> {
+    /// Keeps the writes and removes the log and backups. The log is first renamed to a committed
+    /// marker (atomic), so a failure afterwards is a [`CommitCleanupFailed`] and recovery never
+    /// rolls the applied tree back. If the marker itself cannot be written the error is plain and
+    /// dropping `self` rolls the tree back.
+    pub fn commit(self) -> Result<()> {
+        self.commit_with(&finish_commit)
+    }
+
+    fn commit_with(mut self, finish: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
+        std::fs::rename(wal_path(&self.root), committed_path(&self.root))
+            .context("marking the transaction committed")?;
+        sync_dir(&plans_dir(&self.root));
         self.settled = true;
-        cleanup(&self.root)
+        finish(&self.root).map_err(|e| {
+            anyhow::Error::new(CommitCleanupFailed {
+                cause: format!("{e:#}"),
+            })
+        })
     }
 
     /// Restores every original. On failure the log is kept so [`recover`] can retry.
@@ -301,6 +321,26 @@ impl std::fmt::Display for RollbackFailed {
 
 impl std::error::Error for RollbackFailed {}
 
+/// The apply is committed and kept, but removing the log's leftovers failed. The next kibitzer
+/// refactor start finishes the cleanup; it does not roll anything back.
+#[derive(Debug)]
+pub struct CommitCleanupFailed {
+    pub cause: String,
+}
+
+impl std::fmt::Display for CommitCleanupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the changes were applied and kept, but cleaning up the transaction log failed ({}); \
+             the next kibitzer refactor start removes the leftovers",
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for CommitCleanupFailed {}
+
 impl Session {
     /// Applies `changes` (absolute paths under the root). A failure before this returns rolls
     /// the tree back; afterwards the caller owns the decision.
@@ -387,6 +427,9 @@ fn ensure_plans_dir_is_real(root: &Path) -> Result<()> {
 
 fn recover_locked(root: &Path) -> Result<Option<String>> {
     ensure_plans_dir_is_real(root)?;
+    if std::fs::symlink_metadata(committed_path(root)).is_ok() {
+        finish_commit(root)?;
+    }
     let path = wal_path(root);
     let text = match std::fs::File::open(&path) {
         Ok(f) => {
@@ -474,9 +517,25 @@ fn check_wal_paths(root: &Path, wal: &Wal) -> Result<()> {
                 .any(|c| c.as_os_str() == ".git" || c.as_os_str() == ".kibitzer")
         })
     };
+    let writable_kind = |p: &Path| {
+        resolved_rel(root, p).is_some_and(|rel| {
+            rel.extension().is_some_and(|x| x == "go")
+                || rel.to_str().is_some_and(|r| super::POLICY_FILES.contains(&r))
+        })
+    };
     for e in &wal.entries {
         if !allowed(&e.path) {
             return Err(refuse(&e.path));
+        }
+        if !writable_kind(&e.path) {
+            bail!(
+                "WAL names {}, which is neither a .go file nor a known policy file, so kibitzer \
+                 never wrote it; refusing to roll back automatically. If the log is genuine, \
+                 restore by hand, then delete {}:\n{}",
+                e.path.display(),
+                wal_path(root).display(),
+                manual_restore_commands(wal)
+            );
         }
         if let Some(t) = &e.temp
             && (!allowed(t) || *t != temp_path(&e.path))
@@ -517,6 +576,8 @@ fn rollback(root: &Path, wal: &Wal) -> Result<()> {
     cleanup(root)
 }
 
+/// Restores via a temp file beside the target and a rename, so a read-only (0444) original is
+/// replaceable and a crash never leaves a half-written file.
 fn restore_entry(e: &Entry) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     match &e.backup {
@@ -524,22 +585,55 @@ fn restore_entry(e: &Entry) -> Result<()> {
             if let Some(parent) = e.path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(b, &e.path)
+            let restore = || -> std::io::Result<()> {
+                let bytes = std::fs::read(b)?;
+                // Masked: a hand-edited log must never be able to set setuid/setgid bits.
+                let mode = match e.mode {
+                    Some(m) => Some(m & 0o777),
+                    None => std::fs::metadata(b).ok().map(|m| m.permissions().mode() & 0o777),
+                };
+                let tmp = restore_temp_path(&e.path);
+                let placed = write_synced(&tmp, &bytes)
+                    .and_then(|()| match mode {
+                        Some(m) => std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m)),
+                        None => Ok(()),
+                    })
+                    .and_then(|()| std::fs::rename(&tmp, &e.path));
+                if placed.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                placed?;
+                // The backups are deleted next; make the restored file durable first.
+                if let Some(dir) = e.path.parent() {
+                    sync_dir(dir);
+                }
+                Ok(())
+            };
+            restore()
                 .with_context(|| format!("restoring {} from {}", e.path.display(), b.display()))?;
-            if let Some(mode) = e.mode {
-                std::fs::set_permissions(&e.path, std::fs::Permissions::from_mode(mode))
-                    .with_context(|| format!("restoring mode of {}", e.path.display()))?;
-            }
-            // The backups are deleted next; make the restored file durable first.
-            std::fs::File::open(&e.path)
-                .and_then(|f| f.sync_all())
-                .with_context(|| format!("syncing {}", e.path.display()))?;
         }
         None => ignore_missing(std::fs::remove_file(&e.path))?,
     }
     if let Some(t) = &e.temp {
         ignore_missing(std::fs::remove_file(t))?;
     }
+    Ok(())
+}
+
+fn restore_temp_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    dest.with_file_name(format!(".{name}.kibitzer-restore"))
+}
+
+/// After a commit: the backups go first, the marker last, so a crash in between leaves the marker
+/// for recovery to finish.
+fn finish_commit(root: &Path) -> Result<()> {
+    ignore_missing(std::fs::remove_dir_all(backup_dir(root)))?;
+    ignore_missing(std::fs::remove_file(committed_path(root)))?;
+    let _ = std::fs::remove_dir(plans_dir(root));
+    let _ = std::fs::remove_dir(root.join(".kibitzer"));
     Ok(())
 }
 
@@ -661,12 +755,17 @@ fn swap(wal: &Wal, changes: &[Change], rename: Rename) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         write_synced(temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
-        let perms = mode_from
+        // The backup is a fresh 0644 file, so the replaced file's own recorded mode is the source.
+        let mode = mode_from
             .as_ref()
             .and_then(|m| std::fs::metadata(m).ok())
-            .or_else(|| e.backup.as_ref().and_then(|b| std::fs::metadata(b).ok()));
-        if let Some(meta) = perms {
-            std::fs::set_permissions(temp, meta.permissions())?;
+            .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()))
+            .or(e.mode);
+        if let Some(mode) = mode {
+            std::fs::set_permissions(
+                temp,
+                std::os::unix::fs::PermissionsExt::from_mode(mode & 0o777),
+            )?;
         }
     }
     for e in &wal.entries {
@@ -803,14 +902,14 @@ mod tests {
     #[test]
     fn recover_finishes_a_rollback_a_crash_left_behind() {
         let root = scratch("crash");
-        std::fs::write(root.join("a"), "old").unwrap();
-        let changes = [put(root.join("a"), "new")];
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        let changes = [put(root.join("a.go"), "new")];
         let pending = begin_killed(&root, "p9", &changes, &real_rename).unwrap();
         drop(pending);
-        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "new");
         assert!(wal_path(&root).exists());
         assert_eq!(recover(&root).unwrap().as_deref(), Some("p9"));
-        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "old");
         assert_eq!(recover(&root).unwrap(), None);
     }
 
@@ -1013,13 +1112,13 @@ mod tests {
     #[test]
     fn a_crash_mid_swap_with_leftover_temps_and_deletes_is_fully_rolled_back() {
         let root = scratch("midswap");
-        std::fs::write(root.join("a"), "A-old").unwrap();
-        std::fs::write(root.join("gone"), "G-old").unwrap();
+        std::fs::write(root.join("a.go"), "A-old").unwrap();
+        std::fs::write(root.join("gone.go"), "G-old").unwrap();
         let changes = [
-            put(root.join("a"), "A-new"),
-            put(root.join("sub/b"), "B-new"),
+            put(root.join("a.go"), "A-new"),
+            put(root.join("sub/b.go"), "B-new"),
             Change {
-                path: root.join("gone"),
+                path: root.join("gone.go"),
                 expect_sha256: None,
                 op: Op::Delete,
             },
@@ -1037,19 +1136,19 @@ mod tests {
         }));
         assert!(crashed.is_err());
         assert_eq!(
-            std::fs::read_to_string(root.join("a")).unwrap(),
+            std::fs::read_to_string(root.join("a.go")).unwrap(),
             "A-new",
             "first rename landed"
         );
         assert!(
-            root.join("sub/.b.kibitzer-tmp").exists(),
+            root.join("sub/.b.go.kibitzer-tmp").exists(),
             "a temp is left behind"
         );
         assert!(wal_path(&root).exists());
 
         assert_eq!(recover(&root).unwrap().as_deref(), Some("p"));
-        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "A-old");
-        assert_eq!(std::fs::read_to_string(root.join("gone")).unwrap(), "G-old");
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "A-old");
+        assert_eq!(std::fs::read_to_string(root.join("gone.go")).unwrap(), "G-old");
         assert!(
             !root.join("sub").exists(),
             "created directory and temp removed"
@@ -1060,14 +1159,14 @@ mod tests {
     #[test]
     fn the_next_transaction_recovers_an_orphan_before_doing_anything() {
         let root = scratch("orphan-then-begin");
-        std::fs::write(root.join("a"), "old").unwrap();
+        std::fs::write(root.join("a.go"), "old").unwrap();
         let p1 =
-            begin_killed(&root, "p1", &[put(root.join("a"), "from-p1")], &real_rename).unwrap();
+            begin_killed(&root, "p1", &[put(root.join("a.go"), "from-p1")], &real_rename).unwrap();
         drop(p1);
-        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "from-p1");
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "from-p1");
         let p2 = session(&root).unwrap();
         assert_eq!(
-            std::fs::read_to_string(root.join("a")).unwrap(),
+            std::fs::read_to_string(root.join("a.go")).unwrap(),
             "old",
             "session() must roll the orphan back before the caller reads the tree"
         );
@@ -1211,5 +1310,126 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("second session after release");
         t.join().unwrap();
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(p).unwrap().permissions())
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        std::fs::set_permissions(
+            p,
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replacing_an_executable_without_mode_from_keeps_the_exec_bit() {
+        let root = scratch("exec-bit");
+        std::fs::write(root.join("run.go"), "old").unwrap();
+        chmod(&root.join("run.go"), 0o755);
+        begin(&root, "p", &[put(root.join("run.go"), "new")], &real_rename)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("run.go")).unwrap(), "new");
+        assert_eq!(mode_of(&root.join("run.go")) & 0o777, 0o755);
+    }
+
+    #[test]
+    fn rollback_restores_a_read_only_original() {
+        let root = scratch("ro-restore");
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        chmod(&root.join("a.go"), 0o444);
+        let p = begin(&root, "p", &[put(root.join("a.go"), "new")], &real_rename).unwrap();
+        p.rollback().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "old");
+        assert_eq!(mode_of(&root.join("a.go")) & 0o777, 0o444);
+    }
+
+    #[test]
+    fn a_restore_over_a_read_only_file_does_not_need_write_access_to_it() {
+        // The temp-and-rename restore replaces the file, so a 0444 file left by a half-applied
+        // swap is not an obstacle (an in-place copy would fail with EACCES for a non-root user).
+        let root = scratch("ro-target");
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        let p = begin(&root, "p", &[put(root.join("a.go"), "new")], &real_rename).unwrap();
+        chmod(&root.join("a.go"), 0o444);
+        p.rollback().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "old");
+        assert_eq!(mode_of(&root.join("a.go")) & 0o777, 0o644);
+    }
+
+    #[test]
+    fn a_planted_mode_cannot_set_setuid_bits_on_restore() {
+        let root = scratch("setuid");
+        std::fs::write(root.join("a.go"), "new").unwrap();
+        let backup = root.join(".kibitzer/plans/.wal-backup/0");
+        write_wal_json(
+            &root,
+            serde_json::json!({"plan_id":"x","created_dirs":[],"entries":[
+                {"path": root.join("a.go"), "backup": &backup, "temp": null, "mode": 0o104755}
+            ]}),
+            &[("0", "old")],
+        );
+        recover(&root).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "old");
+        assert_eq!(mode_of(&root.join("a.go")) & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn a_planted_log_cannot_touch_non_go_non_policy_files() {
+        let root = scratch("hostile-kind");
+        std::fs::write(root.join("build.sh"), "good").unwrap();
+        let backup = root.join(".kibitzer/plans/.wal-backup/0");
+        write_wal_json(
+            &root,
+            serde_json::json!({"plan_id":"x","created_dirs":[],"entries":[entry(&root.join("build.sh"), Some(&backup), None)]}),
+            &[("0", "PAYLOAD")],
+        );
+        let msg = format!("{:#}", recover(&root).unwrap_err());
+        assert!(msg.contains("neither a .go file nor a known policy file"), "{msg}");
+        assert!(msg.contains("cp -p"), "{msg}");
+        assert_eq!(std::fs::read_to_string(root.join("build.sh")).unwrap(), "good");
+        // Policy files stay recoverable.
+        std::fs::write(root.join(".golangci.yml"), "new").unwrap();
+        write_wal_json(
+            &root,
+            serde_json::json!({"plan_id":"y","created_dirs":[],"entries":[entry(&root.join(".golangci.yml"), Some(&backup), None)]}),
+            &[("0", "old")],
+        );
+        assert_eq!(recover(&root).unwrap().as_deref(), Some("y"));
+        assert_eq!(std::fs::read_to_string(root.join(".golangci.yml")).unwrap(), "old");
+    }
+
+    #[test]
+    fn a_failed_post_commit_cleanup_is_distinct_and_never_rolled_back() {
+        let root = scratch("commit-cleanup");
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        let p = begin(&root, "p", &[put(root.join("a.go"), "new")], &real_rename).unwrap();
+        let err = p
+            .commit_with(&|_| bail!("injected cleanup failure"))
+            .unwrap_err();
+        assert!(err.downcast_ref::<CommitCleanupFailed>().is_some(), "{err:#}");
+        assert!(!wal_path(&root).exists(), "the log no longer drives a rollback");
+        assert!(committed_path(&root).exists());
+        // The next session finishes the cleanup instead of undoing the committed apply.
+        drop(session(&root).unwrap());
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "new");
+        assert!(!committed_path(&root).exists());
+        assert!(!backup_dir(&root).exists());
+    }
+
+    #[test]
+    fn a_commit_that_cannot_mark_the_log_rolls_the_tree_back() {
+        let root = scratch("commit-mark");
+        std::fs::write(root.join("a.go"), "old").unwrap();
+        let p = begin(&root, "p", &[put(root.join("a.go"), "new")], &real_rename).unwrap();
+        // A non-empty directory squats on the marker name, so the rename cannot land.
+        std::fs::create_dir_all(committed_path(&root).join("x")).unwrap();
+        let err = p.commit().unwrap_err();
+        assert!(err.downcast_ref::<CommitCleanupFailed>().is_none(), "{err:#}");
+        assert_eq!(std::fs::read_to_string(root.join("a.go")).unwrap(), "old");
     }
 }

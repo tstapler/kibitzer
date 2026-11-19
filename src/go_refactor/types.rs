@@ -162,6 +162,10 @@ pub struct ApplyResult {
     /// Paths that could not be restored after a rollback (empty when the rollback was clean).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restore_errors: Vec<String>,
+    /// The apply committed and stands, but removing the transaction log's leftovers failed; the
+    /// next refactor start removes them. Not a rollback and not a dirty tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_warning: Option<String>,
     pub plan: MovePlan,
 }
 

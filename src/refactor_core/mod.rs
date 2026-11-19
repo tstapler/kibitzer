@@ -7,6 +7,16 @@ pub mod exec;
 pub mod guard;
 pub mod txn;
 
+/// Config files the engines may rewrite besides `.go` sources (`sync_policy`); crash recovery
+/// restores nothing else.
+pub const POLICY_FILES: &[&str] = &[
+    ".kibitzer/inspect.json",
+    ".golangci.yml",
+    ".golangci.yaml",
+    ".go-arch-lint.yml",
+    ".depguard.yml",
+];
+
 use sha2::{Digest, Sha256};
 
 /// Lowercase hex SHA-256, the content identity used by plans and the transaction log.
