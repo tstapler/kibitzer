@@ -47,18 +47,6 @@ pub(super) fn is_test_path(file: &std::path::Path) -> bool {
     })
 }
 
-/// The nearest enclosing `function_item` or `closure_expression`.
-pub(super) fn enclosing_fn_or_closure(node: Node) -> Option<Node> {
-    let mut cur = node.parent();
-    while let Some(n) = cur {
-        if matches!(n.kind(), "function_item" | "closure_expression") {
-            return Some(n);
-        }
-        cur = n.parent();
-    }
-    None
-}
-
 pub(super) fn text<'a>(node: Node, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }

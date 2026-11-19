@@ -116,7 +116,7 @@ fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>)
         return;
     }
     if node.kind() == "function_item" {
-        let complexity = 1 + rust_decision_points(node, source);
+        let complexity = 1 + rust_decision_points(node);
         if complexity > CYCLOMATIC_COMPLEXITY_THRESHOLD {
             out.push((node.start_position().row + 1, complexity));
         }
@@ -151,7 +151,7 @@ fn is_rust_test_item(node: Node, source: &str) -> bool {
 
 /// `if`/`if let`, `for`, `while`, `loop`, each `match` arm but the last (the catch-all), and each
 /// `&&`/`||`. Closures are summed into the enclosing function, as with Go's func literals.
-fn rust_decision_points(node: Node, source: &str) -> usize {
+fn rust_decision_points(node: Node) -> usize {
     let mut count = match node.kind() {
         "if_expression" | "for_expression" | "while_expression" | "loop_expression" => 1,
         "match_block" => node
@@ -164,7 +164,7 @@ fn rust_decision_points(node: Node, source: &str) -> usize {
     };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count += rust_decision_points(child, source);
+        count += rust_decision_points(child);
     }
     count
 }

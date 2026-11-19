@@ -49,10 +49,10 @@ impl Checker for PrimitiveObsessionRustChecker {
             .context("primitive-obsession-rust requires a parsed tree")?;
         let mut findings = Vec::new();
         walk_preorder(tree.root_node(), &mut |node| {
-            if node.kind() == "struct_item" {
-                if let Some(f) = check_struct(node, ctx.source) {
-                    findings.push(f);
-                }
+            if node.kind() == "struct_item"
+                && let Some(f) = check_struct(node, ctx.source)
+            {
+                findings.push(f);
             }
             !is_test_module(node, ctx.source)
         });

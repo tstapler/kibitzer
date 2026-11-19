@@ -112,10 +112,10 @@ impl Checker for RustErrorContextChecker {
         let anyhow_fns = same_file_anyhow_fns(tree.root_node(), ctx.source, imports_result);
         let mut findings = Vec::new();
         walk_preorder(tree.root_node(), &mut |node| {
-            if node.kind() == "try_expression" {
-                if let Some(f) = check_try(node, ctx.source, imports_result, &anyhow_fns) {
-                    findings.push(f);
-                }
+            if node.kind() == "try_expression"
+                && let Some(f) = check_try(node, ctx.source, imports_result, &anyhow_fns)
+            {
+                findings.push(f);
             }
             true
         });
