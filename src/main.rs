@@ -66,6 +66,8 @@ mod remove_subclass;
 mod root_cause_clusters;
 mod run;
 mod run_context;
+#[cfg(test)]
+mod rust_parity;
 mod schema;
 mod scope;
 mod single_call_site_delegation;
