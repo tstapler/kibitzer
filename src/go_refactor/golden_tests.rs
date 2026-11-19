@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value;
 
 use super::atomic_apply::{ApplyOptions, apply, apply_with};
-use super::plan::sha256_hex;
+use crate::refactor_core::sha256_hex;
 use super::types::{ApplyStatus, MovePlan, PlanStepKind};
 use super::*;
 

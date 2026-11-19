@@ -208,17 +208,12 @@ fn changes_for(root: &Path, plan: &MovePlan) -> Vec<Change> {
 /// in a policy file under a valid-looking id.
 fn check_policy_derivation(plan: &MovePlan, root: &Path) -> Result<()> {
     let expected = super::policy::sync_policy(root, plan)?;
-    let shape = |p: &MovePlan| {
+    fn shape(p: &MovePlan) -> Vec<(&Option<String>, &Option<String>)> {
         p.steps
             .iter()
-            .map(|s| {
-                (
-                    s.transform.new_path.clone(),
-                    s.transform.new_content.clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
+            .map(|s| (&s.transform.new_path, &s.transform.new_content))
+            .collect()
+    }
     if shape(&expected) != shape(plan) {
         bail!(
             "sync-policy plan differs from what the tool derives from its path map; refusing to apply"

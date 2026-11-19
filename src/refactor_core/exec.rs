@@ -119,10 +119,11 @@ impl Capture {
 #[cfg(unix)]
 fn kill_group(child: &mut std::process::Child) {
     // The child leads its own group (see `process_group(0)`), so this reaches its descendants too.
-    let pid = child.id() as i32;
-    // SAFETY: `kill` takes plain integers and has no memory-safety preconditions.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: `kill` takes plain integers and has no memory-safety preconditions.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
 }

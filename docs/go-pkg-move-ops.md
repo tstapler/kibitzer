@@ -219,6 +219,12 @@ planning) plan differently but apply, verify and roll back through the same code
 | Path/name guards (`is_inside`, `is_protected`, `is_go_ident`, `is_safe_import_path`) | `refactor_core/guard.rs` |
 | Backup + WAL + temp-and-rename + crash `recover` + rollback-on-drop | `refactor_core/txn.rs` |
 
+Known leftovers (follow-up): `src/refactor_split.rs` still carries its own Go keyword list and
+`valid_go_ident`, and calls `Sha256` directly rather than `refactor_core::sha256_hex`; three
+"is generated" predicates remain (`arch_model::looks_generated`, `checkers::file_size::is_generated`,
+`go_syntax::is_generated`) and differ in strictness. The table above therefore describes the
+shared path for the two apply engines, not a repo-wide dedup.
+
 What remains separate on purpose: the plan schemas (`MovePlan` is content-based: each step
 carries the final bytes; `RefactorPlan` is edit-based), the planners, and the MCP engine's
 restriction to `go build ./...`/`go vet ./...` (the CLI also runs `go test`). Behavior change
@@ -329,6 +335,11 @@ vscode caveat: the repo itself contains invalid `.go` fixtures
 `extensions/copilot/test/scenarios/test-explain/functions.go`) and a C++-bearing Go directory,
 so `go build ./...` fails at the repo root with or without the move; the tool rolled the first
 attempt back instead of declaring success. Worktrees were removed afterwards.
+
+Re-run on 2026-11-19 (HEAD `7f8e99b`, `scripts/go-move-backtest.sh all`): all seven rows reproduced the
+results above. One incidental result: the first `k8s-rename` attempt ended `rolled_back` because the
+host `/tmp` filled (`no space left on device` in `go build`/`go vet`); the tool restored the tree and a
+rerun applied cleanly (8 files, +16/−16; build/vet/test exit 0, 0, 0).
 
 Scale/noise run on `kubernetes/kubernetes` (plan only, nothing applied): 60 package
 directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-pkg` to
