@@ -12,7 +12,7 @@ use super::types::{
 use super::workspace::{Workspace, dir_of};
 use crate::refactor_core::exec::{self, EnvPolicy};
 
-pub use crate::refactor_core::sha256_hex;
+use crate::refactor_core::sha256_hex;
 
 /// One entry per input: the formatted source, `Ok(None)` when gofmt is unavailable, or gofmt's
 /// complaint about that file.

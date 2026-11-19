@@ -2,6 +2,10 @@
 
 ## 1. Architecture Decisions
 
+> **As built:** code landed in `src/go_refactor/` (Workspace-based planning, not `ArchModel`/`ImportGraph`),
+> a shared `src/refactor_core/` (txn, exec, guard) and a top-level `src/go_syntax.rs`; §1.1 and §4.1
+> below describe the original design. See `docs/go-pkg-move-ops.md` "One shared core".
+
 ### 1.1 Module placement
 
 All new code lives in `src/refactor/` — a new top-level module under `src/`, parallel to how

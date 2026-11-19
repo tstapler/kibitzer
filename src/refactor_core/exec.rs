@@ -119,10 +119,11 @@ impl Capture {
 #[cfg(unix)]
 fn kill_group(child: &mut std::process::Child) {
     // The child leads its own group (see `process_group(0)`), so this reaches its descendants too.
-    let pid = child.id() as i32;
-    // SAFETY: `kill` takes plain integers and has no memory-safety preconditions.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: `kill` takes plain integers and has no memory-safety preconditions.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
 }
@@ -130,6 +131,20 @@ fn kill_group(child: &mut std::process::Child) {
 #[cfg(not(unix))]
 fn kill_group(child: &mut std::process::Child) {
     let _ = child.kill();
+}
+
+/// The operator's `GOFLAGS` (e.g. `-tags=...`) plus `-mod=readonly`, which is skipped when the
+/// module is vendored (go defaults to `-mod=vendor` there) or the operator already chose a mode.
+fn locked_goflags(existing: Option<&str>, dir: &Path) -> String {
+    let mut flags = existing.unwrap_or("").trim().to_string();
+    let vendored = dir.join("vendor/modules.txt").is_file();
+    if !vendored && !flags.split_whitespace().any(|f| f.starts_with("-mod=")) {
+        if !flags.is_empty() {
+            flags.push(' ');
+        }
+        flags.push_str("-mod=readonly");
+    }
+    flags
 }
 
 pub fn run(spec: &Spec) -> Outcome {
@@ -141,8 +156,10 @@ pub fn run(spec: &Spec) -> Outcome {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if spec.env == EnvPolicy::Locked {
-        cmd.env("GOTOOLCHAIN", "local")
-            .env("GOFLAGS", "-mod=readonly");
+        cmd.env("GOTOOLCHAIN", "local").env(
+            "GOFLAGS",
+            locked_goflags(std::env::var("GOFLAGS").ok().as_deref(), spec.dir),
+        );
     }
     #[cfg(unix)]
     {
@@ -344,6 +361,11 @@ mod tests {
     #[test]
     fn a_descendant_that_left_the_group_is_reported_not_waited_for() {
         if Command::new("setsid").arg("--version").output().is_err() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`setsid` is missing on CI, so this test would silently prove nothing"
+            );
+            eprintln!("SKIPPED: `setsid` is not installed; the left-the-group case is untested");
             return;
         }
         let started = Instant::now();
@@ -366,7 +388,8 @@ mod tests {
             Duration::from_secs(5),
             EnvPolicy::Locked,
         );
-        assert!(o.output.contains("local -mod=readonly"), "{}", o.output);
+        assert!(o.output.contains("local "), "{}", o.output);
+        assert!(o.output.contains("-mod=readonly"), "{}", o.output);
         if std::env::var_os("GOWORK").is_none() {
             assert!(
                 o.output.contains("[unset]"),
@@ -374,6 +397,29 @@ mod tests {
                 o.output
             );
         }
+    }
+
+    #[test]
+    fn locked_goflags_keeps_operator_flags_and_respects_vendor_mode() {
+        let scratch = |tag: &str| {
+            let d =
+                std::env::temp_dir().join(format!("kibitzer-goflags-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let plain = scratch("plain");
+        assert_eq!(locked_goflags(None, &plain), "-mod=readonly");
+        assert_eq!(
+            locked_goflags(Some("-tags=integration"), &plain),
+            "-tags=integration -mod=readonly"
+        );
+        assert_eq!(locked_goflags(Some("-mod=mod -v"), &plain), "-mod=mod -v");
+        let vendored = scratch("vendored");
+        std::fs::create_dir_all(vendored.join("vendor")).unwrap();
+        std::fs::write(vendored.join("vendor/modules.txt"), "").unwrap();
+        assert_eq!(locked_goflags(Some("-tags=x"), &vendored), "-tags=x");
+        assert_eq!(locked_goflags(None, &vendored), "");
     }
 
     #[test]

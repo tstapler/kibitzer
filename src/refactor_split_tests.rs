@@ -133,7 +133,7 @@ fn plan_never_writes_and_apply_then_revert_round_trip() {
             .unwrap()
             .starts_with("package ypart")
     );
-    let files = revert(&dir, &p.plan_id).unwrap();
+    let files = revert(&dir, &p.plan_id).unwrap().files;
     assert!(!files.is_empty());
     assert!(dir.join("a/y.go").is_file() && !dir.join("a/ypart").exists());
     assert!(
@@ -188,6 +188,22 @@ fn failed_verification_rolls_back() {
     assert!(!out.applied && out.rolled_back);
     assert!(dir.join("a/y.go").is_file() && !dir.join("a/ypart").exists());
     assert!(run_git_out(&dir, &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn a_failed_rollback_after_failed_verification_is_an_error_and_keeps_the_log() {
+    let dir = fixture();
+    let mut p = plan(&dir);
+    // Fails verification after destroying the backups the rollback needs.
+    p.verification_steps = vec!["rm -rf .kibitzer/plans/.wal-backup && false".into()];
+    save_plan(&dir, &p).unwrap();
+    let e = apply(&dir, &p.plan_id).unwrap_err();
+    assert_eq!(e.code, "rollback_failed", "{}", e.message);
+    assert!(e.message.contains("verification failed"), "{}", e.message);
+    assert!(
+        dir.join(".kibitzer/plans/.wal").exists(),
+        "the log is kept so the next start can retry"
+    );
 }
 
 #[test]
@@ -316,4 +332,22 @@ fn txn_error_keeps_a_failed_rollback_distinct_from_plain_io() {
     });
     assert_eq!(txn_error(failed).code, "rollback_failed");
     assert_eq!(txn_error(anyhow::anyhow!("plain")).code, "io");
+}
+
+#[test]
+fn a_revert_whose_commit_cleanup_fails_still_finishes_the_revert() {
+    let dir = fixture();
+    let p = plan(&dir);
+    assert!(apply(&dir, &p.plan_id).unwrap().applied);
+    let out = revert_with(&dir, &p.plan_id, &|pending| {
+        pending.commit_with(&|_| anyhow::bail!("injected cleanup failure"))
+    })
+    .unwrap();
+    let warning = out.cleanup_warning.expect("the cleanup failure surfaces");
+    assert!(warning.contains("injected cleanup failure"), "{warning}");
+    assert!(dir.join("a/y.go").is_file() && !dir.join("a/ypart").exists());
+    assert_eq!(
+        load_plan(&dir, &p.plan_id).unwrap().status,
+        PlanStatus::Reverted
+    );
 }

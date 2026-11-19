@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use super::types::{ApplyResult, ApplyStatus, MovePlan, OperationKind, PlanStep, PlanStepKind};
 use super::verify::{DEFAULT_TIMEOUT, run_verify};
 use crate::refactor_core::txn::{self, Change, Op, Rename};
-use crate::refactor_core::{guard, sha256_hex};
+use crate::refactor_core::{POLICY_FILES, guard, sha256_hex};
 
 #[derive(Default)]
 pub struct ApplyOptions {
@@ -102,14 +102,6 @@ fn prune_empty_dirs(root: &Path, plan: &MovePlan) {
     }
 }
 
-const POLICY_FILES: &[&str] = &[
-    ".kibitzer/inspect.json",
-    ".golangci.yml",
-    ".golangci.yaml",
-    ".go-arch-lint.yml",
-    ".depguard.yml",
-];
-
 /// Plans are data a reviewer may have edited, so a plan may only touch what the tool itself
 /// would produce: `.go` files for move operations, known policy files for `sync_policy`;
 /// never a path outside the repo or one that crosses a symlink; and package arguments must
@@ -117,7 +109,9 @@ const POLICY_FILES: &[&str] = &[
 fn validate_plan(plan: &MovePlan, root: &Path) -> Result<()> {
     if plan.plan_id != plan.compute_id() {
         bail!(
-            "plan_id does not match the plan's contents (edited or corrupted); regenerate the plan"
+            "plan_id does not match the plan's contents (edited or corrupted); regenerate the plan. \
+             The id is an unkeyed checksum that only detects accidental corruption; a plan file is \
+             as trusted as code, so review plans you did not generate"
         );
     }
     let policy = plan.operation == OperationKind::SyncPolicy;
@@ -194,19 +188,12 @@ fn changes_for(root: &Path, plan: &MovePlan) -> Vec<Change> {
 /// A sync-policy plan must be exactly what the tool derives from the tree and its own path map,
 /// so a foreign or hand-edited plan cannot plant content (a check `command`, a loosened guard)
 /// in a policy file under a valid-looking id.
-fn check_policy_derivation(plan: &MovePlan, root: &Path) -> Result<()> {
+pub(super) fn check_policy_derivation(plan: &MovePlan, root: &Path) -> Result<()> {
     let expected = super::policy::sync_policy(root, plan)?;
-    let shape = |p: &MovePlan| {
-        p.steps
-            .iter()
-            .map(|s| {
-                (
-                    s.transform.new_path.clone(),
-                    s.transform.new_content.clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
+    // The whole transform, not just the written bytes: a forged `old_path` would delete a file.
+    fn shape(p: &MovePlan) -> Vec<(PlanStepKind, &super::types::FileTransform)> {
+        p.steps.iter().map(|s| (s.kind, &s.transform)).collect()
+    }
     if shape(&expected) != shape(plan) {
         bail!(
             "sync-policy plan differs from what the tool derives from its path map; refusing to apply"
@@ -261,6 +248,7 @@ fn result(
         applied_steps,
         verify,
         restore_errors,
+        cleanup_warning: None,
         plan: plan.clone(),
     }
 }
@@ -340,13 +328,15 @@ fn verify_and_settle(
             ));
         }
     }
-    pending.commit()?;
+    let cleanup_warning = match pending.commit() {
+        Ok(()) => None,
+        Err(e) => match e.downcast_ref::<txn::CommitCleanupFailed>() {
+            Some(c) => Some(c.to_string()),
+            None => return Err(e),
+        },
+    };
     prune_empty_dirs(root, plan);
-    Ok(result(
-        plan,
-        ApplyStatus::Applied,
-        plan.steps.len(),
-        verify,
-        vec![],
-    ))
+    let mut applied = result(plan, ApplyStatus::Applied, plan.steps.len(), verify, vec![]);
+    applied.cleanup_warning = cleanup_warning;
+    Ok(applied)
 }

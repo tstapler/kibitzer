@@ -1638,8 +1638,13 @@ impl KibitzerServer {
     )]
     async fn revert_refactor(&self, req: Parameters<PlanIdRequest>) -> String {
         self.write_tool(req.0, |repo, id| {
-            crate::refactor_split::revert(repo, id)
-                .map(|files| serde_json::json!({"reverted": true, "files": files}))
+            crate::refactor_split::revert(repo, id).map(|o| {
+                serde_json::json!({
+                    "reverted": true,
+                    "files": o.files,
+                    "cleanup_warning": o.cleanup_warning,
+                })
+            })
         })
         .await
     }

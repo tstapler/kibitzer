@@ -274,8 +274,17 @@ pub fn apply_plan(root: &Path, plan: &RefactorPlan, io: &dyn ApplyIo) -> Result<
     let rename = |from: &Path, to: &Path| io.rename(from, to);
     let pending = session.begin_with(&plan.id, &changes, &rename, io.on_drop())?;
     match verify(root, plan, io) {
-        Ok(verification) => {
-            pending.commit()?;
+        Ok(mut verification) => {
+            if let Err(e) = pending.commit() {
+                // Committed but leftovers remain: the apply stands, so report it as a success.
+                let Some(c) = e.downcast_ref::<txn::CommitCleanupFailed>() else {
+                    return Err(e);
+                };
+                verification.push(VerificationStep {
+                    cmd: "post-commit cleanup".into(),
+                    output: c.to_string(),
+                });
+            }
             Ok(ApplyResult {
                 plan_id: plan.id.clone(),
                 files_written: outputs.into_iter().map(|o| o.dest).collect(),

@@ -83,9 +83,9 @@ A plan carries a `plan_id`, the SHA-256 of its contents (everything but `repo_ro
 `apply` refuses a plan whose id does not match, whose steps lack `old_sha256` for an existing
 file, whose paths leave the repo or cross a symlink, or (for `sync_policy`) whose content is
 not exactly what the tool derives from the tree and the plan's path map. The id is a
-**checksum, not a signature**: it catches edits and truncation, not a plan forged with a
-recomputed id, so review plans you did not generate. A plan can still add or rewrite `.go`
-files, and `go test` then runs them.
+**checksum, not a signature** (unkeyed): it detects accidental corruption and truncation, not
+tampering, since whoever edits a plan can recompute it. A plan file is equivalent to code: it can
+add or rewrite `.go` files, and `go test` then runs them, so review plans you did not generate.
 
 Writes go through the shared write-ahead-logged transaction (`src/refactor_core/txn.rs`): a
 failure, a failed verification, or a panic restores every touched file; a killed process
@@ -219,6 +219,12 @@ planning) plan differently but apply, verify and roll back through the same code
 | Path/name guards (`is_inside`, `is_protected`, `is_go_ident`, `is_safe_import_path`) | `refactor_core/guard.rs` |
 | Backup + WAL + temp-and-rename + crash `recover` + rollback-on-drop | `refactor_core/txn.rs` |
 
+Known leftovers (follow-up): `src/refactor_split.rs` still carries its own Go keyword list and
+`valid_go_ident`, and calls `Sha256` directly rather than `refactor_core::sha256_hex`; three
+"is generated" predicates remain (`arch_model::looks_generated`, `checkers::file_size::is_generated`,
+`go_syntax::is_generated`) and differ in strictness. The table above therefore describes the
+shared path for the two apply engines, not a repo-wide dedup.
+
 What remains separate on purpose: the plan schemas (`MovePlan` is content-based: each step
 carries the final bytes; `RefactorPlan` is edit-based), the planners, and the MCP engine's
 restriction to `go build ./...`/`go vet ./...` (the CLI also runs `go test`). Behavior change
@@ -249,6 +255,15 @@ nothing on disk: every path in a log must resolve (symlinks followed) inside the
 regular files, and `.kibitzer` may not be a symlink; a log from the first MCP release
 (`{original, backup, dest, temp}`) is still understood. A crash while changing a `.kibitzer`
 file therefore needs a manual restore from `.kibitzer/plans/.wal-backup`; the error says so.
+Recovery also restores only `.go` files and the known policy files (`refactor_core::POLICY_FILES`),
+masks any logged mode to `0o777` (never setuid/setgid), and restores through a temp file and
+rename so a read-only original is replaceable. A commit first renames the log to
+`.wal.committed`: if cleanup then fails, the apply stands (`cleanup_warning` in the result) and
+the next start only finishes the cleanup instead of rolling the committed tree back.
+**Residual trust assumption:** the log lives inside the repo (`.kibitzer/plans/.wal`), so a
+hostile repo can commit one. The path, kind, mode and backup checks bound what it can overwrite
+to in-repo `.go`/policy files with content taken from a backup the repo also supplies; do not
+run kibitzer refactors in a repository you do not trust.
 The lock is per process: two kibitzer processes on one repo are not serialized. The verification
 runner no longer sets `GOWORK=off` (a `go.work` workspace is a legitimate layout), does not hang
 on a descendant that keeps the output pipe open, and the child dies with its parent on Linux.
@@ -263,6 +278,17 @@ on a descendant that keeps the output pipe open, and the child dies with its par
   write access to the repo during apply can swap a directory for a symlink).
 * The workspace walk reads every `.go` file fully (no size cap, no depth limit).
 * `--out` follows symlinks and uses the default file mode.
+* Known limitation / follow-up: `go_syntax` `top_decls`/`unqualified_refs` are not scope-aware, so
+  local names are treated as top-level (conservative false blockers or a wrong `pkg.` qualifier;
+  build verification catches the latter).
+* Known limitation / follow-up: `txn.rs` holds a process-global `static LOCK` across verification,
+  so long verifications serialize every transaction in the process.
+* Known limitation / follow-up: `exec` kills the process group after the group leader was reaped,
+  so a recycled pid could in principle be signalled.
+* Known limitation / follow-up: `guard::is_protected` has case-insensitive-filesystem and symlink
+  gaps.
+* Known limitation / follow-up: with `EnvPolicy::Inherit`, `refactor_split` verification runs repo
+  test code with your full environment, including any credentials in it.
 * A planned file that is a symlink (or any non-regular file) is refused by the transaction, where the
   first MCP release copied through it; the planner does not yet skip symlinks up front, so such a
   plan fails cleanly at apply, before any write.
@@ -330,6 +356,11 @@ vscode caveat: the repo itself contains invalid `.go` fixtures
 so `go build ./...` fails at the repo root with or without the move; the tool rolled the first
 attempt back instead of declaring success. Worktrees were removed afterwards.
 
+Re-run on 2026-11-19 (HEAD `7f8e99b`, `scripts/go-move-backtest.sh all`): all seven rows reproduced the
+results above. One incidental result: the first `k8s-rename` attempt ended `rolled_back` because the
+host `/tmp` filled (`no space left on device` in `go build`/`go vet`); the tool restored the tree and a
+rerun applied cleanly (8 files, +16/−16; build/vet/test exit 0, 0, 0).
+
 Scale/noise run on `kubernetes/kubernetes` (plan only, nothing applied): 60 package
 directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-pkg` to
 `<pkg>x`: **37 clean, 23 blocked, 0 errors (~0.4 s each)**. Blockers: `has_subpackages` ×18,
@@ -337,6 +368,8 @@ directories under `pkg/` sampled with `random.seed(7)`, each planned as `rename-
 check was added; before it, 38 clean / 22 blocked). The four shadow blockers are the
 conservative-by-design case described above; they were not individually triaged for
 being true or false positives.
+
+<!-- Merged from master (#162); the commit hashes below refer to master's history, not this branch. -->
 
 ### Re-run after the function-split / shared-guard refactor
 
