@@ -927,12 +927,9 @@ fn hierarchy_checks() -> Vec<Check> {
 fn rust_checks() -> Vec<Check> {
     vec![
         native_check("test-no-assertion-rust", Severity::Advisory, &["**/*.rs"]),
-        native_check(
-            "primitive-obsession-rust",
-            Severity::Advisory,
-            &["**/*.rs"],
-        ),
+        native_check("primitive-obsession-rust", Severity::Advisory, &["**/*.rs"]),
         native_check("file-complexity-rust", Severity::Advisory, &["**/*.rs"]),
+        native_check("sentinel-return-rust", Severity::Advisory, &["**/*.rs"]),
     ]
 }
 

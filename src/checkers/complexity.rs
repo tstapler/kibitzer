@@ -154,7 +154,11 @@ fn is_rust_test_item(node: Node, source: &str) -> bool {
 fn rust_decision_points(node: Node, source: &str) -> usize {
     let mut count = match node.kind() {
         "if_expression" | "for_expression" | "while_expression" | "loop_expression" => 1,
-        "match_block" => node.named_children(&mut node.walk()).filter(|c| c.kind() == "match_arm").count().saturating_sub(1),
+        "match_block" => node
+            .named_children(&mut node.walk())
+            .filter(|c| c.kind() == "match_arm")
+            .count()
+            .saturating_sub(1),
         "binary_expression" => usize::from(is_short_circuit(node)),
         _ => 0,
     };

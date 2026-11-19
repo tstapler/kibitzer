@@ -111,7 +111,9 @@ fn check_struct(node: Node, source: &str) -> Option<Finding> {
     if count < MIN_FIELDS || types.len() < 2 || !types.contains("String") {
         return None;
     }
-    let name = node.child_by_field_name("name").map_or("", |n| &source[n.byte_range()]);
+    let name = node
+        .child_by_field_name("name")
+        .map_or("", |n| &source[n.byte_range()]);
     Some(Finding {
         line: node.start_position().row + 1,
         message: format!(
@@ -166,9 +168,7 @@ mod tests {
     #[test]
     fn serde_and_test_structs_are_skipped() {
         assert!(run("#[derive(Deserialize)]\nstruct U { a: String, b: u32, c: bool }").is_empty());
-        assert!(
-            run("#[cfg(test)]\nmod t { struct U { a: String, b: u32, c: bool } }").is_empty()
-        );
+        assert!(run("#[cfg(test)]\nmod t { struct U { a: String, b: u32, c: bool } }").is_empty());
     }
 
     #[test]

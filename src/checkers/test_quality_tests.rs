@@ -812,7 +812,12 @@ mod tests {
 
 #[test]
 fn test_no_assertion_rust_should_FlagOnlyAssertionFreeTest() {
-    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), RUST_SRC, None);
+    let findings = run_source(
+        "test-no-assertion-rust",
+        Path::new("lib.rs"),
+        RUST_SRC,
+        None,
+    );
     assert_eq!(lines(&findings), vec![5], "{findings:?}");
 }
 
