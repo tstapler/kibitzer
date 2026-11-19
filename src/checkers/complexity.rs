@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::node_kind::GoKind;
+use crate::node_kind::{GoKind, RustKind};
 
 /// A function/method whose cyclomatic complexity exceeds this counts toward
 /// `file-complexity`'s per-file aggregate. McCabe's original paper treats 10 as the
@@ -118,12 +118,14 @@ inventory::submit! {
 }
 
 fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>) {
-    if matches!(node.kind(), "mod_item" | "function_item")
-        && crate::checkers::rust_common::in_test_code(node, source)
+    if matches!(
+        RustKind::of(node),
+        RustKind::ModItem | RustKind::FunctionItem
+    ) && crate::checkers::rust_common::in_test_code(node, source)
     {
         return;
     }
-    if node.kind() == "function_item" {
+    if RustKind::of(node) == RustKind::FunctionItem {
         let complexity = 1 + rust_decision_points(node);
         if complexity > CYCLOMATIC_COMPLEXITY_THRESHOLD {
             out.push((node.start_position().row + 1, complexity));
@@ -138,20 +140,23 @@ fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>)
 /// `if`/`if let`, `for`, `while`, `loop`, each `match` arm but the last (the catch-all), and each
 /// `&&`/`||`. Closures are summed into the enclosing function, as with Go's func literals.
 fn rust_decision_points(node: Node) -> usize {
-    let mut count = match node.kind() {
-        "if_expression" | "for_expression" | "while_expression" | "loop_expression" => 1,
-        "match_block" => node
+    let mut count = match RustKind::of(node) {
+        RustKind::IfExpression
+        | RustKind::ForExpression
+        | RustKind::WhileExpression
+        | RustKind::LoopExpression => 1,
+        RustKind::MatchBlock => node
             .named_children(&mut node.walk())
-            .filter(|c| c.kind() == "match_arm")
+            .filter(|c| RustKind::of(*c) == RustKind::MatchArm)
             .count()
             .saturating_sub(1),
-        "binary_expression" => usize::from(is_short_circuit(node)),
+        RustKind::BinaryExpression => usize::from(is_short_circuit(node)),
         _ => 0,
     };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         // A nested `fn` is its own complexity root (`collect_rust_complex` reports it).
-        if child.kind() != "function_item" {
+        if RustKind::of(child) != RustKind::FunctionItem {
             count += rust_decision_points(child);
         }
     }
