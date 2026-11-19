@@ -13,6 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
+use super::rust_common::leading_attrs;
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::tree_walk::walk_preorder;
 
@@ -67,20 +68,6 @@ inventory::submit! {
 /// A `#[cfg(test)] mod`: its structs are fixtures, not domain types.
 fn is_test_module(node: Node, source: &str) -> bool {
     node.kind() == "mod_item" && leading_attrs(node, source).contains("cfg(test)")
-}
-
-fn leading_attrs(node: Node, source: &str) -> String {
-    let mut out = String::new();
-    let mut prev = node.prev_sibling();
-    while let Some(p) = prev {
-        match p.kind() {
-            "attribute_item" => out.push_str(&source[p.byte_range()]),
-            "line_comment" | "block_comment" => {}
-            _ => break,
-        }
-        prev = p.prev_sibling();
-    }
-    out
 }
 
 fn check_struct(node: Node, source: &str) -> Option<Finding> {

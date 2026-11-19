@@ -98,6 +98,12 @@ impl Checker for FileComplexityRustChecker {
         let tree = ctx
             .tree
             .context("file-complexity-rust requires a parsed tree")?;
+        if crate::checkers::split_loop::exceeds_depth(
+            tree.root_node(),
+            crate::checkers::split_loop::MAX_TREE_DEPTH,
+        ) {
+            return Ok(Vec::new());
+        }
         let mut complex = Vec::new();
         collect_rust_complex(tree.root_node(), ctx.source, &mut complex);
         if complex.len() < MIN_COMPLEX_FUNCTIONS {
@@ -112,7 +118,9 @@ inventory::submit! {
 }
 
 fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>) {
-    if is_rust_test_item(node, source) {
+    if matches!(node.kind(), "mod_item" | "function_item")
+        && crate::checkers::rust_common::in_test_code(node, source)
+    {
         return;
     }
     if node.kind() == "function_item" {
@@ -125,28 +133,6 @@ fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>)
     for child in node.children(&mut cursor) {
         collect_rust_complex(child, source, out);
     }
-}
-
-/// A `#[cfg(test)]` module or a `#[test]`-attributed fn: test code is not counted.
-fn is_rust_test_item(node: Node, source: &str) -> bool {
-    if !matches!(node.kind(), "mod_item" | "function_item") {
-        return false;
-    }
-    let mut prev = node.prev_sibling();
-    while let Some(p) = prev {
-        match p.kind() {
-            "attribute_item" => {
-                let text = &source[p.byte_range()];
-                if text.contains("cfg(test)") || text.contains("test]") || text.contains("::test") {
-                    return true;
-                }
-            }
-            "line_comment" | "block_comment" => {}
-            _ => return false,
-        }
-        prev = p.prev_sibling();
-    }
-    false
 }
 
 /// `if`/`if let`, `for`, `while`, `loop`, each `match` arm but the last (the catch-all), and each

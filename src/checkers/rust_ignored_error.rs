@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
-use super::rust_common::{in_test_code, is_test_path, text};
+use super::rust_common::{in_test_code, is_test_path, one_line, text};
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::tree_walk::walk_preorder;
 
@@ -138,7 +138,7 @@ fn ignored_let(decl: Node, source: &str) -> Option<String> {
     }
     Some(format!(
         "`let _ = {}` discards a possible error — handle it, log it, or comment why it is safe to ignore",
-        truncate(text(value, source))
+        one_line(text(value, source), 60)
     ))
 }
 
@@ -195,15 +195,6 @@ fn is_infallible_by_construction(receiver: Node, source: &str) -> bool {
                 any && all_literal
             }),
         _ => false,
-    }
-}
-
-fn truncate(s: &str) -> String {
-    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() > 60 {
-        format!("{}…", one_line.chars().take(60).collect::<String>())
-    } else {
-        one_line
     }
 }
 

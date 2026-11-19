@@ -42,3 +42,5 @@ sample, and servo contributes no signal.
 - `type Result<T> = ..` aliases from another file are not recognised.
 - The allow-list matches method names regardless of receiver type, so a project method named
   `read`/`write`/`open` called as `x.read()` is flagged.
+- The plan's configurable anyhow-type list (`inspect.json` options) was not built: detection is
+  by return-type text and imports only.

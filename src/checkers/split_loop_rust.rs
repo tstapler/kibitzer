@@ -61,6 +61,13 @@ impl Checker for SplitLoopRustChecker {
             return Ok(Vec::new());
         }
         let tree = ctx.tree.context("split-loop-rust requires a parsed tree")?;
+        // The scanners recurse; skip pathological nesting as the Go checker does.
+        if crate::checkers::split_loop::exceeds_depth(
+            tree.root_node(),
+            crate::checkers::split_loop::MAX_TREE_DEPTH,
+        ) {
+            return Ok(Vec::new());
+        }
         let mut findings = Vec::new();
         walk_preorder(tree.root_node(), &mut |node| {
             if matches!(

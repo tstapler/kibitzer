@@ -1283,7 +1283,8 @@ fn rust_calls_in(root: Node, source: &str) -> Vec<Call> {
                         Vec::new(),
                     ));
                     // An `assert!` passed through a wrapper macro's token tree is still an oracle.
-                    if node_text(node, source).contains("assert") {
+                    let body = node_text(node, source);
+                    if body.contains("assert!") || body.contains("assert_") {
                         calls.push(Call::new("assert!".to_string(), Vec::new()));
                     }
                 }

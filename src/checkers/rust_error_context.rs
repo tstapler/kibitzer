@@ -14,7 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::Node;
 
-use super::rust_common::{in_test_code, is_test_path, text};
+use super::rust_common::{in_test_code, is_test_path, one_line, text};
 use crate::checker::{CheckContext, Checker, Finding, Language};
 use crate::tree_walk::walk_preorder;
 
@@ -196,7 +196,7 @@ fn check_try(
         line: node.start_position().row + 1,
         message: format!(
             "`{}?` propagates an anyhow error with no context — add `.context(\"what failed\")` or `.with_context(|| ..)`",
-            short(text(operand, source))
+            one_line(text(operand, source), 50)
         ),
     })
 }
@@ -289,15 +289,6 @@ fn has_context(mut operand: Node, source: &str) -> bool {
         && func
             .child_by_field_name("field")
             .is_some_and(|f| CONTEXT_METHODS.contains(&text(f, source)))
-}
-
-fn short(s: &str) -> String {
-    let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one.chars().count() > 50 {
-        format!("{}…", one.chars().take(50).collect::<String>())
-    } else {
-        one
-    }
 }
 
 #[cfg(test)]

@@ -48,3 +48,6 @@ inherently opinionated; the 15% counts only provable invariants, not "would you 
   discards of non-`Result` values from unlisted callees still fire.
 - Unwraps that follow an explicit guard are flagged; use `.expect("why")` or `kibitzer:ignore`.
 - With 1968 unwrap findings on servo the check is high-volume on unwrap-heavy code bases.
+- The `let _` allow-list is by callee name only (`send`, `join`, `remove`, `insert`, ..), so a
+  dropped `Result` from a same-named method is missed, and the `ExceptionHandling::Report`
+  exemption is specific to servo/mozjs-style bindings. Both came from backtest triage.

@@ -50,3 +50,12 @@ pub(super) fn is_test_path(file: &std::path::Path) -> bool {
 pub(super) fn text<'a>(node: Node, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
+
+/// Whitespace-collapsed `s`, cut to `max` chars with an ellipsis.
+pub(super) fn one_line(s: &str, max: usize) -> String {
+    let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &one[..i]),
+        None => one,
+    }
+}
