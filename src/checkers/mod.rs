@@ -32,16 +32,22 @@ mod magic_literal_context;
 pub mod markdown_link_integrity;
 pub mod paragraph_breaks;
 pub mod primitive_obsession;
+pub mod primitive_obsession_rust;
 pub mod repetitive_sentences;
 pub mod rules;
+pub(crate) mod rust_common;
+pub mod rust_error_context;
+pub mod rust_ignored_error;
 pub mod sentence_length_uniformity;
 mod sentinel_return;
 pub mod sentinel_return_java;
 pub mod sentinel_return_javascript;
 pub mod sentinel_return_kotlin;
 pub mod sentinel_return_python;
+pub mod sentinel_return_rust;
 pub mod sentinel_return_typescript;
 pub mod split_loop;
+pub mod split_loop_rust;
 pub mod test_no_assertion;
 
 /// True for common test-file naming conventions across supported languages. Expects a

@@ -109,22 +109,32 @@ fn finding_lines(file_display: &str, result: &CheckResult) -> Vec<String> {
 ///
 /// `deny_blocking_suppression` also fails the run (exit 1) when any finding of a blocking
 /// check was suppressed inline, so CI can refuse a `kibitzer:ignore` on a blocking check.
+///
+/// With `json`, prints one JSON object (`{"blocking": bool, "lines": [..]}`) instead of text and
+/// leaves out the Rust coverage note, which is prose for a terminal reader.
 pub fn run_batch(
     dir: PathBuf,
     trigger: &str,
     mode: InlineIgnoreMode,
     deny_blocking_suppression: bool,
     config_override: Option<&Path>,
+    json: bool,
 ) -> Result<ExitCode> {
-    let (any_blocking_failure, lines) = run_batch_collect(
+    let (any_blocking_failure, lines) = run_batch_inner(
         &dir,
         trigger,
         mode,
         deny_blocking_suppression,
         config_override,
+        !json,
     )?;
-    for line in &lines {
-        println!("{line}");
+    if json {
+        let out = serde_json::json!({ "blocking": any_blocking_failure, "lines": lines });
+        println!("{out}");
+    } else {
+        for line in &lines {
+            println!("{line}");
+        }
     }
     if any_blocking_failure {
         Ok(ExitCode::from(1))
@@ -133,16 +143,57 @@ pub fn run_batch(
     }
 }
 
+fn is_rust_file(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "rs")
+}
+
+/// Printed when Rust files were checked and none produced a finding, so silence on a Rust repo
+/// reads as "these checks ran and found nothing" rather than "Rust is not covered"
+/// (docs/rust-parity.md). Left out of `--json` output.
+fn rust_coverage_note(rust_files: usize, file_checks: &[Check]) -> String {
+    let mut active: Vec<&str> = file_checks
+        .iter()
+        .filter(|c| c.scope.iter().any(|g| g.ends_with("*.rs")))
+        .map(|c| c.name.as_str())
+        .collect();
+    active.sort_unstable();
+    format!(
+        "[kibitzer] checked {rust_files} .rs file{} — 0 Rust findings ({} Rust checks active: {})",
+        if rust_files == 1 { "" } else { "s" },
+        active.len(),
+        active.join(", ")
+    )
+}
+
 /// The actual batch/run logic behind `run_batch`, with printing deferred to the caller so
 /// it can be exercised end to end in tests without capturing the process's real stdout:
 /// returns whether any check hit a genuine blocking failure, plus every rendered report
 /// line in print order (see `report_lines`).
+#[cfg(test)]
 fn run_batch_collect(
     dir: &Path,
     trigger: &str,
     mode: InlineIgnoreMode,
     deny_blocking_suppression: bool,
     config_override: Option<&Path>,
+) -> Result<(bool, Vec<String>)> {
+    run_batch_inner(
+        dir,
+        trigger,
+        mode,
+        deny_blocking_suppression,
+        config_override,
+        true,
+    )
+}
+
+fn run_batch_inner(
+    dir: &Path,
+    trigger: &str,
+    mode: InlineIgnoreMode,
+    deny_blocking_suppression: bool,
+    config_override: Option<&Path>,
+    include_coverage_note: bool,
 ) -> Result<(bool, Vec<String>)> {
     let (config, repo_root, _source) = find_effective_config_with(config_override, dir)?;
 
@@ -203,6 +254,7 @@ fn run_batch_collect(
         .map(|f| (f, &file_checks[..]))
         .chain(dangling.iter().map(|f| (f, &inspecting[..])));
 
+    let mut rust_findings = 0usize;
     for (file, checks_for_file) in targets {
         let results = run_checks_for_trigger(
             checks_for_file,
@@ -226,6 +278,9 @@ fn run_batch_collect(
             )
         };
         for result in results.iter().chain(&audit) {
+            if !result.passed && is_rust_file(file) {
+                rust_findings += 1;
+            }
             if !result.passed && has_blocking_finding(result) {
                 any_blocking_failure = true;
             }
@@ -234,6 +289,10 @@ fn run_batch_collect(
         }
     }
 
+    let rust_files = files.iter().filter(|f| is_rust_file(f)).count();
+    if include_coverage_note && rust_files > 0 && rust_findings == 0 {
+        lines.push(rust_coverage_note(rust_files, &file_checks));
+    }
     if any_dismissible {
         // Teaches the syntax where developers see findings; otherwise it is only in the docs.
         lines.push(batch_syntax_hint());
@@ -456,5 +515,67 @@ mod tests {
             checks.into_iter().partition(Check::is_per_file);
         assert_eq!(file_checks.len(), 1);
         assert!(repo_checks.is_empty());
+    }
+
+    fn run_lines(dir: &std::path::Path) -> Vec<String> {
+        run_batch_collect(dir, "batch", InlineIgnoreMode::Apply, false, None)
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn clean_rust_repo_prints_a_coverage_note_with_the_file_count() {
+        let dir = tmp_dir("rust-coverage-clean");
+        std::fs::write(
+            dir.join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("util.rs"), "pub fn one() -> i32 {\n    1\n}\n").unwrap();
+        let lines = run_lines(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        let note = lines
+            .iter()
+            .find(|l| l.contains(".rs file"))
+            .unwrap_or_else(|| panic!("no coverage note in {lines:#?}"));
+        assert!(note.contains("checked 2 .rs files"), "{note}");
+        assert!(note.contains("test-no-assertion-rust"), "{note}");
+    }
+
+    #[test]
+    fn rust_repo_with_a_finding_has_no_coverage_note() {
+        let dir = tmp_dir("rust-coverage-finding");
+        std::fs::write(
+            dir.join("lib.rs"),
+            "fn f() {\n    let _ = std::fs::remove_file(\"x\");\n}\n",
+        )
+        .unwrap();
+        let lines = run_lines(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            lines.iter().any(|l| l.contains("rust-ignored-error")),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains(".rs file")), "{lines:#?}");
+    }
+
+    #[test]
+    fn json_mode_omits_the_coverage_note() {
+        let dir = tmp_dir("rust-coverage-json");
+        std::fs::write(dir.join("lib.rs"), "pub fn one() -> i32 {\n    1\n}\n").unwrap();
+        let (_, lines) =
+            super::run_batch_inner(&dir, "batch", InlineIgnoreMode::Apply, false, None, false)
+                .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!lines.iter().any(|l| l.contains(".rs file")), "{lines:#?}");
+    }
+
+    #[test]
+    fn repo_without_rust_files_has_no_coverage_note() {
+        let dir = tmp_dir("rust-coverage-none");
+        std::fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+        let lines = run_lines(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!lines.iter().any(|l| l.contains(".rs file")), "{lines:#?}");
     }
 }

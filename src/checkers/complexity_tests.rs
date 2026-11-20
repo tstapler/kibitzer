@@ -307,3 +307,60 @@ fn a_genuinely_complex_hand_written_function_still_flags() {
     let findings = check_source_at(Path::new("server.go"), &src);
     assert_eq!(findings.len(), 3);
 }
+
+mod rust {
+    use super::super::FileComplexityRustChecker;
+
+    fn complex_fn(name: &str) -> String {
+        format!("fn {name}(a: bool) {{\n{}}}\n", "    if a { }\n".repeat(11))
+    }
+
+    fn run(src: &str) -> usize {
+        crate::test_support::check_rust_source(&FileComplexityRustChecker, src)
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn flags_three_functions_over_threshold() {
+        let src = format!("{}{}{}", complex_fn("a"), complex_fn("b"), complex_fn("c"));
+        assert_eq!(run(&src), 3);
+    }
+
+    #[test]
+    fn two_complex_functions_are_below_the_file_aggregate() {
+        assert_eq!(run(&format!("{}{}", complex_fn("a"), complex_fn("b"))), 0);
+    }
+
+    #[test]
+    fn counts_match_arms_loops_and_short_circuits() {
+        let f = "fn f(x: i32, a: bool, b: bool) -> i32 {\n    for _ in 0..x { while a { loop { break; } } }\n    if a && b { }\n    match x { 1 => 1, 2 => 2, 3 => 3, 4 => 4, _ => 0 }\n}\n";
+        // 1 + for + while + loop + if + && + 4 non-default arms = 10: not over threshold.
+        assert_eq!(run(&format!("{f}{f}{f}")), 0);
+        let f2 = f.replace("4 => 4,", "4 => 4, 5 => 5,");
+        assert_eq!(run(&format!("{f2}{f2}{f2}")), 3);
+    }
+
+    #[test]
+    fn nested_fn_is_not_double_counted_in_its_parent() {
+        // The outer fn has 5 branches of its own; the nested fn has 6: neither exceeds 10 alone,
+        // but summed (12) they would.
+        let outer = format!(
+            "fn outer(a: bool) {{\n{}    fn inner(a: bool) {{\n{}    }}\n}}\n",
+            "    if a { }\n".repeat(5),
+            "    if a { }\n".repeat(6)
+        );
+        assert_eq!(run(&format!("{outer}{outer}{outer}")), 0);
+    }
+
+    #[test]
+    fn test_code_is_not_counted() {
+        let tests = format!(
+            "#[cfg(test)]\nmod t {{\n{}{}{}}}\n",
+            complex_fn("a"),
+            complex_fn("b"),
+            complex_fn("c")
+        );
+        assert_eq!(run(&tests), 0);
+    }
+}

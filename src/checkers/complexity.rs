@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use tree_sitter::Node;
 
 use crate::checker::{CheckContext, Checker, Finding, Language};
-use crate::node_kind::GoKind;
+use crate::node_kind::{GoKind, RustKind};
 
 /// A function/method whose cyclomatic complexity exceeds this counts toward
 /// `file-complexity`'s per-file aggregate. McCabe's original paper treats 10 as the
@@ -68,6 +68,99 @@ impl Checker for FileComplexityChecker {
 
 inventory::submit! {
     crate::checker::CheckerFactory(|| vec![Box::new(FileComplexityChecker)])
+}
+
+/// Rust counterpart of [`FileComplexityChecker`]: same threshold and same
+/// [`MIN_COMPLEX_FUNCTIONS`] aggregate, over `function_item`s outside test code.
+pub struct FileComplexityRustChecker;
+
+impl Checker for FileComplexityRustChecker {
+    fn name(&self) -> &str {
+        "file-complexity-rust"
+    }
+
+    fn description(&self) -> &str {
+        "flags a Rust file with several functions over a cyclomatic-complexity threshold"
+    }
+
+    fn language(&self) -> Option<Language> {
+        Some(Language::Rust)
+    }
+
+    fn file_globs(&self) -> &[&str] {
+        &["**/*.rs"]
+    }
+
+    fn check(&self, _file: &Path, ctx: &CheckContext) -> Result<Vec<Finding>> {
+        if crate::checkers::file_size::is_generated(ctx.source) {
+            return Ok(Vec::new());
+        }
+        let tree = ctx
+            .tree
+            .context("file-complexity-rust requires a parsed tree")?;
+        if crate::checkers::split_loop::exceeds_depth(
+            tree.root_node(),
+            crate::checkers::split_loop::MAX_TREE_DEPTH,
+        ) {
+            return Ok(Vec::new());
+        }
+        let mut complex = Vec::new();
+        collect_rust_complex(tree.root_node(), ctx.source, &mut complex);
+        if complex.len() < MIN_COMPLEX_FUNCTIONS {
+            return Ok(Vec::new());
+        }
+        Ok(aggregate_findings(&complex))
+    }
+}
+
+inventory::submit! {
+    crate::checker::CheckerFactory(|| vec![Box::new(FileComplexityRustChecker)])
+}
+
+fn collect_rust_complex(node: Node, source: &str, out: &mut Vec<(usize, usize)>) {
+    if matches!(
+        RustKind::of(node),
+        RustKind::ModItem | RustKind::FunctionItem
+    ) && crate::checkers::rust_common::in_test_code(node, source)
+    {
+        return;
+    }
+    if RustKind::of(node) == RustKind::FunctionItem {
+        let complexity = 1 + rust_decision_points(node);
+        if complexity > CYCLOMATIC_COMPLEXITY_THRESHOLD {
+            out.push((node.start_position().row + 1, complexity));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_rust_complex(child, source, out);
+    }
+}
+
+/// `if`/`if let`, `for`, `while`, `loop`, each `match` arm but the last (the catch-all), and each
+/// `&&`/`||`. Closures are summed into the enclosing function, as with Go's func literals.
+fn rust_decision_points(node: Node) -> usize {
+    let mut count = match RustKind::of(node) {
+        RustKind::IfExpression
+        | RustKind::ForExpression
+        | RustKind::WhileExpression
+        | RustKind::LoopExpression => 1,
+        RustKind::MatchBlock => node
+            .named_children(&mut node.walk())
+            .filter(|c| RustKind::of(*c) == RustKind::MatchArm)
+            .count()
+            .saturating_sub(1),
+        RustKind::BinaryExpression => usize::from(is_short_circuit(node)),
+        _ => 0,
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // A nested `fn` is its own complexity root (`collect_rust_complex` reports it).
+        if RustKind::of(child) != RustKind::FunctionItem {
+            count += rust_decision_points(child);
+        }
+    }
+    count
 }
 
 /// One finding per complex function, all sharing the same aggregate message — not a

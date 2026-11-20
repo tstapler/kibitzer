@@ -457,7 +457,8 @@ fn registry_should_ListOneInstancePerLanguage_When_FromOneFactory() {
         [
             "test-no-assertion-go",
             "test-no-assertion-python",
-            "test-no-assertion-kotlin"
+            "test-no-assertion-kotlin",
+            "test-no-assertion-rust"
         ]
     );
 }
@@ -764,4 +765,108 @@ fn ux_a2_hook_should_NeverEmitDynamicRule_When_AnyInput() {
         assert!(!out.contains(dynamic));
     }
     std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------- test-no-assertion-rust ----------
+
+const RUST_SRC: &str = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn no_assert() {
+        let _x = 1 + 1;
+    }
+
+    #[test]
+    fn has_assert() {
+        assert_eq!(1 + 1, 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn panics() {
+        let _x = 1;
+    }
+
+    #[test]
+    #[ignore]
+    fn ignored() {
+        let _x = 1;
+    }
+
+    #[test]
+    fn via_helper() {
+        check_it();
+    }
+
+    fn check_it() {
+        assert!(true);
+    }
+
+    #[test]
+    fn snapshot() {
+        insta::assert_snapshot!("x");
+    }
+}
+"#;
+
+#[test]
+fn test_no_assertion_rust_should_FlagOnlyAssertionFreeTest() {
+    let findings = run_source(
+        "test-no-assertion-rust",
+        Path::new("lib.rs"),
+        RUST_SRC,
+        None,
+    );
+    assert_eq!(lines(&findings), vec![5], "{findings:?}");
+}
+
+#[test]
+fn test_no_assertion_rust_should_BeInDefaultChecks() {
+    assert!(
+        crate::config::default_checks()
+            .iter()
+            .any(|c| c.name == "test-no-assertion-rust")
+    );
+}
+
+#[test]
+fn test_no_assertion_rust_should_FollowMethodChainAndWrapperMacro() {
+    let src = r#"
+struct T;
+impl T {
+    fn new() -> T { T }
+    fn run(&self) { assert_eq!(1, 1); }
+}
+#[test]
+fn chained() { T::new().run(); }
+#[test]
+fn wrapped() { my_macro!(x => assert!(true)); }
+#[test]
+fn smoke() { T::new(); }
+"#;
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
+    assert_eq!(lines(&findings), vec![12], "{findings:?}");
+}
+
+#[test]
+fn test_no_assertion_rust_should_NotTreatTestPrefixedHelpersOrStringsAsOracles() {
+    let src = r#"
+fn test_setup() {}
+#[test]
+fn helper_named_like_a_macro() { test_setup(); }
+#[test]
+fn string_mentions_assert() { println!("assert_eq done"); }
+#[test]
+fn wrapped_real_assert() { my_macro!(x => assert!(true)); }
+"#;
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
+    assert_eq!(lines(&findings), vec![4, 6], "{findings:?}");
+}
+
+#[test]
+fn test_no_assertion_rust_should_NotCountAnAssertPrefixedVariableInAMacro() {
+    let src = "#[test]\nfn t() { println!(\"{}\", assert_count); }\n";
+    let findings = run_source("test-no-assertion-rust", Path::new("lib.rs"), src, None);
+    assert_eq!(lines(&findings), vec![2], "{findings:?}");
 }

@@ -53,12 +53,12 @@ inventory::submit! {
 }
 
 /// The recursive walkers below would overflow the stack on pathologically nested input.
-const MAX_TREE_DEPTH: usize = 256;
+pub(crate) const MAX_TREE_DEPTH: usize = 256;
 /// Bounds the quadratic `accounted` scan; larger loops are skipped, not flagged.
 const MAX_LOOP_BODY_NODES: usize = 5000;
 
 /// True when `root`'s subtree is deeper than `limit`. Iterative, so safe on any input.
-fn exceeds_depth(root: Node, limit: usize) -> bool {
+pub(crate) fn exceeds_depth(root: Node, limit: usize) -> bool {
     let mut cursor = root.walk();
     let mut depth = 0usize;
     loop {

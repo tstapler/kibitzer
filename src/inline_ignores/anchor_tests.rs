@@ -58,6 +58,25 @@ const ANCHOR_FIXTURES: &[(&str, &str, Source)] = &[
     ("java-file-size", "C.java", || long_file("//")),
     ("kotlin-file-size", "x.kt", || long_file("//")),
     ("rust-file-size", "x.rs", || long_file("//")),
+    ("primitive-obsession-rust", "x.rs", || {
+        "struct U {\n    a: String,\n    b: String,\n    c: bool,\n}\n".into()
+    }),
+    ("file-complexity-rust", "x.rs", rust_three_complex_functions),
+    ("sentinel-return-rust", "x.rs", || {
+        "fn f(x: &str) -> Result<i32, E> {\n    let a = g(x)?;\n    match h(a) {\n        Ok(b) => Ok(b),\n        Err(e) => return Err(e),\n    }\n}\n".into()
+    }),
+    ("rust-ignored-error", "x.rs", || {
+        "fn f() {\n    let _ = std::fs::remove_file(\"x\");\n}\n".into()
+    }),
+    ("rust-error-context", "x.rs", || {
+        "fn f() -> anyhow::Result<()> {\n    std::fs::read(\"x\")?;\n    Ok(())\n}\n".into()
+    }),
+    ("split-loop-rust", "x.rs", || {
+        "fn f(items: &[i32]) {\n    let mut a = 0;\n    let mut b = 0;\n    for v in items {\n        a += v;\n        b += items.len() as i32;\n    }\n}\n".into()
+    }),
+    ("test-no-assertion-rust", "x.rs", || {
+        "#[test]\nfn t() {\n    let _x = 1;\n}\n".into()
+    }),
     ("bash-file-size", "x.sh", || long_file("#")),
     ("syntax-rules-go", "x.go", || {
         "package main\n\nfunc f() {\n\ta := 86400\n\tb := 86400\n\tc := 86400\n}\n".into()
@@ -217,6 +236,11 @@ fn complex_func(name: &str) -> String {
         body.push_str(&format!("{lead} x == {i} {{\n\t\treturn\n\t}}"));
     }
     format!("func {name}(x int) {{\n{body}\n}}\n")
+}
+
+fn rust_three_complex_functions() -> String {
+    let body = "    if a { } if b { } if c { } if d { } if e { } if f { } if g { } if h { } if i { } if j { } if k { }\n";
+    format!("fn f1() {{\n{body}}}\nfn f2() {{\n{body}}}\nfn f3() {{\n{body}}}\n")
 }
 
 fn go_three_complex_functions() -> String {
